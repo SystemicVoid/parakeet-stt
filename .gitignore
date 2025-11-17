@@ -1,0 +1,14 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+
+# Rust
+target/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
