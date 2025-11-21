@@ -55,7 +55,9 @@ class AudioInput:
             callback=self._callback,
         )
         self._stream.start()
-        logger.info("Audio input stream started (device={}, rate={} Hz)", self.device, self.sample_rate)
+        logger.info(
+            "Audio input stream started (device={}, rate={} Hz)", self.device, self.sample_rate
+        )
 
     def stop(self) -> None:
         if self._stream is None:
@@ -117,7 +119,9 @@ class AudioInput:
             self._stream_ready = []
         return ready
 
-    def _callback(self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags) -> None:  # noqa: ANN401
+    def _callback(
+        self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags
+    ) -> None:  # noqa: ANN401
         if status:
             logger.debug("Sounddevice status: {}", status)
 

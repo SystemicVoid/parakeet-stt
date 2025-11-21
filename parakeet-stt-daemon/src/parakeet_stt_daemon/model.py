@@ -9,8 +9,8 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from importlib import import_module
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -20,8 +20,8 @@ DEFAULT_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 
 if TYPE_CHECKING:  # pragma: no cover
     import nemo.collections.asr as nemo_asr
-    from nemo.collections.asr.models import ASRModel
     import torch
+    from nemo.collections.asr.models import ASRModel
 else:
     nemo_asr = None  # type: ignore
     ASRModel = Any  # type: ignore

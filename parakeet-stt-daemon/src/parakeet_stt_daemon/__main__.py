@@ -6,9 +6,9 @@ import argparse
 from collections.abc import Sequence
 from typing import Literal, TypedDict, cast
 
+import sounddevice as sd
 import uvicorn
 from loguru import logger
-import sounddevice as sd
 
 from .config import ServerSettings
 from .server import DaemonServer, create_app
@@ -112,7 +112,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if settings.streaming_enabled:
         logger.info(
-            "Streaming config: chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}",
+            (
+                "Streaming config: chunk_secs={}, right_context_secs={}, "
+                "left_context_secs={}, batch_size={}"
+            ),
             settings.chunk_secs,
             settings.right_context_secs,
             settings.left_context_secs,
