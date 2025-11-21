@@ -102,11 +102,112 @@ class ParakeetTranscriber:
     def transcribe_iter(self, paths: Iterable[str], *, timestamps: bool = False) -> list[str]:
         return self.transcribe_files(list(paths), timestamps=timestamps)
 
-    def transcribe_wav(self, path: str) -> str:
-        outputs = self.model.transcribe([path], batch_size=1)
-        if not outputs:
+def transcribe_wav(self, path: str) -> str:
+    outputs = self.model.transcribe([path], batch_size=1)
+    if not outputs:
+        return ""
+    return str(outputs[0]).strip()
+
+class ParakeetStreamingSession:
+    """Accumulate audio chunks for a single streaming session."""
+
+    def __init__(self, parent: ParakeetStreamingTranscriber, sample_rate: int) -> None:
+        self._parent = parent
+        self.sample_rate = sample_rate
+        self._chunks: list[np.ndarray] = []
+
+    def feed(self, chunk: np.ndarray) -> None:
+        self._chunks.append(np.array(chunk, dtype=np.float32, copy=True))
+
+    def finalize(self) -> str:
+        if not self._chunks:
             return ""
-        return str(outputs[0]).strip()
+        combined = np.concatenate(self._chunks)
+        if self._parent.chunk_helper is not None:
+            try:
+                return self._parent.chunk_helper.transcribe([combined])[0]  # type: ignore[attr-defined,index]  # noqa: E501
+            except Exception as exc:  # pragma: no cover - fallback path
+                logger.warning("Chunk helper failed, falling back to offline: {}", exc)
+        return self._parent._transcribe_offline(combined, self.sample_rate)
 
 
-__all__ = ["load_parakeet_model", "ParakeetTranscriber", "DEFAULT_MODEL_NAME"]
+class ParakeetStreamingTranscriber:
+    """Streaming-friendly wrapper around Parakeet with offline fallback."""
+
+    def __init__(
+        self,
+        model: ASRModel,
+        *,
+        chunk_secs: float = 2.0,
+        right_context_secs: float = 2.0,
+        left_context_secs: float = 10.0,
+        batch_size: int = 32,
+    ) -> None:
+        self.model = model
+        self.chunk_secs = float(chunk_secs)
+        self.right_context_secs = float(right_context_secs)
+        self.left_context_secs = float(left_context_secs)
+        self.batch_size = int(batch_size)
+        self.chunk_helper: Any | None = None
+
+        self.offline = ParakeetTranscriber(model)
+        self._init_helper()
+
+    def _init_helper(self) -> None:
+        try:
+            from nemo.collections.asr.parts.utils.streaming_utils import (  # type: ignore
+                ChunkedRNNTInfer,
+            )
+
+            cfg = getattr(self.model, "cfg", getattr(self.model, "_cfg", None))
+            sample_rate = getattr(cfg, "sample_rate", 16_000)
+            decoder_delay_ms = getattr(cfg, "decoder_delay_in_ms", 0)
+            self.chunk_helper = ChunkedRNNTInfer(
+                model=self.model,
+                decoder_delay_in_ms=decoder_delay_ms,
+                chunk_len_in_secs=self.chunk_secs,
+                chunk_batch_size=self.batch_size,
+                right_context_len_in_secs=self.right_context_secs,
+                left_context_len_in_secs=self.left_context_secs,
+                audio_sample_rate=sample_rate,
+            )
+            logger.info(
+                "Streaming helper initialised (chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}, sample_rate={})",  # noqa: E501
+                self.chunk_secs,
+                self.right_context_secs,
+                self.left_context_secs,
+                self.batch_size,
+                sample_rate,
+            )
+        except Exception as exc:  # pragma: no cover - environment dependent
+            logger.warning("Chunked streaming helper unavailable; using offline fallback: {}", exc)
+            self.chunk_helper = None
+
+    def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
+        if self.chunk_helper is not None:
+            try:
+                self.chunk_helper.reset()  # type: ignore[attr-defined]
+            except Exception as exc:  # pragma: no cover
+                logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
+                self.chunk_helper = None
+        return ParakeetStreamingSession(self, sample_rate)
+
+    def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            path = Path(tmp.name)
+        try:
+            import soundfile as sf
+
+            sf.write(path, samples, sample_rate)
+            return self.offline.transcribe_wav(str(path))
+        finally:
+            path.unlink(missing_ok=True)
+
+
+__all__ = [
+    "load_parakeet_model",
+    "ParakeetTranscriber",
+    "ParakeetStreamingTranscriber",
+    "ParakeetStreamingSession",
+    "DEFAULT_MODEL_NAME",
+]
