@@ -7,9 +7,14 @@ pluggable for the next iteration.
 ## Quickstart
 
 ```bash
-uv sync --dev                # base + dev tooling (ruff, black, pyright)
-uv sync --extra inference    # add torch/torchaudio/nemo_toolkit (GPU build)
-uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765
+uv sync --dev  # base + dev tooling (ruff, black, pyright)
+uv sync --extra inference --prerelease allow \
+  --index https://download.pytorch.org/whl/nightly/cu124 \
+  --index-strategy unsafe-best-match
+uv run --prerelease allow \
+  --index https://download.pytorch.org/whl/nightly/cu124 \
+  --index-strategy unsafe-best-match \
+  parakeet-stt-daemon --host 127.0.0.1 --port 8765
 ```
 
 - Uses environment variables prefixed with `PARAKEET_` for config overrides
@@ -42,6 +47,6 @@ uv run pyright
 
 ## Notes
 
-- The `inference` extra group pins `torch`, `torchaudio`, and
+- The `inference` extra group pins nightly `torch` (CUDA 12.4 build) plus
   `nemo_toolkit[asr]`; skip it if you only need protocol testing.
 - Package uses a `src/` layout with Hatch build backend.
