@@ -12,6 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -155,73 +156,103 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
         hotkey = %config.hotkey,
         "Starting hotkey loop; press Right Ctrl to talk"
     );
-    let injector: Box<dyn TextInjector> = if let Some(path) = config.wtype_path.clone() {
-        Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
-    } else {
-        Box::new(NoopInjector)
+    let injector: Box<dyn TextInjector> = match config.wtype_path.clone() {
+        Some(path) => {
+            if path.exists() {
+                info!(?path, "Using wtype injector");
+                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+            } else {
+                warn!(?path, "Configured wtype path does not exist; using noop injector");
+                Box::new(NoopInjector)
+            }
+        }
+        None => {
+            warn!("No injector configured; transcription will not be injected");
+            Box::new(NoopInjector)
+        }
     };
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
     let _hotkey_handle = spawn_hotkey_loop(hk_tx)?;
 
-    let mut ws_client = WsClient::connect(&config).await?;
-    let (mut ws_write, mut ws_read) = ws_client.into_split();
-
+    let mut backoff = TokioDuration::from_millis(500);
     loop {
-        tokio::select! {
-            Some(evt) = hk_rx.recv() => {
-                match evt {
-                    HotkeyEvent::Down => {
-                        if let Some(session_id) = state.begin_listening() {
-                            let message = start_message(session_id, Some("auto".to_string()));
-                            send_message(&mut ws_write, &message).await?;
-                            info!(session = %session_id, "start_session sent (hotkey down)");
-                        }
-                    }
-                    HotkeyEvent::Up => {
-                        if let Some(session_id) = state.stop_listening() {
-                            let message = stop_message(session_id);
-                            send_message(&mut ws_write, &message).await?;
-                            info!(session = %session_id, "stop_session sent (hotkey up)");
-                        }
-                    }
-                }
-            }
-            next = ws_read.next() => {
-                match next {
-                    Some(Ok(msg)) => {
-                        match msg {
-                            tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
-                                match serde_json::from_str::<ServerMessage>(&txt) {
-                                    Ok(message) => handle_server_message(message, &mut state, injector.as_ref())?,
-                                    Err(err) => warn!("failed to decode server message: {}", err),
+        match WsClient::connect(&config).await {
+            Ok(ws_client) => {
+                info!("Connected to daemon");
+                backoff = TokioDuration::from_millis(500);
+                let (mut ws_write, mut ws_read) = ws_client.into_split();
+
+                let run_loop = async {
+                    loop {
+                        tokio::select! {
+                            Some(evt) = hk_rx.recv() => {
+                                match evt {
+                                    HotkeyEvent::Down => {
+                                        if let Some(session_id) = state.begin_listening() {
+                                            let message = start_message(session_id, Some("auto".to_string()));
+                                            send_message(&mut ws_write, &message).await?;
+                                            info!(session = %session_id, "start_session sent (hotkey down)");
+                                        }
+                                    }
+                                    HotkeyEvent::Up => {
+                                        if let Some(session_id) = state.stop_listening() {
+                                            let message = stop_message(session_id);
+                                            send_message(&mut ws_write, &message).await?;
+                                            info!(session = %session_id, "stop_session sent (hotkey up)");
+                                        }
+                                    }
                                 }
                             }
-                            tokio_tungstenite::tungstenite::protocol::Message::Ping(payload) => {
-                                ws_write.send(tokio_tungstenite::tungstenite::protocol::Message::Pong(payload)).await?;
+                            next = ws_read.next() => {
+                                match next {
+                                    Some(Ok(msg)) => {
+                                        match msg {
+                                            tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
+                                                match serde_json::from_str::<ServerMessage>(&txt) {
+                                                    Ok(message) => handle_server_message(message, &mut state, injector.as_ref())?,
+                                                    Err(err) => warn!("failed to decode server message: {}", err),
+                                                }
+                                            }
+                                            tokio_tungstenite::tungstenite::protocol::Message::Ping(payload) => {
+                                                ws_write.send(tokio_tungstenite::tungstenite::protocol::Message::Pong(payload)).await?;
+                                            }
+                                            tokio_tungstenite::tungstenite::protocol::Message::Close(_) => {
+                                                warn!("daemon closed the connection");
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Some(Err(err)) => {
+                                        warn!("websocket error: {}", err);
+                                        break;
+                                    }
+                                    None => {
+                                        warn!("websocket stream ended");
+                                        break;
+                                    }
+                                }
                             }
-                            tokio_tungstenite::tungstenite::protocol::Message::Close(_) => {
-                                warn!("daemon closed the connection");
-                                break;
-                            }
-                            _ => {}
                         }
                     }
-                    Some(Err(err)) => {
-                        warn!("websocket error: {}", err);
-                        break;
-                    }
-                    None => {
-                        warn!("websocket stream ended");
-                        break;
-                    }
+                    Result::<()>::Ok(())
+                }.await;
+
+                if let Err(err) = run_loop {
+                    warn!("session loop ended with error: {err}");
                 }
+                state.reset();
+                warn!("Reconnecting to daemon after drop");
+            }
+            Err(err) => {
+                warn!("Connection to daemon failed: {} (retrying in {:.1?})", err, backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(TokioDuration::from_secs(10));
             }
         }
     }
-
-    Ok(())
 }
 
 async fn send_message(
