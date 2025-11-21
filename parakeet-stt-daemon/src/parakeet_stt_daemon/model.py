@@ -43,6 +43,15 @@ def _resolve_device(requested: str) -> str:
     return requested
 
 
+def _extract_text(output: Any) -> str:
+    if isinstance(output, str):
+        return output.strip()
+    text = getattr(output, "text", None)
+    if text is not None:
+        return str(text).strip()
+    return str(output).strip()
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -53,8 +62,20 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
         ) from exc
 
     resolved_device = _resolve_device(device)
-    model: ASRModel = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
-    model.to(resolved_device)
+    model: ASRModel = nemo_asr.models.ASRModel.from_pretrained(
+        model_name=model_name, map_location="cpu"
+    )
+    try:
+        model.to(resolved_device)
+    except Exception as exc:  # pragma: no cover - runtime/device dependent
+        if resolved_device == "cuda":
+            logger.warning(
+                "Failed to place Parakeet on CUDA ({}); retrying on CPU", exc.__class__.__name__
+            )
+            model.to("cpu")
+            resolved_device = "cpu"
+        else:
+            raise
     logger.info("Loaded Parakeet model '{}' on device {}", model_name, resolved_device)
 
     # Optional attention tweak is aligned with the HF card guidance.
@@ -96,17 +117,16 @@ class ParakeetTranscriber:
             return []
         logger.info("Transcribing {} file(s) with Parakeet", len(paths))
         outputs = self.model.transcribe(list(paths), timestamps=timestamps)
-        # `transcribe` returns a list; normalise to list[str]
-        return [str(item) for item in outputs]
+        return [_extract_text(item) for item in outputs]
 
     def transcribe_iter(self, paths: Iterable[str], *, timestamps: bool = False) -> list[str]:
         return self.transcribe_files(list(paths), timestamps=timestamps)
 
-def transcribe_wav(self, path: str) -> str:
-    outputs = self.model.transcribe([path], batch_size=1)
-    if not outputs:
-        return ""
-    return str(outputs[0]).strip()
+    def transcribe_wav(self, path: str) -> str:
+        outputs = self.model.transcribe([path], batch_size=1)
+        if not outputs:
+            return ""
+        return _extract_text(outputs[0])
 
 class ParakeetStreamingSession:
     """Accumulate audio chunks for a single streaming session."""

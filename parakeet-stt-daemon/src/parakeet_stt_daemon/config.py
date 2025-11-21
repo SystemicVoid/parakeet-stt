@@ -34,7 +34,7 @@ class ServerSettings(BaseSettings):
         default=None, description="Optional explicit config file path (reserved)."
     )
     streaming_enabled: bool = Field(
-        default=True, description="Enable streaming inference path when true."
+        default=False, description="Enable streaming inference path when true."
     )
     chunk_secs: float = Field(
         default=2.0, ge=0.1, le=10.0, description="Chunk size (seconds) for streaming inference."
@@ -53,6 +53,12 @@ class ServerSettings(BaseSettings):
     )
     batch_size: int = Field(
         default=32, ge=1, le=128, description="Batch size used by streaming inference helper."
+    )
+    silence_floor_db: float = Field(
+        default=-40.0,
+        ge=-120.0,
+        le=0.0,
+        description="Stop trimming tail silence when RMS exceeds this floor (dB).",
     )
 
     model_config = SettingsConfigDict(

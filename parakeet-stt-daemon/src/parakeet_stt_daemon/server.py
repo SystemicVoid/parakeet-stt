@@ -286,7 +286,7 @@ class DaemonServer:
             task.cancel()
 
     def _trim_tail_silence(
-        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50, floor_db: float = -40.0
+        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50
     ) -> np.ndarray:
         if samples.size == 0:
             return samples
@@ -294,6 +294,7 @@ class DaemonServer:
         # Clamp to mono array
         audio = samples.astype(np.float32, copy=False)
         idx = audio.size
+        floor_db = float(self.settings.silence_floor_db)
         while idx > 0:
             start = max(0, idx - window)
             window_slice = audio[start:idx]
