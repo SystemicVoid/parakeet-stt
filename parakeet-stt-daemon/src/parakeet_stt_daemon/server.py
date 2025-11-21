@@ -60,6 +60,7 @@ class DaemonServer:
         )
         self.model = load_parakeet_model(device=settings.device)
         self.transcriber = ParakeetTranscriber(self.model)
+        self._transcribe_lock = asyncio.Lock()
         self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
             ParakeetStreamingTranscriber(
                 self.model,
@@ -142,55 +143,56 @@ class DaemonServer:
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
         logger.debug("stop_session received: {}", message)
-        try:
-            session = await self.sessions.stop_session(message.session_id)
-        except SessionNotFoundError:
-            await self._send_error(
-                websocket, message.session_id, "SESSION_BUSY", "No matching active session"
-            )
-            return
-        audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
-        self._stop_stream_drain_loop()
-        audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
+        async with self._transcribe_lock:
+            try:
+                session = await self.sessions.stop_session(message.session_id)
+            except SessionNotFoundError:
+                await self._send_error(
+                    websocket, message.session_id, "SESSION_BUSY", "No matching active session"
+                )
+                return
+            audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
+            self._stop_stream_drain_loop()
+            audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
 
-        if audio_samples.size == 0:
-            await self._send_error(
-                websocket, session.session_id, "AUDIO_DEVICE", "No audio captured for session"
+            if audio_samples.size == 0:
+                await self._send_error(
+                    websocket, session.session_id, "AUDIO_DEVICE", "No audio captured for session"
+                )
+                await self.sessions.clear(session.session_id)
+                return
+
+            infer_ms: int | None = None
+            try:
+                infer_started = datetime.now(tz=UTC)
+                text = await self._finalise_transcription(audio_samples, ready_chunks, tail)
+                infer_ms = int((datetime.now(tz=UTC) - infer_started).total_seconds() * 1000)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
+                await self._send_error(
+                    websocket, session.session_id, "MODEL", "Transcription failed"
+                )
+                await self.sessions.clear(session.session_id)
+                return
+
+            latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
+            completion = FinalResult(
+                session_id=session.session_id,
+                text=text,
+                latency_ms=latency_ms,
+                audio_ms=audio_ms,
+                lang=self.settings.language,
+                confidence=None,
             )
+            await websocket.send_json(completion.model_dump())
             await self.sessions.clear(session.session_id)
-            return
-
-        infer_ms: int | None = None
-        try:
-            infer_started = datetime.now(tz=UTC)
-            text = await self._finalise_transcription(audio_samples, ready_chunks, tail)
-            infer_ms = int((datetime.now(tz=UTC) - infer_started).total_seconds() * 1000)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
-            await self._send_error(
-                websocket, session.session_id, "MODEL", "Transcription failed"
+            logger.info(
+                "Session {} completed (audio_ms={}, latency_ms={}, infer_ms={})",
+                session.session_id,
+                audio_ms,
+                latency_ms,
+                infer_ms,
             )
-            await self.sessions.clear(session.session_id)
-            return
-
-        latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
-        completion = FinalResult(
-            session_id=session.session_id,
-            text=text,
-            latency_ms=latency_ms,
-            audio_ms=audio_ms,
-            lang=self.settings.language,
-            confidence=None,
-        )
-        await websocket.send_json(completion.model_dump())
-        await self.sessions.clear(session.session_id)
-        logger.info(
-            "Session {} completed (audio_ms={}, latency_ms={}, infer_ms={})",
-            session.session_id,
-            audio_ms,
-            latency_ms,
-            infer_ms,
-        )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
         logger.debug("abort_session received: {}", message)
