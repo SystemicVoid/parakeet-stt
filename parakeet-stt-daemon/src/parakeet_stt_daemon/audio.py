@@ -85,6 +85,24 @@ class AudioInput:
             return np.zeros((0,), dtype=self.dtype)
         return np.concatenate(chunks).astype(self.dtype, copy=False)
 
+    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+        """Stop accumulation and return captured samples plus streaming slices.
+
+        Returns: (full_audio, ready_chunks, leftover_buffer)
+        """
+        with self._lock:
+            self._session_active = False
+            chunks = self._session_chunks
+            self._session_chunks = []
+            ready = self._stream_ready
+            tail = self._stream_buffer.copy()
+            self._stream_ready = []
+            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+        audio = np.concatenate(chunks).astype(self.dtype, copy=False) if chunks else np.zeros(
+            (0,), dtype=self.dtype
+        )
+        return audio, ready, tail
+
     def configure_stream_chunk_size(self, chunk_samples: int) -> None:
         """Set desired streaming chunk size in samples."""
         with self._lock:

@@ -34,7 +34,12 @@ from .messages import (
     StopSession,
     parse_client_message,
 )
-from .model import ParakeetTranscriber, load_parakeet_model
+from .model import (
+    ParakeetStreamingSession,
+    ParakeetStreamingTranscriber,
+    ParakeetTranscriber,
+    load_parakeet_model,
+)
 from .session import SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 
 ErrorCode = Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
@@ -52,9 +57,23 @@ class DaemonServer:
             dtype="float32",
             device=settings.mic_device,
         )
-        self.transcriber = ParakeetTranscriber(
-            load_parakeet_model(device=settings.device)
+        self.model = load_parakeet_model(device=settings.device)
+        self.transcriber = ParakeetTranscriber(self.model)
+        self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
+            ParakeetStreamingTranscriber(
+                self.model,
+                chunk_secs=settings.chunk_secs,
+                right_context_secs=settings.right_context_secs,
+                left_context_secs=settings.left_context_secs,
+                batch_size=settings.batch_size,
+            )
+            if settings.streaming_enabled
+            else None
         )
+        self._active_stream: ParakeetStreamingSession | None = None
+        if settings.streaming_enabled:
+            chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
+            self.audio.configure_stream_chunk_size(chunk_samples)
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -105,6 +124,8 @@ class DaemonServer:
             )
             return
         self.audio.start_session()
+        if self.streaming_transcriber:
+            self._active_stream = self.streaming_transcriber.start_session(self.audio.sample_rate)
 
         response = SessionStarted(
             session_id=message.session_id,
@@ -124,7 +145,7 @@ class DaemonServer:
                 websocket, message.session_id, "SESSION_BUSY", "No matching active session"
             )
             return
-        audio_samples = self.audio.stop_session()
+        audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
         audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
 
         if audio_samples.size == 0:
@@ -135,16 +156,7 @@ class DaemonServer:
             return
 
         try:
-            audio_path = self._write_wav(audio_samples)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to materialise audio for session {}: {}", session.session_id, exc)
-            await self._send_error(
-                websocket, session.session_id, "AUDIO_DEVICE", "Failed to write audio buffer"
-            )
-            await self.sessions.clear(session.session_id)
-            return
-        try:
-            text = self.transcriber.transcribe_wav(str(audio_path))
+            text = await self._finalise_transcription(audio_samples, ready_chunks, tail)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
             await self._send_error(
@@ -152,8 +164,6 @@ class DaemonServer:
             )
             await self.sessions.clear(session.session_id)
             return
-        finally:
-            audio_path.unlink(missing_ok=True)
 
         latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
         completion = FinalResult(
@@ -208,6 +218,26 @@ class DaemonServer:
             wf.setsampwidth(2)
             wf.setframerate(self.audio.sample_rate)
             wf.writeframes(pcm.tobytes())
+
+    async def _finalise_transcription(
+        self, audio_samples: np.ndarray, ready_chunks: list[np.ndarray], tail: np.ndarray
+    ) -> str:
+        if self.streaming_transcriber and self._active_stream:
+            try:
+                for chunk in ready_chunks:
+                    self._active_stream.feed(chunk)
+                if tail.size:
+                    self._active_stream.feed(tail)
+                return self._active_stream.finalize()
+            finally:
+                self._active_stream = None
+
+        # Offline fallback: write temp wav and transcribe.
+        audio_path = self._write_wav(audio_samples)
+        try:
+            return self.transcriber.transcribe_wav(str(audio_path))
+        finally:
+            audio_path.unlink(missing_ok=True)
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
