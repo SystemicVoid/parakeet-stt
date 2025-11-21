@@ -3,12 +3,13 @@
 These models intentionally mirror the SPEC.md contract and provide a
 single place to evolve the message schema.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Literal, Union
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,7 +57,7 @@ class AbortSession(BaseModel):
     timestamp: Timestamp
 
 
-ClientMessage = Union[StartSession, StopSession, AbortSession]
+ClientMessage = StartSession | StopSession | AbortSession
 
 
 class SessionStarted(BaseModel):
@@ -74,9 +75,7 @@ class SessionStarted(BaseModel):
 class FinalResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal[ServerMessageType.FINAL_RESULT] = Field(
-        default=ServerMessageType.FINAL_RESULT
-    )
+    type: Literal[ServerMessageType.FINAL_RESULT] = Field(default=ServerMessageType.FINAL_RESULT)
     session_id: UUID
     text: str
     latency_ms: int
@@ -88,9 +87,7 @@ class FinalResult(BaseModel):
 class ErrorMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal[ServerMessageType.ERROR] = Field(
-        default=ServerMessageType.ERROR
-    )
+    type: Literal[ServerMessageType.ERROR] = Field(default=ServerMessageType.ERROR)
     session_id: UUID | None = None
     code: Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
     message: str
@@ -105,7 +102,7 @@ class StatusMessage(BaseModel):
     gpu_mem_mb: int | None = None
 
 
-ServerMessage = Union[SessionStarted, FinalResult, ErrorMessage, StatusMessage]
+ServerMessage = SessionStarted | FinalResult | ErrorMessage | StatusMessage
 
 
 @dataclass(frozen=True)

@@ -1,9 +1,10 @@
 """Session lifecycle tracking for push-to-talk interactions."""
+
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from uuid import UUID
 
@@ -17,21 +18,21 @@ class SessionState(str, Enum):
 @dataclass
 class Session:
     session_id: UUID
-    started_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     state: SessionState = SessionState.LISTENING
-    last_updated: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    last_updated: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
     def mark_processing(self) -> None:
         self.state = SessionState.PROCESSING
-        self.last_updated = datetime.now(tz=timezone.utc)
+        self.last_updated = datetime.now(tz=UTC)
 
     def mark_completed(self) -> None:
         self.state = SessionState.IDLE
-        self.last_updated = datetime.now(tz=timezone.utc)
+        self.last_updated = datetime.now(tz=UTC)
 
     @property
     def audio_duration_ms(self) -> int:
-        return int((datetime.now(tz=timezone.utc) - self.started_at).total_seconds() * 1000)
+        return int((datetime.now(tz=UTC) - self.started_at).total_seconds() * 1000)
 
 
 class SessionBusyError(RuntimeError):

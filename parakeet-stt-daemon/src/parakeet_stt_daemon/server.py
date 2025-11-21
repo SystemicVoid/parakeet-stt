@@ -1,7 +1,9 @@
 """FastAPI-based WebSocket server wrapping the Parakeet audio pipeline."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -21,7 +23,9 @@ from .messages import (
     StopSession,
     parse_client_message,
 )
-from .session import SessionManager, SessionState, SessionBusyError, SessionNotFoundError
+from .session import SessionBusyError, SessionManager, SessionNotFoundError, SessionState
+
+ErrorCode = Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
 
 
 class DaemonServer:
@@ -82,7 +86,7 @@ class DaemonServer:
 
         response = SessionStarted(
             session_id=message.session_id,
-            ts=datetime.now(tz=timezone.utc),
+            ts=datetime.now(tz=UTC),
             mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
             lang=message.preferred_lang,
         )
@@ -124,7 +128,7 @@ class DaemonServer:
         )
 
     async def _send_error(
-        self, websocket: WebSocket, session_id: UUID | None, code: str, message: str
+        self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
     ) -> None:
         err = ErrorMessage(session_id=session_id, code=code, message=message)
         await websocket.send_json(err.model_dump())
@@ -148,6 +152,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         return {"status": "ok"}
 
     if settings.status_enabled:
+
         @app.get("/status")
         async def status() -> JSONResponse:
             return JSONResponse(server.status().model_dump())

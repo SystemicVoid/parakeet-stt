@@ -33,6 +33,7 @@ parakeet-stt-daemon = "parakeet_stt_daemon.__main__:main"
 dev = [
   "ruff>=0.7.0",
   "black>=24.10.0",
+  "pyright>=1.1.389",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -40,3 +41,22 @@ packages = ["src/parakeet_stt_daemon"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/parakeet_stt_daemon", "README.md", "pyproject.toml"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", ".uv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+reportMissingImports = "warning"

@@ -1,4 +1,5 @@
 """Configuration management for the Parakeet STT daemon."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,9 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class ServerSettings(BaseSettings):
     """Runtime settings loaded from env vars or CLI overrides."""
 
-    host: str = Field(
-        default="127.0.0.1", description="Host the WebSocket/HTTP server binds to"
-    )
+    host: str = Field(default="127.0.0.1", description="Host the WebSocket/HTTP server binds to")
     port: int = Field(default=8765, ge=1, le=65535)
     shared_secret: str | None = Field(
         default=None,

@@ -1,14 +1,26 @@
 """CLI entrypoint for running the Parakeet STT daemon server."""
+
 from __future__ import annotations
 
 import argparse
-from typing import Sequence
+from collections.abc import Sequence
+from typing import Literal, TypedDict, cast
 
 import uvicorn
 from loguru import logger
 
 from .config import ServerSettings
 from .server import create_app
+
+
+class SettingsKwargs(TypedDict, total=False):
+    host: str
+    port: int
+    language: str | None
+    device: Literal["cuda", "cpu"]
+    mic_device: int | str | None
+    shared_secret: str | None
+    status_enabled: bool
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -34,13 +46,20 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _build_settings(args: argparse.Namespace) -> ServerSettings:
-    kwargs: dict[str, object] = {}
-    for field in ("host", "port", "language", "device", "mic_device", "shared_secret"):
-        value = getattr(args, field, None)
-        if value is not None:
-            kwargs[field] = value
-    if hasattr(args, "status_enabled"):
-        kwargs["status_enabled"] = bool(args.status_enabled)
+    kwargs: SettingsKwargs = {}
+    if args.host is not None:
+        kwargs["host"] = str(args.host)
+    if args.port is not None:
+        kwargs["port"] = int(args.port)
+    if args.language is not None:
+        kwargs["language"] = str(args.language)
+    if args.device is not None:
+        kwargs["device"] = cast(Literal["cuda", "cpu"], args.device)
+    if args.mic_device is not None:
+        kwargs["mic_device"] = args.mic_device
+    if args.shared_secret is not None:
+        kwargs["shared_secret"] = str(args.shared_secret)
+    kwargs["status_enabled"] = bool(args.status_enabled)
     return ServerSettings(**kwargs)
 
 

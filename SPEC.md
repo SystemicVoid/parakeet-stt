@@ -255,4 +255,13 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
 
 ---
 
+## 8. Repo Operations
+
+- Remote `SystemicVoid/parakeet-stt` exists and is set to **private** (verified via `gh repo view`).
+- To recreate/replace the remote via CLI while keeping it private:
+  - `gh repo create SystemicVoid/parakeet-stt --private --source . --remote origin --push`
+- Sanity-check visibility any time with: `gh repo view --json isPrivate,visibility`.
+
+---
+
 Keep this spec updated as implementation evolves. Every major change (new protocol fields, dependency shifts, UX decisions) should be reflected here promptly so future agents can onboard quickly.
