@@ -12,3 +12,5 @@ target/
 .vscode/
 *.swp
 .DS_Store
+parakeet-stt-daemon/2086-149220-0033.wav
+parakeet-stt-daemon/test-run.py
