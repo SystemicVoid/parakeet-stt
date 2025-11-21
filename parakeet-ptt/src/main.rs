@@ -14,12 +14,12 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration as TokioDuration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::client::WsClient;
 use crate::config::{ClientConfig, DEFAULT_ENDPOINT};
-use crate::hotkey::{spawn_hotkey_loop, HotkeyEvent};
+use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{NoopInjector, TextInjector, WtypeInjector};
 use crate::protocol::{start_message, stop_message, ServerMessage};
 use crate::state::PttState;
@@ -86,14 +86,45 @@ async fn main() -> Result<()> {
     run_hotkey_mode(config).await
 }
 
+fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
+    match config.wtype_path.clone() {
+        Some(path) => {
+            if path.exists() {
+                info!(
+                    ?path,
+                    delay_ms = config.wtype_delay_ms,
+                    "Using wtype injector"
+                );
+                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+            } else {
+                error!(
+                    ?path,
+                    "Configured wtype path does not exist; falling back to noop injector"
+                );
+                Box::new(NoopInjector)
+            }
+        }
+        None => match which::which("wtype") {
+            Ok(path) => {
+                info!(
+                    ?path,
+                    delay_ms = config.wtype_delay_ms,
+                    "Found wtype in PATH"
+                );
+                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+            }
+            Err(_) => {
+                error!("wtype not found; transcription will not be injected");
+                Box::new(NoopInjector)
+            }
+        },
+    }
+}
+
 async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result<()> {
     info!(endpoint = %config.endpoint, "Connecting to parakeet-stt-daemon");
     let mut client = WsClient::connect(&config).await?;
-    let injector: Box<dyn TextInjector> = if let Some(path) = config.wtype_path.clone() {
-        Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
-    } else {
-        Box::new(NoopInjector)
-    };
+    let injector = build_injector(&config);
 
     let mut state = PttState::new();
     let Some(session_id) = state.begin_listening() else {
@@ -157,30 +188,8 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
         hotkey = %config.hotkey,
         "Starting hotkey loop; press Right Ctrl to talk"
     );
-    let injector: Box<dyn TextInjector> = match config.wtype_path.clone() {
-        Some(path) => {
-            if path.exists() {
-                info!(?path, "Using wtype injector");
-                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
-            } else {
-                warn!(
-                    ?path,
-                    "Configured wtype path does not exist; using noop injector"
-                );
-                Box::new(NoopInjector)
-            }
-        }
-        None => match which::which("wtype") {
-            Ok(path) => {
-                info!(?path, "Found wtype in PATH");
-                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
-            }
-            Err(_) => {
-                warn!("No injector configured and wtype not found; transcription will not be injected");
-                Box::new(NoopInjector)
-            }
-        },
-    };
+    ensure_input_access()?;
+    let injector = build_injector(&config);
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
@@ -344,19 +353,22 @@ async fn fetch_status_once(config: &ClientConfig) {
         .timeout(Duration::from_secs(2))
         .send()
         .await
-        .and_then(|r| r.json::<StatusInfo>())
-        .await
     {
-        Ok(status) => {
-            info!(
-                "Daemon status: state={:?}, sessions_active={:?}, device={:?}, streaming={:?}, chunk_secs={:?}",
-                status.state, status.sessions_active, status.device, status.streaming_enabled, status.chunk_secs
-            );
-        }
+        Ok(response) => match response.json::<StatusInfo>().await {
+            Ok(status) => {
+                info!(
+                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, streaming={:?}, chunk_secs={:?}",
+                    status.state, status.sessions_active, status.device, status.streaming_enabled, status.chunk_secs
+                );
+            }
+            Err(err) => {
+                warn!("Failed to decode daemon status from {}: {}", url, err);
+            }
+        },
         Err(err) => {
             warn!("Failed to fetch daemon status from {}: {}", url, err);
         }
-    }
+    };
 }
 
 fn init_tracing() {

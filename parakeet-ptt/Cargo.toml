@@ -20,6 +20,6 @@ time = { version = "0.3.36", features = ["formatting", "macros", "serde"] }
 url = "2.5.4"
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 evdev = "0.12.2"
-nix = { version = "0.27.1", features = ["user", "ioctl"] }
+nix = { version = "0.27.1", features = ["user", "ioctl", "fs"] }
 reqwest = { version = "0.12.9", features = ["json", "rustls-tls"] }
 which = "6.0.1"

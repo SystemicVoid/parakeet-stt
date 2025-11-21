@@ -1,16 +1,61 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::ErrorKind;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use evdev::{Device, InputEventKind, Key};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
     Down,
     Up,
+}
+
+pub fn ensure_input_access() -> Result<()> {
+    let mut checked = false;
+    let mut last_err: Option<(String, std::io::Error)> = None;
+    let input_dir = Path::new("/dev/input");
+    for entry in fs::read_dir(input_dir).context("failed to read /dev/input")? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_event = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("event"))
+            .unwrap_or(false);
+        if !is_event {
+            continue;
+        }
+
+        checked = true;
+        match File::open(&path) {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                last_err = Some((path.display().to_string(), err));
+            }
+            Err(err) => {
+                last_err = Some((path.display().to_string(), err));
+            }
+        }
+    }
+    let hint =
+        "Add your user to the 'input' group with `sudo usermod -aG input $USER` and re-login.";
+    if !checked {
+        bail!("No /dev/input/event* devices found. {hint}");
+    }
+    if let Some((path, err)) = last_err {
+        bail!(
+            "No readable /dev/input/event* devices (last tried {}: {}). {hint}",
+            path,
+            err
+        );
+    }
+    bail!("No readable /dev/input/event* devices. {hint}")
 }
 
 pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<thread::JoinHandle<()>> {
@@ -82,13 +127,14 @@ fn find_right_ctrl_devices() -> Result<Vec<Device>> {
         }
 
         match Device::open(&path) {
-            Ok(mut dev) => {
+            Ok(dev) => {
                 if dev
                     .supported_keys()
                     .map(|k| k.contains(Key::KEY_RIGHTCTRL))
                     .unwrap_or(false)
                 {
-                    let _ = dev.set_non_blocking(true);
+                    let raw_fd = dev.as_raw_fd();
+                    let _ = fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
                     devices.push(dev);
                 }
             }
