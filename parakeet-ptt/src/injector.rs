@@ -31,9 +31,8 @@ impl WtypeInjector {
 impl TextInjector for WtypeInjector {
     fn inject(&self, text: &str) -> Result<()> {
         let status = Command::new(&self.binary)
-            .arg("--delay-ms")
+            .arg("-d")
             .arg(self.delay_ms.to_string())
-            .arg("--text")
             .arg(text)
             .status()
             .context("failed to spawn wtype")?;
