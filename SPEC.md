@@ -66,6 +66,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Sample rate 16 kHz mono, 16‑bit PCM.
   - Use `sounddevice.RawInputStream` with callback writing into a lock-free ring buffer (~2 s). Stream remains open; push-to-talk simply toggles whether frames are fed into the model.
   - Optional: capture 200 ms pre-roll on session start.
+  - Streaming defaults (HF-aligned): chunk 2.0 s, right context 2.0 s, left context 10 s, batch size 32; falling back to offline transcription is acceptable when streaming helper is unavailable.
 
 - **Streaming inference**
   - Load `FastConformerTransducerModel` from NeMo with `model.enable_streaming()` (or equivalent) per HF config (`att_context_size=[256,256]`, chunk length 320 samples, stride 160).
