@@ -83,7 +83,11 @@ fn find_right_ctrl_devices() -> Result<Vec<Device>> {
 
         match Device::open(&path) {
             Ok(mut dev) => {
-                if dev.supported_keys().map(|k| k.contains(Key::KEY_RIGHTCTRL)).unwrap_or(false) {
+                if dev
+                    .supported_keys()
+                    .map(|k| k.contains(Key::KEY_RIGHTCTRL))
+                    .unwrap_or(false)
+                {
                     let _ = dev.set_non_blocking(true);
                     devices.push(dev);
                 }

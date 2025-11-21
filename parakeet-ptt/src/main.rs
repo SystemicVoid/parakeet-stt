@@ -1,7 +1,7 @@
 mod client;
 mod config;
-mod injector;
 mod hotkey;
+mod injector;
 mod protocol;
 mod state;
 
@@ -162,7 +162,10 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
                 info!(?path, "Using wtype injector");
                 Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
             } else {
-                warn!(?path, "Configured wtype path does not exist; using noop injector");
+                warn!(
+                    ?path,
+                    "Configured wtype path does not exist; using noop injector"
+                );
                 Box::new(NoopInjector)
             }
         }
@@ -247,7 +250,10 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
-                warn!("Connection to daemon failed: {} (retrying in {:.1?})", err, backoff);
+                warn!(
+                    "Connection to daemon failed: {} (retrying in {:.1?})",
+                    err, backoff
+                );
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(TokioDuration::from_secs(10));
             }
@@ -261,7 +267,9 @@ async fn send_message(
 ) -> Result<()> {
     let payload = serde_json::to_string(message).context("failed to serialize message")?;
     ws_write
-        .send(tokio_tungstenite::tungstenite::protocol::Message::Text(payload))
+        .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+            payload,
+        ))
         .await
         .context("failed to send message")
 }
