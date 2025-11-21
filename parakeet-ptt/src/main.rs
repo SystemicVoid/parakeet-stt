@@ -170,10 +170,16 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
                 Box::new(NoopInjector)
             }
         }
-        None => {
-            warn!("No injector configured; transcription will not be injected");
-            Box::new(NoopInjector)
-        }
+        None => match which::which("wtype") {
+            Ok(path) => {
+                info!(?path, "Found wtype in PATH");
+                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+            }
+            Err(_) => {
+                warn!("No injector configured and wtype not found; transcription will not be injected");
+                Box::new(NoopInjector)
+            }
+        },
     };
 
     let mut state = PttState::new();

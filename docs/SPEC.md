@@ -88,6 +88,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 - **Observability**
   - Structured logs for each session: durations, frames processed, GPU ms, output length.
   - Metrics aggregator (future) to feed UI/waybar when needed.
+  - Quick smoke: `uv run parakeet-stt-daemon --check`, then `uv run parakeet-stt-daemon` (inference extra installed), and in another shell `cargo run --manifest-path parakeet-ptt/Cargo.toml` to exercise the hotkey loop; watch logs for `start_session`/`final_result`.
 
 ### 3.2 `parakeet-ptt` (Rust 1.89+)
 
