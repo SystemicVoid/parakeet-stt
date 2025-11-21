@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
@@ -10,6 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
 
+from .audio import AudioInput
 from .config import ServerSettings
 from .messages import (
     AbortSession,
@@ -34,6 +36,12 @@ class DaemonServer:
     def __init__(self, settings: ServerSettings) -> None:
         self.settings = settings
         self.sessions = SessionManager()
+        self.audio = AudioInput(
+            sample_rate=16_000,
+            channels=1,
+            dtype="float32",
+            device=settings.mic_device,
+        )
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -83,6 +91,7 @@ class DaemonServer:
                 websocket, message.session_id, "SESSION_BUSY", "A session is already active"
             )
             return
+        self.audio.start_session()
 
         response = SessionStarted(
             session_id=message.session_id,
@@ -102,6 +111,8 @@ class DaemonServer:
                 websocket, message.session_id, "SESSION_BUSY", "No matching active session"
             )
             return
+        audio_samples = self.audio.stop_session()
+        audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
 
         # Placeholder inference; the actual model wiring will replace this path.
         placeholder_text = "(parakeet model not connected yet)"
@@ -109,7 +120,7 @@ class DaemonServer:
             session_id=session.session_id,
             text=placeholder_text,
             latency_ms=0,
-            audio_ms=session.audio_duration_ms,
+            audio_ms=audio_ms,
             lang=self.settings.language,
             confidence=None,
         )
@@ -145,7 +156,16 @@ class DaemonServer:
 
 def create_app(settings: ServerSettings) -> FastAPI:
     server = DaemonServer(settings)
-    app = FastAPI(title="Parakeet STT Daemon", version="0.1.0")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info("Starting audio capture")
+        server.audio.start()
+        yield
+        logger.info("Stopping audio capture")
+        server.audio.stop()
+
+    app = FastAPI(title="Parakeet STT Daemon", version="0.1.0", lifespan=lifespan)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
