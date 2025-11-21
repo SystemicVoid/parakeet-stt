@@ -33,6 +33,27 @@ class ServerSettings(BaseSettings):
     config_path: Path | None = Field(
         default=None, description="Optional explicit config file path (reserved)."
     )
+    streaming_enabled: bool = Field(
+        default=True, description="Enable streaming inference path when true."
+    )
+    chunk_secs: float = Field(
+        default=2.0, ge=0.1, le=10.0, description="Chunk size (seconds) for streaming inference."
+    )
+    right_context_secs: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=20.0,
+        description="Right context (seconds) appended for streaming inference.",
+    )
+    left_context_secs: float = Field(
+        default=10.0,
+        ge=0.0,
+        le=60.0,
+        description="Left context (seconds) retained for streaming inference.",
+    )
+    batch_size: int = Field(
+        default=32, ge=1, le=128, description="Batch size used by streaming inference helper."
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="PARAKEET_",
