@@ -100,6 +100,9 @@ class StatusMessage(BaseModel):
     state: Literal["idle", "listening", "processing"]
     sessions_active: int
     gpu_mem_mb: int | None = None
+    device: str | None = None
+    streaming_enabled: bool | None = None
+    chunk_secs: float | None = None
 
 
 ServerMessage = SessionStarted | FinalResult | ErrorMessage | StatusMessage

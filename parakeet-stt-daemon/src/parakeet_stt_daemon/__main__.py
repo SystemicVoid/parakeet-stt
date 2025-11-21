@@ -10,7 +10,7 @@ import uvicorn
 from loguru import logger
 
 from .config import ServerSettings
-from .server import create_app
+from .server import DaemonServer, create_app
 
 
 class SettingsKwargs(TypedDict, total=False):
@@ -63,6 +63,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-size", type=int, help="Batch size for streaming chunked inference helper"
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run startup checks (audio/model/streaming config) then exit",
+    )
     return parser.parse_args(argv)
 
 
@@ -112,8 +117,43 @@ def main(argv: Sequence[str] | None = None) -> None:
             settings.left_context_secs,
             settings.batch_size,
         )
+    if args.check:
+        run_checks(settings)
+        return
+
     app = create_app(settings)
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+
+
+def run_checks(settings: ServerSettings) -> None:
+    logger.info("Running startup checks with settings: {}", settings)
+    try:
+        server = DaemonServer(settings)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to initialise server components: {}", exc)
+        raise
+
+    try:
+        server.audio.start()
+        logger.info("Audio stream opened successfully (device={})", settings.mic_device)
+        server.audio.stop()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Audio stream check failed: {}", exc)
+
+    try:
+        server.transcriber.warmup()
+        logger.info("Model warmup completed")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Model warmup skipped/failed: {}", exc)
+
+    logger.info(
+        "Streaming enabled: {}, chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}",  # noqa: E501
+        settings.streaming_enabled,
+        settings.chunk_secs,
+        settings.right_context_secs,
+        settings.left_context_secs,
+        settings.batch_size,
+    )
 
 
 if __name__ == "__main__":

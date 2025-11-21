@@ -201,6 +201,9 @@ class DaemonServer:
             state=state.value,
             sessions_active=int(active is not None),
             gpu_mem_mb=None,
+            device=str(self.settings.device),
+            streaming_enabled=self.settings.streaming_enabled,
+            chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
         )
 
     def _write_wav(self, samples: np.ndarray) -> Path:
