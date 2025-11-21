@@ -6,7 +6,8 @@ After=network.target sound.target
 WorkingDirectory=/home/hugo/Documents/Engineering/parakeet-stt/parakeet-stt-daemon
 ExecStart=/usr/bin/env uv run parakeet-stt-daemon
 Environment=PARAKEET_DEVICE=cuda
-Environment=PARAKEET_MIC_DEVICE=0
+Environment=PARAKEET_MIC_DEVICE=pulse
+Environment=PARAKEET_STREAMING_ENABLED=false
 Restart=always
 RestartSec=2
 
