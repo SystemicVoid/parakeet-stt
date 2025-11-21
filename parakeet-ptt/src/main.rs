@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod injector;
+mod hotkey;
 mod protocol;
 mod state;
 
