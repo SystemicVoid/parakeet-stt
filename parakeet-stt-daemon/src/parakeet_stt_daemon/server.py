@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import wave
 from contextlib import asynccontextmanager
@@ -71,6 +72,8 @@ class DaemonServer:
             else None
         )
         self._active_stream: ParakeetStreamingSession | None = None
+        self._stream_drain_task: asyncio.Task | None = None
+        self._stream_drain_running = False
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
@@ -126,6 +129,7 @@ class DaemonServer:
         self.audio.start_session()
         if self.streaming_transcriber:
             self._active_stream = self.streaming_transcriber.start_session(self.audio.sample_rate)
+            self._start_stream_drain_loop()
 
         response = SessionStarted(
             session_id=message.session_id,
@@ -146,6 +150,7 @@ class DaemonServer:
             )
             return
         audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
+        self._stop_stream_drain_loop()
         audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
 
         if audio_samples.size == 0:
@@ -155,8 +160,11 @@ class DaemonServer:
             await self.sessions.clear(session.session_id)
             return
 
+        infer_ms: int | None = None
         try:
+            infer_started = datetime.now(tz=UTC)
             text = await self._finalise_transcription(audio_samples, ready_chunks, tail)
+            infer_ms = int((datetime.now(tz=UTC) - infer_started).total_seconds() * 1000)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
             await self._send_error(
@@ -176,7 +184,13 @@ class DaemonServer:
         )
         await websocket.send_json(completion.model_dump())
         await self.sessions.clear(session.session_id)
-        logger.info("Session {} completed", session.session_id)
+        logger.info(
+            "Session {} completed (audio_ms={}, latency_ms={}, infer_ms={})",
+            session.session_id,
+            audio_ms,
+            latency_ms,
+            infer_ms,
+        )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
         logger.debug("abort_session received: {}", message)
@@ -241,6 +255,30 @@ class DaemonServer:
             return self.transcriber.transcribe_wav(str(audio_path))
         finally:
             audio_path.unlink(missing_ok=True)
+
+    def _start_stream_drain_loop(self) -> None:
+        if self._stream_drain_task is not None:
+            return
+        self._stream_drain_running = True
+
+        async def _drain() -> None:
+            while self._stream_drain_running:
+                chunks = self.audio.take_stream_chunks()
+                if self._active_stream:
+                    for chunk in chunks:
+                        self._active_stream.feed(chunk)
+                await asyncio.sleep(0.05)
+
+        self._stream_drain_task = asyncio.create_task(_drain())
+
+    def _stop_stream_drain_loop(self) -> None:
+        if self._stream_drain_task is None:
+            return
+        self._stream_drain_running = False
+        task = self._stream_drain_task
+        self._stream_drain_task = None
+        if not task.done():
+            task.cancel()
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
