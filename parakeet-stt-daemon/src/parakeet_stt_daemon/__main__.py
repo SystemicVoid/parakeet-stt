@@ -8,6 +8,7 @@ from typing import Literal, TypedDict, cast
 
 import uvicorn
 from loguru import logger
+import sounddevice as sd
 
 from .config import ServerSettings
 from .server import DaemonServer, create_app
@@ -145,6 +146,13 @@ def run_checks(settings: ServerSettings) -> None:
         logger.info("Model warmup completed")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model warmup skipped/failed: {}", exc)
+
+    try:
+        devices = sd.query_devices()
+        names = [dev["name"] for dev in devices]
+        logger.info("Detected audio devices ({}): {}", len(names), names)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list audio devices: {}", exc)
 
     logger.info(
         "Streaming enabled: {}, chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}",  # noqa: E501
