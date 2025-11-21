@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use futures::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::client::WsClient;
 use crate::config::{ClientConfig, DEFAULT_ENDPOINT};
+use crate::hotkey::{spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{NoopInjector, TextInjector, WtypeInjector};
 use crate::protocol::{start_message, stop_message, ServerMessage};
 use crate::state::PttState;
@@ -78,12 +81,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    info!(
-        endpoint = %config.endpoint,
-        hotkey = %config.hotkey,
-        "Hotkey loop not implemented yet; run with --demo to exercise the protocol"
-    );
-    Ok(())
+    run_hotkey_mode(config).await
 }
 
 async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result<()> {
@@ -148,6 +146,134 @@ async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result
         }
     }
 
+    Ok(())
+}
+
+async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
+    info!(
+        endpoint = %config.endpoint,
+        hotkey = %config.hotkey,
+        "Starting hotkey loop; press Right Ctrl to talk"
+    );
+    let injector: Box<dyn TextInjector> = if let Some(path) = config.wtype_path.clone() {
+        Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+    } else {
+        Box::new(NoopInjector)
+    };
+
+    let mut state = PttState::new();
+    let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
+    let _hotkey_handle = spawn_hotkey_loop(hk_tx)?;
+
+    let mut ws_client = WsClient::connect(&config).await?;
+    let (mut ws_write, mut ws_read) = ws_client.into_split();
+
+    loop {
+        tokio::select! {
+            Some(evt) = hk_rx.recv() => {
+                match evt {
+                    HotkeyEvent::Down => {
+                        if let Some(session_id) = state.begin_listening() {
+                            let message = start_message(session_id, Some("auto".to_string()));
+                            send_message(&mut ws_write, &message).await?;
+                            info!(session = %session_id, "start_session sent (hotkey down)");
+                        }
+                    }
+                    HotkeyEvent::Up => {
+                        if let Some(session_id) = state.stop_listening() {
+                            let message = stop_message(session_id);
+                            send_message(&mut ws_write, &message).await?;
+                            info!(session = %session_id, "stop_session sent (hotkey up)");
+                        }
+                    }
+                }
+            }
+            next = ws_read.next() => {
+                match next {
+                    Some(Ok(msg)) => {
+                        match msg {
+                            tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
+                                match serde_json::from_str::<ServerMessage>(&txt) {
+                                    Ok(message) => handle_server_message(message, &mut state, injector.as_ref())?,
+                                    Err(err) => warn!("failed to decode server message: {}", err),
+                                }
+                            }
+                            tokio_tungstenite::tungstenite::protocol::Message::Ping(payload) => {
+                                ws_write.send(tokio_tungstenite::tungstenite::protocol::Message::Pong(payload)).await?;
+                            }
+                            tokio_tungstenite::tungstenite::protocol::Message::Close(_) => {
+                                warn!("daemon closed the connection");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!("websocket error: {}", err);
+                        break;
+                    }
+                    None => {
+                        warn!("websocket stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_message(
+    ws_write: &mut crate::client::WsWrite,
+    message: &crate::protocol::ClientMessage,
+) -> Result<()> {
+    let payload = serde_json::to_string(message).context("failed to serialize message")?;
+    ws_write
+        .send(tokio_tungstenite::tungstenite::protocol::Message::Text(payload))
+        .await
+        .context("failed to send message")
+}
+
+fn handle_server_message(
+    message: ServerMessage,
+    state: &mut PttState,
+    injector: &dyn TextInjector,
+) -> Result<()> {
+    match message {
+        ServerMessage::SessionStarted { session_id, .. } => {
+            info!(session = %session_id, "session started ack");
+        }
+        ServerMessage::FinalResult {
+            session_id,
+            text,
+            latency_ms,
+            audio_ms,
+            ..
+        } => {
+            info!(
+                session = %session_id,
+                latency_ms,
+                audio_ms,
+                "final result received"
+            );
+            injector
+                .inject(&text)
+                .context("failed to inject text into focused surface")?;
+            state.reset();
+        }
+        ServerMessage::Error {
+            session_id,
+            message,
+            ..
+        } => {
+            warn!(session = ?session_id, "daemon error: {}", message);
+            state.reset();
+        }
+        other => {
+            debug!(?other, "ignoring server message");
+        }
+    }
     Ok(())
 }
 

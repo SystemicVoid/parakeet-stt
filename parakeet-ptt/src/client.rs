@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -9,6 +10,8 @@ use crate::config::ClientConfig;
 use crate::protocol::{ClientMessage, ServerMessage};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type WsWrite = SplitSink<WsStream, Message>;
+pub type WsRead = SplitStream<WsStream>;
 
 pub struct WsClient {
     stream: WsStream,
@@ -55,6 +58,10 @@ impl WsClient {
             }
         }
         Ok(None)
+    }
+
+    pub fn into_split(self) -> (WsWrite, WsRead) {
+        self.stream.split()
     }
 
     #[allow(dead_code)]
