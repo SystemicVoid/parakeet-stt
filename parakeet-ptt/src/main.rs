@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, info, warn};
@@ -179,6 +180,8 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
     let _hotkey_handle = spawn_hotkey_loop(hk_tx)?;
 
+    fetch_status_once(&config).await;
+
     let mut backoff = TokioDuration::from_millis(500);
     loop {
         match WsClient::connect(&config).await {
@@ -314,6 +317,40 @@ fn handle_server_message(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusInfo {
+    state: Option<String>,
+    sessions_active: Option<u32>,
+    device: Option<String>,
+    streaming_enabled: Option<bool>,
+    chunk_secs: Option<f64>,
+}
+
+async fn fetch_status_once(config: &ClientConfig) {
+    let Some(url) = config.status_url() else {
+        return;
+    };
+    let client = reqwest::Client::new();
+    match client
+        .get(url.clone())
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .and_then(|r| r.json::<StatusInfo>())
+        .await
+    {
+        Ok(status) => {
+            info!(
+                "Daemon status: state={:?}, sessions_active={:?}, device={:?}, streaming={:?}, chunk_secs={:?}",
+                status.state, status.sessions_active, status.device, status.streaming_enabled, status.chunk_secs
+            );
+        }
+        Err(err) => {
+            warn!("Failed to fetch daemon status from {}: {}", url, err);
+        }
+    }
 }
 
 fn init_tracing() {

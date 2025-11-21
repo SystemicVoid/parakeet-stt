@@ -40,6 +40,23 @@ impl ClientConfig {
         })
     }
 
+    pub fn status_url(&self) -> Option<Url> {
+        let mut url = self.endpoint.clone();
+        match url.scheme() {
+            "ws" => {
+                let _ = url.set_scheme("http");
+            }
+            "wss" => {
+                let _ = url.set_scheme("https");
+            }
+            "http" | "https" => {}
+            _ => return None,
+        }
+        // Replace path with /status
+        url.set_path("/status");
+        Some(url)
+    }
+
     pub fn build_request(&self) -> Result<Request<()>> {
         let mut request: Request<()> = self
             .endpoint
