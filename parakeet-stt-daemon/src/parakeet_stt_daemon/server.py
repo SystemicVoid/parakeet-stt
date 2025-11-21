@@ -244,13 +244,16 @@ class DaemonServer:
                 for chunk in ready_chunks:
                     self._active_stream.feed(chunk)
                 if tail.size:
-                    self._active_stream.feed(tail)
+                    trimmed_tail = self._trim_tail_silence(tail, self.audio.sample_rate)
+                    if trimmed_tail.size:
+                        self._active_stream.feed(trimmed_tail)
                 return self._active_stream.finalize()
             finally:
                 self._active_stream = None
 
         # Offline fallback: write temp wav and transcribe.
-        audio_path = self._write_wav(audio_samples)
+        trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
+        audio_path = self._write_wav(trimmed)
         try:
             return self.transcriber.transcribe_wav(str(audio_path))
         finally:
@@ -279,6 +282,25 @@ class DaemonServer:
         self._stream_drain_task = None
         if not task.done():
             task.cancel()
+
+    def _trim_tail_silence(
+        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50, floor_db: float = -40.0
+    ) -> np.ndarray:
+        if samples.size == 0:
+            return samples
+        window = max(1, int(sample_rate * window_ms / 1000))
+        # Clamp to mono array
+        audio = samples.astype(np.float32, copy=False)
+        idx = audio.size
+        while idx > 0:
+            start = max(0, idx - window)
+            window_slice = audio[start:idx]
+            rms = np.sqrt(np.mean(window_slice**2))
+            db = 20 * np.log10(max(rms, 1e-6))
+            if db > floor_db:
+                break
+            idx = start
+        return audio[:idx]
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
