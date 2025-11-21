@@ -19,7 +19,7 @@ class ServerSettings(BaseSettings):
         description="Optional shared secret required on the WebSocket connection.",
     )
     mic_device: int | str | None = Field(
-        default=None, description="Preferred microphone device identifier."
+        default="pulse", description="Preferred microphone device identifier."
     )
     language: str | None = Field(
         default="auto", description="Language hint passed to Parakeet where supported."

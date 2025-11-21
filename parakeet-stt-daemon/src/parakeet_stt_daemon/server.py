@@ -138,7 +138,7 @@ class DaemonServer:
             mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
             lang=message.preferred_lang,
         )
-        await websocket.send_json(response.model_dump())
+        await websocket.send_json(response.model_dump(mode="json"))
         logger.info("Session {} started", session.session_id)
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
@@ -184,7 +184,7 @@ class DaemonServer:
                 lang=self.settings.language,
                 confidence=None,
             )
-            await websocket.send_json(completion.model_dump())
+            await websocket.send_json(completion.model_dump(mode="json"))
             await self.sessions.clear(session.session_id)
             logger.info(
                 "Session {} completed (audio_ms={}, latency_ms={}, infer_ms={})",
@@ -208,7 +208,7 @@ class DaemonServer:
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
     ) -> None:
         err = ErrorMessage(session_id=session_id, code=code, message=message)
-        await websocket.send_json(err.model_dump())
+        await websocket.send_json(err.model_dump(mode="json"))
 
     def status(self) -> StatusMessage:
         active = self.sessions.active
