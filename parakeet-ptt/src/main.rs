@@ -55,6 +55,10 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     timeout_seconds: u64,
 
+    /// Test injector only (types a fixed string then exits)
+    #[arg(long)]
+    test_injection: bool,
+
     /// Run a single start/stop/demo sequence instead of the hotkey loop
     #[arg(long)]
     demo: bool,
@@ -77,6 +81,15 @@ async fn main() -> Result<()> {
         cli.wtype_delay_ms,
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
+
+    if cli.test_injection {
+        let injector = build_injector(&config);
+        injector
+            .inject("Parakeet Test")
+            .context("injector test failed")?;
+        info!("Injector test sent 'Parakeet Test'");
+        return Ok(());
+    }
 
     if cli.demo {
         run_demo(config, cli.demo_text).await?;

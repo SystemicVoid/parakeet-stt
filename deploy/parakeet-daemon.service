@@ -1,0 +1,14 @@
+[Unit]
+Description=Parakeet STT Daemon (uv run)
+After=network.target sound.target
+
+[Service]
+WorkingDirectory=/home/hugo/Documents/Engineering/parakeet-stt/parakeet-stt-daemon
+ExecStart=/usr/bin/env uv run parakeet-stt-daemon
+Environment=PARAKEET_DEVICE=cuda
+Environment=PARAKEET_MIC_DEVICE=
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

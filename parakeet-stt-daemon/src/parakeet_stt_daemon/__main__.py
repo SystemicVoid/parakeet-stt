@@ -152,8 +152,16 @@ def run_checks(settings: ServerSettings) -> None:
 
     try:
         devices = sd.query_devices()
-        names = [dev["name"] for dev in devices]
-        logger.info("Detected audio devices ({}): {}", len(names), names)
+        inputs = [
+            (idx, dev["name"])
+            for idx, dev in enumerate(devices)
+            if dev.get("max_input_channels", 0) > 0
+        ]
+        if inputs:
+            pretty = [f"{idx}: {name}" for idx, name in inputs]
+            logger.info("Input devices (index: name): {}", pretty)
+        else:
+            logger.warning("No audio input devices detected")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to list audio devices: {}", exc)
 

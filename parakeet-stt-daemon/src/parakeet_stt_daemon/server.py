@@ -315,7 +315,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         server.audio.start()
         logger.info("Warming Parakeet model on {}", settings.device)
         try:
-            server.transcriber.warmup()
+            await asyncio.to_thread(server.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
         yield
