@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import tempfile
+import wave
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
+
+try:
+    import soundfile as sf
+except ImportError:  # pragma: no cover - inference extra not installed
+    sf = None  # type: ignore
 
 from .audio import AudioInput
 from .config import ServerSettings
@@ -25,6 +34,7 @@ from .messages import (
     StopSession,
     parse_client_message,
 )
+from .model import ParakeetTranscriber, load_parakeet_model
 from .session import SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 
 ErrorCode = Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
@@ -41,6 +51,9 @@ class DaemonServer:
             channels=1,
             dtype="float32",
             device=settings.mic_device,
+        )
+        self.transcriber = ParakeetTranscriber(
+            load_parakeet_model(device=settings.device)
         )
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
@@ -114,12 +127,31 @@ class DaemonServer:
         audio_samples = self.audio.stop_session()
         audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
 
-        # Placeholder inference; the actual model wiring will replace this path.
-        placeholder_text = "(parakeet model not connected yet)"
+        if audio_samples.size == 0:
+            await self._send_error(
+                websocket, session.session_id, "AUDIO_DEVICE", "No audio captured for session"
+            )
+            await self.sessions.clear(session.session_id)
+            return
+
+        audio_path = self._write_wav(audio_samples)
+        try:
+            text = self.transcriber.transcribe_wav(str(audio_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
+            await self._send_error(
+                websocket, session.session_id, "MODEL", "Transcription failed"
+            )
+            await self.sessions.clear(session.session_id)
+            return
+        finally:
+            audio_path.unlink(missing_ok=True)
+
+        latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
         completion = FinalResult(
             session_id=session.session_id,
-            text=placeholder_text,
-            latency_ms=0,
+            text=text,
+            latency_ms=latency_ms,
             audio_ms=audio_ms,
             lang=self.settings.language,
             confidence=None,
@@ -153,6 +185,22 @@ class DaemonServer:
             gpu_mem_mb=None,
         )
 
+    def _write_wav(self, samples: np.ndarray) -> Path:
+        path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+        if sf is not None:
+            sf.write(path, samples, self.audio.sample_rate)
+        else:  # pragma: no cover - fallback for dev environments
+            self._write_wav_fallback(path, samples)
+        return path
+
+    def _write_wav_fallback(self, path: Path, samples: np.ndarray) -> None:
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.audio.sample_rate)
+            wf.writeframes(pcm.tobytes())
+
 
 def create_app(settings: ServerSettings) -> FastAPI:
     server = DaemonServer(settings)
@@ -161,6 +209,11 @@ def create_app(settings: ServerSettings) -> FastAPI:
     async def lifespan(app: FastAPI):
         logger.info("Starting audio capture")
         server.audio.start()
+        logger.info("Warming Parakeet model on {}", settings.device)
+        try:
+            server.transcriber.warmup()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Model warmup skipped: {}", exc)
         yield
         logger.info("Stopping audio capture")
         server.audio.stop()

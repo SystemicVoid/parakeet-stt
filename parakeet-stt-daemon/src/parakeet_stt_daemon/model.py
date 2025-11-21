@@ -6,11 +6,14 @@ start the daemon for protocol testing.
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from loguru import logger
 
 DEFAULT_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
@@ -18,9 +21,26 @@ DEFAULT_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 if TYPE_CHECKING:  # pragma: no cover
     import nemo.collections.asr as nemo_asr
     from nemo.collections.asr.models import ASRModel
+    import torch
 else:
     nemo_asr = None  # type: ignore
     ASRModel = Any  # type: ignore
+    try:
+        import torch  # type: ignore  # noqa: F401
+    except ImportError:  # pragma: no cover - inference extra not installed
+        torch = None  # type: ignore
+
+
+def _resolve_device(requested: str) -> str:
+    if requested == "cuda":
+        if torch is None:  # pragma: no cover - inference extra not installed
+            logger.warning("CUDA requested but torch is not available; falling back to CPU")
+            return "cpu"
+        if torch.cuda.is_available():  # type: ignore[union-attr]
+            return "cuda"
+        logger.warning("CUDA requested but not available; using CPU instead")
+        return "cpu"
+    return requested
 
 
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
@@ -32,8 +52,9 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
             "nemo_toolkit[asr] is not installed; install with `uv sync --extra inference`"
         ) from exc
 
+    resolved_device = _resolve_device(device)
     model: ASRModel = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
-    model.to(device)
+    model.to(resolved_device)
 
     # Optional attention tweak is aligned with the HF card guidance.
     change_attention = getattr(model, "change_attention_model", None)
@@ -52,10 +73,22 @@ class ParakeetTranscriber:
 
     def warmup(self) -> None:
         """Run a trivial forward pass to pay the first-use cost."""
+        tmp_path: Path | None = None
         try:
-            _ = self.model.transcribe([""], batch_size=1)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            cfg = getattr(self.model, "_cfg", None)
+            sample_rate = getattr(cfg, "sample_rate", 16_000)
+            silence = np.zeros((sample_rate,), dtype=np.float32)
+            import soundfile as sf
+
+            sf.write(tmp_path, silence, sample_rate)
+            _ = self.transcribe_wav(str(tmp_path))
         except Exception as exc:  # pragma: no cover - warmup is optional
             logger.debug("Warmup skipped: {}", exc)
+        finally:
+            if tmp_path:
+                tmp_path.unlink(missing_ok=True)
 
     def transcribe_files(self, paths: Sequence[str], *, timestamps: bool = False) -> list[str]:
         if not paths:
@@ -67,6 +100,12 @@ class ParakeetTranscriber:
 
     def transcribe_iter(self, paths: Iterable[str], *, timestamps: bool = False) -> list[str]:
         return self.transcribe_files(list(paths), timestamps=timestamps)
+
+    def transcribe_wav(self, path: str) -> str:
+        outputs = self.model.transcribe([path], batch_size=1)
+        if not outputs:
+            return ""
+        return str(outputs[0]).strip()
 
 
 __all__ = ["load_parakeet_model", "ParakeetTranscriber", "DEFAULT_MODEL_NAME"]
