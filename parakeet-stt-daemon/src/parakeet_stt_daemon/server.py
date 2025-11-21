@@ -134,7 +134,15 @@ class DaemonServer:
             await self.sessions.clear(session.session_id)
             return
 
-        audio_path = self._write_wav(audio_samples)
+        try:
+            audio_path = self._write_wav(audio_samples)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to materialise audio for session {}: {}", session.session_id, exc)
+            await self._send_error(
+                websocket, session.session_id, "AUDIO_DEVICE", "Failed to write audio buffer"
+            )
+            await self.sessions.clear(session.session_id)
+            return
         try:
             text = self.transcriber.transcribe_wav(str(audio_path))
         except Exception as exc:  # noqa: BLE001

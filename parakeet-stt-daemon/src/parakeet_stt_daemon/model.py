@@ -55,6 +55,7 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
     resolved_device = _resolve_device(device)
     model: ASRModel = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
     model.to(resolved_device)
+    logger.info("Loaded Parakeet model '{}' on device {}", model_name, resolved_device)
 
     # Optional attention tweak is aligned with the HF card guidance.
     change_attention = getattr(model, "change_attention_model", None)
