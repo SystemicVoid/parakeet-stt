@@ -1,28 +1,21 @@
 # Parakeet STT Daemon
 
 Early skeleton for the local Parakeet push-to-talk daemon. It exposes the
-JSON/WebSocket protocol defined in `SPEC.md` and keeps the audio/model plumbing
+JSON/WebSocket protocol defined in `../docs/SPEC.md` and keeps the audio/model plumbing
 pluggable for the next iteration.
 
 ## Quickstart
 
 ```bash
 uv sync --dev  # base + dev tooling (ruff, black, pyright)
-uv sync --extra inference --prerelease allow \
-  --index https://download.pytorch.org/whl/nightly/cu124 \
-  --index-strategy unsafe-best-match
-uv run --prerelease allow \
-  --index https://download.pytorch.org/whl/nightly/cu124 \
-  --index-strategy unsafe-best-match \
-  parakeet-stt-daemon --host 127.0.0.1 --port 8765
+uv sync --extra inference --prerelease allow
+uv run --prerelease allow parakeet-stt-daemon --host 127.0.0.1 --port 8765
 
 # Start both pieces from anywhere on this machine
 repo="$HOME/Documents/Engineering/parakeet-stt"
 
 # Terminal 1: daemon (writes logs to /tmp/parakeet-daemon.log)
 (cd "$repo/parakeet-stt-daemon" && uv run --prerelease allow \
-  --index https://download.pytorch.org/whl/nightly/cu124 \
-  --index-strategy unsafe-best-match \
   parakeet-stt-daemon --host 127.0.0.1 --port 8765 \
   > /tmp/parakeet-daemon.log 2>&1)
 
