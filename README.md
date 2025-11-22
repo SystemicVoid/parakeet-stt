@@ -26,14 +26,14 @@ uv sync --dev
 
 2) Start the daemon (non-streaming)
 ```bash
-uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765 --no-streaming
+uv run parakeet-stt-daemon --no-streaming
 ```
    - Health check only: `uv run parakeet-stt-daemon --check`
 
 3) Start the client
 ```bash
 cd parakeet-ptt
-cargo run --release -- --endpoint ws://127.0.0.1:8765
+cargo run
 ```
    - Hotkey defaults to Right Ctrl. Update your shell aliases (`stt`, `stt start`, etc.) to match the daemon command above.
 
