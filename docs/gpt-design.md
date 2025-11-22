@@ -155,7 +155,7 @@ Keep it tiny and explicit. This is what I’d have your coding agent implement.
   {
     "type": "transcribe_file",
     "session_id": "uuid-2",
-    "path": "/home/hugo/audio/foo.wav"
+    "path": "/path/to/audio/foo.wav"
   }
   ```
 
@@ -579,7 +579,7 @@ Given your goal (“fast, simple, production-grade, Rust-heavy”), I’d:
 
 ---
 
-## 7. Nice future add-ons (for “v2 Hugo”)
+## 7. Nice future add-ons (for “v2”)
 
 Once v1 is stable:
 

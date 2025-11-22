@@ -4,8 +4,9 @@ After=graphical-session.target network.target
 Wants=graphical-session.target
 
 [Service]
-WorkingDirectory=/home/hugo/Documents/Engineering/parakeet-stt/parakeet-ptt
-ExecStart=/home/hugo/Documents/Engineering/parakeet-stt/parakeet-ptt/target/release/parakeet-ptt
+# UPDATE THESE PATHS
+WorkingDirectory=/path/to/parakeet-stt/parakeet-ptt
+ExecStart=/path/to/parakeet-stt/parakeet-ptt/target/release/parakeet-ptt
 Restart=on-failure
 RestartSec=2
 

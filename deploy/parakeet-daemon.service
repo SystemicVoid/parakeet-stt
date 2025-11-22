@@ -3,7 +3,8 @@ Description=Parakeet STT Daemon (uv run)
 After=network.target sound.target
 
 [Service]
-WorkingDirectory=/home/hugo/Documents/Engineering/parakeet-stt/parakeet-stt-daemon
+# UPDATE THIS PATH
+WorkingDirectory=/path/to/parakeet-stt/parakeet-stt-daemon
 ExecStart=/usr/bin/env uv run parakeet-stt-daemon
 Environment=PARAKEET_DEVICE=cuda
 Environment=PARAKEET_MIC_DEVICE=pulse
