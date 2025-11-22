@@ -70,10 +70,20 @@ class AudioInput:
     def start_session(self) -> None:
         """Begin accumulating audio for a new session (includes pre-roll)."""
         with self._lock:
-            self._session_chunks = [chunk.copy() for chunk in self._pre_roll]
+            pre_roll_chunks = [chunk.copy() for chunk in self._pre_roll]
+            self._session_chunks = pre_roll_chunks
             self._session_active = True
             self._stream_ready = []
-            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+            if self._stream_chunk_size:
+                # Seed the streaming buffer with the pre-roll so the streaming path
+                # sees the leading audio instead of starting from the first post-start chunk.
+                self._stream_buffer = (
+                    np.concatenate(pre_roll_chunks, dtype=np.float32)
+                    if pre_roll_chunks
+                    else np.zeros((0,), dtype=np.float32)
+                )
+            else:
+                self._stream_buffer = np.zeros((0,), dtype=np.float32)
 
     def stop_session(self) -> np.ndarray:
         """Stop accumulation and return the captured samples."""
