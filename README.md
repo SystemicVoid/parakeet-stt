@@ -17,36 +17,25 @@ Parakeet STT is a local, low-latency speech-to-text system designed for Linux/Wa
 
 ## Quick Start
 
-### 1. Setup Daemon
-
-Navigate to the daemon directory and install dependencies:
-
+1) Install daemon dependencies (CPU-friendly default)
 ```bash
 cd parakeet-stt-daemon
-# Install base dependencies + inference support (Torch, NeMo)
-uv sync --extra inference --prerelease allow
+uv sync --dev
 ```
+   - GPU inference (optional): `uv sync --dev --extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match`
 
-### 2. Run Daemon
-
-Start the daemon (default port 8765):
-
+2) Start the daemon (non-streaming)
 ```bash
-# Run with default settings
-uv run --prerelease allow parakeet-stt-daemon --host 127.0.0.1 --port 8765
-
-# Or run a health check first
-uv run parakeet-stt-daemon --check
+uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765 --no-streaming
 ```
+   - Health check only: `uv run parakeet-stt-daemon --check`
 
-### 3. Run Client
-
-In a new terminal, build and run the client:
-
+3) Start the client
 ```bash
 cd parakeet-ptt
-cargo run --release
+cargo run --release -- --endpoint ws://127.0.0.1:8765
 ```
+   - Hotkey defaults to Right Ctrl. Update your shell aliases (`stt`, `stt start`, etc.) to match the daemon command above.
 
 ## Key Commands
 
@@ -71,3 +60,4 @@ See `uv run parakeet-stt-daemon --help` for all options.
 
 - [Protocol Specification](docs/SPEC.md): Details the WebSocket protocol between client and daemon.
 - [Design Notes](docs/Designing%20a%20Local%20Live%20Speech-to-Text%20Dictation%20Solution%20(Wayland,%20Parakeet%20ASR).pdf): Background on the system design.
+- Streaming experiments are tracked on the `streaming-experimental-20251122` branch.
