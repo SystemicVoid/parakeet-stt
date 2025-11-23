@@ -60,5 +60,5 @@ See `uv run parakeet-stt-daemon --help` for all options.
 
 - [Protocol Specification](docs/SPEC.md): Details the WebSocket protocol between client and daemon.
 - [Design Notes](docs/Designing%20a%20Local%20Live%20Speech-to-Text%20Dictation%20Solution%20(Wayland,%20Parakeet%20ASR).pdf): Background on the system design.
-- Streaming experiments are tracked on the `streaming-experimental-20251122` branch.
+- Streaming experiments are tracked on the `streaming-experimental-20251122` branch. (streaming rnnt inference : https://github.com/NVIDIA-NeMo/NeMo/blob/main/examples/asr/asr_chunked_inference/rnnt/speech_to_text_streaming_infer_rnnt.py)
 - Troubleshooting the `stt` helper: see [docs/stt-troubleshooting.md](docs/stt-troubleshooting.md).
