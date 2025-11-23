@@ -17,6 +17,7 @@ stt() {
     local DAEMON_PID_FILE="/tmp/parakeet-daemon.pid"
     local DEFAULT_ENDPOINT="ws://127.0.0.1:8765/ws"
     local TMUX_SESSION="parakeet-stt"
+    local TMUX_WINDOW="run"
 
     export RUST_LOG="${RUST_LOG:-info}"
 
@@ -81,7 +82,7 @@ PY
 
     case "$cmd" in
         start)
-            echo ">>> Starting Parakeet STT..."
+            echo ">>> Starting Parakeet STT (detached tmux)..."
 
             if pgrep -f "parakeet-stt-daemon" >/dev/null; then
                 echo "   - Daemon already running."
@@ -104,48 +105,64 @@ PY
                 return 1
             fi
 
-            echo "   - Launching client..."
-            echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
-            _log_client "start release binary"
-
-            if [ -f "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                (
-                    cd "$CLIENT_DIR" || exit 1
-                    nohup ./target/release/parakeet-ptt >> "$LOG_CLIENT" 2>&1 &
-                    echo $! > "$CLIENT_PID_FILE"
-                )
-                if _wait_pid_alive "$CLIENT_PID_FILE" 10; then
-                    _log_client "release binary running (pid $(cat "$CLIENT_PID_FILE"))"
-                    echo "   - Client started (release pid $(cat "$CLIENT_PID_FILE"))"
-                    return 0
-                else
-                    _log_client "release binary exited quickly; fallback to cargo run"
-                    echo "   - Release binary exited quickly. Last log lines:"
-                    tail -n 40 "$LOG_CLIENT"
-                    echo "   - Attempting fallback to 'cargo run --release'..."
-                fi
+            if ! command -v tmux >/dev/null 2>&1; then
+                echo "   - tmux is required for the default start path. Install with: sudo apt install tmux"
+                return 1
             fi
-
-            if ! command -v cargo >/dev/null 2>&1; then
-                echo "   - Error: 'cargo' not found in PATH. Is Rust loaded?"
+            if [ ! -x "$CLIENT_DIR/target/release/parakeet-ptt" ] && ! command -v cargo >/dev/null 2>&1; then
+                echo "   - Release binary missing and 'cargo' not found. Build the client first."
                 return 1
             fi
 
-            _log_client "fallback cargo run --release -- --endpoint $DEFAULT_ENDPOINT"
-            (
-                cd "$CLIENT_DIR" || exit 1
-                nohup cargo run --release -- --endpoint "$DEFAULT_ENDPOINT" >> "$LOG_CLIENT" 2>&1 &
-                echo $! > "$CLIENT_PID_FILE"
-            )
-            if _wait_pid_alive "$CLIENT_PID_FILE" 14; then
-                _log_client "cargo run --release running (pid $(cat "$CLIENT_PID_FILE"))"
-                echo "   - Client running via cargo (pid $(cat "$CLIENT_PID_FILE"))"
-                return 0
+            if pgrep -f "parakeet-ptt" >/dev/null 2>&1; then
+                echo "   - Stopping existing parakeet-ptt processes..."
+                pkill -f "parakeet-ptt" >/dev/null 2>&1 || true
             fi
 
-            echo "   - Client did not stay up; recent client log:"
-            tail -n 120 "$LOG_CLIENT"
-            return 1
+            echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
+            _log_client "start client in tmux"
+
+            if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
+                tmux kill-session -t "$TMUX_SESSION"
+            fi
+
+            local client_cmd
+            client_cmd='
+                set -e
+                if [ -x target/release/parakeet-ptt ]; then
+                    exec ./target/release/parakeet-ptt 2>&1 | tee -a "$LOG_CLIENT"
+                else
+                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    exec cargo run --release -- --endpoint "$DEFAULT_ENDPOINT" 2>&1 | tee -a "$LOG_CLIENT"
+                fi
+            '
+
+            tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
+            tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
+            tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
+
+            local client_ok=0
+            for _ in $(seq 1 20); do
+                local pid
+                pid=$(pgrep -n "parakeet-ptt" || true)
+                if [ -n "$pid" ]; then
+                    echo "$pid" > "$CLIENT_PID_FILE"
+                    client_ok=1
+                    break
+                fi
+                sleep 0.5
+            done
+
+            if [ "$client_ok" -ne 1 ]; then
+                echo "   - Client did not stay up; recent client log:"
+                tail -n 120 "$LOG_CLIENT"
+                return 1
+            fi
+
+            echo "   - Dictation ready (tmux session: $TMUX_SESSION)."
+            echo "     Use 'stt show' to view panes; Ctrl+b d to detach."
             ;;
         restart)
             stt stop
@@ -157,6 +174,9 @@ PY
                 kill -TERM "$(cat "$CLIENT_PID_FILE")" 2>/dev/null || true
             fi
             pkill -f "parakeet-ptt" >/dev/null 2>&1 && echo "   - Client stopped"
+            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+                tmux kill-session -t "$TMUX_SESSION"
+            fi
 
             if _pid_alive "$DAEMON_PID_FILE"; then
                 kill -TERM "$(cat "$DAEMON_PID_FILE")" 2>/dev/null || true
@@ -181,6 +201,18 @@ PY
                     ;;
             esac
             ;;
+        show|attach)
+            if ! command -v tmux >/dev/null 2>&1; then
+                echo "tmux is not installed; install it first (sudo apt install tmux)."
+                return 1
+            fi
+            if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+                echo "Attaching to tmux session '$TMUX_SESSION' (Ctrl+b d to detach)..."
+                tmux attach -t "$TMUX_SESSION"
+            else
+                echo "No tmux session '$TMUX_SESSION' found. Start with 'stt start'."
+            fi
+            ;;
         status)
             echo ">>> Status:"
             if _pid_alive "$DAEMON_PID_FILE"; then
@@ -196,6 +228,9 @@ PY
             if pgrep -af "parakeet" >/dev/null; then
                 echo "   - Matching processes:"
                 pgrep -af "parakeet" | sed 's/^/     /'
+            fi
+            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+                echo "   - tmux session: $TMUX_SESSION"
             fi
             ;;
         tmux)
@@ -240,7 +275,7 @@ PY
             )
             ;;
         *)
-            echo "Usage: stt {start|stop|restart|status|logs [client|daemon],tmux [attach|kill],check}"
+            echo "Usage: stt {start|stop|restart|status|logs [client|daemon],show,tmux [attach|kill],check}"
             ;;
     esac
 }

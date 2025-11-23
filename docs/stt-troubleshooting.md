@@ -22,12 +22,12 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 - On failing runs, the client log was empty or missing; the helper reported a rebuild failure. No daemon errors were present during these failures.
 
 ## Current helper behavior (after rewrite)
-- Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for daemon/client.
+- Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
+- Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
 - Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon --no-streaming >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for port 8765 (0.5s polling). On failure, it prints the last daemon log lines.
-- Client start: appends a session header to `/tmp/parakeet-ptt.log`, logs helper events into the file, tries the release binary first, waits briefly for the PID to stay up, then falls back to `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws` if the release binary exits.
-- Logging: append-only (`>>`) for both daemon and client; helper now emits markers like `start release binary`, `release binary exited quickly; fallback to cargo run` into the client log.
-- Tmux option: `stt tmux` spins up a tmux session `parakeet-stt` with panes for the daemon, client, and combined log tail; `stt tmux kill` kills that session.
-- Commands: `stt start` (default), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]`, `stt check` (daemon `--check`).
+- Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
+- Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
+- Commands: `stt start` (default detached tmux), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
 
 ## Suspicions / hypotheses
 - The release binary may occasionally be in a bad state (stale build artifacts) and exits immediately; a rebuild should fix that, but we need logs to confirm.
@@ -36,10 +36,9 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 - If `cargo`/`rustc` are missing in a shell, the build step would fail—this should now be visible in the log.
 
 ## Next debugging steps
-1) Reload the helper and try a clean start: `source ~/Documents/Engineering/parakeet-stt/74-aliases-functions.bash && stt stop && stt start`. Give it ~10–15s (daemon warm-up), then tail both logs: `stt logs client` and `stt logs daemon`.
-2) If the daemon wait still times out, grab the last 80 lines of `/tmp/parakeet-daemon.log` (the helper prints them automatically on failure).
-3) If the client drops to the cargo fallback or still exits, tail `/tmp/parakeet-ptt.log` and look for the helper markers (`start release binary`, `release binary exited quickly`, `fallback cargo run --release -- --endpoint ...`). Share the full log.
-4) Prefer tmux? Run `stt tmux` to get daemon/client panes plus a live log tail; `stt tmux kill` tears it down. If tmux is missing, `sudo apt install tmux`.
-5) Still empty logs? Capture env for that shell: `env | sort > /tmp/stt-env.txt`, set `RUST_LOG=debug`, and rerun `stt start`.
+1) Reload the helper and try a clean start: `source ~/Documents/Engineering/parakeet-stt/74-aliases-functions.bash && stt stop && stt start`. It will detach after “Dictation ready”. Use `stt show` to view the tmux panes (top: client, bottom: live logs).
+2) If the daemon wait times out, grab the last 80 lines of `/tmp/parakeet-daemon.log` (printed automatically on failure).
+3) If the client drops to cargo fallback or still exits, tail `/tmp/parakeet-ptt.log` and look for helper markers. Share the log.
+4) Still empty logs? Capture env for that shell: `env | sort > /tmp/stt-env.txt`, set `RUST_LOG=debug`, and rerun `stt start`.
 
-With the append-only logging, PID tracking, and longer socket wait, any new failure should leave a clearer trace in `/tmp/parakeet-ptt.log` or `/tmp/parakeet-daemon.log`.***
+With the append-only logging, tmux-based client start, PID tracking, and longer socket wait, any new failure should leave a clear trace in `/tmp/parakeet-ptt.log` or `/tmp/parakeet-daemon.log`.***
