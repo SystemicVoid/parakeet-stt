@@ -258,7 +258,7 @@ PY
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
 
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" uv run parakeet-stt-daemon --no-streaming >> \"$LOG_DAEMON\" 2>&1"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --no-streaming >> \"$LOG_DAEMON\" 2>&1"
             local client_cmd="RUST_LOG=\"$RUST_LOG\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\"; if [ -x ./target/release/parakeet-ptt ]; then exec ./target/release/parakeet-ptt >> \"$LOG_CLIENT\" 2>&1; else exec cargo run --release -- --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; fi"
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
