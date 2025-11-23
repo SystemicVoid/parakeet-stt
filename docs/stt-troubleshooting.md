@@ -21,10 +21,13 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 - The daemon log `/tmp/parakeet-daemon.log` consistently shows a healthy startup on `cuda`, audio capture starting, websocket accepted, and session start/stop pairs with reasonable inference times.
 - On failing runs, the client log was empty or missing; the helper reported a rebuild failure. No daemon errors were present during these failures.
 
-## Current helper behavior (after fixes)
-- Start flow: start daemon → wait for port 8765 → truncate client log with a timestamp header → run release binary; if it dies, tail logs → rebuild release → retry; if still dead, fall back to `cargo run -- --endpoint ws://127.0.0.1:8765/ws`.
-- All steps log timestamps into `/tmp/parakeet-ptt.log` so we always have artifacts now.
-- Commands: `stt start`, `stt stream`, `stt restart`, `stt stop`, `stt status`, `stt logs`, `stt check`.
+## Current helper behavior (after rewrite)
+- Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for daemon/client.
+- Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon --no-streaming >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for port 8765 (0.5s polling). On failure, it prints the last daemon log lines.
+- Client start: appends a session header to `/tmp/parakeet-ptt.log`, logs helper events into the file, tries the release binary first, waits briefly for the PID to stay up, then falls back to `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws` if the release binary exits.
+- Logging: append-only (`>>`) for both daemon and client; helper now emits markers like `start release binary`, `release binary exited quickly; fallback to cargo run` into the client log.
+- Tmux option: `stt tmux` spins up a tmux session `parakeet-stt` with panes for the daemon, client, and combined log tail; `stt tmux kill` kills that session.
+- Commands: `stt start` (default), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]`, `stt check` (daemon `--check`).
 
 ## Suspicions / hypotheses
 - The release binary may occasionally be in a bad state (stale build artifacts) and exits immediately; a rebuild should fix that, but we need logs to confirm.
@@ -33,32 +36,10 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 - If `cargo`/`rustc` are missing in a shell, the build step would fail—this should now be visible in the log.
 
 ## Next debugging steps
-1) Reproduce failure with logging kept:  
-   ```bash
-   stt stop
-   rm -f /tmp/parakeet-ptt.log
-   stt start
-   sleep 8
-   tail -n +1 /tmp/parakeet-ptt.log
-   ps -ef | grep parakeet-ptt
-   ```
-   Share the full log so we can see the build/run error.
+1) Reload the helper and try a clean start: `source ~/Documents/Engineering/parakeet-stt/74-aliases-functions.bash && stt stop && stt start`. Give it ~10–15s (daemon warm-up), then tail both logs: `stt logs client` and `stt logs daemon`.
+2) If the daemon wait still times out, grab the last 80 lines of `/tmp/parakeet-daemon.log` (the helper prints them automatically on failure).
+3) If the client drops to the cargo fallback or still exits, tail `/tmp/parakeet-ptt.log` and look for the helper markers (`start release binary`, `release binary exited quickly`, `fallback cargo run --release -- --endpoint ...`). Share the full log.
+4) Prefer tmux? Run `stt tmux` to get daemon/client panes plus a live log tail; `stt tmux kill` tears it down. If tmux is missing, `sudo apt install tmux`.
+5) Still empty logs? Capture env for that shell: `env | sort > /tmp/stt-env.txt`, set `RUST_LOG=debug`, and rerun `stt start`.
 
-2) If the release binary keeps dying, force a clean rebuild:  
-   ```bash
-   cd parakeet-ptt
-   cargo clean && cargo build --release
-   ```
-   Then `stt start` again and check the log.
-
-3) If the fallback `cargo run` path triggers, inspect the log for compile errors; ensure Rust toolchain and deps are present (`rustup show`, `cargo --version`).
-
-4) To rule out PATH issues in login shells, capture env from the failing shell:  
-   ```bash
-   env | sort > /tmp/stt-env.txt
-   ```
-   Compare to a working shell.
-
-5) If failures persist, increase verbosity: set `RUST_LOG=debug` before `stt start` and check `/tmp/parakeet-ptt.log`.
-
-With the current instrumentation, the next failing start should leave evidence in `/tmp/parakeet-ptt.log` that will point to the exact cause.***
+With the append-only logging, PID tracking, and longer socket wait, any new failure should leave a clearer trace in `/tmp/parakeet-ptt.log` or `/tmp/parakeet-daemon.log`.***
