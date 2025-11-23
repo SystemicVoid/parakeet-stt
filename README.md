@@ -24,18 +24,31 @@ uv sync --dev
 ```
    - GPU inference (optional): `uv sync --dev --extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match`
 
-2) Start the daemon (non-streaming)
+2) Run with the tmux-based helper (recommended)
 ```bash
-uv run parakeet-stt-daemon --no-streaming
+source scripts/stt-helper.sh   # one time per shell
+stt start                      # starts daemon + client, detaches tmux
 ```
-   - Health check only: `uv run parakeet-stt-daemon --check`
+   - Attach to the panes: `stt show` (top: client via `tee`; bottom: live daemon/client logs).
+   - Stop everything: `stt stop`. Status: `stt status`. Logs: `stt logs [client|daemon|both]`.
 
-3) Start the client
+   The helper:
+   - Starts the daemon with `--no-streaming`, waits for port 8765, and logs to `/tmp/parakeet-daemon.log`.
+   - Launches the client in a detached tmux session `parakeet-stt`, teeing output to `/tmp/parakeet-ptt.log`.
+   - Uses `target/release/parakeet-ptt` when available; otherwise falls back to `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`.
+
+3) Manual start (if you prefer two terminals)
 ```bash
+# Terminal A
+cd parakeet-stt-daemon
+uv run parakeet-stt-daemon --no-streaming
+
+# Terminal B
 cd parakeet-ptt
-cargo run
+cargo run --release -- --endpoint ws://127.0.0.1:8765/ws
 ```
-   - Hotkey defaults to Right Ctrl. Update your shell aliases (`stt`, `stt start`, etc.) to match the daemon command above.
+   - Health check only: `uv run parakeet-stt-daemon --check`.
+   - Hotkey defaults to Right Ctrl.
 
 ## Key Commands
 
@@ -55,6 +68,12 @@ See `uv run parakeet-stt-daemon --help` for all options.
 |---------|-------------|
 | `cargo run --release` | Run the client in release mode. |
 | `cargo run -- --help` | Show client configuration options. |
+
+### Helper Script (`scripts/stt-helper.sh`)
+- Source it in your shell to get `stt start|stop|status|logs|show|tmux|check`.
+- Detached tmux session: `stt start` spins up the daemon + client, tails logs in a second pane, and returns you to your shell.
+- Logs live in `/tmp/parakeet-daemon.log` and `/tmp/parakeet-ptt.log`; `stt show` attaches to the tmux layout.
+- Keep your personal shell config private: only this helper is intended for sharing. You can copy the function into your dotfiles or re-source the script when needed.
 
 ## Documentation
 
