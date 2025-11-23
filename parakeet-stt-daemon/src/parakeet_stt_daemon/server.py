@@ -143,6 +143,7 @@ class DaemonServer:
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
         logger.debug("stop_session received: {}", message)
+        await asyncio.sleep(0.25)  # brief post-roll to capture tail audio before stopping
         async with self._transcribe_lock:
             try:
                 session = await self.sessions.stop_session(message.session_id)
