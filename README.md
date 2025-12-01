@@ -33,9 +33,9 @@ stt start                      # starts daemon + client, detaches tmux
    - Stop everything: `stt stop`. Status: `stt status`. Logs: `stt logs [client|daemon|both]`.
 
    The helper:
-   - Starts the daemon with `--no-streaming`, waits for port 8765, and logs to `/tmp/parakeet-daemon.log`.
-   - Launches the client in a detached tmux session `parakeet-stt`, teeing output to `/tmp/parakeet-ptt.log`.
-   - Uses `target/release/parakeet-ptt` when available; otherwise falls back to `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`.
+   - Starts the daemon with `--no-streaming`, binds to `PARAKEET_HOST:PARAKEET_PORT` (default `127.0.0.1:8765`), and waits for the socket; logs land in `/tmp/parakeet-daemon.log`. If 8765 is occupied, it picks the next free port unless you pin `PARAKEET_PORT`.
+   - Launches the client in a detached tmux session `parakeet-stt`, teeing output to `/tmp/parakeet-ptt.log`, and always targets the resolved endpoint.
+   - Uses `target/release/parakeet-ptt` when available; otherwise falls back to `cargo run --release -- --endpoint <endpoint>`.
 
 3) Manual start (if you prefer two terminals)
 ```bash

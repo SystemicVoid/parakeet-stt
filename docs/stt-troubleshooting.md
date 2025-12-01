@@ -12,6 +12,7 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 ## What fails (intermittent client start)
 - When invoked from `stt start` (or plain `stt`), the client sometimes exits immediately. The helper then reports “Client failed to stay up” and may also report “Client rebuild failed” even though manual `cargo run` works.
 - In failing runs, `/tmp/parakeet-ptt.log` ended up empty because the helper truncated the log before spawning the client and the client exited before writing anything. We now keep a header and more instrumentation in the log.
+- If another process binds port 8765 (e.g., Anki), the daemon would previously crash with `address already in use`; the helper now rebinds to the next free port unless `PARAKEET_PORT` is explicitly set.
 
 ## Evidence from logs
 - Successful runs show `/tmp/parakeet-ptt.log` entries like:
@@ -24,8 +25,8 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 ## Current helper behavior (after rewrite)
 - Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
 - Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
-- Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon --no-streaming >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for port 8765 (0.5s polling). On failure, it prints the last daemon log lines.
-- Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
+- Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon --no-streaming >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). On failure, it prints the last daemon log lines.
+- Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint <resolved endpoint>`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
 - Commands: `stt start` (default detached tmux), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
 
