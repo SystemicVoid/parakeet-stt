@@ -9,7 +9,10 @@ stt() {
     local LOG_DAEMON="/tmp/parakeet-daemon.log"
     local CLIENT_PID_FILE="/tmp/parakeet-ptt.pid"
     local DAEMON_PID_FILE="/tmp/parakeet-daemon.pid"
-    local DEFAULT_ENDPOINT="ws://127.0.0.1:8765/ws"
+    local HOST="${PARAKEET_HOST:-127.0.0.1}"
+    local PORT="${PARAKEET_PORT:-8765}"
+    local PORT_FILE="/tmp/parakeet-daemon.port"
+    local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
 
@@ -29,17 +32,19 @@ stt() {
         local ready=0
         for _ in $(seq 1 "$tries"); do
             if command -v nc >/dev/null 2>&1; then
-                if nc -z 127.0.0.1 8765 2>/dev/null; then
+                if nc -z "$HOST" "$PORT" 2>/dev/null; then
                     ready=1
                     break
                 fi
             else
-                if python3 - <<'PY' >/dev/null 2>&1
+                if python3 - "$HOST" "$PORT" <<'PY' >/dev/null 2>&1
 import socket, sys
+host = sys.argv[1]
+port = int(sys.argv[2])
 s = socket.socket()
 s.settimeout(0.5)
 try:
-    s.connect(("127.0.0.1", 8765))
+    s.connect((host, port))
 except Exception:
     sys.exit(1)
 else:
@@ -71,12 +76,63 @@ PY
         return 1
     }
 
+    _port_owner() {
+        local port="$1"
+        if command -v lsof >/dev/null 2>&1; then
+            lsof -iTCP:"$port" -sTCP:LISTEN -n -P 2>/dev/null | awk 'NR>1 {print $1 ":" $2; exit}'
+        elif command -v ss >/dev/null 2>&1; then
+            ss -ltnp "sport = :$port" 2>/dev/null | awk 'NR>1 {print $6}' | sed 's/users://;s/\"//g' | head -n1
+        fi
+    }
+
+    _find_free_port() {
+        local start="$1"
+        local end=$((start + 10))
+        local candidate owner
+        for candidate in $(seq "$start" "$end"); do
+            owner=$(_port_owner "$candidate")
+            if [ -z "$owner" ]; then
+                echo "$candidate"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    _resolve_port() {
+        local env_port_set="${PARAKEET_PORT+set}"
+        local owner
+        owner=$(_port_owner "$PORT")
+        if [ -n "$owner" ] && ! grep -qi "parakeet" <<<"$owner"; then
+            if [ "$env_port_set" = "set" ]; then
+                echo "   - Port $PORT is in use by $owner; stop it or set PARAKEET_PORT to a free port."
+                return 1
+            fi
+            local next_port
+            next_port=$(_find_free_port "$((PORT + 1))")
+            if [ -z "$next_port" ]; then
+                echo "   - Port $PORT is in use by $owner; no alternate port found near $PORT."
+                return 1
+            fi
+            echo "   - Port $PORT busy (owner: $owner); switching to $next_port."
+            PORT="$next_port"
+        fi
+        DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
+        export PARAKEET_HOST="$HOST"
+        export PARAKEET_PORT="$PORT"
+        return 0
+    }
+
     _log_client() { echo "[$(date -Is)] $*" >> "$LOG_CLIENT"; }
     _log_daemon() { echo "[$(date -Is)] $*" >> "$LOG_DAEMON"; }
 
     case "$cmd" in
         start)
             echo ">>> Starting Parakeet STT (detached tmux)..."
+
+            if ! _resolve_port; then
+                return 1
+            fi
 
             if pgrep -f "parakeet-stt-daemon" >/dev/null; then
                 echo "   - Daemon already running."
@@ -85,7 +141,7 @@ PY
                 _log_daemon "launch via stt helper (--no-streaming)"
                 (
                     cd "$DAEMON_DIR" || exit 1
-                    nohup uv run parakeet-stt-daemon --no-streaming >> "$LOG_DAEMON" 2>&1 &
+                    PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" --no-streaming >> "$LOG_DAEMON" 2>&1 &
                     echo $! > "$DAEMON_PID_FILE"
                 )
             fi
@@ -93,6 +149,7 @@ PY
             echo -n "   - Waiting for socket..."
             if _wait_for_socket "$DAEMON_PID_FILE" 60; then
                 echo " OK"
+                echo "${HOST}:${PORT}" > "$PORT_FILE"
             else
                 echo " not ready; last daemon log lines:"
                 tail -n 80 "$LOG_DAEMON"
@@ -124,7 +181,7 @@ PY
             client_cmd='
                 set -e
                 if [ -x target/release/parakeet-ptt ]; then
-                    exec ./target/release/parakeet-ptt 2>&1 | tee -a "$LOG_CLIENT"
+                    exec ./target/release/parakeet-ptt --endpoint "$DEFAULT_ENDPOINT" 2>&1 | tee -a "$LOG_CLIENT"
                 else
                     echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
                     exec cargo run --release -- --endpoint "$DEFAULT_ENDPOINT" 2>&1 | tee -a "$LOG_CLIENT"
@@ -177,7 +234,7 @@ PY
             fi
             pkill -f "parakeet-stt-daemon" >/dev/null 2>&1 && echo "   - Daemon stopped"
 
-            rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE"
+            rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE" "$PORT_FILE"
             ;;
         logs)
             case "${1:-both}" in
@@ -219,6 +276,11 @@ PY
             else
                 echo "   - Client not running"
             fi
+            if [ -f "$PORT_FILE" ]; then
+                echo "   - Endpoint: ws://$(cat "$PORT_FILE")/ws"
+            else
+                echo "   - Endpoint: $DEFAULT_ENDPOINT"
+            fi
             if pgrep -af "parakeet" >/dev/null; then
                 echo "   - Matching processes:"
                 pgrep -af "parakeet" | sed 's/^/     /'
@@ -248,12 +310,17 @@ PY
                 echo "Warning: parakeet processes already running; use 'stt stop' first to avoid duplicates."
             fi
 
+            if ! _resolve_port; then
+                return 1
+            fi
+
             echo "Creating tmux session '$TMUX_SESSION' (daemon | client | logs)..."
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
+            echo "${HOST}:${PORT}" > "$PORT_FILE"
 
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --no-streaming >> \"$LOG_DAEMON\" 2>&1"
-            local client_cmd="RUST_LOG=\"$RUST_LOG\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\"; if [ -x ./target/release/parakeet-ptt ]; then exec ./target/release/parakeet-ptt >> \"$LOG_CLIENT\" 2>&1; else exec cargo run --release -- --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; fi"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --no-streaming >> \"$LOG_DAEMON\" 2>&1"
+            local client_cmd="RUST_LOG=\"$RUST_LOG\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\"; if [ -x ./target/release/parakeet-ptt ]; then exec ./target/release/parakeet-ptt --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; else exec cargo run --release -- --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; fi"
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
             tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "$client_cmd"
