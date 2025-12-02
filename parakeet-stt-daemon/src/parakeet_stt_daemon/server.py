@@ -258,7 +258,9 @@ class DaemonServer:
         trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
         audio_path = self._write_wav(trimmed)
         try:
-            return self.transcriber.transcribe_wav(str(audio_path))
+            return await asyncio.get_running_loop().run_in_executor(
+                None, self.transcriber.transcribe_wav, str(audio_path)
+            )
         finally:
             audio_path.unlink(missing_ok=True)
 
