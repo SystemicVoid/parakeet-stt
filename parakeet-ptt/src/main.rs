@@ -206,7 +206,11 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let _hotkey_handles = spawn_hotkey_loop(hk_tx)?;
+    let hotkey_tasks = spawn_hotkey_loop(hk_tx)?;
+    info!(
+        devices = hotkey_tasks.len(),
+        "Hotkey listeners started for KEY_RIGHTCTRL"
+    );
 
     fetch_status_once(&config).await;
 

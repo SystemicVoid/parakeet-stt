@@ -1,11 +1,9 @@
 use std::fs::{self, File};
 use std::io::ErrorKind;
 
-use std::path::Path;
-
-
 use anyhow::{bail, Context, Result};
 use evdev::{Device, InputEventKind, Key};
+use std::path::Path;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -14,6 +12,24 @@ use tokio::task::JoinHandle;
 pub enum HotkeyEvent {
     Down,
     Up,
+}
+
+pub struct HotkeyTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl HotkeyTasks {
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+}
+
+impl Drop for HotkeyTasks {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }
 
 pub fn ensure_input_access() -> Result<()> {
@@ -58,7 +74,7 @@ pub fn ensure_input_access() -> Result<()> {
     bail!("No readable /dev/input/event* devices. {hint}")
 }
 
-pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<Vec<JoinHandle<()>>> {
+pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyTasks> {
     let devices = find_right_ctrl_devices()?;
     if devices.is_empty() {
         anyhow::bail!("no input devices exposing KEY_RIGHTCTRL were found");
@@ -105,7 +121,7 @@ pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<Vec<JoinHan
         handles.push(handle);
     }
 
-    Ok(handles)
+    Ok(HotkeyTasks { handles })
 }
 
 fn find_right_ctrl_devices() -> Result<Vec<Device>> {
