@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Parakeet STT helper (tmux-based start/stop). Source this file, then run: stt start
 
+# Resolve repo root at load time so it works even when sourced via symlinks.
+__STT_HELPER_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+    __STT_HELPER_PATH="$(readlink -f "$__STT_HELPER_PATH" 2>/dev/null || echo "$__STT_HELPER_PATH")"
+fi
+__STT_REPO_ROOT_DEFAULT="${PARAKEET_ROOT:-$(cd "$(dirname "$__STT_HELPER_PATH")/.." && pwd)}"
+
 stt() {
-    local REPO_ROOT="${PARAKEET_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local REPO_ROOT="${PARAKEET_ROOT:-$__STT_REPO_ROOT_DEFAULT}"
     local DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
     local CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
     local LOG_CLIENT="/tmp/parakeet-ptt.log"
@@ -15,6 +22,28 @@ stt() {
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
+    local default_injection_mode="${PARAKEET_INJECTION_MODE:-type}"
+
+    # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
+    if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
+        local helper_path="${BASH_SOURCE[0]:-$__STT_HELPER_PATH}"
+        if command -v readlink >/dev/null 2>&1; then
+            helper_path="$(readlink -f "$helper_path" 2>/dev/null || echo "$helper_path")"
+        fi
+        REPO_ROOT="$(cd "$(dirname "$helper_path")/.." && pwd 2>/dev/null)"
+    fi
+    # Final guard: ensure the repo path actually has the expected subdirs.
+    if [ ! -d "$REPO_ROOT/parakeet-stt-daemon" ] || [ ! -d "$REPO_ROOT/parakeet-ptt" ]; then
+        local guessed="$HOME/Documents/Engineering/parakeet-stt"
+        if [ -d "$guessed/parakeet-stt-daemon" ] && [ -d "$guessed/parakeet-ptt" ]; then
+            REPO_ROOT="$guessed"
+        else
+            echo "stt helper: could not locate repo root (REPO_ROOT='$REPO_ROOT'). Set PARAKEET_ROOT explicitly."
+            return 1
+        fi
+    fi
+    DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
+    CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
 
     export RUST_LOG="${RUST_LOG:-info}"
 
@@ -128,7 +157,28 @@ PY
 
     case "$cmd" in
         start)
+            local injection_mode="$default_injection_mode"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --paste)
+                        injection_mode="paste"
+                        shift
+                        ;;
+                    --type)
+                        injection_mode="type"
+                        shift
+                        ;;
+                    *)
+                        # Unknown option, maybe for something else?
+                        # For now we ignore or could error.
+                        # Let's assume other args might be valid or ignored.
+                        shift
+                        ;;
+                esac
+            done
+
             echo ">>> Starting Parakeet STT (detached tmux)..."
+            echo "   - Injection mode: $injection_mode"
 
             if ! _resolve_port; then
                 return 1
@@ -171,7 +221,7 @@ PY
             fi
 
             echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
-            _log_client "start client in tmux"
+            _log_client "start client in tmux (mode: $injection_mode)"
 
             if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
                 tmux kill-session -t "$TMUX_SESSION"
@@ -180,16 +230,23 @@ PY
             local client_cmd
             client_cmd='
                 set -e
+                runner=""
                 if [ -x target/release/parakeet-ptt ]; then
-                    exec ./target/release/parakeet-ptt --endpoint "$DEFAULT_ENDPOINT" 2>&1 | tee -a "$LOG_CLIENT"
-                else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
-                    exec cargo run --release -- --endpoint "$DEFAULT_ENDPOINT" 2>&1 | tee -a "$LOG_CLIENT"
+                    if target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode"; then
+                        runner="./target/release/parakeet-ptt"
+                    else
+                        echo "[helper] release binary missing --injection-mode; falling back to cargo run --release" >> "$LOG_CLIENT"
+                    fi
                 fi
+                if [ -z "$runner" ]; then
+                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    runner="cargo run --release --"
+                fi
+                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "$INJECTION_MODE" 2>&1 | tee -a "$LOG_CLIENT"
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
@@ -217,7 +274,7 @@ PY
             ;;
         restart)
             stt stop
-            stt start
+            stt start "$@"
             ;;
         stop)
             echo ">>> Stopping Parakeet..."
@@ -320,7 +377,23 @@ PY
             echo "${HOST}:${PORT}" > "$PORT_FILE"
 
             local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --no-streaming >> \"$LOG_DAEMON\" 2>&1"
-            local client_cmd="RUST_LOG=\"$RUST_LOG\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\"; if [ -x ./target/release/parakeet-ptt ]; then exec ./target/release/parakeet-ptt --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; else exec cargo run --release -- --endpoint \"$DEFAULT_ENDPOINT\" >> \"$LOG_CLIENT\" 2>&1; fi"
+            local injection_mode="${INJECTION_MODE:-$default_injection_mode}"
+            local client_cmd='
+                set -e
+                runner=""
+                if [ -x ./target/release/parakeet-ptt ]; then
+                    if ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode"; then
+                        runner="./target/release/parakeet-ptt"
+                    else
+                        echo "[helper] release binary missing --injection-mode; falling back to cargo run --release" >> "$LOG_CLIENT"
+                    fi
+                fi
+                if [ -z "$runner" ]; then
+                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    runner="cargo run --release --"
+                fi
+                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "${INJECTION_MODE:-type}" >> "$LOG_CLIENT" 2>&1
+            '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
             tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "$client_cmd"
