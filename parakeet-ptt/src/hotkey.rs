@@ -1,14 +1,14 @@
 use std::fs::{self, File};
 use std::io::ErrorKind;
-use std::os::unix::io::AsRawFd;
+
 use std::path::Path;
-use std::thread;
-use std::time::Duration;
+
 
 use anyhow::{bail, Context, Result};
 use evdev::{Device, InputEventKind, Key};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
@@ -58,16 +58,19 @@ pub fn ensure_input_access() -> Result<()> {
     bail!("No readable /dev/input/event* devices. {hint}")
 }
 
-pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<thread::JoinHandle<()>> {
-    let mut devices = find_right_ctrl_devices()?;
+pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<Vec<JoinHandle<()>>> {
+    let devices = find_right_ctrl_devices()?;
     if devices.is_empty() {
         anyhow::bail!("no input devices exposing KEY_RIGHTCTRL were found");
     }
 
-    let handle = thread::spawn(move || {
-        let mut is_down = false;
-        loop {
-            for device in devices.iter_mut() {
+    let mut handles = Vec::new();
+
+    for mut device in devices {
+        let tx = tx.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut is_down = false;
+            loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
@@ -85,30 +88,24 @@ pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<thread::Joi
                                             is_down = false;
                                         }
                                     }
-                                    2 => {
-                                        // auto-repeat; ignore
-                                    }
                                     _ => {}
                                 }
                             }
                         }
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
                     Err(err) => {
-                        // Log-style diagnostics are not available here; just continue.
-                        let _ = tx.send(HotkeyEvent::Up);
                         eprintln!("hotkey device error: {err}");
-                        thread::sleep(Duration::from_millis(50));
+                        // If the device is gone or errored, we probably can't recover in this loop easily without re-opening.
+                        // For now, we break to exit the thread for this device.
+                        break;
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(5));
-        }
-    });
+        });
+        handles.push(handle);
+    }
 
-    Ok(handle)
+    Ok(handles)
 }
 
 fn find_right_ctrl_devices() -> Result<Vec<Device>> {
@@ -133,8 +130,9 @@ fn find_right_ctrl_devices() -> Result<Vec<Device>> {
                     .map(|k| k.contains(Key::KEY_RIGHTCTRL))
                     .unwrap_or(false)
                 {
-                    let raw_fd = dev.as_raw_fd();
-                    let _ = fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
+                    // We intentionally do NOT set O_NONBLOCK so that fetch_events blocks.
+                    // let raw_fd = dev.as_raw_fd();
+                    // let _ = fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
                     devices.push(dev);
                 }
             }

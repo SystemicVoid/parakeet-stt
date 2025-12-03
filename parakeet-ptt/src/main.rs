@@ -206,7 +206,7 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let _hotkey_handle = spawn_hotkey_loop(hk_tx)?;
+    let _hotkey_handles = spawn_hotkey_loop(hk_tx)?;
 
     fetch_status_once(&config).await;
 
