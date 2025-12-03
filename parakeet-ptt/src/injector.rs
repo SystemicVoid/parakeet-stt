@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use tracing::{debug, info, warn};
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
@@ -30,6 +31,13 @@ impl WtypeInjector {
 
 impl TextInjector for WtypeInjector {
     fn inject(&self, text: &str) -> Result<()> {
+        debug!(
+            mode = "type",
+            len = text.len(),
+            preview = %preview(text),
+            "injecting via wtype"
+        );
+
         let status = Command::new(&self.binary)
             .arg("-d")
             .arg(self.delay_ms.to_string())
@@ -47,11 +55,15 @@ impl TextInjector for WtypeInjector {
 #[derive(Debug, Clone)]
 pub struct ClipboardInjector {
     wtype_binary: PathBuf,
+    delay_ms: u64,
 }
 
 impl ClipboardInjector {
-    pub fn new(wtype_binary: PathBuf) -> Self {
-        Self { wtype_binary }
+    pub fn new(wtype_binary: PathBuf, delay_ms: u64) -> Self {
+        Self {
+            wtype_binary,
+            delay_ms,
+        }
     }
 
     fn get_clipboard() -> Result<String> {
@@ -78,7 +90,9 @@ impl ClipboardInjector {
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            stdin.write_all(text.as_bytes()).context("failed to write to wl-copy stdin")?;
+            stdin
+                .write_all(text.as_bytes())
+                .context("failed to write to wl-copy stdin")?;
         }
 
         let status = child.wait().context("failed to wait for wl-copy")?;
@@ -91,11 +105,30 @@ impl ClipboardInjector {
 
 impl TextInjector for ClipboardInjector {
     fn inject(&self, text: &str) -> Result<()> {
+        info!(
+            mode = "paste",
+            len = text.len(),
+            preview = %preview(text),
+            "injecting via clipboard"
+        );
+
         // 1. Save current clipboard
         let original_clipboard = Self::get_clipboard().unwrap_or_default();
 
         // 2. Set new text to clipboard
         Self::set_clipboard(text)?;
+
+        // 2b. Verify clipboard round-trip so we can bail early if the compositor rejected it.
+        let roundtrip = Self::get_clipboard().unwrap_or_default();
+        if roundtrip != text {
+            warn!(
+                mode = "paste",
+                requested_len = text.len(),
+                stored_len = roundtrip.len(),
+                "clipboard roundtrip mismatch; falling back to type injection"
+            );
+            return WtypeInjector::new(self.wtype_binary.clone(), self.delay_ms).inject(text);
+        }
 
         // 3. Simulate Ctrl+V
         // wtype -M ctrl -k v -m ctrl
@@ -110,7 +143,11 @@ impl TextInjector for ClipboardInjector {
             .context("failed to spawn wtype for paste")?;
 
         if !status.success() {
-            anyhow::bail!("wtype paste exited with status {}", status);
+            warn!(
+                code = ?status.code(),
+                "wtype paste exited non-zero; falling back to type injection"
+            );
+            return WtypeInjector::new(self.wtype_binary.clone(), self.delay_ms).inject(text);
         }
 
         // 4. Restore original clipboard (optional, but good UX)
@@ -119,5 +156,14 @@ impl TextInjector for ClipboardInjector {
         let _ = Self::set_clipboard(&original_clipboard);
 
         Ok(())
+    }
+}
+
+fn preview(text: &str) -> String {
+    const MAX: usize = 80;
+    if text.len() <= MAX {
+        text.to_string()
+    } else {
+        format!("{}…", &text[..MAX])
     }
 }

@@ -158,11 +158,8 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
             Box::new(WtypeInjector::new(wtype_binary, config.wtype_delay_ms))
         }
         InjectionMode::Paste => {
-            info!(
-                ?wtype_binary,
-                "Using clipboard injector (paste mode)"
-            );
-            Box::new(ClipboardInjector::new(wtype_binary))
+            info!(?wtype_binary, "Using clipboard injector (paste mode)");
+            Box::new(ClipboardInjector::new(wtype_binary, config.wtype_delay_ms))
         }
     }
 }
