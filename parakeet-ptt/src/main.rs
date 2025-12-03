@@ -66,6 +66,24 @@ struct Cli {
     /// Override text to inject during demo (otherwise uses daemon final result)
     #[arg(long)]
     demo_text: Option<String>,
+    /// Injection mode: 'type' (default) or 'paste'
+    #[arg(long, value_enum, default_value_t = CliInjectionMode::Type)]
+    injection_mode: CliInjectionMode,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliInjectionMode {
+    Type,
+    Paste,
+}
+
+impl From<CliInjectionMode> for crate::config::InjectionMode {
+    fn from(mode: CliInjectionMode) -> Self {
+        match mode {
+            CliInjectionMode::Type => crate::config::InjectionMode::Type,
+            CliInjectionMode::Paste => crate::config::InjectionMode::Paste,
+        }
+    }
 }
 
 #[tokio::main]
@@ -79,6 +97,7 @@ async fn main() -> Result<()> {
         cli.hotkey.clone(),
         cli.wtype.clone(),
         cli.wtype_delay_ms,
+        cli.injection_mode.into(),
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
@@ -100,37 +119,51 @@ async fn main() -> Result<()> {
 }
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
-    match config.wtype_path.clone() {
-        Some(path) => {
+    use crate::config::InjectionMode;
+    use crate::injector::ClipboardInjector;
+
+    // Helper to find wtype
+    let find_wtype = || -> Option<PathBuf> {
+        if let Some(path) = &config.wtype_path {
             if path.exists() {
-                info!(
-                    ?path,
-                    delay_ms = config.wtype_delay_ms,
-                    "Using wtype injector"
-                );
-                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
+                return Some(path.clone());
             } else {
-                error!(
-                    ?path,
-                    "Configured wtype path does not exist; falling back to noop injector"
-                );
-                Box::new(NoopInjector)
+                error!(?path, "Configured wtype path does not exist");
             }
         }
-        None => match which::which("wtype") {
-            Ok(path) => {
-                info!(
-                    ?path,
-                    delay_ms = config.wtype_delay_ms,
-                    "Found wtype in PATH"
-                );
-                Box::new(WtypeInjector::new(path, config.wtype_delay_ms))
-            }
+        match which::which("wtype") {
+            Ok(path) => Some(path),
             Err(_) => {
-                error!("wtype not found; transcription will not be injected");
-                Box::new(NoopInjector)
+                error!("wtype not found");
+                None
             }
-        },
+        }
+    };
+
+    let wtype_binary = match find_wtype() {
+        Some(path) => path,
+        None => {
+            error!("wtype is required for injection but was not found; falling back to noop");
+            return Box::new(NoopInjector);
+        }
+    };
+
+    match config.injection_mode {
+        InjectionMode::Type => {
+            info!(
+                ?wtype_binary,
+                delay_ms = config.wtype_delay_ms,
+                "Using wtype injector (type mode)"
+            );
+            Box::new(WtypeInjector::new(wtype_binary, config.wtype_delay_ms))
+        }
+        InjectionMode::Paste => {
+            info!(
+                ?wtype_binary,
+                "Using clipboard injector (paste mode)"
+            );
+            Box::new(ClipboardInjector::new(wtype_binary))
+        }
     }
 }
 

@@ -9,6 +9,12 @@ use url::Url;
 
 pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum InjectionMode {
+    Type,
+    Paste,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub endpoint: Url,
@@ -16,6 +22,7 @@ pub struct ClientConfig {
     pub hotkey: String,
     pub wtype_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
+    pub injection_mode: InjectionMode,
     pub connect_timeout: Duration,
 }
 
@@ -26,6 +33,7 @@ impl ClientConfig {
         hotkey: String,
         wtype_path: Option<PathBuf>,
         wtype_delay_ms: u64,
+        injection_mode: InjectionMode,
         connect_timeout: Duration,
     ) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
@@ -36,6 +44,7 @@ impl ClientConfig {
             hotkey,
             wtype_path,
             wtype_delay_ms,
+            injection_mode,
             connect_timeout,
         })
     }
