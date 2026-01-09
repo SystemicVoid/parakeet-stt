@@ -32,9 +32,9 @@ parakeet-stt-daemon = "parakeet_stt_daemon.__main__:main"
 
 [dependency-groups]
 dev = [
-  "ruff>=0.7.0",
-  "black>=24.10.0",
-  "pyright>=1.1.389",
+  "ruff>=0.14.0",
+  "black>=25.12.0",
+  "pyright>=1.1.408",
 ]
 
 [tool.hatch.build.targets.wheel]
