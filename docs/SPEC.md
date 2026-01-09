@@ -195,31 +195,31 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
 
 ## 5. Implementation Guidelines
 
-1. **Use uv & cargo consistently**  
-   - Python: `uv run`, `uv pip`, `uv lock`. No `pip install` without uv.  
+1. **Use uv & cargo consistently**
+   - Python: `uv run`, `uv pip`, `uv lock`. No `pip install` without uv.
    - Rust: standard `cargo` commands; consider workspace layout early.
 
 2. **Coding standards**
-   - Python: type hints, `ruff` + `black` for lint/format (invoked via `uv run`).  
+   - Python: type hints, `ruff` + `black` for lint/format (invoked via `uv run`).
    - Rust: `cargo fmt`, `cargo clippy --all-targets`.
 
 3. **Security & permissions**
-   - Limit WebSocket server to localhost; optionally require auth token.  
+   - Limit WebSocket server to localhost; optionally require auth token.
    - Ensure `parakeet-ptt` only opens necessary `/dev/input` descriptors and handles permission failures gracefully.
 
 4. **Performance**
-   - Keep model on GPU at all times.  
-   - Avoid copying audio data twice; use memoryview or `numpy.frombuffer` around the ring buffer.  
+   - Keep model on GPU at all times.
+   - Avoid copying audio data twice; use memoryview or `numpy.frombuffer` around the ring buffer.
    - Measure and log latency on every session to detect regressions.
 
 5. **Testing**
-   - Python: unit tests for streaming state machine, mocked audio input, and WebSocket handlers.  
-   - Integration: CLI script feeding a short WAV file to ensure deterministic output.  
+   - Python: unit tests for streaming state machine, mocked audio input, and WebSocket handlers.
+   - Integration: CLI script feeding a short WAV file to ensure deterministic output.
    - Rust: mock daemon responses to verify state transitions and injection calls; property-based tests for key event handling.
 
 6. **Deployment**
-   - Provide systemd user units: `parakeet-stt-daemon.service` (runs via `uv run`), `parakeet-ptt.service` (runs `cargo` binary).  
-   - Document required groups (`input`, maybe `audio`).  
+   - Provide systemd user units: `parakeet-stt-daemon.service` (runs via `uv run`), `parakeet-ptt.service` (runs `cargo` binary).
+   - Document required groups (`input`, maybe `audio`).
    - Offer a `setup.sh` (later) that installs dependencies, builds binaries, enables services.
 
 ---
@@ -231,22 +231,22 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
    - Create Rust crate skeleton; connect to dummy WebSocket server.
 
 2. **M1 – Push-to-talk MVP**
-   - Implement daemon ring buffer + streaming inference.  
-   - Implement Rust hotkey detection and WebSocket control.  
+   - Implement daemon ring buffer + streaming inference.
+   - Implement Rust hotkey detection and WebSocket control.
    - Return transcription as log (no injection yet).
 
 3. **M2 – Text Injection**
-   - Integrate `wtype` fallback; type transcriptions into focused window.  
+   - Integrate `wtype` fallback; type transcriptions into focused window.
    - Add configurables (delay, trimming).
 
 4. **M3 – Hardening**
-   - Error handling, reconnection logic, systemd units, metrics endpoint.  
+   - Error handling, reconnection logic, systemd units, metrics endpoint.
    - Permission setup script/instructions.
 
 5. **M4 – Enhancements (future)**
-   - Virtual-keyboard implementation.  
-   - Optional overlay with live partials.  
-   - CLI for offline file transcription via same daemon.  
+   - Virtual-keyboard implementation.
+   - Optional overlay with live partials.
+   - CLI for offline file transcription via same daemon.
    - Post-processing (local LLM) and macros.
 
 ---
