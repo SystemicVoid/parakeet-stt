@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from typing import Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import sounddevice as sd
 import uvicorn
@@ -151,7 +151,8 @@ def run_checks(settings: ServerSettings) -> None:
         logger.warning("Model warmup skipped/failed: {}", exc)
 
     try:
-        devices = sd.query_devices()
+        # sounddevice returns DeviceList which pyright doesn't recognize as dict-like
+        devices = cast(Sequence[dict[str, Any]], sd.query_devices())
         inputs = [
             (idx, dev["name"])
             for idx, dev in enumerate(devices)
