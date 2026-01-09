@@ -116,14 +116,15 @@ class ParakeetTranscriber:
         if not paths:
             return []
         logger.info("Transcribing {} file(s) with Parakeet", len(paths))
-        outputs = self.model.transcribe(list(paths), timestamps=timestamps)
+        # NeMo's type stubs are incomplete; transcribe() returns list of transcription results
+        outputs = self.model.transcribe(list(paths), timestamps=timestamps)  # type: ignore[operator]
         return [_extract_text(item) for item in outputs]
 
     def transcribe_iter(self, paths: Iterable[str], *, timestamps: bool = False) -> list[str]:
         return self.transcribe_files(list(paths), timestamps=timestamps)
 
     def transcribe_wav(self, path: str) -> str:
-        outputs = self.model.transcribe([path], batch_size=1)
+        outputs = self.model.transcribe([path], batch_size=1)  # type: ignore[operator]
         if not outputs:
             return ""
         return _extract_text(outputs[0])
@@ -175,8 +176,9 @@ class ParakeetStreamingTranscriber:
 
     def _init_helper(self) -> None:
         try:
-            from nemo.collections.asr.parts.utils.streaming_utils import (  # type: ignore
-                ChunkedRNNTInfer,
+            # ChunkedRNNTInfer may not exist in all NeMo versions; ignore missing stubs
+            from nemo.collections.asr.parts.utils.streaming_utils import (
+                ChunkedRNNTInfer,  # type: ignore[attr-defined]
             )
 
             cfg = getattr(self.model, "cfg", getattr(self.model, "_cfg", None))
