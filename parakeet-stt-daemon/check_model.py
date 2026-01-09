@@ -35,7 +35,7 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
         sf.write(path, samples, SAMPLE_RATE)
     except Exception:  # pragma: no cover - minimal fallback
         pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
-        with wave.open(path, "wb") as wf:
+        with wave.open(str(path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)

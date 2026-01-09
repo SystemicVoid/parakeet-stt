@@ -233,7 +233,7 @@ class DaemonServer:
 
     def _write_wav_fallback(self, path: Path, samples: np.ndarray) -> None:
         pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
-        with wave.open(path, "wb") as wf:
+        with wave.open(str(path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self.audio.sample_rate)
