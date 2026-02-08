@@ -28,6 +28,25 @@ impl TextInjector for NoopInjector {
 }
 
 #[derive(Debug, Clone)]
+pub struct FailInjector {
+    message: Arc<str>,
+}
+
+impl FailInjector {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: Arc::<str>::from(message.into()),
+        }
+    }
+}
+
+impl TextInjector for FailInjector {
+    fn inject(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("{}", self.message)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WtypeInjector {
     binary: PathBuf,
     delay_ms: u64,

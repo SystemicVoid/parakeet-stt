@@ -313,8 +313,8 @@ async fn main() -> Result<()> {
 }
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
-    use crate::config::{InjectionMode, PasteKeyBackend};
-    use crate::injector::{ClipboardInjector, PasteKeySender, UinputChordSender};
+    use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
+    use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
 
     let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
         if let Some(path) = configured {
@@ -329,6 +329,29 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
 
     let wtype_binary = resolve_binary(config.wtype_path.as_ref(), "wtype");
     let ydotool_binary = resolve_binary(config.ydotool_path.as_ref(), "ydotool");
+
+    let backend_failure_fallback = |reason: String| -> Box<dyn TextInjector> {
+        match config.clipboard.backend_failure_policy {
+            PasteBackendFailurePolicy::CopyOnly => {
+                warn!(
+                    reason = %reason,
+                    "paste backend unavailable; falling back to copy-only injection"
+                );
+                Box::new(ClipboardInjector::new(
+                    PasteKeySender::Disabled,
+                    config.clipboard.clone(),
+                    true,
+                ))
+            }
+            PasteBackendFailurePolicy::Error => {
+                error!(
+                    reason = %reason,
+                    "paste backend unavailable and policy=error; returning explicit injector error"
+                );
+                Box::new(FailInjector::new(reason))
+            }
+        }
+    };
 
     match config.injection_mode {
         InjectionMode::Type => {
@@ -353,15 +376,17 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 match config.clipboard.key_backend {
                     PasteKeyBackend::Wtype => {
                         let Some(path) = wtype_binary.clone() else {
-                            error!("paste_key_backend=wtype but wtype was not found; falling back to noop");
-                            return Box::new(NoopInjector);
+                            return backend_failure_fallback(
+                                "paste_key_backend=wtype but wtype was not found".to_string(),
+                            );
                         };
                         PasteKeySender::Wtype(path)
                     }
                     PasteKeyBackend::Ydotool => {
                         let Some(path) = ydotool_binary.clone() else {
-                            error!("paste_key_backend=ydotool but ydotool was not found; falling back to noop");
-                            return Box::new(NoopInjector);
+                            return backend_failure_fallback(
+                                "paste_key_backend=ydotool but ydotool was not found".to_string(),
+                            );
                         };
                         PasteKeySender::Ydotool(path)
                     }
@@ -369,12 +394,10 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                     {
                         Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
                         Err(err) => {
-                            error!(
-                                error = %err,
-                                dwell_ms = config.uinput_dwell_ms,
-                                "paste_key_backend=uinput could not initialize /dev/uinput; falling back to noop"
-                            );
-                            return Box::new(NoopInjector);
+                            return backend_failure_fallback(format!(
+                                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                                err
+                            ));
                         }
                     },
                     PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
@@ -390,8 +413,9 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                             } else if let Some(path) = wtype_binary.clone() {
                                 PasteKeySender::Wtype(path)
                             } else {
-                                error!("paste_key_backend=auto could not initialize uinput and could not find ydotool or wtype; falling back to noop");
-                                return Box::new(NoopInjector);
+                                return backend_failure_fallback(
+                                    "paste_key_backend=auto could not initialize uinput and could not find ydotool or wtype".to_string(),
+                                );
                             }
                         }
                     },
