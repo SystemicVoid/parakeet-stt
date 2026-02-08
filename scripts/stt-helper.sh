@@ -69,18 +69,13 @@ stt() {
         [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" >/dev/null 2>&1
     }
 
-    _wait_for_socket() {
-        local pid_file="$1"
-        local tries="${2:-60}" # 30s with 0.5s sleep
-        local ready=0
-        for _ in $(seq 1 "$tries"); do
-            if command -v nc >/dev/null 2>&1; then
-                if nc -z "$HOST" "$PORT" 2>/dev/null; then
-                    ready=1
-                    break
-                fi
-            else
-                if python3 - "$HOST" "$PORT" <<'PY' >/dev/null 2>&1
+    _socket_ready_once() {
+        if command -v nc >/dev/null 2>&1; then
+            nc -z "$HOST" "$PORT" 2>/dev/null
+            return $?
+        fi
+
+        python3 - "$HOST" "$PORT" <<'PY' >/dev/null 2>&1
 import socket, sys
 host = sys.argv[1]
 port = int(sys.argv[2])
@@ -94,10 +89,17 @@ else:
     s.close()
     sys.exit(0)
 PY
-                then
-                    ready=1
-                    break
-                fi
+        return $?
+    }
+
+    _wait_for_socket() {
+        local pid_file="$1"
+        local tries="${2:-60}" # 30s with 0.5s sleep
+        local ready=0
+        for _ in $(seq 1 "$tries"); do
+            if _socket_ready_once; then
+                ready=1
+                break
             fi
             if [ -n "$pid_file" ] && [ -f "$pid_file" ] && ! ps -p "$(cat "$pid_file")" >/dev/null 2>&1; then
                 break
@@ -117,6 +119,26 @@ PY
             sleep 0.5
         done
         return 1
+    }
+
+    _stop_pid() {
+        local pid_file="$1"
+        if ! _pid_alive "$pid_file"; then
+            return 1
+        fi
+
+        local pid
+        pid="$(cat "$pid_file")"
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            if ! ps -p "$pid" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.2
+        done
+
+        kill -KILL "$pid" 2>/dev/null || true
+        ! ps -p "$pid" >/dev/null 2>&1
     }
 
     _port_owner() {
@@ -341,9 +363,19 @@ PY
                 return 1
             fi
 
-            if pgrep -f "[p]arakeet-stt-daemon" >/dev/null; then
-                echo "   - Daemon already running."
-            else
+            local daemon_reused=0
+            if _pid_alive "$DAEMON_PID_FILE"; then
+                if _socket_ready_once; then
+                    echo "   - Daemon already running (pid $(cat "$DAEMON_PID_FILE"))."
+                    daemon_reused=1
+                else
+                    echo "   - Daemon pid $(cat "$DAEMON_PID_FILE") is stale (socket not ready); restarting."
+                    _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
+                    rm -f "$DAEMON_PID_FILE"
+                fi
+            fi
+
+            if [ "$daemon_reused" -ne 1 ]; then
                 echo "   - Launching daemon..."
                 _log_daemon "launch via stt helper (--no-streaming)"
                 (
@@ -484,9 +516,10 @@ PY
             fi
 
             if _pid_alive "$DAEMON_PID_FILE"; then
-                kill -TERM "$(cat "$DAEMON_PID_FILE")" 2>/dev/null || true
+                if _stop_pid "$DAEMON_PID_FILE"; then
+                    echo "   - Daemon stopped"
+                fi
             fi
-            pkill -f "[p]arakeet-stt-daemon" >/dev/null 2>&1 && echo "   - Daemon stopped"
 
             rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE" "$PORT_FILE"
             ;;
