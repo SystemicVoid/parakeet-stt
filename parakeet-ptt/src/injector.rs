@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -83,18 +83,31 @@ impl ClipboardInjector {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    fn set_clipboard(text: &str) -> Result<()> {
-        debug!(len = text.len(), "setting clipboard via wl-copy");
-        let mut child = Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to spawn wl-copy")?;
+    fn set_clipboard(text: &str, mime_type: &str, foreground: bool) -> Result<Option<Child>> {
+        debug!(
+            len = text.len(),
+            foreground,
+            mime_type = %mime_type,
+            "setting clipboard via wl-copy"
+        );
+        let mut command = Command::new("wl-copy");
+        command.arg("--type").arg(mime_type).stdin(Stdio::piped());
+        if foreground {
+            command.arg("--foreground");
+        }
+
+        let mut child = command.spawn().context("failed to spawn wl-copy")?;
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin
                 .write_all(text.as_bytes())
                 .context("failed to write to wl-copy stdin")?;
+        }
+
+        if foreground {
+            debug!("wl-copy foreground source started");
+            return Ok(Some(child));
         }
 
         // wl-copy forks a background helper by default. Piping stderr and reading
@@ -104,7 +117,7 @@ impl ClipboardInjector {
         if !status.success() {
             anyhow::bail!("wl-copy exited with status {}", status);
         }
-        Ok(())
+        Ok(None)
     }
 
     fn shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
@@ -140,7 +153,53 @@ impl ClipboardInjector {
         Ok(())
     }
 
-    fn restore_clipboard(original: &Option<String>) {
+    fn stop_foreground_source(source: &mut Option<Child>) {
+        let Some(mut child) = source.take() else {
+            return;
+        };
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                debug!(?status, "wl-copy foreground source already exited");
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to query wl-copy foreground source state"
+                );
+            }
+        }
+
+        if let Err(err) = child.kill() {
+            warn!(error = %err, "failed to stop wl-copy foreground source");
+        }
+        if let Err(err) = child.wait() {
+            warn!(error = %err, "failed to wait for wl-copy foreground source");
+        } else {
+            debug!("wl-copy foreground source stopped");
+        }
+    }
+
+    fn transfer_to_background_if_needed(&self, text: &str, source: &mut Option<Child>) {
+        if source.is_none() {
+            return;
+        }
+
+        debug!("transferring clipboard ownership from foreground to background source");
+        if let Err(err) = Self::set_clipboard(text, &self.options.mime_type, false) {
+            warn!(
+                error = %err,
+                "failed to transfer clipboard ownership to background source"
+            );
+        }
+        Self::stop_foreground_source(source);
+    }
+
+    fn restore_clipboard(&self, original: &Option<String>, source: &mut Option<Child>) {
+        Self::stop_foreground_source(source);
+
         let Some(original_clipboard) = original else {
             debug!("no original clipboard captured; skipping restore");
             return;
@@ -150,7 +209,7 @@ impl ClipboardInjector {
             len = original_clipboard.len(),
             "restoring original clipboard"
         );
-        if let Err(err) = Self::set_clipboard(original_clipboard) {
+        if let Err(err) = Self::set_clipboard(original_clipboard, &self.options.mime_type, false) {
             warn!(error = %err, "failed to restore original clipboard");
         } else {
             debug!("original clipboard restored");
@@ -166,6 +225,8 @@ impl TextInjector for ClipboardInjector {
             shortcut = ?self.options.paste_shortcut,
             restore_policy = ?self.options.restore_policy,
             restore_delay_ms = self.options.restore_delay_ms,
+            copy_foreground = self.options.copy_foreground,
+            mime_type = %self.options.mime_type,
             len = text.len(),
             preview = %preview(text),
             "injecting via clipboard"
@@ -193,7 +254,8 @@ impl TextInjector for ClipboardInjector {
             requested_len = text.len(),
             "writing transcript to clipboard"
         );
-        Self::set_clipboard(text)?;
+        let mut foreground_source =
+            Self::set_clipboard(text, &self.options.mime_type, self.options.copy_foreground)?;
         debug!(
             elapsed_ms = start.elapsed().as_millis(),
             "clipboard write completed"
@@ -235,7 +297,9 @@ impl TextInjector for ClipboardInjector {
                 "paste chord failed; attempting clipboard restore"
             );
             if matches!(self.options.restore_policy, PasteRestorePolicy::Delayed) {
-                Self::restore_clipboard(&original_clipboard);
+                self.restore_clipboard(&original_clipboard, &mut foreground_source);
+            } else {
+                self.transfer_to_background_if_needed(text, &mut foreground_source);
             }
             return Err(err);
         }
@@ -246,6 +310,7 @@ impl TextInjector for ClipboardInjector {
 
         match self.options.restore_policy {
             PasteRestorePolicy::Never => {
+                self.transfer_to_background_if_needed(text, &mut foreground_source);
                 debug!(
                     elapsed_ms = start.elapsed().as_millis(),
                     "restore policy is never; leaving transcript in clipboard"
@@ -261,7 +326,7 @@ impl TextInjector for ClipboardInjector {
                 std::thread::sleep(std::time::Duration::from_millis(
                     self.options.restore_delay_ms,
                 ));
-                Self::restore_clipboard(&original_clipboard);
+                self.restore_clipboard(&original_clipboard, &mut foreground_source);
             }
         }
         debug!(

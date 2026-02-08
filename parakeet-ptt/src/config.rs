@@ -33,6 +33,8 @@ pub struct ClipboardOptions {
     pub paste_shortcut: PasteShortcut,
     pub restore_policy: PasteRestorePolicy,
     pub restore_delay_ms: u64,
+    pub copy_foreground: bool,
+    pub mime_type: String,
 }
 
 #[derive(Clone, Debug)]

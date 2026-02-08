@@ -84,6 +84,14 @@ struct Cli {
     /// Use `never` to maximize paste reliability.
     #[arg(long, value_enum, default_value_t = CliPasteRestorePolicy::Never)]
     paste_restore_policy: CliPasteRestorePolicy,
+
+    /// Keep wl-copy in foreground during paste choreography for deterministic ownership.
+    #[arg(long, default_value_t = true)]
+    paste_copy_foreground: bool,
+
+    /// MIME type passed to wl-copy in paste mode.
+    #[arg(long, default_value = "text/plain;charset=utf-8")]
+    paste_mime_type: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -150,6 +158,8 @@ async fn main() -> Result<()> {
                 paste_shortcut: cli.paste_shortcut.into(),
                 restore_policy: cli.paste_restore_policy.into(),
                 restore_delay_ms: cli.paste_restore_delay_ms,
+                copy_foreground: cli.paste_copy_foreground,
+                mime_type: cli.paste_mime_type.clone(),
             },
         },
         Duration::from_secs(cli.timeout_seconds.max(1)),
@@ -217,6 +227,8 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 paste_shortcut = ?config.clipboard.paste_shortcut,
                 restore_policy = ?config.clipboard.restore_policy,
                 restore_delay_ms = config.clipboard.restore_delay_ms,
+                copy_foreground = config.clipboard.copy_foreground,
+                paste_mime_type = %config.clipboard.mime_type,
                 "Using clipboard injector (paste mode)"
             );
             Box::new(ClipboardInjector::new(
