@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -89,6 +90,7 @@ impl ClipboardInjector {
     }
 
     fn set_clipboard(text: &str) -> Result<()> {
+        debug!(len = text.len(), "setting clipboard via wl-copy");
         let mut child = Command::new("wl-copy")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -104,6 +106,7 @@ impl ClipboardInjector {
         // wl-copy forks a background helper by default. Piping stderr and reading
         // with wait_with_output can hang because the helper keeps the pipe open.
         let status = child.wait().context("failed to wait for wl-copy")?;
+        debug!(?status, "wl-copy finished");
         if !status.success() {
             anyhow::bail!("wl-copy exited with status {}", status);
         }
@@ -121,11 +124,17 @@ impl ClipboardInjector {
     }
 
     fn run_paste_shortcut(&self) -> Result<()> {
+        debug!(
+            shortcut = ?self.paste_shortcut,
+            args = ?Self::shortcut_args(self.paste_shortcut),
+            "sending paste chord via wtype"
+        );
         let status = Command::new(&self.wtype_binary)
             .args(Self::shortcut_args(self.paste_shortcut))
             .status()
             .context("failed to spawn wtype for paste chord")?;
 
+        debug!(?status, "paste chord command finished");
         if !status.success() {
             anyhow::bail!(
                 "paste key chord {:?} exited with status {}",
@@ -139,20 +148,29 @@ impl ClipboardInjector {
 
     fn restore_clipboard(original: &Option<String>) {
         let Some(original_clipboard) = original else {
+            debug!("no original clipboard captured; skipping restore");
             return;
         };
 
+        debug!(
+            len = original_clipboard.len(),
+            "restoring original clipboard"
+        );
         if let Err(err) = Self::set_clipboard(original_clipboard) {
             warn!(error = %err, "failed to restore original clipboard");
+        } else {
+            debug!("original clipboard restored");
         }
     }
 }
 
 impl TextInjector for ClipboardInjector {
     fn inject(&self, text: &str) -> Result<()> {
+        let start = Instant::now();
         info!(
             mode = "paste",
             shortcut = ?self.paste_shortcut,
+            restore_delay_ms = self.restore_delay_ms,
             len = text.len(),
             preview = %preview(text),
             "injecting via clipboard"
@@ -160,7 +178,14 @@ impl TextInjector for ClipboardInjector {
 
         // 1. Save current clipboard
         let original_clipboard = match Self::get_clipboard() {
-            Ok(value) => Some(value),
+            Ok(value) => {
+                debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    captured_len = value.len(),
+                    "captured existing clipboard"
+                );
+                Some(value)
+            }
             Err(err) => {
                 warn!(error = %err, "failed to read current clipboard before paste; restore will be skipped");
                 None
@@ -168,7 +193,16 @@ impl TextInjector for ClipboardInjector {
         };
 
         // 2. Set new text to clipboard
+        debug!(
+            elapsed_ms = start.elapsed().as_millis(),
+            requested_len = text.len(),
+            "writing transcript to clipboard"
+        );
         Self::set_clipboard(text)?;
+        debug!(
+            elapsed_ms = start.elapsed().as_millis(),
+            "clipboard write completed"
+        );
 
         // 2b. Round-trip verification is informative only: some clipboard managers
         // transform/normalize content, so mismatch should not block paste.
@@ -176,15 +210,23 @@ impl TextInjector for ClipboardInjector {
             Ok(roundtrip) if roundtrip != text => {
                 warn!(
                     mode = "paste",
+                    elapsed_ms = start.elapsed().as_millis(),
                     requested_len = text.len(),
                     stored_len = roundtrip.len(),
                     "clipboard roundtrip mismatch; continuing paste attempt"
                 );
             }
-            Ok(_) => {}
+            Ok(roundtrip) => {
+                debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    stored_len = roundtrip.len(),
+                    "clipboard roundtrip matched requested text"
+                );
+            }
             Err(err) => {
                 warn!(
                     error = %err,
+                    elapsed_ms = start.elapsed().as_millis(),
                     "failed to read clipboard after wl-copy; continuing paste attempt"
                 );
             }
@@ -192,14 +234,32 @@ impl TextInjector for ClipboardInjector {
 
         // 3. Simulate the configured paste shortcut (e.g. Ctrl+Shift+V in Ghostty).
         if let Err(err) = self.run_paste_shortcut() {
+            warn!(
+                error = %err,
+                elapsed_ms = start.elapsed().as_millis(),
+                "paste chord failed; attempting clipboard restore"
+            );
             Self::restore_clipboard(&original_clipboard);
             return Err(err);
         }
+        debug!(
+            elapsed_ms = start.elapsed().as_millis(),
+            "paste chord completed"
+        );
 
         // 4. Restore original clipboard (optional, but good UX)
         // A delay avoids racing the target application's clipboard read.
+        debug!(
+            elapsed_ms = start.elapsed().as_millis(),
+            restore_delay_ms = self.restore_delay_ms,
+            "sleeping before clipboard restore"
+        );
         std::thread::sleep(std::time::Duration::from_millis(self.restore_delay_ms));
         Self::restore_clipboard(&original_clipboard);
+        debug!(
+            elapsed_ms = start.elapsed().as_millis(),
+            "clipboard injection flow finished"
+        );
 
         Ok(())
     }
