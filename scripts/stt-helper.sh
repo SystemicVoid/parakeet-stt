@@ -33,6 +33,7 @@ stt() {
     local default_paste_copy_foreground="${PARAKEET_PASTE_COPY_FOREGROUND:-true}"
     local default_paste_mime_type="${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}"
     local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-wtype}"
+    local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
     local default_ydotool_path="${PARAKEET_YDOTOOL_PATH:-}"
@@ -181,6 +182,7 @@ PY
             local paste_copy_foreground="$default_paste_copy_foreground"
             local paste_mime_type="$default_paste_mime_type"
             local paste_key_backend="$default_paste_key_backend"
+            local uinput_dwell_ms="$default_uinput_dwell_ms"
             local paste_seat="$default_paste_seat"
             local paste_write_primary="$default_paste_write_primary"
             local ydotool_path="$default_ydotool_path"
@@ -278,6 +280,14 @@ PY
                         paste_key_backend="$2"
                         shift 2
                         ;;
+                    --uinput-dwell-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --uinput-dwell-ms"
+                            return 1
+                        fi
+                        uinput_dwell_ms="$2"
+                        shift 2
+                        ;;
                     --paste-seat)
                         if [[ $# -lt 2 ]]; then
                             echo "   - Missing value for --paste-seat"
@@ -323,6 +333,7 @@ PY
             echo "   - Paste copy foreground: $paste_copy_foreground"
             echo "   - Paste MIME type: $paste_mime_type"
             echo "   - Paste key backend: $paste_key_backend"
+            echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
             echo "   - Paste write primary: $paste_write_primary"
 
@@ -389,6 +400,7 @@ PY
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-copy-foreground" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
                         runner_bin="./target/release/parakeet-ptt"
@@ -413,6 +425,7 @@ PY
                     --paste-copy-foreground "$PASTE_COPY_FOREGROUND" \
                     --paste-mime-type "$PASTE_MIME_TYPE" \
                     --paste-key-backend "$PASTE_KEY_BACKEND" \
+                    --uinput-dwell-ms "$UINPUT_DWELL_MS" \
                     --paste-write-primary "$PASTE_WRITE_PRIMARY" \
                 )
                 if [ -n "${PASTE_SEAT:-}" ]; then
@@ -430,7 +443,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
@@ -572,6 +585,7 @@ PY
             local paste_copy_foreground="${PASTE_COPY_FOREGROUND:-$default_paste_copy_foreground}"
             local paste_mime_type="${PASTE_MIME_TYPE:-$default_paste_mime_type}"
             local paste_key_backend="${PASTE_KEY_BACKEND:-$default_paste_key_backend}"
+            local uinput_dwell_ms="${UINPUT_DWELL_MS:-$default_uinput_dwell_ms}"
             local paste_seat="${PASTE_SEAT:-$default_paste_seat}"
             local paste_write_primary="${PASTE_WRITE_PRIMARY:-$default_paste_write_primary}"
             local ydotool_path="${YDOTOOL_PATH:-$default_ydotool_path}"
@@ -590,6 +604,7 @@ PY
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-copy-foreground" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
                         runner_bin="./target/release/parakeet-ptt"
@@ -614,6 +629,7 @@ PY
                     --paste-copy-foreground "${PASTE_COPY_FOREGROUND:-true}" \
                     --paste-mime-type "${PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
                     --paste-key-backend "${PASTE_KEY_BACKEND:-wtype}" \
+                    --uinput-dwell-ms "${UINPUT_DWELL_MS:-18}" \
                     --paste-write-primary "${PASTE_WRITE_PRIMARY:-false}" \
                 )
                 if [ -n "${PASTE_SEAT:-}" ]; then
@@ -631,7 +647,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
@@ -672,6 +688,7 @@ PY
                             --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
                             --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
                             --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
@@ -686,6 +703,7 @@ PY
                             --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
                             --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
                             --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
                     fi
                 }
