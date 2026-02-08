@@ -522,15 +522,6 @@ impl ClipboardInjector {
             }
         }
 
-        if !attempts.contains(&PasteShortcut::CtrlV)
-            && matches!(
-                self.options.paste_strategy,
-                PasteStrategy::OnError | PasteStrategy::AlwaysChain
-            )
-        {
-            attempts.push(PasteShortcut::CtrlV);
-        }
-
         attempts
     }
 
@@ -1085,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn on_error_strategy_adds_ctrl_v_tail() {
+    fn on_error_strategy_uses_explicit_fallback_only() {
         let injector = ClipboardInjector::new(
             PasteKeySender::Disabled,
             options(
@@ -1097,16 +1088,25 @@ mod tests {
         );
         assert_eq!(
             injector.shortcut_attempt_order(),
-            vec![
-                PasteShortcut::ShiftInsert,
-                PasteShortcut::CtrlShiftV,
-                PasteShortcut::CtrlV,
-            ]
+            vec![PasteShortcut::ShiftInsert, PasteShortcut::CtrlShiftV]
         );
     }
 
     #[test]
-    fn always_chain_deduplicates_ctrl_v() {
+    fn on_error_strategy_respects_fallback_none() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Disabled,
+            options(PasteStrategy::OnError, PasteShortcut::CtrlShiftV, None),
+            false,
+        );
+        assert_eq!(
+            injector.shortcut_attempt_order(),
+            vec![PasteShortcut::CtrlShiftV]
+        );
+    }
+
+    #[test]
+    fn always_chain_deduplicates_identical_shortcuts() {
         let injector = ClipboardInjector::new(
             PasteKeySender::Disabled,
             options(
@@ -1119,6 +1119,19 @@ mod tests {
         assert_eq!(
             injector.shortcut_attempt_order(),
             vec![PasteShortcut::CtrlV]
+        );
+    }
+
+    #[test]
+    fn always_chain_strategy_respects_fallback_none() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Disabled,
+            options(PasteStrategy::AlwaysChain, PasteShortcut::CtrlShiftV, None),
+            false,
+        );
+        assert_eq!(
+            injector.shortcut_attempt_order(),
+            vec![PasteShortcut::CtrlShiftV]
         );
     }
 
