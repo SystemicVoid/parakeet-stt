@@ -23,6 +23,8 @@ stt() {
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-type}"
+    local default_paste_shortcut="${PARAKEET_PASTE_SHORTCUT:-ctrl-shift-v}"
+    local default_paste_restore_delay_ms="${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}"
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
     if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
@@ -158,6 +160,8 @@ PY
     case "$cmd" in
         start)
             local injection_mode="$default_injection_mode"
+            local paste_shortcut="$default_paste_shortcut"
+            local paste_restore_delay_ms="$default_paste_restore_delay_ms"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --paste)
@@ -167,6 +171,22 @@ PY
                     --type)
                         injection_mode="type"
                         shift
+                        ;;
+                    --paste-shortcut)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-shortcut"
+                            return 1
+                        fi
+                        paste_shortcut="$2"
+                        shift 2
+                        ;;
+                    --paste-restore-delay-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-restore-delay-ms"
+                            return 1
+                        fi
+                        paste_restore_delay_ms="$2"
+                        shift 2
                         ;;
                     *)
                         # Unknown option, maybe for something else?
@@ -179,6 +199,8 @@ PY
 
             echo ">>> Starting Parakeet STT (detached tmux)..."
             echo "   - Injection mode: $injection_mode"
+            echo "   - Paste shortcut: $paste_shortcut"
+            echo "   - Paste restore delay (ms): $paste_restore_delay_ms"
 
             if ! _resolve_port; then
                 return 1
@@ -232,21 +254,26 @@ PY
                 set -e
                 runner=""
                 if [ -x target/release/parakeet-ptt ]; then
-                    if target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode"; then
+                    if target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-delay-ms"; then
                         runner="./target/release/parakeet-ptt"
                     else
-                        echo "[helper] release binary missing --injection-mode; falling back to cargo run --release" >> "$LOG_CLIENT"
+                        echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
                 if [ -z "$runner" ]; then
                     echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
                     runner="cargo run --release --"
                 fi
-                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "$INJECTION_MODE" 2>&1 | tee -a "$LOG_CLIENT"
+                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "$INJECTION_MODE" \
+                    --paste-shortcut "$PASTE_SHORTCUT" \
+                    --paste-restore-delay-ms "$PASTE_RESTORE_DELAY_MS" \
+                    2>&1 | tee -a "$LOG_CLIENT"
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
@@ -378,25 +405,33 @@ PY
 
             local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --no-streaming >> \"$LOG_DAEMON\" 2>&1"
             local injection_mode="${INJECTION_MODE:-$default_injection_mode}"
+            local paste_shortcut="${PASTE_SHORTCUT:-$default_paste_shortcut}"
+            local paste_restore_delay_ms="${PASTE_RESTORE_DELAY_MS:-$default_paste_restore_delay_ms}"
             local client_cmd='
                 set -e
                 runner=""
                 if [ -x ./target/release/parakeet-ptt ]; then
-                    if ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode"; then
+                    if ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-delay-ms"; then
                         runner="./target/release/parakeet-ptt"
                     else
-                        echo "[helper] release binary missing --injection-mode; falling back to cargo run --release" >> "$LOG_CLIENT"
+                        echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
                 if [ -z "$runner" ]; then
                     echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
                     runner="cargo run --release --"
                 fi
-                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "${INJECTION_MODE:-type}" >> "$LOG_CLIENT" 2>&1
+                exec $runner --endpoint "$DEFAULT_ENDPOINT" \
+                    --injection-mode "${INJECTION_MODE:-type}" \
+                    --paste-shortcut "${PASTE_SHORTCUT:-ctrl-shift-v}" \
+                    --paste-restore-delay-ms "${PASTE_RESTORE_DELAY_MS:-250}" \
+                    >> "$LOG_CLIENT" 2>&1
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "$client_cmd"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
