@@ -31,6 +31,7 @@ pub enum PasteRestorePolicy {
 #[derive(Clone, Debug)]
 pub struct ClipboardOptions {
     pub paste_shortcut: PasteShortcut,
+    pub shortcut_fallback: Option<PasteShortcut>,
     pub restore_policy: PasteRestorePolicy,
     pub restore_delay_ms: u64,
     pub copy_foreground: bool,

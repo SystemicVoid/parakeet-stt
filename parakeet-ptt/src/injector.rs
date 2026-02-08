@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -130,14 +130,14 @@ impl ClipboardInjector {
         }
     }
 
-    fn run_paste_shortcut(&self) -> Result<()> {
+    fn run_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
         debug!(
-            shortcut = ?self.options.paste_shortcut,
-            args = ?Self::shortcut_args(self.options.paste_shortcut),
+            shortcut = ?shortcut,
+            args = ?Self::shortcut_args(shortcut),
             "sending paste chord via wtype"
         );
         let status = Command::new(&self.wtype_binary)
-            .args(Self::shortcut_args(self.options.paste_shortcut))
+            .args(Self::shortcut_args(shortcut))
             .status()
             .context("failed to spawn wtype for paste chord")?;
 
@@ -145,9 +145,42 @@ impl ClipboardInjector {
         if !status.success() {
             anyhow::bail!(
                 "paste key chord {:?} exited with status {}",
-                self.options.paste_shortcut,
+                shortcut,
                 status
             );
+        }
+
+        Ok(())
+    }
+
+    fn run_paste_shortcut(&self) -> Result<()> {
+        if let Err(primary_err) = self.run_shortcut(self.options.paste_shortcut) {
+            let Some(fallback) = self.options.shortcut_fallback else {
+                return Err(primary_err);
+            };
+
+            if fallback == self.options.paste_shortcut {
+                warn!(
+                    shortcut = ?fallback,
+                    "fallback shortcut matches primary shortcut; skipping retry"
+                );
+                return Err(primary_err);
+            }
+
+            warn!(
+                primary = ?self.options.paste_shortcut,
+                fallback = ?fallback,
+                primary_error = %primary_err,
+                "primary paste chord failed; trying fallback shortcut"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+
+            return self.run_shortcut(fallback).with_context(|| {
+                format!(
+                    "primary paste chord {:?} failed and fallback {:?} also failed",
+                    self.options.paste_shortcut, fallback
+                )
+            });
         }
 
         Ok(())
@@ -323,9 +356,7 @@ impl TextInjector for ClipboardInjector {
                     restore_delay_ms = self.options.restore_delay_ms,
                     "sleeping before clipboard restore"
                 );
-                std::thread::sleep(std::time::Duration::from_millis(
-                    self.options.restore_delay_ms,
-                ));
+                std::thread::sleep(Duration::from_millis(self.options.restore_delay_ms));
                 self.restore_clipboard(&original_clipboard, &mut foreground_source);
             }
         }

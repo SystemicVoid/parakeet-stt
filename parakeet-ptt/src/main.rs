@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
     paste_shortcut: CliPasteShortcut,
 
+    /// Optional fallback chord when the primary paste shortcut fails.
+    #[arg(long, value_enum, default_value_t = CliPasteShortcutFallback::None)]
+    paste_shortcut_fallback: CliPasteShortcutFallback,
+
     /// Delay before restoring clipboard after paste key chord.
     #[arg(long, default_value_t = 250)]
     paste_restore_delay_ms: u64,
@@ -127,6 +131,25 @@ impl From<CliPasteShortcut> for crate::config::PasteShortcut {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteShortcutFallback {
+    None,
+    CtrlV,
+    ShiftInsert,
+}
+
+impl From<CliPasteShortcutFallback> for Option<crate::config::PasteShortcut> {
+    fn from(fallback: CliPasteShortcutFallback) -> Self {
+        match fallback {
+            CliPasteShortcutFallback::None => None,
+            CliPasteShortcutFallback::CtrlV => Some(crate::config::PasteShortcut::CtrlV),
+            CliPasteShortcutFallback::ShiftInsert => {
+                Some(crate::config::PasteShortcut::ShiftInsert)
+            }
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteRestorePolicy {
     Never,
     Delayed,
@@ -156,6 +179,7 @@ async fn main() -> Result<()> {
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
                 paste_shortcut: cli.paste_shortcut.into(),
+                shortcut_fallback: cli.paste_shortcut_fallback.into(),
                 restore_policy: cli.paste_restore_policy.into(),
                 restore_delay_ms: cli.paste_restore_delay_ms,
                 copy_foreground: cli.paste_copy_foreground,
@@ -225,6 +249,7 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
             info!(
                 ?wtype_binary,
                 paste_shortcut = ?config.clipboard.paste_shortcut,
+                paste_shortcut_fallback = ?config.clipboard.shortcut_fallback,
                 restore_policy = ?config.clipboard.restore_policy,
                 restore_delay_ms = config.clipboard.restore_delay_ms,
                 copy_foreground = config.clipboard.copy_foreground,
