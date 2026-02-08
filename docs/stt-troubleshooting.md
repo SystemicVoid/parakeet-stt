@@ -67,7 +67,7 @@ Paste/copy injection now exposes a strategy-driven pipeline through `stt start` 
 - `--injection-mode type|paste|copy-only`
 - `--paste-shortcut ctrl-v|ctrl-shift-v|shift-insert`
 - `--paste-shortcut-fallback none|ctrl-v|ctrl-shift-v|shift-insert`
-- `--paste-strategy single|on-error|always-chain` (default: `always-chain`)
+- `--paste-strategy single|on-error|always-chain` (default: `single`)
 - `--paste-chain-delay-ms <ms>` (default: `45`)
 - `--paste-post-chord-hold-ms <ms>` (default: `700`)
 - `--paste-restore-policy never|delayed` (default: `never`)
@@ -87,7 +87,7 @@ Recommended baseline for Ghostty/COSMIC:
 stt start --paste \
   --paste-shortcut ctrl-shift-v \
   --paste-shortcut-fallback shift-insert \
-  --paste-strategy always-chain \
+  --paste-strategy single \
   --paste-chain-delay-ms 45 \
   --paste-post-chord-hold-ms 700 \
   --paste-key-backend wtype \

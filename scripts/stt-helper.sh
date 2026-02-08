@@ -25,7 +25,7 @@ stt() {
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-type}"
     local default_paste_shortcut="${PARAKEET_PASTE_SHORTCUT:-ctrl-shift-v}"
     local default_paste_shortcut_fallback="${PARAKEET_PASTE_SHORTCUT_FALLBACK:-none}"
-    local default_paste_strategy="${PARAKEET_PASTE_STRATEGY:-always-chain}"
+    local default_paste_strategy="${PARAKEET_PASTE_STRATEGY:-single}"
     local default_paste_chain_delay_ms="${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}"
     local default_paste_restore_policy="${PARAKEET_PASTE_RESTORE_POLICY:-never}"
     local default_paste_restore_delay_ms="${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}"
@@ -668,7 +668,7 @@ PY
                     --injection-mode "${INJECTION_MODE:-type}" \
                     --paste-shortcut "${PASTE_SHORTCUT:-ctrl-shift-v}" \
                     --paste-shortcut-fallback "${PASTE_SHORTCUT_FALLBACK:-none}" \
-                    --paste-strategy "${PASTE_STRATEGY:-always-chain}" \
+                    --paste-strategy "${PASTE_STRATEGY:-single}" \
                     --paste-chain-delay-ms "${PASTE_CHAIN_DELAY_MS:-45}" \
                     --paste-restore-policy "${PASTE_RESTORE_POLICY:-never}" \
                     --paste-restore-delay-ms "${PASTE_RESTORE_DELAY_MS:-250}" \
@@ -741,7 +741,7 @@ PY
                             "$runner_bin" --test-injection --injection-mode paste \
                             --paste-shortcut "$shortcut" \
                             --paste-shortcut-fallback "$fallback" \
-                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-always-chain}" \
+                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-single}" \
                             --paste-chain-delay-ms "${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}" \
                             --paste-restore-policy "${PARAKEET_PASTE_RESTORE_POLICY:-never}" \
                             --paste-restore-delay-ms "${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}" \
@@ -757,7 +757,7 @@ PY
                             cargo run --release -- --test-injection --injection-mode paste \
                             --paste-shortcut "$shortcut" \
                             --paste-shortcut-fallback "$fallback" \
-                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-always-chain}" \
+                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-single}" \
                             --paste-chain-delay-ms "${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}" \
                             --paste-restore-policy "${PARAKEET_PASTE_RESTORE_POLICY:-never}" \
                             --paste-restore-delay-ms "${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}" \

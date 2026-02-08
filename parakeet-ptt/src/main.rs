@@ -89,7 +89,7 @@ struct Cli {
     paste_shortcut_fallback: CliPasteShortcutFallback,
 
     /// Paste shortcut strategy.
-    #[arg(long, value_enum, default_value_t = CliPasteStrategy::AlwaysChain)]
+    #[arg(long, value_enum, default_value_t = CliPasteStrategy::Single)]
     paste_strategy: CliPasteStrategy,
 
     /// Delay between chained paste shortcuts.
@@ -733,6 +733,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -741,7 +742,7 @@ mod tests {
         PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
     };
 
-    use super::build_injector;
+    use super::{build_injector, Cli, CliPasteStrategy};
 
     fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
         ClipboardOptions {
@@ -786,5 +787,17 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("wtype"));
         assert!(message.contains("not found"));
+    }
+
+    #[test]
+    fn cli_default_paste_strategy_is_single() {
+        let cli = Cli::parse_from(["parakeet-ptt"]);
+        assert!(matches!(cli.paste_strategy, CliPasteStrategy::Single));
+    }
+
+    #[test]
+    fn cli_accepts_explicit_always_chain_strategy() {
+        let cli = Cli::parse_from(["parakeet-ptt", "--paste-strategy", "always-chain"]);
+        assert!(matches!(cli.paste_strategy, CliPasteStrategy::AlwaysChain));
     }
 }
