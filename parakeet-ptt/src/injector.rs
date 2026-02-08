@@ -62,6 +62,9 @@ pub struct ClipboardInjector {
 }
 
 impl ClipboardInjector {
+    const CLIPBOARD_READY_TIMEOUT_MS: u64 = 250;
+    const CLIPBOARD_READY_POLL_MS: u64 = 10;
+
     pub fn new(wtype_binary: PathBuf, options: ClipboardOptions) -> Self {
         Self {
             wtype_binary,
@@ -118,6 +121,40 @@ impl ClipboardInjector {
             anyhow::bail!("wl-copy exited with status {}", status);
         }
         Ok(None)
+    }
+
+    fn wait_for_clipboard_value(
+        expected: &str,
+        timeout: Duration,
+        poll: Duration,
+    ) -> (bool, Option<String>) {
+        let started = Instant::now();
+        let mut last_observed = None;
+
+        loop {
+            match Self::get_clipboard() {
+                Ok(value) => {
+                    let matches = value == expected;
+                    last_observed = Some(value);
+                    if matches {
+                        return (true, last_observed);
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        error = %err,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "clipboard read failed while waiting for requested content"
+                    );
+                }
+            }
+
+            if started.elapsed() >= timeout {
+                return (false, last_observed);
+            }
+
+            std::thread::sleep(poll);
+        }
     }
 
     fn shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
@@ -294,32 +331,28 @@ impl TextInjector for ClipboardInjector {
             "clipboard write completed"
         );
 
-        // 2b. Round-trip verification is informative only: some clipboard managers
-        // transform/normalize content, so mismatch should not block paste.
-        match Self::get_clipboard() {
-            Ok(roundtrip) if roundtrip != text => {
-                warn!(
-                    mode = "paste",
-                    elapsed_ms = start.elapsed().as_millis(),
-                    requested_len = text.len(),
-                    stored_len = roundtrip.len(),
-                    "clipboard roundtrip mismatch; continuing paste attempt"
-                );
-            }
-            Ok(roundtrip) => {
-                debug!(
-                    elapsed_ms = start.elapsed().as_millis(),
-                    stored_len = roundtrip.len(),
-                    "clipboard roundtrip matched requested text"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "failed to read clipboard after wl-copy; continuing paste attempt"
-                );
-            }
+        // 2b. Wait briefly for wl-copy ownership to become readable before firing
+        // the paste chord. This reduces stale-paste races.
+        let (ready, observed) = Self::wait_for_clipboard_value(
+            text,
+            Duration::from_millis(Self::CLIPBOARD_READY_TIMEOUT_MS),
+            Duration::from_millis(Self::CLIPBOARD_READY_POLL_MS),
+        );
+        if ready {
+            debug!(
+                elapsed_ms = start.elapsed().as_millis(),
+                stored_len = observed.as_ref().map_or(0, |value| value.len()),
+                "clipboard became ready with requested text"
+            );
+        } else {
+            warn!(
+                mode = "paste",
+                elapsed_ms = start.elapsed().as_millis(),
+                requested_len = text.len(),
+                stored_len = observed.as_ref().map_or(0, |value| value.len()),
+                timeout_ms = Self::CLIPBOARD_READY_TIMEOUT_MS,
+                "clipboard did not match requested text before timeout; continuing paste attempt"
+            );
         }
 
         // 3. Simulate the configured paste shortcut (e.g. Ctrl+Shift+V in Ghostty).

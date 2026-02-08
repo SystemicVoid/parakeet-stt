@@ -90,7 +90,7 @@ struct Cli {
     paste_restore_policy: CliPasteRestorePolicy,
 
     /// Keep wl-copy in foreground during paste choreography for deterministic ownership.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     paste_copy_foreground: bool,
 
     /// MIME type passed to wl-copy in paste mode.
