@@ -389,3 +389,113 @@ Observed by user:
   - <https://manpages.ubuntu.com/manpages/jammy/man1/wl-copy.1.html>
 - tmux environment behavior (`update-environment`, server/session env model):
   - <https://manpages.ubuntu.com/manpages/focal/man1/tmux.1.html>
+
+## Update (latest runtime evidence: 2026-02-08 18:19-18:30 UTC)
+
+### User command matrix that was tested
+
+```bash
+stt start --paste \
+  --paste-shortcut ctrl-shift-v \
+  --paste-shortcut-fallback shift-insert \
+  --paste-strategy always-chain \
+  --paste-chain-delay-ms 45 \
+  --paste-post-chord-hold-ms 700 \
+  --paste-restore-policy never \
+  --paste-copy-foreground true
+
+stt start --copy-only
+
+stt start
+```
+
+### Latest user-visible behavior
+
+- `copy-only` starts and processes STT normally.
+- In paste mode, injection is triggered but transcript does not get inserted in-place.
+- Progress vs earlier state: key-chord injection now fires consistently (paste action observable).
+- Web input surfaces show a focus side effect: after trigger, input often needs a click to regain text entry focus.
+- That focus side effect is not seen in terminal prompts or COSMIC Text Editor.
+
+### What logs now prove (and what they still do not prove)
+
+1. STT pipeline is healthy end-to-end.
+   - `/tmp/parakeet-daemon.log`: start/stop/final_result flows are clean during 18:20-18:30.
+   - `/tmp/parakeet-ptt.log`: matching `final result received` lines for each session.
+
+2. Clipboard injector executes all intended steps at process level.
+   - Example timeline from `/tmp/parakeet-ptt.log`:
+     - `2026-02-08T18:20:08.558630Z` `starting clipboard injection` (`trace_id=1`)
+     - `paste shortcut executed` for `CtrlShiftV`, `ShiftInsert`, `CtrlV`
+     - `clipboard injection flow finished ... outcome="success_assumed"`
+   - Same pattern repeats for `trace_id` 1..4 in the 18:19-18:30 window.
+
+3. No warnings/errors are emitted in this latest window.
+   - No `WARN`/`ERROR` from injector during those injections.
+   - Outcomes observed in current instrumentation:
+     - `success_assumed`: 8
+     - `copy_only`: 2
+
+4. Gap: current success criterion remains process-level, not UI-level.
+   - `success_assumed` means command execution looked good.
+   - It does not prove focused app inserted transcript text.
+
+### Updated interpretation
+
+- This is no longer primarily a "did injector run?" problem; it clearly runs.
+- Current blocker is likely at the app/compositor interaction boundary:
+  - synthetic chord acceptance in specific surfaces
+  - focus churn caused by chained shortcuts
+  - semantic mismatch between process success and UI insertion success
+- `always-chain` likely increases side effects in web inputs by sending extra chords after the first one.
+
+### Updated hypothesis ranking
+
+1. Chord chaining side effects on focus/target surface (35%)
+   - `always-chain` sends 2-3 shortcuts every time.
+   - This can cause unintended UI state transitions in browser fields.
+
+2. Surface-specific key acceptance of virtual keyboard events (25%)
+   - Process-level success does not guarantee app-level acceptance.
+   - Ghostty already has known virtual-keyboard problems for `wtype`.
+
+3. Clipboard ownership/read timing vs app paste-read timing (20%)
+   - `copy_foreground=true` + hold helped reliability, but timing could still diverge by app.
+
+4. Nu wrapper argument shelling/path semantics causing subtle mode mismatch (10%)
+   - Current `nu` bridge builds a single shell string via `str join ' '`.
+   - This is fragile if arguments ever include shell-sensitive content.
+
+5. Seat/session context mismatch edge case (10%)
+   - Client env is stable (`WAYLAND_DISPLAY=wayland-1`, DBus set), but `XDG_SESSION_TYPE=tty`.
+   - Worth validating with explicit seat pinning (`--paste-seat`) in experiments.
+
+### Out-of-the-box strategies to investigate next
+
+1. Replace `always-chain` with per-surface profiles.
+   - Browser/text fields: `single` + `ctrl-v`.
+   - Terminals: `single` + `ctrl-shift-v` or `shift-insert`.
+   - Only chain when explicitly debugging.
+
+2. Add a UI-fidelity backend path (independent of `wtype`).
+   - Test `--paste-key-backend ydotool` systematically.
+   - Evaluate libei + portal-based input injection as a longer-term backend.
+
+3. Promote copy-first workflow as a deterministic fallback.
+   - Keep `copy-only` as "known good" path.
+   - Optionally add explicit user feedback (notification or log marker) when clipboard updated.
+
+4. Stop doing semantic fallback by default in one pass.
+   - A/B run `single` mode first to remove confounding side effects.
+   - Add stateful retries only after single-mode failure is confirmed.
+
+5. Harden the nu wrapper invocation.
+   - Use argv-style external invocation in nu instead of joining into one shell string.
+   - Eliminates shell-escaping ambiguity from command assembly.
+
+### Additional context discovered (possible confounders)
+
+- Package timeline indicates multiple moving parts around this period:
+  - Ghostty 1.2.3 installed on 2026-01-25 (`apt-get install ... ghostty_1.2.3-0.ppa1...`).
+  - COSMIC components and compositor were upgraded repeatedly, including 2026-02-07.
+- So "breakage after nu migration" may be real, but co-timed app/compositor upgrades remain plausible contributors.
