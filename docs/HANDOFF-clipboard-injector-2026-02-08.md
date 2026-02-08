@@ -1,5 +1,126 @@
 # Clipboard Injector Handoff (2026-02-08)
 
+## Update (deeper pass after user repro: stale first paste, then empty)
+
+### Latest user-reported behavior
+
+- In paste mode, first attempt pasted current/old clipboard content.
+- Subsequent attempts pasted nothing.
+- Core symptom persisted after prior injector hardening commits.
+
+### New evidence gathered in this pass
+
+1. End-to-end STT still succeeds up to injection dispatch.
+   - `/tmp/parakeet-ptt.log` repeatedly shows:
+     - `final result received ...`
+     - `parakeet_ptt::injector: injecting via clipboard ...`
+   - No injector errors/warnings are emitted at `info` level during these runs.
+
+2. Direct injector test flow succeeds in-process with debug logs.
+   - Command:
+     - `cd parakeet-ptt && RUST_LOG=debug cargo run --release -- --test-injection --injection-mode paste --paste-shortcut ctrl-shift-v --paste-restore-policy never --paste-copy-foreground true --paste-mime-type 'text/plain;charset=utf-8'`
+   - Observed flow in logs (all successful):
+     - capture existing clipboard
+     - `wl-copy --foreground` write
+     - readiness check matches expected text in ~12ms
+     - `wtype` paste chord exits `0`
+     - foreground -> background ownership transfer succeeds
+   - Post-run check:
+     - `wl-paste --no-newline` returned `Parakeet Test`
+     - resident process present: `wl-copy --type text/plain;charset=utf-8`
+
+3. Nu/tmux runtime context verified.
+   - Client process env includes:
+     - `WAYLAND_DISPLAY=wayland-1`
+     - `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`
+     - `DISPLAY=:0`
+   - Nu wrapper in `~/.config/forge/nushell/.config/nushell/config.nu` runs:
+     - `bash -lc "source .../scripts/stt-helper.sh && stt ..."`
+   - Wrapper uses raw string-join argument interpolation (no shell escaping), which is fragile for special chars in args.
+
+4. Helper lifecycle/process detection issues discovered (adjacent reliability risk).
+   - `stt restart` can hit:
+     - "Daemon already running" (based on `pgrep`) followed by
+     - "Waiting for socket... not ready"
+   - `stt status` can report daemon not running even after launch attempts.
+   - This is likely because daemon matching relies on `[p]arakeet-stt-daemon`, but uv/Python process command lines do not always include that token.
+   - This issue is orthogonal to clipboard paste semantics, but it confounds debugging and restart loops.
+
+### Updated hypothesis ranking (after new logs)
+
+1. Target-surface acceptance/timing mismatch for synthetic paste chord (35%)
+   - Injection path is invoked and succeeds internally, but focused app behavior diverges.
+   - Ghostty virtual-keyboard issues are confirmed upstream for `wtype` typing; paste chord handling may still be inconsistent across apps.
+
+2. Clipboard ownership timing still races app read path (30%)
+   - Even with readiness checks, ownership transfer immediately after chord may be too early for some apps.
+   - A compositor/app may read clipboard slightly later than expected.
+
+3. Nu/tmux environment/session semantics causing intermittent path differences (15%)
+   - tmux environment model and shell-bridging can create stale/inconsistent runtime context across restarts.
+   - Not the primary signal right now, but plausible as an intermittent amplifier.
+
+4. Shortcut mismatch by target app/profile (10%)
+   - `Ctrl+Shift+V` is terminal-centric; some surfaces expect `Ctrl+V` or `Shift+Insert`.
+   - Current fallback only triggers on command failure, not on semantic no-op.
+
+5. Helper daemon detection/restart bug masking real injector tests (10%)
+   - If daemon is down or flapping, user perception of "paste failure" can blur with "no transcription event occurred."
+
+### Lateral solution strategies (beyond current implementation)
+
+1. Make paste success criteria explicit and stateful in injector.
+   - Add optional `post_chord_hold_ms` (keep foreground source alive N ms after chord).
+   - Defer foreground->background transfer until hold elapses.
+   - Keep last foreground `wl-copy` child alive between injections (replace on next injection), not per-injection teardown.
+
+2. Treat fallback shortcuts as semantic fallback, not process-exit fallback only.
+   - Add optional chained mode:
+     - `Ctrl+Shift+V` then `Shift+Insert` then `Ctrl+V` with short delays.
+   - Run regardless of primary exit status when enabled.
+
+3. Add configurable seat pinning for wl-clipboard.
+   - Expose `--paste-seat` and pass `wl-copy --seat <seat>`, `wl-paste --seat <seat>`.
+   - Reduces ambiguity in multi-seat/multi-device setups.
+
+4. Add alternate key injection backend for Ghostty/COSMIC path.
+   - Integrate optional `ydotool` backend (uinput-based, not Wayland virtual keyboard protocol).
+   - Use as opt-in fallback for environments where `wtype` virtual-keyboard path is unreliable.
+   - Upstream reference: <https://github.com/ReimuNotMoe/ydotool>
+
+5. Add "copy-only" degradation mode.
+   - On injection event: write clipboard and notify user in logs.
+   - Skip synthetic key chord entirely.
+   - Useful as deterministic fallback while compositor/app-specific paste injection is tuned.
+
+6. Harden helper daemon health logic (debuggability prerequisite).
+   - Replace name-based daemon checks with PID file + socket/status probe.
+   - Treat "process exists but socket dead" as unhealthy and restart automatically.
+   - This should be fixed independently to prevent false debugging signals.
+
+### Immediate high-signal test matrix to run next
+
+Run all with `RUST_LOG=parakeet_ptt=info,parakeet_ptt::injector=debug` and capture `/tmp/parakeet-ptt.log`:
+
+1. `--paste-shortcut ctrl-shift-v --paste-shortcut-fallback shift-insert --paste-restore-policy never`
+2. Same + injected `post_chord_hold_ms` (once implemented): `500`, `1000`
+3. `--paste-shortcut shift-insert --paste-shortcut-fallback ctrl-v`
+4. `--paste-shortcut ctrl-v --paste-shortcut-fallback shift-insert`
+5. Cross-app matrix:
+   - Ghostty terminal prompt
+   - COSMIC Terminal prompt
+   - Brave address bar
+   - Native GTK text entry (e.g., settings/search box)
+
+### Key references
+
+- Ghostty discussion tracking `wtype`/virtual keyboard corruption:
+  - <https://github.com/ghostty-org/ghostty/discussions/10558>
+- `wl-copy`/`wl-paste` options (`--foreground`, `--paste-once`, `--seat`, `--type`):
+  - local man/help output (`wl-copy --help`, `wl-paste --help`)
+- tmux environment model (`update-environment`, global/session env merge):
+  - local `man tmux` ("GLOBAL AND SESSION ENVIRONMENT")
+
 ## Update (implemented)
 
 The paste injector path has now been reworked and instrumented in-tree:
