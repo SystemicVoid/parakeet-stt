@@ -250,7 +250,7 @@ PY
                 return 1
             fi
 
-            if pgrep -f "parakeet-stt-daemon" >/dev/null; then
+            if pgrep -f "[p]arakeet-stt-daemon" >/dev/null; then
                 echo "   - Daemon already running."
             else
                 echo "   - Launching daemon..."
@@ -281,9 +281,9 @@ PY
                 return 1
             fi
 
-            if pgrep -f "parakeet-ptt" >/dev/null 2>&1; then
+            if pgrep -f "[p]arakeet-ptt" >/dev/null 2>&1; then
                 echo "   - Stopping existing parakeet-ptt processes..."
-                pkill -f "parakeet-ptt" >/dev/null 2>&1 || true
+                pkill -f "[p]arakeet-ptt" >/dev/null 2>&1 || true
             fi
 
             echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
@@ -360,7 +360,7 @@ PY
             if _pid_alive "$CLIENT_PID_FILE"; then
                 kill -TERM "$(cat "$CLIENT_PID_FILE")" 2>/dev/null || true
             fi
-            pkill -f "parakeet-ptt" >/dev/null 2>&1 && echo "   - Client stopped"
+            pkill -f "[p]arakeet-ptt" >/dev/null 2>&1 && echo "   - Client stopped"
             if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
                 tmux kill-session -t "$TMUX_SESSION"
             fi
@@ -368,7 +368,7 @@ PY
             if _pid_alive "$DAEMON_PID_FILE"; then
                 kill -TERM "$(cat "$DAEMON_PID_FILE")" 2>/dev/null || true
             fi
-            pkill -f "parakeet-stt-daemon" >/dev/null 2>&1 && echo "   - Daemon stopped"
+            pkill -f "[p]arakeet-stt-daemon" >/dev/null 2>&1 && echo "   - Daemon stopped"
 
             rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE" "$PORT_FILE"
             ;;
@@ -417,9 +417,9 @@ PY
             else
                 echo "   - Endpoint: $DEFAULT_ENDPOINT"
             fi
-            if pgrep -af "parakeet" >/dev/null; then
+            if pgrep -af "[p]arakeet" >/dev/null; then
                 echo "   - Matching processes:"
-                pgrep -af "parakeet" | sed 's/^/     /'
+                pgrep -af "[p]arakeet" | sed 's/^/     /'
             fi
             if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
                 echo "   - tmux session: $TMUX_SESSION"
@@ -442,7 +442,7 @@ PY
                 return $?
             fi
 
-            if pgrep -af "parakeet-stt-daemon" >/dev/null || pgrep -af "parakeet-ptt" >/dev/null; then
+            if pgrep -af "[p]arakeet-stt-daemon" >/dev/null || pgrep -af "[p]arakeet-ptt" >/dev/null; then
                 echo "Warning: parakeet processes already running; use 'stt stop' first to avoid duplicates."
             fi
 
