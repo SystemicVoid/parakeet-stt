@@ -9,6 +9,12 @@ This document now has two parts:
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
+- Default startup profile is now paste-mode with explicit single-shortcut behavior:
+  - `--injection-mode paste`
+  - `--paste-shortcut ctrl-shift-v`
+  - `--paste-shortcut-fallback none`
+  - `--paste-strategy single`
+  - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
@@ -74,7 +80,7 @@ Paste/copy injection now exposes a strategy-driven pipeline through `stt start` 
 - `--paste-restore-delay-ms <ms>` (default: `250`)
 - `--paste-copy-foreground true|false` (default: `true`)
 - `--paste-mime-type text/plain;charset=utf-8` (default)
-- `--paste-key-backend wtype|ydotool|uinput|auto` (default: `wtype`)
+- `--paste-key-backend wtype|ydotool|uinput|auto` (default: `auto`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
@@ -86,11 +92,11 @@ Recommended baseline for Ghostty/COSMIC:
 ```bash
 stt start --paste \
   --paste-shortcut ctrl-shift-v \
-  --paste-shortcut-fallback shift-insert \
+  --paste-shortcut-fallback none \
   --paste-strategy single \
   --paste-chain-delay-ms 45 \
   --paste-post-chord-hold-ms 700 \
-  --paste-key-backend wtype \
+  --paste-key-backend auto \
   --paste-backend-failure-policy copy-only \
   --paste-restore-policy never \
   --paste-copy-foreground true

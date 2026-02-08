@@ -27,8 +27,8 @@ uv sync --dev
 2) Run with the tmux-based helper (recommended)
 ```bash
 source scripts/stt-helper.sh   # one time per shell
-stt start                      # starts daemon + client, detaches tmux
-stt start --paste              # paste-mode injection (recommended for Ghostty)
+stt start                      # starts daemon + client in robust paste profile, detaches tmux
+stt start --type               # opt back into direct typing via wtype
 ```
    - Attach to the panes: `stt show` (top: client via `tee`; bottom: live daemon/client logs).
    - Stop everything: `stt stop`. Status: `stt status`. Logs: `stt logs [client|daemon|both]`.
@@ -73,6 +73,13 @@ See `uv run parakeet-stt-daemon --help` for all options.
 ### Helper Script (`scripts/stt-helper.sh`)
 - Source it in your shell to get `stt start|stop|status|logs|show|tmux|check`.
 - Detached tmux session: `stt start` spins up the daemon + client, tails logs in a second pane, and returns you to your shell.
+- `stt start` defaults to a reliability-first profile for Wayland terminals/browsers:
+  - `--injection-mode paste`
+  - `--paste-shortcut ctrl-shift-v`
+  - `--paste-shortcut-fallback none`
+  - `--paste-strategy single`
+  - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
+  - `--paste-backend-failure-policy copy-only`
 - Paste-mode controls are exposed through `stt start`:
   - `--paste-shortcut <ctrl-v|ctrl-shift-v|shift-insert>`
   - `--paste-shortcut-fallback <none|ctrl-v|ctrl-shift-v|shift-insert>`
@@ -83,9 +90,9 @@ See `uv run parakeet-stt-daemon --help` for all options.
   - `--paste-key-backend <wtype|ydotool|uinput|auto>`
   - `--paste-backend-failure-policy <copy-only|error>` (default `copy-only`)
   - `--uinput-dwell-ms <ms>`
-- Backend defaults are intentionally conservative while migration is in progress:
-  - `--paste-key-backend wtype`
-  - `--paste-backend-failure-policy copy-only`
+- Chained shortcut execution is still available for targeted troubleshooting only:
+  - `--paste-strategy always-chain`
+  - optional `--paste-shortcut-fallback <...>`
 - Logs live in `/tmp/parakeet-daemon.log` and `/tmp/parakeet-ptt.log`; `stt show` attaches to the tmux layout.
 - Keep your personal shell config private: only this helper is intended for sharing. You can copy the function into your dotfiles or re-source the script when needed.
 
