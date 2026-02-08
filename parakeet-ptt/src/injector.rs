@@ -87,6 +87,7 @@ pub enum PasteKeySender {
     Wtype(PathBuf),
     Ydotool(PathBuf),
     Uinput(Arc<UinputChordSender>),
+    Chain(Vec<PasteKeySender>),
     Disabled,
 }
 
@@ -373,8 +374,22 @@ impl ClipboardInjector {
         }
     }
 
-    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
-        match &self.sender {
+    fn sender_name(sender: &PasteKeySender) -> &'static str {
+        match sender {
+            PasteKeySender::Wtype(_) => "wtype",
+            PasteKeySender::Ydotool(_) => "ydotool",
+            PasteKeySender::Uinput(_) => "uinput",
+            PasteKeySender::Chain(_) => "chain",
+            PasteKeySender::Disabled => "disabled",
+        }
+    }
+
+    fn run_shortcut_with_sender(
+        trace_id: u64,
+        shortcut: PasteShortcut,
+        sender: &PasteKeySender,
+    ) -> Result<()> {
+        match sender {
             PasteKeySender::Wtype(binary) => {
                 debug!(
                     trace_id,
@@ -448,7 +463,50 @@ impl ClipboardInjector {
                 debug!(trace_id, backend = "uinput", "paste chord command finished");
                 Ok(())
             }
+            PasteKeySender::Chain(_) => anyhow::bail!("nested sender chain is not supported"),
             PasteKeySender::Disabled => anyhow::bail!("paste key sender is disabled"),
+        }
+    }
+
+    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
+        match &self.sender {
+            PasteKeySender::Chain(backends) => {
+                let mut errors = Vec::new();
+                for (idx, backend) in backends.iter().enumerate() {
+                    if idx > 0 {
+                        info!(
+                            trace_id,
+                            shortcut = ?shortcut,
+                            backend = Self::sender_name(backend),
+                            attempt = idx + 1,
+                            total_attempts = backends.len(),
+                            "attempting paste backend fallback"
+                        );
+                    }
+                    match Self::run_shortcut_with_sender(trace_id, shortcut, backend) {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            warn!(
+                                trace_id,
+                                shortcut = ?shortcut,
+                                backend = Self::sender_name(backend),
+                                attempt = idx + 1,
+                                total_attempts = backends.len(),
+                                error = %err,
+                                "paste backend attempt failed"
+                            );
+                            errors.push(format!("{}: {}", Self::sender_name(backend), err));
+                        }
+                    }
+                }
+
+                anyhow::bail!(
+                    "all paste backend attempts failed for shortcut {:?}: {}",
+                    shortcut,
+                    errors.join(" | ")
+                )
+            }
+            sender => Self::run_shortcut_with_sender(trace_id, shortcut, sender),
         }
     }
 

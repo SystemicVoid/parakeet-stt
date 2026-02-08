@@ -401,21 +401,39 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                         }
                     },
                     PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
-                        Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
+                        Ok(sender) => {
+                            let mut senders = Vec::new();
+                            senders.push(PasteKeySender::Uinput(std::sync::Arc::new(sender)));
+                            if let Some(path) = ydotool_binary.clone() {
+                                senders.push(PasteKeySender::Ydotool(path));
+                            }
+                            if let Some(path) = wtype_binary.clone() {
+                                senders.push(PasteKeySender::Wtype(path));
+                            }
+                            PasteKeySender::Chain(senders)
+                        }
                         Err(err) => {
                             warn!(
                                 error = %err,
                                 dwell_ms = config.uinput_dwell_ms,
                                 "paste_key_backend=auto could not initialize uinput; trying ydotool/wtype backends"
                             );
+                            let mut senders = Vec::new();
                             if let Some(path) = ydotool_binary.clone() {
-                                PasteKeySender::Ydotool(path)
-                            } else if let Some(path) = wtype_binary.clone() {
-                                PasteKeySender::Wtype(path)
-                            } else {
+                                senders.push(PasteKeySender::Ydotool(path));
+                            }
+                            if let Some(path) = wtype_binary.clone() {
+                                senders.push(PasteKeySender::Wtype(path));
+                            }
+                            if senders.is_empty() {
                                 return backend_failure_fallback(
                                     "paste_key_backend=auto could not initialize uinput and could not find ydotool or wtype".to_string(),
                                 );
+                            }
+                            if senders.len() == 1 {
+                                senders.remove(0)
+                            } else {
+                                PasteKeySender::Chain(senders)
                             }
                         }
                     },
