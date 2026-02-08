@@ -75,11 +75,13 @@ See `uv run parakeet-stt-daemon --help` for all options.
 - Detached tmux session: `stt start` spins up the daemon + client, tails logs in a second pane, and returns you to your shell.
 - Paste-mode controls are exposed through `stt start`:
   - `--paste-shortcut <ctrl-v|ctrl-shift-v|shift-insert>`
-  - `--paste-shortcut-fallback <none|ctrl-v|shift-insert>`
+  - `--paste-shortcut-fallback <none|ctrl-v|ctrl-shift-v|shift-insert>`
   - `--paste-restore-policy <never|delayed>` (default `never`)
   - `--paste-restore-delay-ms <ms>`
   - `--paste-copy-foreground <true|false>`
   - `--paste-mime-type <mime>`
+  - `--paste-key-backend <wtype|ydotool|uinput|auto>`
+  - `--uinput-dwell-ms <ms>`
 - Logs live in `/tmp/parakeet-daemon.log` and `/tmp/parakeet-ptt.log`; `stt show` attaches to the tmux layout.
 - Keep your personal shell config private: only this helper is intended for sharing. You can copy the function into your dotfiles or re-source the script when needed.
 
