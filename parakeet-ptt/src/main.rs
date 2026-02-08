@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long)]
     wtype: Option<PathBuf>,
 
+    /// Path to ydotool binary (used when paste key backend is ydotool/auto)
+    #[arg(long)]
+    ydotool: Option<PathBuf>,
+
     /// Delay between key events when using wtype
     #[arg(long, default_value_t = 6)]
     wtype_delay_ms: u64,
@@ -80,9 +84,21 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliPasteShortcutFallback::None)]
     paste_shortcut_fallback: CliPasteShortcutFallback,
 
+    /// Paste shortcut strategy.
+    #[arg(long, value_enum, default_value_t = CliPasteStrategy::AlwaysChain)]
+    paste_strategy: CliPasteStrategy,
+
+    /// Delay between chained paste shortcuts.
+    #[arg(long, default_value_t = 45)]
+    paste_chain_delay_ms: u64,
+
     /// Delay before restoring clipboard after paste key chord.
     #[arg(long, default_value_t = 250)]
     paste_restore_delay_ms: u64,
+
+    /// Time to keep the foreground wl-copy source alive after paste chord(s).
+    #[arg(long, default_value_t = 700)]
+    paste_post_chord_hold_ms: u64,
 
     /// Clipboard restore policy in paste mode.
     /// Use `never` to maximize paste reliability.
@@ -96,12 +112,25 @@ struct Cli {
     /// MIME type passed to wl-copy in paste mode.
     #[arg(long, default_value = "text/plain;charset=utf-8")]
     paste_mime_type: String,
+
+    /// Keyboard injection backend for paste shortcut(s).
+    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Wtype)]
+    paste_key_backend: CliPasteKeyBackend,
+
+    /// Optional Wayland seat for wl-copy/wl-paste operations.
+    #[arg(long)]
+    paste_seat: Option<String>,
+
+    /// Mirror transcript into PRIMARY selection in addition to clipboard.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    paste_write_primary: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum CliInjectionMode {
     Type,
     Paste,
+    CopyOnly,
 }
 
 impl From<CliInjectionMode> for crate::config::InjectionMode {
@@ -109,6 +138,7 @@ impl From<CliInjectionMode> for crate::config::InjectionMode {
         match mode {
             CliInjectionMode::Type => crate::config::InjectionMode::Type,
             CliInjectionMode::Paste => crate::config::InjectionMode::Paste,
+            CliInjectionMode::CopyOnly => crate::config::InjectionMode::CopyOnly,
         }
     }
 }
@@ -134,6 +164,7 @@ impl From<CliPasteShortcut> for crate::config::PasteShortcut {
 enum CliPasteShortcutFallback {
     None,
     CtrlV,
+    CtrlShiftV,
     ShiftInsert,
 }
 
@@ -142,9 +173,27 @@ impl From<CliPasteShortcutFallback> for Option<crate::config::PasteShortcut> {
         match fallback {
             CliPasteShortcutFallback::None => None,
             CliPasteShortcutFallback::CtrlV => Some(crate::config::PasteShortcut::CtrlV),
+            CliPasteShortcutFallback::CtrlShiftV => Some(crate::config::PasteShortcut::CtrlShiftV),
             CliPasteShortcutFallback::ShiftInsert => {
                 Some(crate::config::PasteShortcut::ShiftInsert)
             }
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteStrategy {
+    Single,
+    OnError,
+    AlwaysChain,
+}
+
+impl From<CliPasteStrategy> for crate::config::PasteStrategy {
+    fn from(strategy: CliPasteStrategy) -> Self {
+        match strategy {
+            CliPasteStrategy::Single => crate::config::PasteStrategy::Single,
+            CliPasteStrategy::OnError => crate::config::PasteStrategy::OnError,
+            CliPasteStrategy::AlwaysChain => crate::config::PasteStrategy::AlwaysChain,
         }
     }
 }
@@ -164,6 +213,23 @@ impl From<CliPasteRestorePolicy> for crate::config::PasteRestorePolicy {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteKeyBackend {
+    Wtype,
+    Ydotool,
+    Auto,
+}
+
+impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
+    fn from(backend: CliPasteKeyBackend) -> Self {
+        match backend {
+            CliPasteKeyBackend::Wtype => crate::config::PasteKeyBackend::Wtype,
+            CliPasteKeyBackend::Ydotool => crate::config::PasteKeyBackend::Ydotool,
+            CliPasteKeyBackend::Auto => crate::config::PasteKeyBackend::Auto,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -175,15 +241,22 @@ async fn main() -> Result<()> {
         cli.hotkey.clone(),
         InjectionConfig {
             wtype_path: cli.wtype.clone(),
+            ydotool_path: cli.ydotool.clone(),
             wtype_delay_ms: cli.wtype_delay_ms,
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
                 paste_shortcut: cli.paste_shortcut.into(),
                 shortcut_fallback: cli.paste_shortcut_fallback.into(),
+                paste_strategy: cli.paste_strategy.into(),
+                chain_delay_ms: cli.paste_chain_delay_ms,
                 restore_policy: cli.paste_restore_policy.into(),
                 restore_delay_ms: cli.paste_restore_delay_ms,
+                post_chord_hold_ms: cli.paste_post_chord_hold_ms,
                 copy_foreground: cli.paste_copy_foreground,
                 mime_type: cli.paste_mime_type.clone(),
+                key_backend: cli.paste_key_backend.into(),
+                seat: cli.paste_seat.clone(),
+                write_primary: cli.paste_write_primary,
             },
         },
         Duration::from_secs(cli.timeout_seconds.max(1)),
@@ -207,37 +280,32 @@ async fn main() -> Result<()> {
 }
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
-    use crate::config::InjectionMode;
-    use crate::injector::ClipboardInjector;
+    use crate::config::{InjectionMode, PasteKeyBackend};
+    use crate::injector::{ClipboardInjector, PasteKeySender};
 
-    // Helper to find wtype
-    let find_wtype = || -> Option<PathBuf> {
-        if let Some(path) = &config.wtype_path {
+    let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
+        if let Some(path) = configured {
             if path.exists() {
                 return Some(path.clone());
-            } else {
-                error!(?path, "Configured wtype path does not exist");
             }
+            error!(?path, binary, "Configured binary path does not exist");
+            return None;
         }
-        match which::which("wtype") {
-            Ok(path) => Some(path),
-            Err(_) => {
-                error!("wtype not found");
-                None
-            }
-        }
+        which::which(binary).ok()
     };
 
-    let wtype_binary = match find_wtype() {
-        Some(path) => path,
-        None => {
-            error!("wtype is required for injection but was not found; falling back to noop");
-            return Box::new(NoopInjector);
-        }
-    };
+    let wtype_binary = resolve_binary(config.wtype_path.as_ref(), "wtype");
+    let ydotool_binary = resolve_binary(config.ydotool_path.as_ref(), "ydotool");
 
     match config.injection_mode {
         InjectionMode::Type => {
+            let Some(wtype_binary) = wtype_binary else {
+                error!(
+                    "wtype is required for type injection but was not found; falling back to noop"
+                );
+                return Box::new(NoopInjector);
+            };
+
             info!(
                 ?wtype_binary,
                 delay_ms = config.wtype_delay_ms,
@@ -245,20 +313,63 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
             );
             Box::new(WtypeInjector::new(wtype_binary, config.wtype_delay_ms))
         }
-        InjectionMode::Paste => {
+        InjectionMode::Paste | InjectionMode::CopyOnly => {
+            let sender = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
+                PasteKeySender::Disabled
+            } else {
+                match config.clipboard.key_backend {
+                    PasteKeyBackend::Wtype => {
+                        let Some(path) = wtype_binary.clone() else {
+                            error!("paste_key_backend=wtype but wtype was not found; falling back to noop");
+                            return Box::new(NoopInjector);
+                        };
+                        PasteKeySender::Wtype(path)
+                    }
+                    PasteKeyBackend::Ydotool => {
+                        let Some(path) = ydotool_binary.clone() else {
+                            error!("paste_key_backend=ydotool but ydotool was not found; falling back to noop");
+                            return Box::new(NoopInjector);
+                        };
+                        PasteKeySender::Ydotool(path)
+                    }
+                    PasteKeyBackend::Auto => {
+                        if let Some(path) = ydotool_binary.clone() {
+                            PasteKeySender::Ydotool(path)
+                        } else if let Some(path) = wtype_binary.clone() {
+                            PasteKeySender::Wtype(path)
+                        } else {
+                            error!("paste_key_backend=auto could not find ydotool or wtype; falling back to noop");
+                            return Box::new(NoopInjector);
+                        }
+                    }
+                }
+            };
+
             info!(
-                ?wtype_binary,
+                mode = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
+                    "copy-only"
+                } else {
+                    "paste"
+                },
                 paste_shortcut = ?config.clipboard.paste_shortcut,
                 paste_shortcut_fallback = ?config.clipboard.shortcut_fallback,
+                paste_strategy = ?config.clipboard.paste_strategy,
+                chain_delay_ms = config.clipboard.chain_delay_ms,
                 restore_policy = ?config.clipboard.restore_policy,
                 restore_delay_ms = config.clipboard.restore_delay_ms,
+                post_chord_hold_ms = config.clipboard.post_chord_hold_ms,
                 copy_foreground = config.clipboard.copy_foreground,
                 paste_mime_type = %config.clipboard.mime_type,
-                "Using clipboard injector (paste mode)"
+                paste_key_backend = ?config.clipboard.key_backend,
+                paste_seat = ?config.clipboard.seat,
+                paste_write_primary = config.clipboard.write_primary,
+                "Using clipboard injector"
             );
+
             Box::new(ClipboardInjector::new(
-                wtype_binary,
+                sender,
                 config.clipboard.clone(),
+                matches!(config.injection_mode, InjectionMode::CopyOnly),
             ))
         }
     }

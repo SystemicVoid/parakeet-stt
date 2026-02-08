@@ -13,6 +13,7 @@ pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
 pub enum InjectionMode {
     Type,
     Paste,
+    CopyOnly,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -28,19 +29,40 @@ pub enum PasteRestorePolicy {
     Delayed,
 }
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteStrategy {
+    Single,
+    OnError,
+    AlwaysChain,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteKeyBackend {
+    Wtype,
+    Ydotool,
+    Auto,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipboardOptions {
     pub paste_shortcut: PasteShortcut,
     pub shortcut_fallback: Option<PasteShortcut>,
+    pub paste_strategy: PasteStrategy,
+    pub chain_delay_ms: u64,
     pub restore_policy: PasteRestorePolicy,
     pub restore_delay_ms: u64,
+    pub post_chord_hold_ms: u64,
     pub copy_foreground: bool,
     pub mime_type: String,
+    pub key_backend: PasteKeyBackend,
+    pub seat: Option<String>,
+    pub write_primary: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct InjectionConfig {
     pub wtype_path: Option<PathBuf>,
+    pub ydotool_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -52,6 +74,7 @@ pub struct ClientConfig {
     pub shared_secret: Option<String>,
     pub hotkey: String,
     pub wtype_path: Option<PathBuf>,
+    pub ydotool_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -73,6 +96,7 @@ impl ClientConfig {
             shared_secret,
             hotkey,
             wtype_path: injection.wtype_path,
+            ydotool_path: injection.ydotool_path,
             wtype_delay_ms: injection.wtype_delay_ms,
             injection_mode: injection.injection_mode,
             clipboard: injection.clipboard,
