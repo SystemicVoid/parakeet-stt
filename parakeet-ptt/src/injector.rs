@@ -2,9 +2,12 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
+use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
 use tracing::{debug, info, warn};
 
 use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
@@ -21,6 +24,25 @@ pub struct NoopInjector;
 impl TextInjector for NoopInjector {
     fn inject(&self, _text: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FailInjector {
+    message: Arc<str>,
+}
+
+impl FailInjector {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: Arc::<str>::from(message.into()),
+        }
+    }
+}
+
+impl TextInjector for FailInjector {
+    fn inject(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("{}", self.message)
     }
 }
 
@@ -64,7 +86,95 @@ impl TextInjector for WtypeInjector {
 pub enum PasteKeySender {
     Wtype(PathBuf),
     Ydotool(PathBuf),
+    Uinput(Arc<UinputChordSender>),
+    Chain(Vec<PasteKeySender>),
     Disabled,
+}
+
+pub struct UinputChordSender {
+    device: Mutex<VirtualDevice>,
+    dwell: Duration,
+}
+
+impl std::fmt::Debug for UinputChordSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UinputChordSender")
+            .field("dwell_ms", &self.dwell_ms())
+            .finish()
+    }
+}
+
+impl UinputChordSender {
+    pub fn new(dwell_ms: u64) -> Result<Self> {
+        let mut keys = AttributeSet::<Key>::new();
+        keys.insert(Key::KEY_LEFTCTRL);
+        keys.insert(Key::KEY_LEFTSHIFT);
+        keys.insert(Key::KEY_V);
+        keys.insert(Key::KEY_INSERT);
+
+        let device = VirtualDeviceBuilder::new()
+            .context("failed to open /dev/uinput for direct keyboard injection")?
+            .name("Parakeet STT Virtual Keyboard")
+            .input_id(InputId::new(BusType::BUS_USB, 0x1d6b, 0x1050, 0x0001))
+            .with_keys(&keys)
+            .context("failed to configure uinput keyboard capabilities")?
+            .build()
+            .context("failed to create uinput virtual keyboard device")?;
+
+        Ok(Self {
+            device: Mutex::new(device),
+            dwell: Duration::from_millis(dwell_ms.max(1)),
+        })
+    }
+
+    fn shortcut_plan(shortcut: PasteShortcut) -> (&'static [Key], Key) {
+        const CTRL: [Key; 1] = [Key::KEY_LEFTCTRL];
+        const SHIFT: [Key; 1] = [Key::KEY_LEFTSHIFT];
+        const CTRL_SHIFT: [Key; 2] = [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT];
+
+        match shortcut {
+            PasteShortcut::CtrlV => (&CTRL, Key::KEY_V),
+            PasteShortcut::CtrlShiftV => (&CTRL_SHIFT, Key::KEY_V),
+            PasteShortcut::ShiftInsert => (&SHIFT, Key::KEY_INSERT),
+        }
+    }
+
+    fn emit_key(device: &mut VirtualDevice, key: Key, value: i32) -> Result<()> {
+        device
+            .emit(&[InputEvent::new(EventType::KEY, key.code(), value)])
+            .with_context(|| {
+                format!(
+                    "failed to emit uinput event key={} value={value}",
+                    key.code()
+                )
+            })
+    }
+
+    pub fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
+        let (modifiers, key) = Self::shortcut_plan(shortcut);
+        let mut device = self
+            .device
+            .lock()
+            .map_err(|_| anyhow::anyhow!("uinput virtual keyboard lock poisoned"))?;
+
+        for modifier in modifiers {
+            Self::emit_key(&mut device, *modifier, 1)?;
+        }
+
+        Self::emit_key(&mut device, key, 1)?;
+        std::thread::sleep(self.dwell);
+        Self::emit_key(&mut device, key, 0)?;
+
+        for modifier in modifiers.iter().rev() {
+            Self::emit_key(&mut device, *modifier, 0)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn dwell_ms(&self) -> u64 {
+        self.dwell.as_millis() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,8 +374,22 @@ impl ClipboardInjector {
         }
     }
 
-    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
-        match &self.sender {
+    fn sender_name(sender: &PasteKeySender) -> &'static str {
+        match sender {
+            PasteKeySender::Wtype(_) => "wtype",
+            PasteKeySender::Ydotool(_) => "ydotool",
+            PasteKeySender::Uinput(_) => "uinput",
+            PasteKeySender::Chain(_) => "chain",
+            PasteKeySender::Disabled => "disabled",
+        }
+    }
+
+    fn run_shortcut_with_sender(
+        trace_id: u64,
+        shortcut: PasteShortcut,
+        sender: &PasteKeySender,
+    ) -> Result<()> {
+        match sender {
             PasteKeySender::Wtype(binary) => {
                 debug!(
                     trace_id,
@@ -325,7 +449,64 @@ impl ClipboardInjector {
                 }
                 Ok(())
             }
+            PasteKeySender::Uinput(sender) => {
+                debug!(
+                    trace_id,
+                    shortcut = ?shortcut,
+                    backend = "uinput",
+                    dwell_ms = sender.dwell_ms(),
+                    "sending paste chord"
+                );
+                sender.send_shortcut(shortcut).with_context(|| {
+                    format!("failed to emit paste key chord {:?} via uinput", shortcut)
+                })?;
+                debug!(trace_id, backend = "uinput", "paste chord command finished");
+                Ok(())
+            }
+            PasteKeySender::Chain(_) => anyhow::bail!("nested sender chain is not supported"),
             PasteKeySender::Disabled => anyhow::bail!("paste key sender is disabled"),
+        }
+    }
+
+    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
+        match &self.sender {
+            PasteKeySender::Chain(backends) => {
+                let mut errors = Vec::new();
+                for (idx, backend) in backends.iter().enumerate() {
+                    if idx > 0 {
+                        info!(
+                            trace_id,
+                            shortcut = ?shortcut,
+                            backend = Self::sender_name(backend),
+                            attempt = idx + 1,
+                            total_attempts = backends.len(),
+                            "attempting paste backend fallback"
+                        );
+                    }
+                    match Self::run_shortcut_with_sender(trace_id, shortcut, backend) {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            warn!(
+                                trace_id,
+                                shortcut = ?shortcut,
+                                backend = Self::sender_name(backend),
+                                attempt = idx + 1,
+                                total_attempts = backends.len(),
+                                error = %err,
+                                "paste backend attempt failed"
+                            );
+                            errors.push(format!("{}: {}", Self::sender_name(backend), err));
+                        }
+                    }
+                }
+
+                anyhow::bail!(
+                    "all paste backend attempts failed for shortcut {:?}: {}",
+                    shortcut,
+                    errors.join(" | ")
+                )
+            }
+            sender => Self::run_shortcut_with_sender(trace_id, shortcut, sender),
         }
     }
 
@@ -856,10 +1037,13 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardInjector, PasteKeySender};
+    use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
-        ClipboardOptions, PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
+        PasteShortcut, PasteStrategy,
     };
+    use evdev::Key;
+    use std::path::PathBuf;
 
     fn options(
         strategy: PasteStrategy,
@@ -877,6 +1061,7 @@ mod tests {
             copy_foreground: true,
             mime_type: "text/plain;charset=utf-8".to_string(),
             key_backend: PasteKeyBackend::Wtype,
+            backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
             seat: None,
             write_primary: false,
         }
@@ -935,5 +1120,46 @@ mod tests {
             injector.shortcut_attempt_order(),
             vec![PasteShortcut::CtrlV]
         );
+    }
+
+    #[test]
+    fn uinput_shortcut_plan_ctrl_shift_v() {
+        let (modifiers, key) = UinputChordSender::shortcut_plan(PasteShortcut::CtrlShiftV);
+        assert_eq!(modifiers, [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT]);
+        assert_eq!(key, Key::KEY_V);
+    }
+
+    #[test]
+    fn chain_sender_falls_through_to_next_backend() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Chain(vec![
+                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
+                PasteKeySender::Wtype(PathBuf::from("/bin/true")),
+            ]),
+            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
+            false,
+        );
+
+        assert!(injector.run_shortcut(1, PasteShortcut::CtrlV).is_ok());
+    }
+
+    #[test]
+    fn chain_sender_reports_all_backend_failures() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Chain(vec![
+                PasteKeySender::Disabled,
+                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
+            ]),
+            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
+            false,
+        );
+
+        let err = injector
+            .run_shortcut(1, PasteShortcut::CtrlV)
+            .expect_err("expected chain failure");
+        let message = format!("{err:#}");
+        assert!(message.contains("all paste backend attempts failed"));
+        assert!(message.contains("disabled"));
+        assert!(message.contains("wtype"));
     }
 }

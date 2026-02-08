@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)] // Keep wire-level message names aligned with protocol spec.
 pub enum ClientMessage {
     StartSession {
         session_id: Uuid,

@@ -55,6 +55,10 @@ struct Cli {
     #[arg(long, default_value_t = 6)]
     wtype_delay_ms: u64,
 
+    /// Key dwell time in milliseconds for direct uinput paste chords
+    #[arg(long, default_value_t = 18)]
+    uinput_dwell_ms: u64,
+
     /// Connection timeout in seconds
     #[arg(long, default_value_t = 5)]
     timeout_seconds: u64,
@@ -116,6 +120,14 @@ struct Cli {
     /// Keyboard injection backend for paste shortcut(s).
     #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Wtype)]
     paste_key_backend: CliPasteKeyBackend,
+
+    /// Behavior when selected paste backend cannot be initialized or used.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliPasteBackendFailurePolicy::CopyOnly
+    )]
+    paste_backend_failure_policy: CliPasteBackendFailurePolicy,
 
     /// Optional Wayland seat for wl-copy/wl-paste operations.
     #[arg(long)]
@@ -217,6 +229,7 @@ impl From<CliPasteRestorePolicy> for crate::config::PasteRestorePolicy {
 enum CliPasteKeyBackend {
     Wtype,
     Ydotool,
+    Uinput,
     Auto,
 }
 
@@ -225,7 +238,25 @@ impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
         match backend {
             CliPasteKeyBackend::Wtype => crate::config::PasteKeyBackend::Wtype,
             CliPasteKeyBackend::Ydotool => crate::config::PasteKeyBackend::Ydotool,
+            CliPasteKeyBackend::Uinput => crate::config::PasteKeyBackend::Uinput,
             CliPasteKeyBackend::Auto => crate::config::PasteKeyBackend::Auto,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteBackendFailurePolicy {
+    CopyOnly,
+    Error,
+}
+
+impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePolicy {
+    fn from(policy: CliPasteBackendFailurePolicy) -> Self {
+        match policy {
+            CliPasteBackendFailurePolicy::CopyOnly => {
+                crate::config::PasteBackendFailurePolicy::CopyOnly
+            }
+            CliPasteBackendFailurePolicy::Error => crate::config::PasteBackendFailurePolicy::Error,
         }
     }
 }
@@ -243,6 +274,7 @@ async fn main() -> Result<()> {
             wtype_path: cli.wtype.clone(),
             ydotool_path: cli.ydotool.clone(),
             wtype_delay_ms: cli.wtype_delay_ms,
+            uinput_dwell_ms: cli.uinput_dwell_ms,
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
                 paste_shortcut: cli.paste_shortcut.into(),
@@ -255,6 +287,7 @@ async fn main() -> Result<()> {
                 copy_foreground: cli.paste_copy_foreground,
                 mime_type: cli.paste_mime_type.clone(),
                 key_backend: cli.paste_key_backend.into(),
+                backend_failure_policy: cli.paste_backend_failure_policy.into(),
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -280,8 +313,8 @@ async fn main() -> Result<()> {
 }
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
-    use crate::config::{InjectionMode, PasteKeyBackend};
-    use crate::injector::{ClipboardInjector, PasteKeySender};
+    use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
+    use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
 
     let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
         if let Some(path) = configured {
@@ -296,6 +329,29 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
 
     let wtype_binary = resolve_binary(config.wtype_path.as_ref(), "wtype");
     let ydotool_binary = resolve_binary(config.ydotool_path.as_ref(), "ydotool");
+
+    let backend_failure_fallback = |reason: String| -> Box<dyn TextInjector> {
+        match config.clipboard.backend_failure_policy {
+            PasteBackendFailurePolicy::CopyOnly => {
+                warn!(
+                    reason = %reason,
+                    "paste backend unavailable; falling back to copy-only injection"
+                );
+                Box::new(ClipboardInjector::new(
+                    PasteKeySender::Disabled,
+                    config.clipboard.clone(),
+                    true,
+                ))
+            }
+            PasteBackendFailurePolicy::Error => {
+                error!(
+                    reason = %reason,
+                    "paste backend unavailable and policy=error; returning explicit injector error"
+                );
+                Box::new(FailInjector::new(reason))
+            }
+        }
+    };
 
     match config.injection_mode {
         InjectionMode::Type => {
@@ -320,28 +376,67 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 match config.clipboard.key_backend {
                     PasteKeyBackend::Wtype => {
                         let Some(path) = wtype_binary.clone() else {
-                            error!("paste_key_backend=wtype but wtype was not found; falling back to noop");
-                            return Box::new(NoopInjector);
+                            return backend_failure_fallback(
+                                "paste_key_backend=wtype but wtype was not found".to_string(),
+                            );
                         };
                         PasteKeySender::Wtype(path)
                     }
                     PasteKeyBackend::Ydotool => {
                         let Some(path) = ydotool_binary.clone() else {
-                            error!("paste_key_backend=ydotool but ydotool was not found; falling back to noop");
-                            return Box::new(NoopInjector);
+                            return backend_failure_fallback(
+                                "paste_key_backend=ydotool but ydotool was not found".to_string(),
+                            );
                         };
                         PasteKeySender::Ydotool(path)
                     }
-                    PasteKeyBackend::Auto => {
-                        if let Some(path) = ydotool_binary.clone() {
-                            PasteKeySender::Ydotool(path)
-                        } else if let Some(path) = wtype_binary.clone() {
-                            PasteKeySender::Wtype(path)
-                        } else {
-                            error!("paste_key_backend=auto could not find ydotool or wtype; falling back to noop");
-                            return Box::new(NoopInjector);
+                    PasteKeyBackend::Uinput => match UinputChordSender::new(config.uinput_dwell_ms)
+                    {
+                        Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
+                        Err(err) => {
+                            return backend_failure_fallback(format!(
+                                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                                err
+                            ));
                         }
-                    }
+                    },
+                    PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
+                        Ok(sender) => {
+                            let mut senders = Vec::new();
+                            senders.push(PasteKeySender::Uinput(std::sync::Arc::new(sender)));
+                            if let Some(path) = ydotool_binary.clone() {
+                                senders.push(PasteKeySender::Ydotool(path));
+                            }
+                            if let Some(path) = wtype_binary.clone() {
+                                senders.push(PasteKeySender::Wtype(path));
+                            }
+                            PasteKeySender::Chain(senders)
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                dwell_ms = config.uinput_dwell_ms,
+                                "paste_key_backend=auto could not initialize uinput; trying ydotool/wtype backends"
+                            );
+                            let mut senders = Vec::new();
+                            if let Some(path) = ydotool_binary.clone() {
+                                senders.push(PasteKeySender::Ydotool(path));
+                            }
+                            if let Some(path) = wtype_binary.clone() {
+                                senders.push(PasteKeySender::Wtype(path));
+                            }
+                            if senders.is_empty() {
+                                return backend_failure_fallback(
+                                    "paste_key_backend=auto could not initialize uinput and could not find ydotool or wtype".to_string(),
+                                );
+                            }
+                            if senders.len() == 1 {
+                                senders.remove(0)
+                            } else {
+                                PasteKeySender::Chain(senders)
+                            }
+                        }
+                    },
                 }
             };
 
@@ -361,6 +456,8 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 copy_foreground = config.clipboard.copy_foreground,
                 paste_mime_type = %config.clipboard.mime_type,
                 paste_key_backend = ?config.clipboard.key_backend,
+                paste_backend_failure_policy = ?config.clipboard.backend_failure_policy,
+                uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
                 "Using clipboard injector"
@@ -632,4 +729,62 @@ async fn fetch_status_once(config: &ClientConfig) {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::config::{
+        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
+        PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+    };
+
+    use super::build_injector;
+
+    fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
+        ClipboardOptions {
+            paste_shortcut: PasteShortcut::CtrlV,
+            shortcut_fallback: None,
+            paste_strategy: PasteStrategy::Single,
+            chain_delay_ms: 45,
+            restore_policy: PasteRestorePolicy::Never,
+            restore_delay_ms: 250,
+            post_chord_hold_ms: 700,
+            copy_foreground: true,
+            mime_type: "text/plain;charset=utf-8".to_string(),
+            key_backend: PasteKeyBackend::Wtype,
+            backend_failure_policy: policy,
+            seat: None,
+            write_primary: false,
+        }
+    }
+
+    #[test]
+    fn backend_failure_policy_error_returns_injector_error() {
+        let config = ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                wtype_path: Some(PathBuf::from("/definitely/missing/wtype")),
+                ydotool_path: None,
+                wtype_delay_ms: 6,
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: clipboard_options(PasteBackendFailurePolicy::Error),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("config should parse");
+
+        let injector = build_injector(&config);
+        let err = injector
+            .inject("test")
+            .expect_err("policy=error should fail injection");
+        let message = format!("{err:#}");
+        assert!(message.contains("wtype"));
+        assert!(message.contains("not found"));
+    }
 }

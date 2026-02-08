@@ -1,6 +1,21 @@
-# STT helper status (Nov 22, 2025)
+# STT helper status (updated 2026-02-08)
 
-This notes what we tried for the `stt` bash helper, what currently works, what does not, and the next debugging steps.
+This document now has two parts:
+
+1. **Current truth (2026 migration branch)** for day-to-day operations.
+2. **Historical investigation notes** from earlier debugging passes.
+
+## Current truth (2026 migration branch)
+
+- `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
+- `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
+- Paste backend failures are policy-driven:
+  - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
+  - `error`: fail fast for strict debugging.
+- `auto` backend now performs runtime fallback attempts (`uinput -> ydotool -> wtype`) per shortcut execution.
+- `stt diag-injector` reports backend capability prerequisites (`wtype`, `ydotool`, `/dev/uinput` write access) before running matrix cases.
+
+## Historical notes (pre-2026 migration hardening)
 
 ## What works
 - Running the commands manually (from the README) in two terminals works:  
@@ -59,7 +74,9 @@ Paste/copy injection now exposes a strategy-driven pipeline through `stt start` 
 - `--paste-restore-delay-ms <ms>` (default: `250`)
 - `--paste-copy-foreground true|false` (default: `true`)
 - `--paste-mime-type text/plain;charset=utf-8` (default)
-- `--paste-key-backend wtype|ydotool|auto` (default: `wtype`)
+- `--paste-key-backend wtype|ydotool|uinput|auto` (default: `wtype`)
+- `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
+- `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
 - `--paste-write-primary true|false` (default: `false`)
 - `--ydotool <path>` (optional explicit path override)
@@ -73,6 +90,8 @@ stt start --paste \
   --paste-strategy always-chain \
   --paste-chain-delay-ms 45 \
   --paste-post-chord-hold-ms 700 \
+  --paste-key-backend wtype \
+  --paste-backend-failure-policy copy-only \
   --paste-restore-policy never \
   --paste-copy-foreground true
 ```
@@ -92,4 +111,4 @@ Use the new helper matrix command:
 stt diag-injector
 ```
 
-It runs three `--test-injection` shortcut combinations with injector debug logging.
+It prints backend capability checks and then runs three `--test-injection` shortcut combinations with injector debug logging.

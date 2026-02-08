@@ -29,13 +29,19 @@ The following are already present in `parakeet-ptt` and helper tooling:
 - Restore policy (`never` or `delayed`).
 
 4. Multiple key backend options for chord injection.
-- `wtype`, `ydotool`, `auto` backend selection surface.
+- `wtype`, `ydotool`, `uinput`, `auto` backend selection surface.
+- `auto` runtime ladder: `uinput -> ydotool -> wtype`.
 
-5. Operational fallback mode.
+5. Explicit backend failure policy.
+- `--paste-backend-failure-policy copy-only|error`.
+- Default is `copy-only` to preserve transcript delivery when key backend init fails.
+
+6. Operational fallback mode.
 - `--injection-mode copy-only` for deterministic clipboard-only behavior.
 
-6. Diagnostics and helper wiring.
+7. Diagnostics and helper wiring.
 - `stt` helper forwards advanced paste flags.
+- `stt start` rejects unknown options to prevent silent misconfiguration.
 - `stt diag-injector` runs reproducible test-injection combinations.
 
 ## 3. Known Remaining Problem
@@ -106,7 +112,7 @@ Planned injection flow:
 
 ## 8. Implementation Phases
 
-## Phase 0: Baseline Lock + Instrumentation Tightening
+## Phase 0: Baseline Lock + Instrumentation Tightening (Completed)
 
 Scope:
 1. Freeze baseline behavior in worktree with no default changes.
@@ -120,7 +126,7 @@ Acceptance:
 1. Existing tests pass.
 2. New logs make backend behavior and fallback path unambiguous.
 
-## Phase 1: Direct `uinput` Backend MVP
+## Phase 1: Direct `uinput` Backend MVP (Completed)
 
 Scope:
 1. Add `uinput` backend implementation in Rust (no external daemon dependency).
@@ -132,12 +138,23 @@ Acceptance:
 2. `--test-injection` works with `--paste-key-backend uinput`.
 3. Fail-fast with clear message when `/dev/uinput` permission is missing.
 
-## Phase 2: Reliability Ladder and Fallback Semantics
+## Phase 2: Reliability Ladder and Fallback Semantics (In Progress)
 
 Scope:
 1. Define deterministic fallback order (configurable).
 2. Allow fallback on both hard errors and explicit timeout policies.
 3. Keep fallback behavior observable in logs/metrics.
+
+Implemented in this phase:
+1. Runtime backend ladder for `auto`: `uinput -> ydotool -> wtype`.
+2. Explicit backend failure policy:
+- `copy-only` preserves transcript via clipboard-only path.
+- `error` surfaces explicit injector failure.
+3. Unit test coverage for chain fallback and error-policy path.
+
+Remaining in this phase:
+1. Add app-level semantic success evidence (not only command/clipboard success).
+2. Run and record repeated multi-app acceptance matrix results.
 
 Acceptance:
 1. Unit tests cover attempt ordering and fallback transitions.
@@ -166,6 +183,24 @@ Matrix (must pass in repeated runs):
 Decision gate:
 1. Promote backend default only if matrix pass rate exceeds current default and no severe regressions are found.
 2. Otherwise ship as opt-in backend and continue hardening.
+
+Current default policy (explicit):
+1. Keep `--paste-key-backend wtype`.
+2. Keep `--paste-backend-failure-policy copy-only`.
+
+Acceptance matrix recording template:
+
+| Surface | Backend | Attempts | Successes | Failure class | Notes |
+|---------|---------|----------|-----------|---------------|-------|
+| Ghostty prompt | wtype |  |  |  |  |
+| Ghostty prompt | uinput |  |  |  |  |
+| COSMIC Terminal prompt | wtype |  |  |  |  |
+| COSMIC Terminal prompt | uinput |  |  |  |  |
+| Brave address bar | wtype |  |  |  |  |
+| Brave address bar | uinput |  |  |  |  |
+| GTK/native text entry | wtype |  |  |  |  |
+| GTK/native text entry | uinput |  |  |  |  |
+| Clipboard-only regression check | copy-only |  |  |  |  |
 
 ## Phase 5: Deferred R&D Track (Non-blocking)
 
@@ -201,7 +236,7 @@ Automated:
 3. `cargo test`
 
 Behavioral:
-1. `stt diag-injector` extended to include `uinput`.
+1. `stt diag-injector` extended to include `uinput` capability checks and matrix runs.
 2. Repeated multi-app insertion matrix runs with backend-specific logs.
 3. Permission-denied and missing-device error-path checks.
 
@@ -217,4 +252,3 @@ Behavioral:
 1. `docs/HANDOFF-clipboard-injector-2026-02-08.md`
 2. `docs/SYSTEM-SPECS-and-FULL-STACK-REFERENCES-2026-02-08.md`
 3. `docs/stt-troubleshooting.md`
-

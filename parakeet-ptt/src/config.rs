@@ -40,7 +40,14 @@ pub enum PasteStrategy {
 pub enum PasteKeyBackend {
     Wtype,
     Ydotool,
+    Uinput,
     Auto,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteBackendFailurePolicy {
+    CopyOnly,
+    Error,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +62,7 @@ pub struct ClipboardOptions {
     pub copy_foreground: bool,
     pub mime_type: String,
     pub key_backend: PasteKeyBackend,
+    pub backend_failure_policy: PasteBackendFailurePolicy,
     pub seat: Option<String>,
     pub write_primary: bool,
 }
@@ -64,6 +72,7 @@ pub struct InjectionConfig {
     pub wtype_path: Option<PathBuf>,
     pub ydotool_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
+    pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
 }
@@ -76,6 +85,7 @@ pub struct ClientConfig {
     pub wtype_path: Option<PathBuf>,
     pub ydotool_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
+    pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
     pub connect_timeout: Duration,
@@ -98,6 +108,7 @@ impl ClientConfig {
             wtype_path: injection.wtype_path,
             ydotool_path: injection.ydotool_path,
             wtype_delay_ms: injection.wtype_delay_ms,
+            uinput_dwell_ms: injection.uinput_dwell_ms,
             injection_mode: injection.injection_mode,
             clipboard: injection.clipboard,
             connect_timeout,
