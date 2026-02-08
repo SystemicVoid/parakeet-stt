@@ -1,5 +1,41 @@
 # Clipboard Injector Handoff (2026-02-08)
 
+## Update (implemented)
+
+The paste injector path has now been reworked and instrumented in-tree:
+
+- Reliability-first default: `--paste-restore-policy never` (no auto-restore race by default).
+- Deterministic clipboard ownership path:
+  - `wl-copy --type <mime>` is always used.
+  - Optional foreground ownership (`--paste-copy-foreground true`) is held through paste.
+  - Ownership can be transferred to background mode after paste to avoid leaked processes.
+- Readiness wait before paste chord:
+  - Injector now waits briefly for clipboard readback to match requested text before firing `wtype`.
+- Optional fallback paste chord:
+  - `--paste-shortcut-fallback <none|ctrl-v|shift-insert>` is only attempted when primary chord fails.
+- End-to-end helper propagation:
+  - `scripts/stt-helper.sh` now forwards all paste-related flags/env vars and validates release-binary support.
+
+Validated locally:
+
+- `cargo test` passes.
+- `bash -n scripts/stt-helper.sh` passes.
+- `cargo run --release -- --test-injection ...` works with new flags.
+- Clipboard semantics are verified:
+  - `restore-policy never` leaves transcript in clipboard.
+  - `restore-policy delayed` restores original clipboard.
+
+Relevant commits (same day, ordered):
+
+- `de70dff` chore(ptt): add clipboard injector step diagnostics
+- `52984ee` fix(ptt): add explicit paste restore policy
+- `47e9dbe` fix(ptt): harden wl-copy ownership for paste mode
+- `49131b5` fix(ptt): add optional fallback paste chord
+- `e005a56` fix(helper): forward full paste injector controls
+- `e3903c4` fix(ptt): wait for clipboard readiness before paste
+
+## Historical context (pre-fix investigation)
+
 ### Current status
 - End-to-end STT pipeline is healthy: hotkey start/stop, daemon transcription, and `final_result` delivery all work.
 - Paste injection still behaves incorrectly in user-facing apps:

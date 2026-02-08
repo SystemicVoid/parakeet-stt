@@ -28,6 +28,7 @@ uv sync --dev
 ```bash
 source scripts/stt-helper.sh   # one time per shell
 stt start                      # starts daemon + client, detaches tmux
+stt start --paste              # paste-mode injection (recommended for Ghostty)
 ```
    - Attach to the panes: `stt show` (top: client via `tee`; bottom: live daemon/client logs).
    - Stop everything: `stt stop`. Status: `stt status`. Logs: `stt logs [client|daemon|both]`.
@@ -72,6 +73,13 @@ See `uv run parakeet-stt-daemon --help` for all options.
 ### Helper Script (`scripts/stt-helper.sh`)
 - Source it in your shell to get `stt start|stop|status|logs|show|tmux|check`.
 - Detached tmux session: `stt start` spins up the daemon + client, tails logs in a second pane, and returns you to your shell.
+- Paste-mode controls are exposed through `stt start`:
+  - `--paste-shortcut <ctrl-v|ctrl-shift-v|shift-insert>`
+  - `--paste-shortcut-fallback <none|ctrl-v|shift-insert>`
+  - `--paste-restore-policy <never|delayed>` (default `never`)
+  - `--paste-restore-delay-ms <ms>`
+  - `--paste-copy-foreground <true|false>`
+  - `--paste-mime-type <mime>`
 - Logs live in `/tmp/parakeet-daemon.log` and `/tmp/parakeet-ptt.log`; `stt show` attaches to the tmux layout.
 - Keep your personal shell config private: only this helper is intended for sharing. You can copy the function into your dotfiles or re-source the script when needed.
 

@@ -61,6 +61,7 @@ cargo test
 source scripts/stt-helper.sh     # Source once per shell
 stt start                        # Start daemon + client in tmux
 stt start --paste                # Use clipboard injection mode
+stt start --paste --paste-restore-policy never  # Reliability-first paste
 stt stop                         # Stop everything
 stt status                       # Check running processes
 stt show                         # Attach to tmux session
@@ -116,6 +117,12 @@ See `docs/SPEC.md` for complete protocol specification.
 - `PARAKEET_HOST` / `PARAKEET_PORT` - Daemon bind address (default: 127.0.0.1:8765)
 - `PARAKEET_ROOT` - Override repo root for helper script
 - `PARAKEET_INJECTION_MODE` - Default injection mode (type/paste)
+- `PARAKEET_PASTE_SHORTCUT` - Paste chord in paste mode (`ctrl-shift-v`, etc.)
+- `PARAKEET_PASTE_SHORTCUT_FALLBACK` - Optional fallback chord (`none` by default)
+- `PARAKEET_PASTE_RESTORE_POLICY` - `never` or `delayed` (default `never`)
+- `PARAKEET_PASTE_RESTORE_DELAY_MS` - Delay before restore when using delayed policy
+- `PARAKEET_PASTE_COPY_FOREGROUND` - Keep wl-copy foreground source during paste (`true` default)
+- `PARAKEET_PASTE_MIME_TYPE` - MIME type for clipboard writes (default `text/plain;charset=utf-8`)
 - `PARAKEET_SILENCE_FLOOR_DB` - Silence trim threshold
 - `RUST_LOG` - Rust logging level (default: info)
 

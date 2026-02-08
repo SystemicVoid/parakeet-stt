@@ -42,4 +42,24 @@ This notes what we tried for the `stt` bash helper, what currently works, what d
 3) If the client drops to cargo fallback or still exits, tail `/tmp/parakeet-ptt.log` and look for helper markers. Share the log.
 4) Still empty logs? Capture env for that shell: `env | sort > /tmp/stt-env.txt`, set `RUST_LOG=debug`, and rerun `stt start`.
 
-With the append-only logging, tmux-based client start, PID tracking, and longer socket wait, any new failure should leave a clear trace in `/tmp/parakeet-ptt.log` or `/tmp/parakeet-daemon.log`.***
+With the append-only logging, tmux-based client start, PID tracking, and longer socket wait, any new failure should leave a clear trace in `/tmp/parakeet-ptt.log` or `/tmp/parakeet-daemon.log`.
+
+## Clipboard injection tuning (Feb 8, 2026)
+
+Paste mode now exposes reliability controls end-to-end through `stt start` and `parakeet-ptt`:
+
+- `--paste-restore-policy never|delayed` (default: `never`)
+- `--paste-restore-delay-ms <ms>`
+- `--paste-copy-foreground true|false` (default: `true`)
+- `--paste-mime-type text/plain;charset=utf-8` (default)
+- `--paste-shortcut-fallback none|ctrl-v|shift-insert` (default: `none`)
+
+Recommended baseline for Ghostty/COSMIC:
+
+```bash
+stt start --paste \
+  --paste-shortcut ctrl-shift-v \
+  --paste-shortcut-fallback shift-insert \
+  --paste-restore-policy never \
+  --paste-copy-foreground true
+```
