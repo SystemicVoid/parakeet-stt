@@ -730,3 +730,61 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::config::{
+        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
+        PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+    };
+
+    use super::build_injector;
+
+    fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
+        ClipboardOptions {
+            paste_shortcut: PasteShortcut::CtrlV,
+            shortcut_fallback: None,
+            paste_strategy: PasteStrategy::Single,
+            chain_delay_ms: 45,
+            restore_policy: PasteRestorePolicy::Never,
+            restore_delay_ms: 250,
+            post_chord_hold_ms: 700,
+            copy_foreground: true,
+            mime_type: "text/plain;charset=utf-8".to_string(),
+            key_backend: PasteKeyBackend::Wtype,
+            backend_failure_policy: policy,
+            seat: None,
+            write_primary: false,
+        }
+    }
+
+    #[test]
+    fn backend_failure_policy_error_returns_injector_error() {
+        let config = ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                wtype_path: Some(PathBuf::from("/definitely/missing/wtype")),
+                ydotool_path: None,
+                wtype_delay_ms: 6,
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: clipboard_options(PasteBackendFailurePolicy::Error),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("config should parse");
+
+        let injector = build_injector(&config);
+        let err = injector
+            .inject("test")
+            .expect_err("policy=error should fail injection");
+        let message = format!("{err:#}");
+        assert!(message.contains("wtype"));
+        assert!(message.contains("not found"));
+    }
+}

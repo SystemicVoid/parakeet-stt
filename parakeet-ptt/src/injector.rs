@@ -1043,6 +1043,7 @@ mod tests {
         PasteShortcut, PasteStrategy,
     };
     use evdev::Key;
+    use std::path::PathBuf;
 
     fn options(
         strategy: PasteStrategy,
@@ -1126,5 +1127,39 @@ mod tests {
         let (modifiers, key) = UinputChordSender::shortcut_plan(PasteShortcut::CtrlShiftV);
         assert_eq!(modifiers, [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT]);
         assert_eq!(key, Key::KEY_V);
+    }
+
+    #[test]
+    fn chain_sender_falls_through_to_next_backend() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Chain(vec![
+                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
+                PasteKeySender::Wtype(PathBuf::from("/bin/true")),
+            ]),
+            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
+            false,
+        );
+
+        assert!(injector.run_shortcut(1, PasteShortcut::CtrlV).is_ok());
+    }
+
+    #[test]
+    fn chain_sender_reports_all_backend_failures() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Chain(vec![
+                PasteKeySender::Disabled,
+                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
+            ]),
+            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
+            false,
+        );
+
+        let err = injector
+            .run_shortcut(1, PasteShortcut::CtrlV)
+            .expect_err("expected chain failure");
+        let message = format!("{err:#}");
+        assert!(message.contains("all paste backend attempts failed"));
+        assert!(message.contains("disabled"));
+        assert!(message.contains("wtype"));
     }
 }
