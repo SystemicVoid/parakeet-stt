@@ -44,6 +44,12 @@ pub enum PasteKeyBackend {
     Auto,
 }
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteBackendFailurePolicy {
+    CopyOnly,
+    Error,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipboardOptions {
     pub paste_shortcut: PasteShortcut,
@@ -56,6 +62,7 @@ pub struct ClipboardOptions {
     pub copy_foreground: bool,
     pub mime_type: String,
     pub key_backend: PasteKeyBackend,
+    pub backend_failure_policy: PasteBackendFailurePolicy,
     pub seat: Option<String>,
     pub write_primary: bool,
 }

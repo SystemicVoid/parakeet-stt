@@ -121,6 +121,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Wtype)]
     paste_key_backend: CliPasteKeyBackend,
 
+    /// Behavior when selected paste backend cannot be initialized or used.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliPasteBackendFailurePolicy::CopyOnly
+    )]
+    paste_backend_failure_policy: CliPasteBackendFailurePolicy,
+
     /// Optional Wayland seat for wl-copy/wl-paste operations.
     #[arg(long)]
     paste_seat: Option<String>,
@@ -236,6 +244,23 @@ impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteBackendFailurePolicy {
+    CopyOnly,
+    Error,
+}
+
+impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePolicy {
+    fn from(policy: CliPasteBackendFailurePolicy) -> Self {
+        match policy {
+            CliPasteBackendFailurePolicy::CopyOnly => {
+                crate::config::PasteBackendFailurePolicy::CopyOnly
+            }
+            CliPasteBackendFailurePolicy::Error => crate::config::PasteBackendFailurePolicy::Error,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -262,6 +287,7 @@ async fn main() -> Result<()> {
                 copy_foreground: cli.paste_copy_foreground,
                 mime_type: cli.paste_mime_type.clone(),
                 key_backend: cli.paste_key_backend.into(),
+                backend_failure_policy: cli.paste_backend_failure_policy.into(),
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -388,6 +414,7 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 copy_foreground = config.clipboard.copy_foreground,
                 paste_mime_type = %config.clipboard.mime_type,
                 paste_key_backend = ?config.clipboard.key_backend,
+                paste_backend_failure_policy = ?config.clipboard.backend_failure_policy,
                 uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,

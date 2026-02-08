@@ -962,7 +962,8 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
-        ClipboardOptions, PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
+        PasteShortcut, PasteStrategy,
     };
     use evdev::Key;
 
@@ -982,6 +983,7 @@ mod tests {
             copy_foreground: true,
             mime_type: "text/plain;charset=utf-8".to_string(),
             key_backend: PasteKeyBackend::Wtype,
+            backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
             seat: None,
             write_primary: false,
         }
