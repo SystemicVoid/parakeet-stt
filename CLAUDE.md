@@ -12,11 +12,13 @@ Parakeet STT is a local, low-latency speech-to-text system for Linux/Wayland. It
 parakeet-ptt (Rust)              parakeet-stt-daemon (Python)
 ├── evdev hotkey (Right Ctrl)    ├── FastAPI WebSocket server
 ├── WebSocket client       ────► ├── Audio capture (sounddevice)
-├── Text injection (wtype)  ◄──── ├── NeMo Parakeet inference
+├── Text injection (paste/type) ◄─ ├── NeMo Parakeet inference
 └── State machine                └── Session management
 ```
 
-**Control flow**: User presses Right Ctrl → client sends `start_session` → daemon captures audio → user releases → client sends `stop_session` → daemon transcribes → returns `final_result` → client injects text via wtype.
+**Control flow**: User presses Right Ctrl -> client sends `start_session` -> daemon captures audio -> user releases -> client sends `stop_session` -> daemon transcribes -> returns `final_result` -> client injects text based on configured mode (`paste`, `type`, or `copy-only`).
+
+Current default runtime profile (via `stt start`) is paste mode with strict single-shot behavior and no implicit shortcut fallback chaining.
 
 ## Build Commands
 
@@ -59,14 +61,14 @@ cargo test
 ### Helper Script (recommended workflow)
 ```bash
 source scripts/stt-helper.sh     # Source once per shell
-stt start                        # Start daemon + client in tmux
-stt start --paste                # Use clipboard injection mode
-stt start --paste --paste-restore-policy never  # Reliability-first paste
+stt start                        # Start daemon + client in tmux with robust defaults
+stt start --type                 # Opt back into direct typing mode
 stt stop                         # Stop everything
 stt status                       # Check running processes
 stt show                         # Attach to tmux session
 stt logs [client|daemon|both]    # Tail log files
 stt check                        # Run daemon health check
+stt diag-injector                # Capability checks + injection test matrix
 ```
 
 Logs: `/tmp/parakeet-daemon.log`, `/tmp/parakeet-ptt.log`
@@ -84,7 +86,7 @@ Logs: `/tmp/parakeet-daemon.log`, `/tmp/parakeet-ptt.log`
 ### Client (`parakeet-ptt/src/`)
 - `main.rs` - CLI entry, hotkey loop, WebSocket message handling
 - `hotkey.rs` - evdev Right Ctrl detection
-- `injector.rs` - `WtypeInjector`, `ClipboardInjector` implementations
+- `injector.rs` - `WtypeInjector`, `ClipboardInjector`, uinput/ydotool/wtype backend ladder
 - `client.rs` - WebSocket connection wrapper
 - `protocol.rs` - Message types matching daemon protocol
 - `state.rs` - `PttState` (Idle → Listening → WaitingResult)
@@ -116,23 +118,38 @@ See `docs/SPEC.md` for complete protocol specification.
 
 - `PARAKEET_HOST` / `PARAKEET_PORT` - Daemon bind address (default: 127.0.0.1:8765)
 - `PARAKEET_ROOT` - Override repo root for helper script
-- `PARAKEET_INJECTION_MODE` - Default injection mode (type/paste)
-- `PARAKEET_PASTE_SHORTCUT` - Paste chord in paste mode (`ctrl-shift-v`, etc.)
-- `PARAKEET_PASTE_SHORTCUT_FALLBACK` - Optional fallback chord (`none` by default)
+- `PARAKEET_INJECTION_MODE` - Default injection mode (`paste` default)
+- `PARAKEET_PASTE_SHORTCUT` - Paste chord (`ctrl-shift-v` default)
+- `PARAKEET_PASTE_SHORTCUT_FALLBACK` - Fallback chord (`none` default)
+- `PARAKEET_PASTE_STRATEGY` - `single|on-error|always-chain` (`single` default)
+- `PARAKEET_PASTE_CHAIN_DELAY_MS` - Delay between chained shortcuts (`45` default)
 - `PARAKEET_PASTE_RESTORE_POLICY` - `never` or `delayed` (default `never`)
 - `PARAKEET_PASTE_RESTORE_DELAY_MS` - Delay before restore when using delayed policy
+- `PARAKEET_PASTE_POST_CHORD_HOLD_MS` - Keep ownership after chord (`700` default)
 - `PARAKEET_PASTE_COPY_FOREGROUND` - Keep wl-copy foreground source during paste (`true` default)
 - `PARAKEET_PASTE_MIME_TYPE` - MIME type for clipboard writes (default `text/plain;charset=utf-8`)
+- `PARAKEET_PASTE_KEY_BACKEND` - `wtype|ydotool|uinput|auto` (`auto` default via helper)
+- `PARAKEET_PASTE_BACKEND_FAILURE_POLICY` - `copy-only|error` (`copy-only` default)
+- `PARAKEET_UINPUT_DWELL_MS` - uinput key dwell time (default `18`)
+- `PARAKEET_PASTE_SEAT` - Optional seat override for wl-copy/wl-paste
+- `PARAKEET_PASTE_WRITE_PRIMARY` - Mirror transcript to PRIMARY selection (`false` default)
+- `PARAKEET_YDOTOOL_PATH` - Optional path override for ydotool binary
 - `PARAKEET_SILENCE_FLOOR_DB` - Silence trim threshold
 - `RUST_LOG` - Rust logging level (default: info)
 
 ## Testing
 
-No formal test suite yet. Manual verification:
+Primary checks:
+- `cargo test` in `parakeet-ptt` (includes injector fallback/policy tests)
+- `uv run pytest` in `parakeet-stt-daemon` when tests are present
+
+Manual verification:
 - `parakeet-stt-daemon/test-run.py` + sample WAV for model smoke test
-- `cargo run -- --test-injection` to verify wtype works
-- `cargo run -- --demo` for single start/stop cycle
+- `stt diag-injector` for backend capability and chord path checks
+- `cargo run --release -- --test-injection --injection-mode paste ...` for focused injector runs
 
 ## Handoffs
 
 - Clipboard injector investigation: `docs/HANDOFF-clipboard-injector-2026-02-08.md`
+- Injection strategy and phased delivery: `docs/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
+- Product-facing UX roadmap: `ROADMAP.md`
