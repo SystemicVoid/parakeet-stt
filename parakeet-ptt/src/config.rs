@@ -22,13 +22,25 @@ pub enum PasteShortcut {
     ShiftInsert,
 }
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteRestorePolicy {
+    Never,
+    Delayed,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipboardOptions {
+    pub paste_shortcut: PasteShortcut,
+    pub restore_policy: PasteRestorePolicy,
+    pub restore_delay_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct InjectionConfig {
     pub wtype_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
     pub injection_mode: InjectionMode,
-    pub paste_shortcut: PasteShortcut,
-    pub paste_restore_delay_ms: u64,
+    pub clipboard: ClipboardOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -39,8 +51,7 @@ pub struct ClientConfig {
     pub wtype_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
     pub injection_mode: InjectionMode,
-    pub paste_shortcut: PasteShortcut,
-    pub paste_restore_delay_ms: u64,
+    pub clipboard: ClipboardOptions,
     pub connect_timeout: Duration,
 }
 
@@ -61,8 +72,7 @@ impl ClientConfig {
             wtype_path: injection.wtype_path,
             wtype_delay_ms: injection.wtype_delay_ms,
             injection_mode: injection.injection_mode,
-            paste_shortcut: injection.paste_shortcut,
-            paste_restore_delay_ms: injection.paste_restore_delay_ms,
+            clipboard: injection.clipboard,
             connect_timeout,
         })
     }

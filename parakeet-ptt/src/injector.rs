@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::config::PasteShortcut;
+use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut};
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
@@ -58,20 +58,14 @@ impl TextInjector for WtypeInjector {
 #[derive(Debug, Clone)]
 pub struct ClipboardInjector {
     wtype_binary: PathBuf,
-    paste_shortcut: PasteShortcut,
-    restore_delay_ms: u64,
+    options: ClipboardOptions,
 }
 
 impl ClipboardInjector {
-    pub fn new(
-        wtype_binary: PathBuf,
-        paste_shortcut: PasteShortcut,
-        restore_delay_ms: u64,
-    ) -> Self {
+    pub fn new(wtype_binary: PathBuf, options: ClipboardOptions) -> Self {
         Self {
             wtype_binary,
-            paste_shortcut,
-            restore_delay_ms,
+            options,
         }
     }
 
@@ -125,12 +119,12 @@ impl ClipboardInjector {
 
     fn run_paste_shortcut(&self) -> Result<()> {
         debug!(
-            shortcut = ?self.paste_shortcut,
-            args = ?Self::shortcut_args(self.paste_shortcut),
+            shortcut = ?self.options.paste_shortcut,
+            args = ?Self::shortcut_args(self.options.paste_shortcut),
             "sending paste chord via wtype"
         );
         let status = Command::new(&self.wtype_binary)
-            .args(Self::shortcut_args(self.paste_shortcut))
+            .args(Self::shortcut_args(self.options.paste_shortcut))
             .status()
             .context("failed to spawn wtype for paste chord")?;
 
@@ -138,7 +132,7 @@ impl ClipboardInjector {
         if !status.success() {
             anyhow::bail!(
                 "paste key chord {:?} exited with status {}",
-                self.paste_shortcut,
+                self.options.paste_shortcut,
                 status
             );
         }
@@ -169,8 +163,9 @@ impl TextInjector for ClipboardInjector {
         let start = Instant::now();
         info!(
             mode = "paste",
-            shortcut = ?self.paste_shortcut,
-            restore_delay_ms = self.restore_delay_ms,
+            shortcut = ?self.options.paste_shortcut,
+            restore_policy = ?self.options.restore_policy,
+            restore_delay_ms = self.options.restore_delay_ms,
             len = text.len(),
             preview = %preview(text),
             "injecting via clipboard"
@@ -239,7 +234,9 @@ impl TextInjector for ClipboardInjector {
                 elapsed_ms = start.elapsed().as_millis(),
                 "paste chord failed; attempting clipboard restore"
             );
-            Self::restore_clipboard(&original_clipboard);
+            if matches!(self.options.restore_policy, PasteRestorePolicy::Delayed) {
+                Self::restore_clipboard(&original_clipboard);
+            }
             return Err(err);
         }
         debug!(
@@ -247,15 +244,26 @@ impl TextInjector for ClipboardInjector {
             "paste chord completed"
         );
 
-        // 4. Restore original clipboard (optional, but good UX)
-        // A delay avoids racing the target application's clipboard read.
-        debug!(
-            elapsed_ms = start.elapsed().as_millis(),
-            restore_delay_ms = self.restore_delay_ms,
-            "sleeping before clipboard restore"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(self.restore_delay_ms));
-        Self::restore_clipboard(&original_clipboard);
+        match self.options.restore_policy {
+            PasteRestorePolicy::Never => {
+                debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "restore policy is never; leaving transcript in clipboard"
+                );
+            }
+            PasteRestorePolicy::Delayed => {
+                // A delay avoids racing the target application's clipboard read.
+                debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    restore_delay_ms = self.options.restore_delay_ms,
+                    "sleeping before clipboard restore"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(
+                    self.options.restore_delay_ms,
+                ));
+                Self::restore_clipboard(&original_clipboard);
+            }
+        }
         debug!(
             elapsed_ms = start.elapsed().as_millis(),
             "clipboard injection flow finished"
