@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::client::WsClient;
-use crate::config::{ClientConfig, DEFAULT_ENDPOINT};
+use crate::config::{ClientConfig, InjectionConfig, DEFAULT_ENDPOINT};
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{NoopInjector, TextInjector, WtypeInjector};
 use crate::protocol::{start_message, stop_message, ServerMessage};
@@ -66,9 +66,19 @@ struct Cli {
     /// Override text to inject during demo (otherwise uses daemon final result)
     #[arg(long)]
     demo_text: Option<String>,
+
     /// Injection mode: 'type' (default) or 'paste'
     #[arg(long, value_enum, default_value_t = CliInjectionMode::Type)]
     injection_mode: CliInjectionMode,
+
+    /// Paste key chord to use in paste mode.
+    /// Use `ctrl-shift-v` for terminals like Ghostty.
+    #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
+    paste_shortcut: CliPasteShortcut,
+
+    /// Delay before restoring clipboard after paste key chord.
+    #[arg(long, default_value_t = 250)]
+    paste_restore_delay_ms: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -86,6 +96,23 @@ impl From<CliInjectionMode> for crate::config::InjectionMode {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteShortcut {
+    CtrlV,
+    CtrlShiftV,
+    ShiftInsert,
+}
+
+impl From<CliPasteShortcut> for crate::config::PasteShortcut {
+    fn from(shortcut: CliPasteShortcut) -> Self {
+        match shortcut {
+            CliPasteShortcut::CtrlV => crate::config::PasteShortcut::CtrlV,
+            CliPasteShortcut::CtrlShiftV => crate::config::PasteShortcut::CtrlShiftV,
+            CliPasteShortcut::ShiftInsert => crate::config::PasteShortcut::ShiftInsert,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -95,9 +122,13 @@ async fn main() -> Result<()> {
         &cli.endpoint,
         cli.shared_secret.clone(),
         cli.hotkey.clone(),
-        cli.wtype.clone(),
-        cli.wtype_delay_ms,
-        cli.injection_mode.into(),
+        InjectionConfig {
+            wtype_path: cli.wtype.clone(),
+            wtype_delay_ms: cli.wtype_delay_ms,
+            injection_mode: cli.injection_mode.into(),
+            paste_shortcut: cli.paste_shortcut.into(),
+            paste_restore_delay_ms: cli.paste_restore_delay_ms,
+        },
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
@@ -158,8 +189,17 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
             Box::new(WtypeInjector::new(wtype_binary, config.wtype_delay_ms))
         }
         InjectionMode::Paste => {
-            info!(?wtype_binary, "Using clipboard injector (paste mode)");
-            Box::new(ClipboardInjector::new(wtype_binary, config.wtype_delay_ms))
+            info!(
+                ?wtype_binary,
+                paste_shortcut = ?config.paste_shortcut,
+                restore_delay_ms = config.paste_restore_delay_ms,
+                "Using clipboard injector (paste mode)"
+            );
+            Box::new(ClipboardInjector::new(
+                wtype_binary,
+                config.paste_shortcut,
+                config.paste_restore_delay_ms,
+            ))
         }
     }
 }

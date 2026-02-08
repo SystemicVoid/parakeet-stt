@@ -4,6 +4,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+use crate::config::PasteShortcut;
+
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
 }
@@ -55,14 +57,20 @@ impl TextInjector for WtypeInjector {
 #[derive(Debug, Clone)]
 pub struct ClipboardInjector {
     wtype_binary: PathBuf,
-    delay_ms: u64,
+    paste_shortcut: PasteShortcut,
+    restore_delay_ms: u64,
 }
 
 impl ClipboardInjector {
-    pub fn new(wtype_binary: PathBuf, delay_ms: u64) -> Self {
+    pub fn new(
+        wtype_binary: PathBuf,
+        paste_shortcut: PasteShortcut,
+        restore_delay_ms: u64,
+    ) -> Self {
         Self {
             wtype_binary,
-            delay_ms,
+            paste_shortcut,
+            restore_delay_ms,
         }
     }
 
@@ -81,8 +89,6 @@ impl ClipboardInjector {
     }
 
     fn set_clipboard(text: &str) -> Result<()> {
-        // wl-copy reads from stdin if no arguments are provided, or we can use echo | wl-copy
-        // But safer to write to stdin of the process
         let mut child = Command::new("wl-copy")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -95,11 +101,50 @@ impl ClipboardInjector {
                 .context("failed to write to wl-copy stdin")?;
         }
 
+        // wl-copy forks a background helper by default. Piping stderr and reading
+        // with wait_with_output can hang because the helper keeps the pipe open.
         let status = child.wait().context("failed to wait for wl-copy")?;
         if !status.success() {
             anyhow::bail!("wl-copy exited with status {}", status);
         }
         Ok(())
+    }
+
+    fn shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
+        match shortcut {
+            PasteShortcut::CtrlV => &["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+            PasteShortcut::CtrlShiftV => &[
+                "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
+            ],
+            PasteShortcut::ShiftInsert => &["-M", "shift", "-k", "Insert", "-m", "shift"],
+        }
+    }
+
+    fn run_paste_shortcut(&self) -> Result<()> {
+        let status = Command::new(&self.wtype_binary)
+            .args(Self::shortcut_args(self.paste_shortcut))
+            .status()
+            .context("failed to spawn wtype for paste chord")?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "paste key chord {:?} exited with status {}",
+                self.paste_shortcut,
+                status
+            );
+        }
+
+        Ok(())
+    }
+
+    fn restore_clipboard(original: &Option<String>) {
+        let Some(original_clipboard) = original else {
+            return;
+        };
+
+        if let Err(err) = Self::set_clipboard(original_clipboard) {
+            warn!(error = %err, "failed to restore original clipboard");
+        }
     }
 }
 
@@ -107,53 +152,54 @@ impl TextInjector for ClipboardInjector {
     fn inject(&self, text: &str) -> Result<()> {
         info!(
             mode = "paste",
+            shortcut = ?self.paste_shortcut,
             len = text.len(),
             preview = %preview(text),
             "injecting via clipboard"
         );
 
         // 1. Save current clipboard
-        let original_clipboard = Self::get_clipboard().unwrap_or_default();
+        let original_clipboard = match Self::get_clipboard() {
+            Ok(value) => Some(value),
+            Err(err) => {
+                warn!(error = %err, "failed to read current clipboard before paste; restore will be skipped");
+                None
+            }
+        };
 
         // 2. Set new text to clipboard
         Self::set_clipboard(text)?;
 
-        // 2b. Verify clipboard round-trip so we can bail early if the compositor rejected it.
-        let roundtrip = Self::get_clipboard().unwrap_or_default();
-        if roundtrip != text {
-            warn!(
-                mode = "paste",
-                requested_len = text.len(),
-                stored_len = roundtrip.len(),
-                "clipboard roundtrip mismatch; falling back to type injection"
-            );
-            return WtypeInjector::new(self.wtype_binary.clone(), self.delay_ms).inject(text);
+        // 2b. Round-trip verification is informative only: some clipboard managers
+        // transform/normalize content, so mismatch should not block paste.
+        match Self::get_clipboard() {
+            Ok(roundtrip) if roundtrip != text => {
+                warn!(
+                    mode = "paste",
+                    requested_len = text.len(),
+                    stored_len = roundtrip.len(),
+                    "clipboard roundtrip mismatch; continuing paste attempt"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to read clipboard after wl-copy; continuing paste attempt"
+                );
+            }
         }
 
-        // 3. Simulate Ctrl+V
-        // wtype -M ctrl -k v -m ctrl
-        let status = Command::new(&self.wtype_binary)
-            .arg("-M")
-            .arg("ctrl")
-            .arg("-k")
-            .arg("v")
-            .arg("-m")
-            .arg("ctrl")
-            .status()
-            .context("failed to spawn wtype for paste")?;
-
-        if !status.success() {
-            warn!(
-                code = ?status.code(),
-                "wtype paste exited non-zero; falling back to type injection"
-            );
-            return WtypeInjector::new(self.wtype_binary.clone(), self.delay_ms).inject(text);
+        // 3. Simulate the configured paste shortcut (e.g. Ctrl+Shift+V in Ghostty).
+        if let Err(err) = self.run_paste_shortcut() {
+            Self::restore_clipboard(&original_clipboard);
+            return Err(err);
         }
 
         // 4. Restore original clipboard (optional, but good UX)
-        // We need a small delay to ensure the paste has happened before we restore
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = Self::set_clipboard(&original_clipboard);
+        // A delay avoids racing the target application's clipboard read.
+        std::thread::sleep(std::time::Duration::from_millis(self.restore_delay_ms));
+        Self::restore_clipboard(&original_clipboard);
 
         Ok(())
     }

@@ -15,6 +15,22 @@ pub enum InjectionMode {
     Paste,
 }
 
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteShortcut {
+    CtrlV,
+    CtrlShiftV,
+    ShiftInsert,
+}
+
+#[derive(Clone, Debug)]
+pub struct InjectionConfig {
+    pub wtype_path: Option<PathBuf>,
+    pub wtype_delay_ms: u64,
+    pub injection_mode: InjectionMode,
+    pub paste_shortcut: PasteShortcut,
+    pub paste_restore_delay_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub endpoint: Url,
@@ -23,6 +39,8 @@ pub struct ClientConfig {
     pub wtype_path: Option<PathBuf>,
     pub wtype_delay_ms: u64,
     pub injection_mode: InjectionMode,
+    pub paste_shortcut: PasteShortcut,
+    pub paste_restore_delay_ms: u64,
     pub connect_timeout: Duration,
 }
 
@@ -31,9 +49,7 @@ impl ClientConfig {
         endpoint: &str,
         shared_secret: Option<String>,
         hotkey: String,
-        wtype_path: Option<PathBuf>,
-        wtype_delay_ms: u64,
-        injection_mode: InjectionMode,
+        injection: InjectionConfig,
         connect_timeout: Duration,
     ) -> Result<Self> {
         let endpoint = Url::parse(endpoint)
@@ -42,9 +58,11 @@ impl ClientConfig {
             endpoint,
             shared_secret,
             hotkey,
-            wtype_path,
-            wtype_delay_ms,
-            injection_mode,
+            wtype_path: injection.wtype_path,
+            wtype_delay_ms: injection.wtype_delay_ms,
+            injection_mode: injection.injection_mode,
+            paste_shortcut: injection.paste_shortcut,
+            paste_restore_delay_ms: injection.paste_restore_delay_ms,
             connect_timeout,
         })
     }
