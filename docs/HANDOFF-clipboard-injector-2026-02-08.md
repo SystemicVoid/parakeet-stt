@@ -1,5 +1,13 @@
 # Clipboard Injector Handoff (2026-02-08)
 
+## Canonical roadmap
+
+For implementation strategy and phased execution, start with:
+
+- `docs/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
+
+This handoff remains the detailed investigation log and runtime evidence archive.
+
 ## Update (systematic implementation pass)
 
 This pass implemented the planned robustness changes across Rust injector + helper.
