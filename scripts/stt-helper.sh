@@ -22,7 +22,7 @@ stt() {
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
-    local default_injection_mode="${PARAKEET_INJECTION_MODE:-type}"
+    local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
     local default_paste_shortcut="${PARAKEET_PASTE_SHORTCUT:-ctrl-shift-v}"
     local default_paste_shortcut_fallback="${PARAKEET_PASTE_SHORTCUT_FALLBACK:-none}"
     local default_paste_strategy="${PARAKEET_PASTE_STRATEGY:-single}"
@@ -32,7 +32,7 @@ stt() {
     local default_paste_post_chord_hold_ms="${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}"
     local default_paste_copy_foreground="${PARAKEET_PASTE_COPY_FOREGROUND:-true}"
     local default_paste_mime_type="${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}"
-    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-wtype}"
+    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
@@ -665,7 +665,7 @@ PY
 
                 args=( \
                     --endpoint "$DEFAULT_ENDPOINT" \
-                    --injection-mode "${INJECTION_MODE:-type}" \
+                    --injection-mode "${INJECTION_MODE:-paste}" \
                     --paste-shortcut "${PASTE_SHORTCUT:-ctrl-shift-v}" \
                     --paste-shortcut-fallback "${PASTE_SHORTCUT_FALLBACK:-none}" \
                     --paste-strategy "${PASTE_STRATEGY:-single}" \
@@ -675,7 +675,7 @@ PY
                     --paste-post-chord-hold-ms "${PASTE_POST_CHORD_HOLD_MS:-700}" \
                     --paste-copy-foreground "${PASTE_COPY_FOREGROUND:-true}" \
                     --paste-mime-type "${PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
-                    --paste-key-backend "${PASTE_KEY_BACKEND:-wtype}" \
+                    --paste-key-backend "${PASTE_KEY_BACKEND:-auto}" \
                     --paste-backend-failure-policy "${PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                     --uinput-dwell-ms "${UINPUT_DWELL_MS:-18}" \
                     --paste-write-primary "${PASTE_WRITE_PRIMARY:-false}" \
@@ -748,7 +748,7 @@ PY
                             --paste-post-chord-hold-ms "${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}" \
                             --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
                             --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
-                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-auto}" \
                             --paste-backend-failure-policy "${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                             --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -764,7 +764,7 @@ PY
                             --paste-post-chord-hold-ms "${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}" \
                             --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
                             --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
-                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-auto}" \
                             --paste-backend-failure-policy "${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                             --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
