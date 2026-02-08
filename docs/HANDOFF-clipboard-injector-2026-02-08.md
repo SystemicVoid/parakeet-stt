@@ -1,5 +1,90 @@
 # Clipboard Injector Handoff (2026-02-08)
 
+## Update (systematic implementation pass)
+
+This pass implemented the planned robustness changes across Rust injector + helper.
+
+### New behavior now in tree
+
+1. Structured per-injection tracing in `parakeet-ptt/src/injector.rs`.
+   - Adds monotonic `trace_id` and outcome classification:
+     - `success_assumed`
+     - `clipboard_not_ready`
+     - `chord_failed`
+     - `no_effect_suspected`
+     - `copy_only`
+   - Logs clipboard fingerprints/lengths and step timings, without dumping full transcript text.
+
+2. Paste strategy engine.
+   - New strategy control:
+     - `single`
+     - `on-error`
+     - `always-chain`
+   - Shortcut attempts now support semantic chaining with configurable inter-chord delay.
+   - Chain can include primary shortcut, configured fallback, and `Ctrl+V` as a final rescue attempt.
+
+3. Post-chord ownership hold and improved race handling.
+   - New configurable hold after shortcut(s): `--paste-post-chord-hold-ms`.
+   - Foreground `wl-copy` ownership remains alive through chord and hold before transfer/restore.
+
+4. Wayland clipboard controls.
+   - Seat-aware clipboard IO (`--paste-seat`).
+   - Optional PRIMARY selection mirroring (`--paste-write-primary`).
+
+5. Alternate key backend + copy-only mode.
+   - Paste key backend now configurable:
+     - `wtype`
+     - `ydotool`
+     - `auto` (prefer `ydotool`, fallback `wtype`)
+   - New injection mode: `copy-only` (writes clipboard, skips key chord).
+
+6. Helper propagation in `scripts/stt-helper.sh`.
+   - `stt start` and `stt tmux` now forward all new flags/env defaults.
+   - Added `stt diag-injector` matrix command for repeatable `--test-injection` runs.
+   - Startup output now prints active strategy/backend/hold settings.
+
+### New CLI surfaces (Rust client)
+
+- `--injection-mode type|paste|copy-only`
+- `--ydotool <path>`
+- `--paste-strategy single|on-error|always-chain`
+- `--paste-chain-delay-ms <ms>`
+- `--paste-post-chord-hold-ms <ms>`
+- `--paste-key-backend wtype|ydotool|auto`
+- `--paste-seat <seat>`
+- `--paste-write-primary true|false`
+- fallback now accepts `ctrl-shift-v` too
+
+### Verification in this pass
+
+- `cargo fmt` (client) passed.
+- `cargo test` (client) passed.
+- `bash -n scripts/stt-helper.sh` passed.
+- `cargo run --release -- --test-injection --injection-mode copy-only` passed with debug trace output.
+- `cargo run --release -- --test-injection --injection-mode paste ... --paste-strategy always-chain ...` passed with expected multi-step logs.
+- `cargo clippy --all-targets --all-features -- -D warnings` still fails only on pre-existing `clippy::enum_variant_names` in `parakeet-ptt/src/protocol.rs` (unchanged in this pass).
+
+### Operational recommendation right now
+
+Start with:
+
+```bash
+stt start --paste \
+  --paste-shortcut ctrl-shift-v \
+  --paste-shortcut-fallback shift-insert \
+  --paste-strategy always-chain \
+  --paste-chain-delay-ms 45 \
+  --paste-post-chord-hold-ms 700 \
+  --paste-restore-policy never \
+  --paste-copy-foreground true
+```
+
+If key chord acceptance remains inconsistent in a target app:
+
+```bash
+stt start --copy-only
+```
+
 ## Update (deeper pass after user repro: stale first paste, then empty)
 
 ### Latest user-reported behavior

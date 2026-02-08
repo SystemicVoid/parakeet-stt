@@ -46,13 +46,23 @@ With the append-only logging, tmux-based client start, PID tracking, and longer 
 
 ## Clipboard injection tuning (Feb 8, 2026)
 
-Paste mode now exposes reliability controls end-to-end through `stt start` and `parakeet-ptt`:
+Paste/copy injection now exposes a strategy-driven pipeline through `stt start` and
+`parakeet-ptt`:
 
+- `--injection-mode type|paste|copy-only`
+- `--paste-shortcut ctrl-v|ctrl-shift-v|shift-insert`
+- `--paste-shortcut-fallback none|ctrl-v|ctrl-shift-v|shift-insert`
+- `--paste-strategy single|on-error|always-chain` (default: `always-chain`)
+- `--paste-chain-delay-ms <ms>` (default: `45`)
+- `--paste-post-chord-hold-ms <ms>` (default: `700`)
 - `--paste-restore-policy never|delayed` (default: `never`)
-- `--paste-restore-delay-ms <ms>`
+- `--paste-restore-delay-ms <ms>` (default: `250`)
 - `--paste-copy-foreground true|false` (default: `true`)
 - `--paste-mime-type text/plain;charset=utf-8` (default)
-- `--paste-shortcut-fallback none|ctrl-v|shift-insert` (default: `none`)
+- `--paste-key-backend wtype|ydotool|auto` (default: `wtype`)
+- `--paste-seat <seat>` (optional)
+- `--paste-write-primary true|false` (default: `false`)
+- `--ydotool <path>` (optional explicit path override)
 
 Recommended baseline for Ghostty/COSMIC:
 
@@ -60,6 +70,26 @@ Recommended baseline for Ghostty/COSMIC:
 stt start --paste \
   --paste-shortcut ctrl-shift-v \
   --paste-shortcut-fallback shift-insert \
+  --paste-strategy always-chain \
+  --paste-chain-delay-ms 45 \
+  --paste-post-chord-hold-ms 700 \
   --paste-restore-policy never \
   --paste-copy-foreground true
 ```
+
+If automatic paste is still unstable, force deterministic behavior while preserving transcript
+delivery:
+
+```bash
+stt start --copy-only
+```
+
+### Injector diagnostics
+
+Use the new helper matrix command:
+
+```bash
+stt diag-injector
+```
+
+It runs three `--test-injection` shortcut combinations with injector debug logging.
