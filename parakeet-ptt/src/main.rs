@@ -55,6 +55,10 @@ struct Cli {
     #[arg(long, default_value_t = 6)]
     wtype_delay_ms: u64,
 
+    /// Key dwell time in milliseconds for direct uinput paste chords
+    #[arg(long, default_value_t = 18)]
+    uinput_dwell_ms: u64,
+
     /// Connection timeout in seconds
     #[arg(long, default_value_t = 5)]
     timeout_seconds: u64,
@@ -217,6 +221,7 @@ impl From<CliPasteRestorePolicy> for crate::config::PasteRestorePolicy {
 enum CliPasteKeyBackend {
     Wtype,
     Ydotool,
+    Uinput,
     Auto,
 }
 
@@ -225,6 +230,7 @@ impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
         match backend {
             CliPasteKeyBackend::Wtype => crate::config::PasteKeyBackend::Wtype,
             CliPasteKeyBackend::Ydotool => crate::config::PasteKeyBackend::Ydotool,
+            CliPasteKeyBackend::Uinput => crate::config::PasteKeyBackend::Uinput,
             CliPasteKeyBackend::Auto => crate::config::PasteKeyBackend::Auto,
         }
     }
@@ -243,6 +249,7 @@ async fn main() -> Result<()> {
             wtype_path: cli.wtype.clone(),
             ydotool_path: cli.ydotool.clone(),
             wtype_delay_ms: cli.wtype_delay_ms,
+            uinput_dwell_ms: cli.uinput_dwell_ms,
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
                 paste_shortcut: cli.paste_shortcut.into(),
@@ -281,7 +288,7 @@ async fn main() -> Result<()> {
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
     use crate::config::{InjectionMode, PasteKeyBackend};
-    use crate::injector::{ClipboardInjector, PasteKeySender};
+    use crate::injector::{ClipboardInjector, PasteKeySender, UinputChordSender};
 
     let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
         if let Some(path) = configured {
@@ -332,16 +339,36 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                         };
                         PasteKeySender::Ydotool(path)
                     }
-                    PasteKeyBackend::Auto => {
-                        if let Some(path) = ydotool_binary.clone() {
-                            PasteKeySender::Ydotool(path)
-                        } else if let Some(path) = wtype_binary.clone() {
-                            PasteKeySender::Wtype(path)
-                        } else {
-                            error!("paste_key_backend=auto could not find ydotool or wtype; falling back to noop");
+                    PasteKeyBackend::Uinput => match UinputChordSender::new(config.uinput_dwell_ms)
+                    {
+                        Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                dwell_ms = config.uinput_dwell_ms,
+                                "paste_key_backend=uinput could not initialize /dev/uinput; falling back to noop"
+                            );
                             return Box::new(NoopInjector);
                         }
-                    }
+                    },
+                    PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
+                        Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                dwell_ms = config.uinput_dwell_ms,
+                                "paste_key_backend=auto could not initialize uinput; trying ydotool/wtype backends"
+                            );
+                            if let Some(path) = ydotool_binary.clone() {
+                                PasteKeySender::Ydotool(path)
+                            } else if let Some(path) = wtype_binary.clone() {
+                                PasteKeySender::Wtype(path)
+                            } else {
+                                error!("paste_key_backend=auto could not initialize uinput and could not find ydotool or wtype; falling back to noop");
+                                return Box::new(NoopInjector);
+                            }
+                        }
+                    },
                 }
             };
 
@@ -361,6 +388,7 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 copy_foreground = config.clipboard.copy_foreground,
                 paste_mime_type = %config.clipboard.mime_type,
                 paste_key_backend = ?config.clipboard.key_backend,
+                uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
                 "Using clipboard injector"
