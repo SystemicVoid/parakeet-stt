@@ -8,6 +8,50 @@ For implementation strategy and phased execution, start with:
 
 This handoff remains the detailed investigation log and runtime evidence archive.
 
+## Current truth snapshot (2026-02-08, post-uinput MVP hardening)
+
+This section is the canonical quick state for current branch behavior.
+
+### What is now implemented
+
+1. Direct `uinput` paste backend is available (`--paste-key-backend uinput`).
+2. `auto` backend now uses runtime fallback ladder:
+   - `uinput -> ydotool -> wtype` per shortcut attempt.
+3. Paste backend failure policy is explicit:
+   - `--paste-backend-failure-policy copy-only|error` (default `copy-only`).
+4. Backend init failures in paste mode no longer degrade to noop.
+   - `copy-only` policy preserves transcript delivery via clipboard write.
+   - `error` policy returns explicit injector failure.
+5. Helper lifecycle hardening:
+   - daemon reuse/restart decisions now use PID file + socket readiness, not name-only `pgrep`.
+6. Helper strictness and diagnostics:
+   - `stt start` now fails on unknown options.
+   - `stt diag-injector` now reports capability checks (`wtype`, `ydotool`, `/dev/uinput` writeability).
+
+### Verification in latest pass
+
+- `cargo fmt` (client) passed.
+- `cargo test` (client) passed: 7 tests.
+- `bash -n scripts/stt-helper.sh` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` still fails on pre-existing `clippy::enum_variant_names` in `parakeet-ptt/src/protocol.rs` (unchanged by injector migration work).
+
+### Current operational default recommendation
+
+Until app-matrix evidence justifies default promotion, keep conservative defaults:
+
+```bash
+stt start --paste \
+  --paste-key-backend wtype \
+  --paste-backend-failure-policy copy-only \
+  --paste-shortcut ctrl-shift-v \
+  --paste-shortcut-fallback shift-insert \
+  --paste-strategy always-chain \
+  --paste-chain-delay-ms 45 \
+  --paste-post-chord-hold-ms 700 \
+  --paste-restore-policy never \
+  --paste-copy-foreground true
+```
+
 ## Update (systematic implementation pass)
 
 This pass implemented the planned robustness changes across Rust injector + helper.
@@ -43,7 +87,8 @@ This pass implemented the planned robustness changes across Rust injector + help
    - Paste key backend now configurable:
      - `wtype`
      - `ydotool`
-     - `auto` (prefer `ydotool`, fallback `wtype`)
+     - `uinput`
+     - `auto` (runtime chain: `uinput -> ydotool -> wtype`)
    - New injection mode: `copy-only` (writes clipboard, skips key chord).
 
 6. Helper propagation in `scripts/stt-helper.sh`.
@@ -58,7 +103,8 @@ This pass implemented the planned robustness changes across Rust injector + help
 - `--paste-strategy single|on-error|always-chain`
 - `--paste-chain-delay-ms <ms>`
 - `--paste-post-chord-hold-ms <ms>`
-- `--paste-key-backend wtype|ydotool|auto`
+- `--paste-key-backend wtype|ydotool|uinput|auto`
+- `--paste-backend-failure-policy copy-only|error`
 - `--paste-seat <seat>`
 - `--paste-write-primary true|false`
 - fallback now accepts `ctrl-shift-v` too

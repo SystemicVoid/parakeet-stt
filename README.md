@@ -81,7 +81,11 @@ See `uv run parakeet-stt-daemon --help` for all options.
   - `--paste-copy-foreground <true|false>`
   - `--paste-mime-type <mime>`
   - `--paste-key-backend <wtype|ydotool|uinput|auto>`
+  - `--paste-backend-failure-policy <copy-only|error>` (default `copy-only`)
   - `--uinput-dwell-ms <ms>`
+- Backend defaults are intentionally conservative while migration is in progress:
+  - `--paste-key-backend wtype`
+  - `--paste-backend-failure-policy copy-only`
 - Logs live in `/tmp/parakeet-daemon.log` and `/tmp/parakeet-ptt.log`; `stt show` attaches to the tmux layout.
 - Keep your personal shell config private: only this helper is intended for sharing. You can copy the function into your dotfiles or re-source the script when needed.
 
