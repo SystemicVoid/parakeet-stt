@@ -25,10 +25,17 @@ stt() {
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-type}"
     local default_paste_shortcut="${PARAKEET_PASTE_SHORTCUT:-ctrl-shift-v}"
     local default_paste_shortcut_fallback="${PARAKEET_PASTE_SHORTCUT_FALLBACK:-none}"
+    local default_paste_strategy="${PARAKEET_PASTE_STRATEGY:-always-chain}"
+    local default_paste_chain_delay_ms="${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}"
     local default_paste_restore_policy="${PARAKEET_PASTE_RESTORE_POLICY:-never}"
     local default_paste_restore_delay_ms="${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}"
+    local default_paste_post_chord_hold_ms="${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}"
     local default_paste_copy_foreground="${PARAKEET_PASTE_COPY_FOREGROUND:-true}"
     local default_paste_mime_type="${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}"
+    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-wtype}"
+    local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
+    local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
+    local default_ydotool_path="${PARAKEET_YDOTOOL_PATH:-}"
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
     if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
@@ -166,10 +173,17 @@ PY
             local injection_mode="$default_injection_mode"
             local paste_shortcut="$default_paste_shortcut"
             local paste_shortcut_fallback="$default_paste_shortcut_fallback"
+            local paste_strategy="$default_paste_strategy"
+            local paste_chain_delay_ms="$default_paste_chain_delay_ms"
             local paste_restore_policy="$default_paste_restore_policy"
             local paste_restore_delay_ms="$default_paste_restore_delay_ms"
+            local paste_post_chord_hold_ms="$default_paste_post_chord_hold_ms"
             local paste_copy_foreground="$default_paste_copy_foreground"
             local paste_mime_type="$default_paste_mime_type"
+            local paste_key_backend="$default_paste_key_backend"
+            local paste_seat="$default_paste_seat"
+            local paste_write_primary="$default_paste_write_primary"
+            local ydotool_path="$default_ydotool_path"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --paste)
@@ -178,6 +192,10 @@ PY
                         ;;
                     --type)
                         injection_mode="type"
+                        shift
+                        ;;
+                    --copy-only)
+                        injection_mode="copy-only"
                         shift
                         ;;
                     --paste-shortcut)
@@ -196,6 +214,22 @@ PY
                         paste_shortcut_fallback="$2"
                         shift 2
                         ;;
+                    --paste-strategy)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-strategy"
+                            return 1
+                        fi
+                        paste_strategy="$2"
+                        shift 2
+                        ;;
+                    --paste-chain-delay-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-chain-delay-ms"
+                            return 1
+                        fi
+                        paste_chain_delay_ms="$2"
+                        shift 2
+                        ;;
                     --paste-restore-policy)
                         if [[ $# -lt 2 ]]; then
                             echo "   - Missing value for --paste-restore-policy"
@@ -210,6 +244,14 @@ PY
                             return 1
                         fi
                         paste_restore_delay_ms="$2"
+                        shift 2
+                        ;;
+                    --paste-post-chord-hold-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-post-chord-hold-ms"
+                            return 1
+                        fi
+                        paste_post_chord_hold_ms="$2"
                         shift 2
                         ;;
                     --paste-copy-foreground)
@@ -228,6 +270,38 @@ PY
                         paste_mime_type="$2"
                         shift 2
                         ;;
+                    --paste-key-backend)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-key-backend"
+                            return 1
+                        fi
+                        paste_key_backend="$2"
+                        shift 2
+                        ;;
+                    --paste-seat)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-seat"
+                            return 1
+                        fi
+                        paste_seat="$2"
+                        shift 2
+                        ;;
+                    --paste-write-primary)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --paste-write-primary"
+                            return 1
+                        fi
+                        paste_write_primary="$2"
+                        shift 2
+                        ;;
+                    --ydotool)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --ydotool"
+                            return 1
+                        fi
+                        ydotool_path="$2"
+                        shift 2
+                        ;;
                     *)
                         # Unknown option, maybe for something else?
                         # For now we ignore or could error.
@@ -241,10 +315,16 @@ PY
             echo "   - Injection mode: $injection_mode"
             echo "   - Paste shortcut: $paste_shortcut"
             echo "   - Paste shortcut fallback: $paste_shortcut_fallback"
+            echo "   - Paste strategy: $paste_strategy"
+            echo "   - Paste chain delay (ms): $paste_chain_delay_ms"
             echo "   - Paste restore policy: $paste_restore_policy"
             echo "   - Paste restore delay (ms): $paste_restore_delay_ms"
+            echo "   - Paste post-chord hold (ms): $paste_post_chord_hold_ms"
             echo "   - Paste copy foreground: $paste_copy_foreground"
             echo "   - Paste MIME type: $paste_mime_type"
+            echo "   - Paste key backend: $paste_key_backend"
+            echo "   - Paste seat: ${paste_seat:-<default>}"
+            echo "   - Paste write primary: $paste_write_primary"
 
             if ! _resolve_port; then
                 return 1
@@ -296,36 +376,61 @@ PY
             local client_cmd
             client_cmd='
                 set -e
-                runner=""
+                runner_bin=""
                 if [ -x target/release/parakeet-ptt ]; then
                     if target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut-fallback" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-strategy" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-chain-delay-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-policy" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-delay-ms" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-post-chord-hold-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-copy-foreground" \
-                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type"; then
-                        runner="./target/release/parakeet-ptt"
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
+                        runner_bin="./target/release/parakeet-ptt"
                     else
                         echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
-                if [ -z "$runner" ]; then
+                if [ -z "$runner_bin" ]; then
                     echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
-                    runner="cargo run --release --"
                 fi
-                exec $runner --endpoint "$DEFAULT_ENDPOINT" --injection-mode "$INJECTION_MODE" \
+
+                args=( \
+                    --endpoint "$DEFAULT_ENDPOINT" \
+                    --injection-mode "$INJECTION_MODE" \
                     --paste-shortcut "$PASTE_SHORTCUT" \
                     --paste-shortcut-fallback "$PASTE_SHORTCUT_FALLBACK" \
+                    --paste-strategy "$PASTE_STRATEGY" \
+                    --paste-chain-delay-ms "$PASTE_CHAIN_DELAY_MS" \
                     --paste-restore-policy "$PASTE_RESTORE_POLICY" \
                     --paste-restore-delay-ms "$PASTE_RESTORE_DELAY_MS" \
+                    --paste-post-chord-hold-ms "$PASTE_POST_CHORD_HOLD_MS" \
                     --paste-copy-foreground "$PASTE_COPY_FOREGROUND" \
                     --paste-mime-type "$PASTE_MIME_TYPE" \
-                    2>&1 | tee -a "$LOG_CLIENT"
+                    --paste-key-backend "$PASTE_KEY_BACKEND" \
+                    --paste-write-primary "$PASTE_WRITE_PRIMARY" \
+                )
+                if [ -n "${PASTE_SEAT:-}" ]; then
+                    args+=(--paste-seat "$PASTE_SEAT")
+                fi
+                if [ -n "${YDOTOOL_PATH:-}" ]; then
+                    args+=(--ydotool "$YDOTOOL_PATH")
+                fi
+
+                if [ -n "$runner_bin" ]; then
+                    "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                else
+                    cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                fi
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
@@ -459,43 +564,74 @@ PY
             local injection_mode="${INJECTION_MODE:-$default_injection_mode}"
             local paste_shortcut="${PASTE_SHORTCUT:-$default_paste_shortcut}"
             local paste_shortcut_fallback="${PASTE_SHORTCUT_FALLBACK:-$default_paste_shortcut_fallback}"
+            local paste_strategy="${PASTE_STRATEGY:-$default_paste_strategy}"
+            local paste_chain_delay_ms="${PASTE_CHAIN_DELAY_MS:-$default_paste_chain_delay_ms}"
             local paste_restore_policy="${PASTE_RESTORE_POLICY:-$default_paste_restore_policy}"
             local paste_restore_delay_ms="${PASTE_RESTORE_DELAY_MS:-$default_paste_restore_delay_ms}"
+            local paste_post_chord_hold_ms="${PASTE_POST_CHORD_HOLD_MS:-$default_paste_post_chord_hold_ms}"
             local paste_copy_foreground="${PASTE_COPY_FOREGROUND:-$default_paste_copy_foreground}"
             local paste_mime_type="${PASTE_MIME_TYPE:-$default_paste_mime_type}"
+            local paste_key_backend="${PASTE_KEY_BACKEND:-$default_paste_key_backend}"
+            local paste_seat="${PASTE_SEAT:-$default_paste_seat}"
+            local paste_write_primary="${PASTE_WRITE_PRIMARY:-$default_paste_write_primary}"
+            local ydotool_path="${YDOTOOL_PATH:-$default_ydotool_path}"
             local client_cmd='
                 set -e
-                runner=""
+                runner_bin=""
                 if [ -x ./target/release/parakeet-ptt ]; then
                     if ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--injection-mode" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-shortcut-fallback" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-strategy" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-chain-delay-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-policy" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-restore-delay-ms" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-post-chord-hold-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-copy-foreground" \
-                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type"; then
-                        runner="./target/release/parakeet-ptt"
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-mime-type" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
+                        runner_bin="./target/release/parakeet-ptt"
                     else
                         echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
-                if [ -z "$runner" ]; then
+                if [ -z "$runner_bin" ]; then
                     echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
-                    runner="cargo run --release --"
                 fi
-                exec $runner --endpoint "$DEFAULT_ENDPOINT" \
+
+                args=( \
+                    --endpoint "$DEFAULT_ENDPOINT" \
                     --injection-mode "${INJECTION_MODE:-type}" \
                     --paste-shortcut "${PASTE_SHORTCUT:-ctrl-shift-v}" \
                     --paste-shortcut-fallback "${PASTE_SHORTCUT_FALLBACK:-none}" \
+                    --paste-strategy "${PASTE_STRATEGY:-always-chain}" \
+                    --paste-chain-delay-ms "${PASTE_CHAIN_DELAY_MS:-45}" \
                     --paste-restore-policy "${PASTE_RESTORE_POLICY:-never}" \
                     --paste-restore-delay-ms "${PASTE_RESTORE_DELAY_MS:-250}" \
+                    --paste-post-chord-hold-ms "${PASTE_POST_CHORD_HOLD_MS:-700}" \
                     --paste-copy-foreground "${PASTE_COPY_FOREGROUND:-true}" \
                     --paste-mime-type "${PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
-                    >> "$LOG_CLIENT" 2>&1
+                    --paste-key-backend "${PASTE_KEY_BACKEND:-wtype}" \
+                    --paste-write-primary "${PASTE_WRITE_PRIMARY:-false}" \
+                )
+                if [ -n "${PASTE_SEAT:-}" ]; then
+                    args+=(--paste-seat "$PASTE_SEAT")
+                fi
+                if [ -n "${YDOTOOL_PATH:-}" ]; then
+                    args+=(--ydotool "$YDOTOOL_PATH")
+                fi
+
+                if [ -n "$runner_bin" ]; then
+                    "$runner_bin" "${args[@]}" >> "$LOG_CLIENT" 2>&1
+                else
+                    cargo run --release -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
+                fi
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
@@ -507,8 +643,60 @@ PY
                 UV_CACHE_DIR="$REPO_ROOT/.uv-cache" uv run parakeet-stt-daemon --check
             )
             ;;
+        diag-injector)
+            echo ">>> Clipboard injector diagnostics (test-injection)"
+            (
+                cd "$CLIENT_DIR" || exit 1
+                set -e
+                runner_bin=""
+                if [ -x ./target/release/parakeet-ptt ] \
+                    && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-strategy" \
+                    && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend"; then
+                    runner_bin="./target/release/parakeet-ptt"
+                fi
+
+                run_case() {
+                    local shortcut="$1"
+                    local fallback="$2"
+                    echo "   - case shortcut=$shortcut fallback=$fallback"
+                    if [ -n "$runner_bin" ]; then
+                        RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
+                            "$runner_bin" --test-injection --injection-mode paste \
+                            --paste-shortcut "$shortcut" \
+                            --paste-shortcut-fallback "$fallback" \
+                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-always-chain}" \
+                            --paste-chain-delay-ms "${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}" \
+                            --paste-restore-policy "${PARAKEET_PASTE_RESTORE_POLICY:-never}" \
+                            --paste-restore-delay-ms "${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}" \
+                            --paste-post-chord-hold-ms "${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}" \
+                            --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
+                            --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
+                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
+                    else
+                        RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
+                            cargo run --release -- --test-injection --injection-mode paste \
+                            --paste-shortcut "$shortcut" \
+                            --paste-shortcut-fallback "$fallback" \
+                            --paste-strategy "${PARAKEET_PASTE_STRATEGY:-always-chain}" \
+                            --paste-chain-delay-ms "${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}" \
+                            --paste-restore-policy "${PARAKEET_PASTE_RESTORE_POLICY:-never}" \
+                            --paste-restore-delay-ms "${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}" \
+                            --paste-post-chord-hold-ms "${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}" \
+                            --paste-copy-foreground "${PARAKEET_PASTE_COPY_FOREGROUND:-true}" \
+                            --paste-mime-type "${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}" \
+                            --paste-key-backend "${PARAKEET_PASTE_KEY_BACKEND:-wtype}" \
+                            --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
+                    fi
+                }
+
+                run_case "ctrl-shift-v" "shift-insert"
+                run_case "shift-insert" "ctrl-v"
+                run_case "ctrl-v" "shift-insert"
+            )
+            ;;
         *)
-            echo "Usage: stt {start|stop|restart|status|logs [client|daemon],show,tmux [attach|kill],check}"
+            echo "Usage: stt {start|stop|restart|status|logs [client|daemon],show,tmux [attach|kill],check,diag-injector}"
             ;;
     esac
 }
