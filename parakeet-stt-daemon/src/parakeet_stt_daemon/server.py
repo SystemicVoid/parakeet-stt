@@ -154,7 +154,8 @@ class DaemonServer:
                 return
             audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
             self._stop_stream_drain_loop()
-            audio_ms = int(len(audio_samples) / self.audio.sample_rate * 1000)
+            audio_duration_raw = len(audio_samples) / self.audio.sample_rate
+            audio_ms = int(audio_duration_raw * 1000)
 
             if audio_samples.size == 0:
                 await self._send_error(
@@ -187,12 +188,20 @@ class DaemonServer:
             )
             await websocket.send_json(completion.model_dump(mode="json"))
             await self.sessions.clear(session.session_id)
+
+            # Diagnostic logging for truncation investigation
+            text_len = len(text)
+            chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
             logger.info(
-                "Session {} completed (audio_ms={}, latency_ms={}, infer_ms={})",
+                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, latency_ms={}, infer_ms={}, "
+                "text_len={}, chars_per_sec={:.1f}",
                 session.session_id,
+                audio_duration_raw,
                 audio_ms,
                 latency_ms,
                 infer_ms,
+                text_len,
+                chars_per_sec,
             )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
