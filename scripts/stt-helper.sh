@@ -38,6 +38,9 @@ stt() {
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
     local default_ydotool_path="${PARAKEET_YDOTOOL_PATH:-}"
+    local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
+    local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
+    local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
     if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
@@ -210,6 +213,9 @@ PY
             local paste_seat="$default_paste_seat"
             local paste_write_primary="$default_paste_write_primary"
             local ydotool_path="$default_ydotool_path"
+            local completion_sound="$default_completion_sound"
+            local completion_sound_path="$default_completion_sound_path"
+            local completion_sound_volume="$default_completion_sound_volume"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --paste)
@@ -344,6 +350,30 @@ PY
                         ydotool_path="$2"
                         shift 2
                         ;;
+                    --completion-sound)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --completion-sound"
+                            return 1
+                        fi
+                        completion_sound="$2"
+                        shift 2
+                        ;;
+                    --completion-sound-path)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --completion-sound-path"
+                            return 1
+                        fi
+                        completion_sound_path="$2"
+                        shift 2
+                        ;;
+                    --completion-sound-volume)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --completion-sound-volume"
+                            return 1
+                        fi
+                        completion_sound_volume="$2"
+                        shift 2
+                        ;;
                     *)
                         echo "   - Unknown option for 'stt start': $1"
                         echo "   - Run 'stt' with no args to see supported commands."
@@ -368,6 +398,9 @@ PY
             echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
             echo "   - Paste write primary: $paste_write_primary"
+            echo "   - Completion sound: $completion_sound"
+            echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
+            echo "   - Completion sound volume: $completion_sound_volume"
 
             if ! _resolve_port; then
                 return 1
@@ -445,10 +478,11 @@ PY
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-backend-failure-policy" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
-                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--completion-sound"; then
                         runner_bin="./target/release/parakeet-ptt"
                     else
-                        echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                        echo "[helper] release binary missing new flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
                 if [ -z "$runner_bin" ]; then
@@ -471,12 +505,17 @@ PY
                     --paste-backend-failure-policy "$PASTE_BACKEND_FAILURE_POLICY" \
                     --uinput-dwell-ms "$UINPUT_DWELL_MS" \
                     --paste-write-primary "$PASTE_WRITE_PRIMARY" \
+                    --completion-sound "$COMPLETION_SOUND" \
+                    --completion-sound-volume "$COMPLETION_SOUND_VOLUME" \
                 )
                 if [ -n "${PASTE_SEAT:-}" ]; then
                     args+=(--paste-seat "$PASTE_SEAT")
                 fi
                 if [ -n "${YDOTOOL_PATH:-}" ]; then
                     args+=(--ydotool "$YDOTOOL_PATH")
+                fi
+                if [ -n "${COMPLETION_SOUND_PATH:-}" ]; then
+                    args+=(--completion-sound-path "$COMPLETION_SOUND_PATH")
                 fi
 
                 if [ -n "$runner_bin" ]; then
@@ -487,7 +526,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
@@ -635,6 +674,9 @@ PY
             local paste_seat="${PASTE_SEAT:-$default_paste_seat}"
             local paste_write_primary="${PASTE_WRITE_PRIMARY:-$default_paste_write_primary}"
             local ydotool_path="${YDOTOOL_PATH:-$default_ydotool_path}"
+            local completion_sound="${COMPLETION_SOUND:-$default_completion_sound}"
+            local completion_sound_path="${COMPLETION_SOUND_PATH:-$default_completion_sound_path}"
+            local completion_sound_volume="${COMPLETION_SOUND_VOLUME:-$default_completion_sound_volume}"
             local client_cmd='
                 set -e
                 runner_bin=""
@@ -653,10 +695,11 @@ PY
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-backend-failure-policy" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
-                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary"; then
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-write-primary" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--completion-sound"; then
                         runner_bin="./target/release/parakeet-ptt"
                     else
-                        echo "[helper] release binary missing new injection flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                        echo "[helper] release binary missing new flags; falling back to cargo run --release" >> "$LOG_CLIENT"
                     fi
                 fi
                 if [ -z "$runner_bin" ]; then
@@ -679,12 +722,17 @@ PY
                     --paste-backend-failure-policy "${PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                     --uinput-dwell-ms "${UINPUT_DWELL_MS:-18}" \
                     --paste-write-primary "${PASTE_WRITE_PRIMARY:-false}" \
+                    --completion-sound "${COMPLETION_SOUND:-true}" \
+                    --completion-sound-volume "${COMPLETION_SOUND_VOLUME:-100}" \
                 )
                 if [ -n "${PASTE_SEAT:-}" ]; then
                     args+=(--paste-seat "$PASTE_SEAT")
                 fi
                 if [ -n "${YDOTOOL_PATH:-}" ]; then
                     args+=(--ydotool "$YDOTOOL_PATH")
+                fi
+                if [ -n "${COMPLETION_SOUND_PATH:-}" ]; then
+                    args+=(--completion-sound-path "$COMPLETION_SOUND_PATH")
                 fi
 
                 if [ -n "$runner_bin" ]; then
@@ -695,7 +743,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"

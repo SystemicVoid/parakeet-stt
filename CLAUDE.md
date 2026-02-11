@@ -87,6 +87,7 @@ Logs: `/tmp/parakeet-daemon.log`, `/tmp/parakeet-ptt.log`
 - `main.rs` - CLI entry, hotkey loop, WebSocket message handling
 - `hotkey.rs` - evdev Right Ctrl detection
 - `injector.rs` - `WtypeInjector`, `ClipboardInjector`, uinput/ydotool/wtype backend ladder
+- `audio_feedback.rs` - Completion sound playback via pw-play/paplay
 - `client.rs` - WebSocket connection wrapper
 - `protocol.rs` - Message types matching daemon protocol
 - `state.rs` - `PttState` (Idle → Listening → WaitingResult)
@@ -135,6 +136,9 @@ See `docs/SPEC.md` for complete protocol specification.
 - `PARAKEET_PASTE_WRITE_PRIMARY` - Mirror transcript to PRIMARY selection (`false` default)
 - `PARAKEET_YDOTOOL_PATH` - Optional path override for ydotool binary
 - `PARAKEET_SILENCE_FLOOR_DB` - Silence trim threshold
+- `PARAKEET_COMPLETION_SOUND` - Enable/disable completion sound (`true` default)
+- `PARAKEET_COMPLETION_SOUND_PATH` - Custom sound file path (uses system default if unset)
+- `PARAKEET_COMPLETION_SOUND_VOLUME` - Volume level 0-100 (`100` default)
 - `RUST_LOG` - Rust logging level (default: info)
 
 ## Testing
