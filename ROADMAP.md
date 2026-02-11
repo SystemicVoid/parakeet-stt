@@ -26,7 +26,7 @@ Scope:
   - ready
   - listening start
   - listening stop
-  - transcript injected
+  - transcript injected ✓ (implemented 2026-02-11, but see limitation below)
   - injection fallback/copy-only
   - hard error
 - Add optional desktop notification summaries for error/fallback events.
@@ -35,6 +35,13 @@ Implementation direction:
 - Rust-side event emission from `parakeet-ptt` state transitions.
 - Configurable cue backend (`none|sound|notify|sound+notify`).
 - Keep defaults lightweight and local-only.
+
+**Known limitation (completion sound):**
+Current completion sound plays *after* button release because offline mode only
+transcribes once `stop_session` is received. The sound confirms completion but
+cannot signal "ready to release" during long utterances. Fixing this requires
+streaming mode where partial results arrive while holding, enabling a "settled"
+detection (no new words for N ms) to trigger a release-ready cue.
 
 Acceptance:
 - User can run one dictation cycle without looking at logs and correctly infer system state.
@@ -102,6 +109,25 @@ Acceptance:
 - Paste success rate per backend and app surface.
 - Fallback/copy-only event rate.
 - User-reported "had to check logs" frequency.
+
+## Streaming-Dependent Features (Blocked)
+
+The following UX improvements require streaming mode to be stable and default:
+
+1. **"Ready to release" audio cue** - Play sound when transcription settles (no new
+   words for N ms) while user is still holding, signaling they can release without
+   truncation. Current offline mode cannot provide this because transcription only
+   starts after button release.
+
+2. **Live transcript preview** - Show partial transcription in TUI/GUI overlay as
+   user speaks. Requires streaming partial results.
+
+3. **Confidence-based early termination** - Detect silence + high confidence to
+   auto-stop session without waiting for button release.
+
+Streaming mode exists (`--streaming`) but is not yet default due to architectural
+differences in how audio chunks are processed. Stabilizing streaming is a
+prerequisite for these features.
 
 ## Non-Goals (Near-Term)
 
