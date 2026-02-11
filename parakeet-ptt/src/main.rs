@@ -1,3 +1,4 @@
+mod audio_feedback;
 mod client;
 mod config;
 mod hotkey;
@@ -17,6 +18,7 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::config::{ClientConfig, ClipboardOptions, InjectionConfig, DEFAULT_ENDPOINT};
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
@@ -136,6 +138,18 @@ struct Cli {
     /// Mirror transcript into PRIMARY selection in addition to clipboard.
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     paste_write_primary: bool,
+
+    /// Enable or disable completion sound feedback.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    completion_sound: bool,
+
+    /// Path to a custom completion sound file (WAV, OGG, etc.).
+    #[arg(long)]
+    completion_sound_path: Option<PathBuf>,
+
+    /// Volume for completion sound (0-100).
+    #[arg(long, default_value_t = 100)]
+    completion_sound_volume: u8,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -305,11 +319,21 @@ async fn main() -> Result<()> {
     }
 
     if cli.demo {
-        run_demo(config, cli.demo_text).await?;
+        let audio_feedback = AudioFeedback::new(
+            cli.completion_sound,
+            cli.completion_sound_path.clone(),
+            cli.completion_sound_volume,
+        );
+        run_demo(config, cli.demo_text, audio_feedback).await?;
         return Ok(());
     }
 
-    run_hotkey_mode(config).await
+    let audio_feedback = AudioFeedback::new(
+        cli.completion_sound,
+        cli.completion_sound_path,
+        cli.completion_sound_volume,
+    );
+    run_hotkey_mode(config, audio_feedback).await
 }
 
 fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
@@ -472,7 +496,11 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
     }
 }
 
-async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result<()> {
+async fn run_demo(
+    config: ClientConfig,
+    override_text: Option<String>,
+    audio_feedback: AudioFeedback,
+) -> Result<()> {
     info!(endpoint = %config.endpoint, "Connecting to parakeet-stt-daemon");
     let mut client = WsClient::connect(&config).await?;
     let injector = build_injector(&config);
@@ -510,6 +538,7 @@ async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result
                     audio_ms,
                     "final result received"
                 );
+                audio_feedback.play_completion();
                 injector
                     .inject(to_inject)
                     .context("failed to inject text into focused surface")?;
@@ -533,10 +562,11 @@ async fn run_demo(config: ClientConfig, override_text: Option<String>) -> Result
     Ok(())
 }
 
-async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
+async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) -> Result<()> {
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
+        completion_sound = audio_feedback.is_enabled(),
         "Starting hotkey loop; press Right Ctrl to talk"
     );
     ensure_input_access()?;
@@ -587,7 +617,7 @@ async fn run_hotkey_mode(config: ClientConfig) -> Result<()> {
                                         match msg {
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
                                                 match serde_json::from_str::<ServerMessage>(&txt) {
-                                                    Ok(message) => handle_server_message(message, &mut state, injector.as_ref())?,
+                                                    Ok(message) => handle_server_message(message, &mut state, injector.as_ref(), &audio_feedback)?,
                                                     Err(err) => warn!("failed to decode server message: {}", err),
                                                 }
                                             }
@@ -651,6 +681,7 @@ fn handle_server_message(
     message: ServerMessage,
     state: &mut PttState,
     injector: &dyn TextInjector,
+    audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -669,6 +700,7 @@ fn handle_server_message(
                 audio_ms,
                 "final result received"
             );
+            audio_feedback.play_completion();
             injector
                 .inject(&text)
                 .context("failed to inject text into focused surface")?;
