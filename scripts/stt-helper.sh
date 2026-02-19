@@ -632,7 +632,11 @@ PY
                 "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_ROUTING_MODE=\"$paste_routing_mode\" ADAPTIVE_TERMINAL_SHORTCUT=\"$adaptive_terminal_shortcut\" ADAPTIVE_GENERAL_SHORTCUT=\"$adaptive_general_shortcut\" ADAPTIVE_UNKNOWN_SHORTCUT=\"$adaptive_unknown_shortcut\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
-            tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
+            local primary_pane
+            primary_pane="$(tmux list-panes -t "$TMUX_SESSION:$TMUX_WINDOW" -F '#{pane_id}' | head -n1)"
+            if [ -n "$primary_pane" ]; then
+                tmux select-pane -t "$primary_pane"
+            fi
 
             if ! _wait_for_client_ready "$client_ready_timeout_seconds"; then
                 if _client_build_in_progress; then

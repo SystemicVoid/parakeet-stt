@@ -326,7 +326,7 @@ This section tracks implementation in atomic units so work can resume after cont
 
 - [x] T1 Add checklist/ledger scaffolding and validation template in this handoff.
 - [x] T2 Fix helper cold-start false negative during `cargo run --release` compile windows.
-- [ ] T3 Fix helper tmux pane selection to avoid zero-based index assumptions.
+- [x] T3 Fix helper tmux pane selection to avoid zero-based index assumptions.
 - [ ] T4 Harden adaptive routing when AT-SPI snapshot is low-confidence (`focus_focused=false`).
 - [ ] T5 Add AT-SPI `gdbus` timeout bounds to prevent routing stalls.
 - [ ] T6 Run validation matrix, update docs, and close out residual risks.
@@ -336,8 +336,8 @@ This section tracks implementation in atomic units so work can resume after cont
 | Task | Scope | Commit | Status | Notes |
 |---|---|---|---|---|
 | T1 | `HANDOFF-stt-cross-surface-injection-2026-02-19.md` | `27f14a9` | Done | Added checklist, task IDs, commit ledger, and validation template |
-| T2 | `scripts/stt-helper.sh`, handoff | pending (this commit) | Done | Added timeout-based readiness loop with compile-aware wait extension |
-| T3 | `scripts/stt-helper.sh`, handoff | pending | Not started | Remove `.0` pane assumption |
+| T2 | `scripts/stt-helper.sh`, handoff | `b18575a` | Done | Added timeout-based readiness loop with compile-aware wait extension |
+| T3 | `scripts/stt-helper.sh`, handoff | pending (this commit) | Done | Switched to pane-id based selection instead of `.0` target |
 | T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | pending | Not started | Degrade low-confidence focus to unknown route |
 | T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | pending | Not started | Add explicit `gdbus` timeouts |
 | T6 | handoff + runtime docs (if needed) | pending | Not started | Record validation outcomes and remaining risks |
