@@ -4,7 +4,9 @@ mod config;
 mod hotkey;
 mod injector;
 mod protocol;
+mod routing;
 mod state;
+mod surface_focus;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -122,6 +124,22 @@ struct Cli {
     /// Keyboard injection backend for paste shortcut(s).
     #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Wtype)]
     paste_key_backend: CliPasteKeyBackend,
+
+    /// Routing mode for choosing paste shortcut(s).
+    #[arg(long, value_enum, default_value_t = CliPasteRoutingMode::Adaptive)]
+    paste_routing_mode: CliPasteRoutingMode,
+
+    /// Preferred shortcut when focused surface is classified as terminal-like.
+    #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
+    adaptive_terminal_shortcut: CliPasteShortcut,
+
+    /// Preferred shortcut when focused surface is classified as editor/browser-like.
+    #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlV)]
+    adaptive_general_shortcut: CliPasteShortcut,
+
+    /// Preferred shortcut when focused surface cannot be classified.
+    #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
+    adaptive_unknown_shortcut: CliPasteShortcut,
 
     /// Behavior when selected paste backend cannot be initialized or used.
     #[arg(
@@ -259,6 +277,21 @@ impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
+enum CliPasteRoutingMode {
+    Static,
+    Adaptive,
+}
+
+impl From<CliPasteRoutingMode> for crate::config::PasteRoutingMode {
+    fn from(mode: CliPasteRoutingMode) -> Self {
+        match mode {
+            CliPasteRoutingMode::Static => crate::config::PasteRoutingMode::Static,
+            CliPasteRoutingMode::Adaptive => crate::config::PasteRoutingMode::Adaptive,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteBackendFailurePolicy {
     CopyOnly,
     Error,
@@ -302,6 +335,10 @@ async fn main() -> Result<()> {
                 mime_type: cli.paste_mime_type.clone(),
                 key_backend: cli.paste_key_backend.into(),
                 backend_failure_policy: cli.paste_backend_failure_policy.into(),
+                routing_mode: cli.paste_routing_mode.into(),
+                adaptive_terminal_shortcut: cli.adaptive_terminal_shortcut.into(),
+                adaptive_general_shortcut: cli.adaptive_general_shortcut.into(),
+                adaptive_unknown_shortcut: cli.adaptive_unknown_shortcut.into(),
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -481,11 +518,21 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 paste_mime_type = %config.clipboard.mime_type,
                 paste_key_backend = ?config.clipboard.key_backend,
                 paste_backend_failure_policy = ?config.clipboard.backend_failure_policy,
+                paste_routing_mode = ?config.clipboard.routing_mode,
+                adaptive_terminal_shortcut = ?config.clipboard.adaptive_terminal_shortcut,
+                adaptive_general_shortcut = ?config.clipboard.adaptive_general_shortcut,
+                adaptive_unknown_shortcut = ?config.clipboard.adaptive_unknown_shortcut,
                 uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
                 "Using clipboard injector"
             );
+            if let Some(message) = shortcut_interop_warning(config) {
+                warn!(
+                    hint = message,
+                    "paste shortcut may not work across all app types"
+                );
+            }
 
             Box::new(ClipboardInjector::new(
                 sender,
@@ -493,6 +540,33 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 matches!(config.injection_mode, InjectionMode::CopyOnly),
             ))
         }
+    }
+}
+
+fn shortcut_interop_warning(config: &ClientConfig) -> Option<&'static str> {
+    use crate::config::{InjectionMode, PasteRoutingMode, PasteShortcut, PasteStrategy};
+
+    if !matches!(config.injection_mode, InjectionMode::Paste) {
+        return None;
+    }
+    if matches!(config.clipboard.routing_mode, PasteRoutingMode::Adaptive) {
+        return None;
+    }
+    if !matches!(config.clipboard.paste_strategy, PasteStrategy::Single) {
+        return None;
+    }
+    if config.clipboard.shortcut_fallback.is_some() {
+        return None;
+    }
+
+    match config.clipboard.paste_shortcut {
+        PasteShortcut::CtrlV => None,
+        PasteShortcut::CtrlShiftV => Some(
+            "paste_shortcut=ctrl-shift-v with single strategy is app-specific; browsers/terminals often accept it, but editors like VS Code and COSMIC Text usually require ctrl-v",
+        ),
+        PasteShortcut::ShiftInsert => Some(
+            "paste_shortcut=shift-insert with single strategy is app-specific; many browser/native editor fields require ctrl-v",
+        ),
     }
 }
 
@@ -771,10 +845,10 @@ mod tests {
 
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
-        PasteKeyBackend, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+        PasteKeyBackend, PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
 
-    use super::{build_injector, Cli, CliPasteStrategy};
+    use super::{build_injector, shortcut_interop_warning, Cli, CliPasteStrategy};
 
     fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
         ClipboardOptions {
@@ -789,6 +863,10 @@ mod tests {
             mime_type: "text/plain;charset=utf-8".to_string(),
             key_backend: PasteKeyBackend::Wtype,
             backend_failure_policy: policy,
+            routing_mode: PasteRoutingMode::Static,
+            adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
+            adaptive_general_shortcut: PasteShortcut::CtrlV,
+            adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
             seat: None,
             write_primary: false,
         }
@@ -831,5 +909,81 @@ mod tests {
     fn cli_accepts_explicit_always_chain_strategy() {
         let cli = Cli::parse_from(["parakeet-ptt", "--paste-strategy", "always-chain"]);
         assert!(matches!(cli.paste_strategy, CliPasteStrategy::AlwaysChain));
+    }
+
+    #[test]
+    fn interop_warning_triggers_for_ctrl_shift_v_single_no_fallback() {
+        let mut config = ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                wtype_path: None,
+                ydotool_path: None,
+                wtype_delay_ms: 6,
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: clipboard_options(PasteBackendFailurePolicy::CopyOnly),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("config should parse");
+        config.clipboard.paste_shortcut = PasteShortcut::CtrlShiftV;
+        config.clipboard.paste_strategy = PasteStrategy::Single;
+        config.clipboard.shortcut_fallback = None;
+
+        let warning =
+            shortcut_interop_warning(&config).expect("expected interop warning for ctrl-shift-v");
+        assert!(warning.contains("ctrl-shift-v"));
+        assert!(warning.contains("VS Code"));
+    }
+
+    #[test]
+    fn interop_warning_not_emitted_for_ctrl_v_single() {
+        let mut config = ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                wtype_path: None,
+                ydotool_path: None,
+                wtype_delay_ms: 6,
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: clipboard_options(PasteBackendFailurePolicy::CopyOnly),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("config should parse");
+        config.clipboard.paste_shortcut = PasteShortcut::CtrlV;
+        config.clipboard.paste_strategy = PasteStrategy::Single;
+        config.clipboard.shortcut_fallback = None;
+
+        assert!(shortcut_interop_warning(&config).is_none());
+    }
+
+    #[test]
+    fn interop_warning_not_emitted_in_adaptive_mode() {
+        let mut config = ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                wtype_path: None,
+                ydotool_path: None,
+                wtype_delay_ms: 6,
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: clipboard_options(PasteBackendFailurePolicy::CopyOnly),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("config should parse");
+        config.clipboard.routing_mode = PasteRoutingMode::Adaptive;
+        config.clipboard.paste_shortcut = PasteShortcut::CtrlShiftV;
+        config.clipboard.paste_strategy = PasteStrategy::Single;
+        config.clipboard.shortcut_fallback = None;
+
+        assert!(shortcut_interop_warning(&config).is_none());
     }
 }

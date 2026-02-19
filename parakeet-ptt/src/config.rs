@@ -45,6 +45,12 @@ pub enum PasteKeyBackend {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum PasteRoutingMode {
+    Static,
+    Adaptive,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum PasteBackendFailurePolicy {
     CopyOnly,
     Error,
@@ -63,6 +69,10 @@ pub struct ClipboardOptions {
     pub mime_type: String,
     pub key_backend: PasteKeyBackend,
     pub backend_failure_policy: PasteBackendFailurePolicy,
+    pub routing_mode: PasteRoutingMode,
+    pub adaptive_terminal_shortcut: PasteShortcut,
+    pub adaptive_general_shortcut: PasteShortcut,
+    pub adaptive_unknown_shortcut: PasteShortcut,
     pub seat: Option<String>,
     pub write_primary: bool,
 }

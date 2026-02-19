@@ -11,6 +11,8 @@ use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
 use tracing::{debug, info, warn};
 
 use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
+use crate::routing::decide_route;
+use crate::surface_focus::AtspiFocusResolver;
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -182,6 +184,7 @@ pub struct ClipboardInjector {
     sender: PasteKeySender,
     options: ClipboardOptions,
     copy_only: bool,
+    focus_resolver: AtspiFocusResolver,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,6 +217,7 @@ impl ClipboardInjector {
             sender,
             options,
             copy_only,
+            focus_resolver: AtspiFocusResolver::new(),
         }
     }
 
@@ -510,10 +514,20 @@ impl ClipboardInjector {
         }
     }
 
-    fn shortcut_attempt_order(&self) -> Vec<PasteShortcut> {
-        let mut attempts = vec![self.options.paste_shortcut];
+    fn shortcut_attempt_order(
+        &self,
+        primary: PasteShortcut,
+        adaptive_fallback: Option<PasteShortcut>,
+    ) -> Vec<PasteShortcut> {
+        let mut attempts = vec![primary];
         if matches!(self.options.paste_strategy, PasteStrategy::Single) {
             return attempts;
+        }
+
+        if let Some(fallback) = adaptive_fallback {
+            if !attempts.contains(&fallback) {
+                attempts.push(fallback);
+            }
         }
 
         if let Some(fallback) = self.options.shortcut_fallback {
@@ -525,13 +539,18 @@ impl ClipboardInjector {
         attempts
     }
 
-    fn run_paste_shortcuts(&self, trace_id: u64) -> Result<()> {
-        let attempts = self.shortcut_attempt_order();
+    fn run_paste_shortcuts(
+        &self,
+        trace_id: u64,
+        primary: PasteShortcut,
+        adaptive_fallback: Option<PasteShortcut>,
+    ) -> Result<()> {
+        let attempts = self.shortcut_attempt_order(primary, adaptive_fallback);
         let mut errors = Vec::new();
 
         match self.options.paste_strategy {
             PasteStrategy::Single => {
-                return self.run_shortcut(trace_id, self.options.paste_shortcut);
+                return self.run_shortcut(trace_id, primary);
             }
             PasteStrategy::OnError => {
                 for (idx, shortcut) in attempts.iter().enumerate() {
@@ -765,6 +784,10 @@ impl TextInjector for ClipboardInjector {
             post_chord_hold_ms = self.options.post_chord_hold_ms,
             copy_foreground = self.options.copy_foreground,
             key_backend = ?self.options.key_backend,
+            routing_mode = ?self.options.routing_mode,
+            adaptive_terminal_shortcut = ?self.options.adaptive_terminal_shortcut,
+            adaptive_general_shortcut = ?self.options.adaptive_general_shortcut,
+            adaptive_unknown_shortcut = ?self.options.adaptive_unknown_shortcut,
             seat = ?self.options.seat,
             write_primary = self.options.write_primary,
             mime_type = %self.options.mime_type,
@@ -887,8 +910,49 @@ impl TextInjector for ClipboardInjector {
             return Ok(());
         }
 
+        let focus_snapshot = match self.focus_resolver.resolve() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(
+                    trace_id,
+                    error = %err,
+                    "failed to resolve focused surface metadata; adaptive routing will use unknown fallback"
+                );
+                None
+            }
+        };
+
+        let route = decide_route(&self.options, focus_snapshot.as_ref());
+        if let Some(snapshot) = focus_snapshot.as_ref() {
+            info!(
+                trace_id,
+                resolver = snapshot.resolver,
+                focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
+                focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
+                focus_object_path = snapshot.object_path.as_deref().unwrap_or("<unknown>"),
+                focus_service = snapshot.service_name.as_deref().unwrap_or("<unknown>"),
+                focus_active = snapshot.active,
+                focus_focused = snapshot.focused,
+                route_class = ?route.class,
+                route_primary = ?route.primary,
+                route_adaptive_fallback = ?route.adaptive_fallback,
+                route_reason = route.reason,
+                "resolved focused surface for adaptive routing"
+            );
+        } else {
+            info!(
+                trace_id,
+                route_class = ?route.class,
+                route_primary = ?route.primary,
+                route_adaptive_fallback = ?route.adaptive_fallback,
+                route_reason = route.reason,
+                "no focused surface metadata available; using unknown routing fallback"
+            );
+        }
+
         // 3. Send paste shortcut(s).
-        if let Err(err) = self.run_paste_shortcuts(trace_id) {
+        if let Err(err) = self.run_paste_shortcuts(trace_id, route.primary, route.adaptive_fallback)
+        {
             outcome = InjectionOutcome::ChordFailed;
             warn!(
                 trace_id,
@@ -1031,7 +1095,7 @@ mod tests {
     use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
-        PasteShortcut, PasteStrategy,
+        PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
     use evdev::Key;
     use std::path::PathBuf;
@@ -1053,6 +1117,10 @@ mod tests {
             mime_type: "text/plain;charset=utf-8".to_string(),
             key_backend: PasteKeyBackend::Wtype,
             backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
+            routing_mode: PasteRoutingMode::Static,
+            adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
+            adaptive_general_shortcut: PasteShortcut::CtrlV,
+            adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
             seat: None,
             write_primary: false,
         }
@@ -1070,7 +1138,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            injector.shortcut_attempt_order(),
+            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
             vec![PasteShortcut::CtrlShiftV]
         );
     }
@@ -1087,7 +1155,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            injector.shortcut_attempt_order(),
+            injector.shortcut_attempt_order(PasteShortcut::ShiftInsert, None),
             vec![PasteShortcut::ShiftInsert, PasteShortcut::CtrlShiftV]
         );
     }
@@ -1100,8 +1168,29 @@ mod tests {
             false,
         );
         assert_eq!(
-            injector.shortcut_attempt_order(),
+            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
             vec![PasteShortcut::CtrlShiftV]
+        );
+    }
+
+    #[test]
+    fn on_error_strategy_includes_adaptive_fallback_before_explicit_fallback() {
+        let injector = ClipboardInjector::new(
+            PasteKeySender::Disabled,
+            options(
+                PasteStrategy::OnError,
+                PasteShortcut::CtrlShiftV,
+                Some(PasteShortcut::ShiftInsert),
+            ),
+            false,
+        );
+        assert_eq!(
+            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV)),
+            vec![
+                PasteShortcut::CtrlShiftV,
+                PasteShortcut::CtrlV,
+                PasteShortcut::ShiftInsert
+            ]
         );
     }
 
@@ -1117,7 +1206,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            injector.shortcut_attempt_order(),
+            injector.shortcut_attempt_order(PasteShortcut::CtrlV, None),
             vec![PasteShortcut::CtrlV]
         );
     }
@@ -1130,7 +1219,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            injector.shortcut_attempt_order(),
+            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
             vec![PasteShortcut::CtrlShiftV]
         );
     }
