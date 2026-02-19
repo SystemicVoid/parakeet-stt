@@ -38,8 +38,11 @@ stt() {
     local default_adaptive_terminal_shortcut="${PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}"
     local default_adaptive_general_shortcut="${PARAKEET_ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}"
     local default_adaptive_unknown_shortcut="${PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}"
+    local default_focus_resolver_source="${PARAKEET_FOCUS_RESOLVER_SOURCE:-atspi}"
     local default_focus_resolve_budget_ms="${PARAKEET_FOCUS_RESOLVE_BUDGET_MS:-450}"
     local default_focus_deep_scan_max_apps="${PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS:-1}"
+    local default_focus_wayland_stale_ms="${PARAKEET_FOCUS_WAYLAND_STALE_MS:-1200}"
+    local default_focus_wayland_transition_grace_ms="${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-200}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -263,8 +266,11 @@ PY
             local adaptive_terminal_shortcut="$default_adaptive_terminal_shortcut"
             local adaptive_general_shortcut="$default_adaptive_general_shortcut"
             local adaptive_unknown_shortcut="$default_adaptive_unknown_shortcut"
+            local focus_resolver_source="$default_focus_resolver_source"
             local focus_resolve_budget_ms="$default_focus_resolve_budget_ms"
             local focus_deep_scan_max_apps="$default_focus_deep_scan_max_apps"
+            local focus_wayland_stale_ms="$default_focus_wayland_stale_ms"
+            local focus_wayland_transition_grace_ms="$default_focus_wayland_transition_grace_ms"
             local uinput_dwell_ms="$default_uinput_dwell_ms"
             local paste_seat="$default_paste_seat"
             local paste_write_primary="$default_paste_write_primary"
@@ -415,6 +421,30 @@ PY
                         focus_deep_scan_max_apps="$2"
                         shift 2
                         ;;
+                    --focus-resolver-source)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --focus-resolver-source"
+                            return 1
+                        fi
+                        focus_resolver_source="$2"
+                        shift 2
+                        ;;
+                    --focus-wayland-stale-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --focus-wayland-stale-ms"
+                            return 1
+                        fi
+                        focus_wayland_stale_ms="$2"
+                        shift 2
+                        ;;
+                    --focus-wayland-transition-grace-ms)
+                        if [[ $# -lt 2 ]]; then
+                            echo "   - Missing value for --focus-wayland-transition-grace-ms"
+                            return 1
+                        fi
+                        focus_wayland_transition_grace_ms="$2"
+                        shift 2
+                        ;;
                     --paste-backend-failure-policy)
                         if [[ $# -lt 2 ]]; then
                             echo "   - Missing value for --paste-backend-failure-policy"
@@ -509,8 +539,11 @@ PY
             echo "   - Adaptive terminal shortcut: $adaptive_terminal_shortcut"
             echo "   - Adaptive general shortcut: $adaptive_general_shortcut"
             echo "   - Adaptive unknown shortcut: $adaptive_unknown_shortcut"
+            echo "   - Focus resolver source: $focus_resolver_source"
             echo "   - Focus resolve budget (ms): $focus_resolve_budget_ms"
             echo "   - Focus deep-scan max apps: $focus_deep_scan_max_apps"
+            echo "   - Focus wayland stale (ms): $focus_wayland_stale_ms"
+            echo "   - Focus wayland transition grace (ms): $focus_wayland_transition_grace_ms"
             echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
             echo "   - Paste write primary: $paste_write_primary"
@@ -596,8 +629,11 @@ PY
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-terminal-shortcut" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-general-shortcut" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-unknown-shortcut" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-resolver-source" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-resolve-budget-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-deep-scan-max-apps" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-stale-ms" \
+                        && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-transition-grace-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-backend-failure-policy" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
@@ -629,8 +665,11 @@ PY
                     --adaptive-terminal-shortcut "$ADAPTIVE_TERMINAL_SHORTCUT" \
                     --adaptive-general-shortcut "$ADAPTIVE_GENERAL_SHORTCUT" \
                     --adaptive-unknown-shortcut "$ADAPTIVE_UNKNOWN_SHORTCUT" \
+                    --focus-resolver-source "$FOCUS_RESOLVER_SOURCE" \
                     --focus-resolve-budget-ms "$FOCUS_RESOLVE_BUDGET_MS" \
                     --focus-deep-scan-max-apps "$FOCUS_DEEP_SCAN_MAX_APPS" \
+                    --focus-wayland-stale-ms "$FOCUS_WAYLAND_STALE_MS" \
+                    --focus-wayland-transition-grace-ms "$FOCUS_WAYLAND_TRANSITION_GRACE_MS" \
                     --paste-backend-failure-policy "$PASTE_BACKEND_FAILURE_POLICY" \
                     --uinput-dwell-ms "$UINPUT_DWELL_MS" \
                     --paste-write-primary "$PASTE_WRITE_PRIMARY" \
@@ -655,7 +694,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_ROUTING_MODE=\"$paste_routing_mode\" ADAPTIVE_TERMINAL_SHORTCUT=\"$adaptive_terminal_shortcut\" ADAPTIVE_GENERAL_SHORTCUT=\"$adaptive_general_shortcut\" ADAPTIVE_UNKNOWN_SHORTCUT=\"$adaptive_unknown_shortcut\" FOCUS_RESOLVE_BUDGET_MS=\"$focus_resolve_budget_ms\" FOCUS_DEEP_SCAN_MAX_APPS=\"$focus_deep_scan_max_apps\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_ROUTING_MODE=\"$paste_routing_mode\" ADAPTIVE_TERMINAL_SHORTCUT=\"$adaptive_terminal_shortcut\" ADAPTIVE_GENERAL_SHORTCUT=\"$adaptive_general_shortcut\" ADAPTIVE_UNKNOWN_SHORTCUT=\"$adaptive_unknown_shortcut\" FOCUS_RESOLVER_SOURCE=\"$focus_resolver_source\" FOCUS_RESOLVE_BUDGET_MS=\"$focus_resolve_budget_ms\" FOCUS_DEEP_SCAN_MAX_APPS=\"$focus_deep_scan_max_apps\" FOCUS_WAYLAND_STALE_MS=\"$focus_wayland_stale_ms\" FOCUS_WAYLAND_TRANSITION_GRACE_MS=\"$focus_wayland_transition_grace_ms\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             local primary_pane
@@ -799,8 +838,11 @@ PY
             local adaptive_terminal_shortcut="${ADAPTIVE_TERMINAL_SHORTCUT:-$default_adaptive_terminal_shortcut}"
             local adaptive_general_shortcut="${ADAPTIVE_GENERAL_SHORTCUT:-$default_adaptive_general_shortcut}"
             local adaptive_unknown_shortcut="${ADAPTIVE_UNKNOWN_SHORTCUT:-$default_adaptive_unknown_shortcut}"
+            local focus_resolver_source="${FOCUS_RESOLVER_SOURCE:-$default_focus_resolver_source}"
             local focus_resolve_budget_ms="${FOCUS_RESOLVE_BUDGET_MS:-$default_focus_resolve_budget_ms}"
             local focus_deep_scan_max_apps="${FOCUS_DEEP_SCAN_MAX_APPS:-$default_focus_deep_scan_max_apps}"
+            local focus_wayland_stale_ms="${FOCUS_WAYLAND_STALE_MS:-$default_focus_wayland_stale_ms}"
+            local focus_wayland_transition_grace_ms="${FOCUS_WAYLAND_TRANSITION_GRACE_MS:-$default_focus_wayland_transition_grace_ms}"
             local uinput_dwell_ms="${UINPUT_DWELL_MS:-$default_uinput_dwell_ms}"
             local paste_seat="${PASTE_SEAT:-$default_paste_seat}"
             local paste_write_primary="${PASTE_WRITE_PRIMARY:-$default_paste_write_primary}"
@@ -827,8 +869,11 @@ PY
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-terminal-shortcut" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-general-shortcut" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--adaptive-unknown-shortcut" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-resolver-source" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-resolve-budget-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-deep-scan-max-apps" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-stale-ms" \
+                        && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-transition-grace-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-backend-failure-policy" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--uinput-dwell-ms" \
                         && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-seat" \
@@ -860,8 +905,11 @@ PY
                     --adaptive-terminal-shortcut "${ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}" \
                     --adaptive-general-shortcut "${ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}" \
                     --adaptive-unknown-shortcut "${ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}" \
+                    --focus-resolver-source "${FOCUS_RESOLVER_SOURCE:-atspi}" \
                     --focus-resolve-budget-ms "${FOCUS_RESOLVE_BUDGET_MS:-450}" \
                     --focus-deep-scan-max-apps "${FOCUS_DEEP_SCAN_MAX_APPS:-1}" \
+                    --focus-wayland-stale-ms "${FOCUS_WAYLAND_STALE_MS:-1200}" \
+                    --focus-wayland-transition-grace-ms "${FOCUS_WAYLAND_TRANSITION_GRACE_MS:-200}" \
                     --paste-backend-failure-policy "${PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                     --uinput-dwell-ms "${UINPUT_DWELL_MS:-18}" \
                     --paste-write-primary "${PASTE_WRITE_PRIMARY:-false}" \
@@ -886,7 +934,7 @@ PY
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_ROUTING_MODE=\"$paste_routing_mode\" ADAPTIVE_TERMINAL_SHORTCUT=\"$adaptive_terminal_shortcut\" ADAPTIVE_GENERAL_SHORTCUT=\"$adaptive_general_shortcut\" ADAPTIVE_UNKNOWN_SHORTCUT=\"$adaptive_unknown_shortcut\" FOCUS_RESOLVE_BUDGET_MS=\"$focus_resolve_budget_ms\" FOCUS_DEEP_SCAN_MAX_APPS=\"$focus_deep_scan_max_apps\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" DEFAULT_ENDPOINT=\"$DEFAULT_ENDPOINT\" INJECTION_MODE=\"$injection_mode\" PASTE_SHORTCUT=\"$paste_shortcut\" PASTE_SHORTCUT_FALLBACK=\"$paste_shortcut_fallback\" PASTE_STRATEGY=\"$paste_strategy\" PASTE_CHAIN_DELAY_MS=\"$paste_chain_delay_ms\" PASTE_RESTORE_POLICY=\"$paste_restore_policy\" PASTE_RESTORE_DELAY_MS=\"$paste_restore_delay_ms\" PASTE_POST_CHORD_HOLD_MS=\"$paste_post_chord_hold_ms\" PASTE_COPY_FOREGROUND=\"$paste_copy_foreground\" PASTE_MIME_TYPE=\"$paste_mime_type\" PASTE_KEY_BACKEND=\"$paste_key_backend\" PASTE_ROUTING_MODE=\"$paste_routing_mode\" ADAPTIVE_TERMINAL_SHORTCUT=\"$adaptive_terminal_shortcut\" ADAPTIVE_GENERAL_SHORTCUT=\"$adaptive_general_shortcut\" ADAPTIVE_UNKNOWN_SHORTCUT=\"$adaptive_unknown_shortcut\" FOCUS_RESOLVER_SOURCE=\"$focus_resolver_source\" FOCUS_RESOLVE_BUDGET_MS=\"$focus_resolve_budget_ms\" FOCUS_DEEP_SCAN_MAX_APPS=\"$focus_deep_scan_max_apps\" FOCUS_WAYLAND_STALE_MS=\"$focus_wayland_stale_ms\" FOCUS_WAYLAND_TRANSITION_GRACE_MS=\"$focus_wayland_transition_grace_ms\" PASTE_BACKEND_FAILURE_POLICY=\"$paste_backend_failure_policy\" UINPUT_DWELL_MS=\"$uinput_dwell_ms\" PASTE_SEAT=\"$paste_seat\" PASTE_WRITE_PRIMARY=\"$paste_write_primary\" YDOTOOL_PATH=\"$ydotool_path\" COMPLETION_SOUND=\"$completion_sound\" COMPLETION_SOUND_PATH=\"$completion_sound_path\" COMPLETION_SOUND_VOLUME=\"$completion_sound_volume\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
@@ -944,8 +992,11 @@ PY
                             --adaptive-terminal-shortcut "${PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}" \
                             --adaptive-general-shortcut "${PARAKEET_ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}" \
                             --adaptive-unknown-shortcut "${PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}" \
+                            --focus-resolver-source "${PARAKEET_FOCUS_RESOLVER_SOURCE:-atspi}" \
                             --focus-resolve-budget-ms "${PARAKEET_FOCUS_RESOLVE_BUDGET_MS:-450}" \
                             --focus-deep-scan-max-apps "${PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS:-1}" \
+                            --focus-wayland-stale-ms "${PARAKEET_FOCUS_WAYLAND_STALE_MS:-1200}" \
+                            --focus-wayland-transition-grace-ms "${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-200}" \
                             --paste-backend-failure-policy "${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                             --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -966,8 +1017,11 @@ PY
                             --adaptive-terminal-shortcut "${PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}" \
                             --adaptive-general-shortcut "${PARAKEET_ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}" \
                             --adaptive-unknown-shortcut "${PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}" \
+                            --focus-resolver-source "${PARAKEET_FOCUS_RESOLVER_SOURCE:-atspi}" \
                             --focus-resolve-budget-ms "${PARAKEET_FOCUS_RESOLVE_BUDGET_MS:-450}" \
                             --focus-deep-scan-max-apps "${PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS:-1}" \
+                            --focus-wayland-stale-ms "${PARAKEET_FOCUS_WAYLAND_STALE_MS:-1200}" \
+                            --focus-wayland-transition-grace-ms "${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-200}" \
                             --paste-backend-failure-policy "${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}" \
                             --uinput-dwell-ms "${PARAKEET_UINPUT_DWELL_MS:-18}" \
                             --paste-write-primary "${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
