@@ -340,7 +340,7 @@ This section tracks implementation in atomic units so work can resume after cont
 | T3 | `scripts/stt-helper.sh`, handoff | `9d9c5b1` | Done | Switched to pane-id based selection instead of `.0` target |
 | T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | `9359f59` | Done | Route degrades to unknown when `focus_focused=false`; added confidence logging/tests |
 | T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | `442565b` | Done | Added bounded `gdbus` timeouts (`--timeout 2`) for AT-SPI lookup calls |
-| T6 | handoff + runtime docs | pending (this commit) | Done | Recorded validation outcomes, doc updates, and remaining manual matrix |
+| T6 | handoff + runtime docs | `fed209d` | Done | Recorded validation outcomes, doc updates, and remaining manual matrix |
 
 ### 12.3 Validation summary (post-fix)
 
