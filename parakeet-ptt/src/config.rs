@@ -73,6 +73,8 @@ pub struct ClipboardOptions {
     pub adaptive_terminal_shortcut: PasteShortcut,
     pub adaptive_general_shortcut: PasteShortcut,
     pub adaptive_unknown_shortcut: PasteShortcut,
+    pub focus_resolve_budget_ms: u64,
+    pub focus_deep_scan_max_apps: u8,
     pub seat: Option<String>,
     pub write_primary: bool,
 }

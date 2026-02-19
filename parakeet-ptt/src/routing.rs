@@ -165,6 +165,8 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            focus_resolve_budget_ms: 450,
+            focus_deep_scan_max_apps: 1,
             seat: None,
             write_primary: false,
         }

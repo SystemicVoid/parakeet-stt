@@ -141,6 +141,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
     adaptive_unknown_shortcut: CliPasteShortcut,
 
+    /// Global budget for AT-SPI focus resolution before falling back.
+    #[arg(long, default_value_t = 450)]
+    focus_resolve_budget_ms: u64,
+
+    /// Maximum number of active apps to deep-scan for focused descendants.
+    #[arg(long, default_value_t = 1)]
+    focus_deep_scan_max_apps: u8,
+
     /// Behavior when selected paste backend cannot be initialized or used.
     #[arg(
         long,
@@ -339,6 +347,8 @@ async fn main() -> Result<()> {
                 adaptive_terminal_shortcut: cli.adaptive_terminal_shortcut.into(),
                 adaptive_general_shortcut: cli.adaptive_general_shortcut.into(),
                 adaptive_unknown_shortcut: cli.adaptive_unknown_shortcut.into(),
+                focus_resolve_budget_ms: cli.focus_resolve_budget_ms,
+                focus_deep_scan_max_apps: cli.focus_deep_scan_max_apps,
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -522,6 +532,8 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 adaptive_terminal_shortcut = ?config.clipboard.adaptive_terminal_shortcut,
                 adaptive_general_shortcut = ?config.clipboard.adaptive_general_shortcut,
                 adaptive_unknown_shortcut = ?config.clipboard.adaptive_unknown_shortcut,
+                focus_resolve_budget_ms = config.clipboard.focus_resolve_budget_ms,
+                focus_deep_scan_max_apps = config.clipboard.focus_deep_scan_max_apps,
                 uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
@@ -867,6 +879,8 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            focus_resolve_budget_ms: 450,
+            focus_deep_scan_max_apps: 1,
             seat: None,
             write_primary: false,
         }

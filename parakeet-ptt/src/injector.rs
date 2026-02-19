@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
 use crate::routing::decide_route;
-use crate::surface_focus::AtspiFocusResolver;
+use crate::surface_focus::{AtspiFocusResolver, FocusResolveStats};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -910,15 +910,26 @@ impl TextInjector for ClipboardInjector {
             return Ok(());
         }
 
-        let focus_snapshot = match self.focus_resolver.resolve() {
-            Ok(snapshot) => snapshot,
+        let focus_resolve_started = Instant::now();
+        let (focus_snapshot, focus_resolve_stats) = match self.focus_resolver.resolve_with_limits(
+            self.options.focus_resolve_budget_ms,
+            self.options.focus_deep_scan_max_apps,
+        ) {
+            Ok(result) => (result.snapshot, result.stats),
             Err(err) => {
+                let stats = FocusResolveStats {
+                    duration_ms: focus_resolve_started.elapsed().as_millis() as u64,
+                    ..FocusResolveStats::default()
+                };
                 warn!(
                     trace_id,
                     error = %err,
+                    focus_resolve_ms = stats.duration_ms,
+                    focus_resolve_budget_ms = self.options.focus_resolve_budget_ms,
+                    focus_deep_scan_max_apps = self.options.focus_deep_scan_max_apps,
                     "failed to resolve focused surface metadata; adaptive routing will use unknown fallback"
                 );
-                None
+                (None, stats)
             }
         };
 
@@ -933,6 +944,11 @@ impl TextInjector for ClipboardInjector {
                 focus_service = snapshot.service_name.as_deref().unwrap_or("<unknown>"),
                 focus_active = snapshot.active,
                 focus_focused = snapshot.focused,
+                focus_resolve_ms = focus_resolve_stats.duration_ms,
+                focus_resolve_timed_out = focus_resolve_stats.timed_out,
+                focus_resolve_gdbus_calls = focus_resolve_stats.gdbus_calls,
+                focus_resolve_deep_scan_apps = focus_resolve_stats.deep_scan_apps,
+                focus_resolve_deep_scan_nodes = focus_resolve_stats.deep_scan_nodes,
                 route_class = ?route.class,
                 route_primary = ?route.primary,
                 route_adaptive_fallback = ?route.adaptive_fallback,
@@ -943,6 +959,11 @@ impl TextInjector for ClipboardInjector {
         } else {
             info!(
                 trace_id,
+                focus_resolve_ms = focus_resolve_stats.duration_ms,
+                focus_resolve_timed_out = focus_resolve_stats.timed_out,
+                focus_resolve_gdbus_calls = focus_resolve_stats.gdbus_calls,
+                focus_resolve_deep_scan_apps = focus_resolve_stats.deep_scan_apps,
+                focus_resolve_deep_scan_nodes = focus_resolve_stats.deep_scan_nodes,
                 route_class = ?route.class,
                 route_primary = ?route.primary,
                 route_adaptive_fallback = ?route.adaptive_fallback,
@@ -1123,6 +1144,8 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            focus_resolve_budget_ms: 450,
+            focus_deep_scan_max_apps: 1,
             seat: None,
             write_primary: false,
         }
