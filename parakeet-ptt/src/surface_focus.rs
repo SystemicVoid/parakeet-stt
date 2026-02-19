@@ -1,10 +1,19 @@
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use cosmic_protocols::toplevel_info::v1::client::{
+    zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1,
+};
 use regex::Regex;
+use wayland_client::protocol::wl_registry;
+use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
+};
 
 #[derive(Debug, Clone)]
 struct ObjectRef {
@@ -637,6 +646,440 @@ fn parse_uint32_list(value: &str) -> Vec<u32> {
     values
 }
 
+#[derive(Debug, Clone)]
+pub enum WaylandFocusObservation {
+    Fresh {
+        snapshot: FocusSnapshot,
+        cache_age_ms: u64,
+    },
+    LowConfidence {
+        snapshot: FocusSnapshot,
+        cache_age_ms: u64,
+        reason: &'static str,
+    },
+    Unavailable {
+        reason: &'static str,
+        cache_age_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct WaylandFocusCache {
+    shared: Arc<Mutex<WaylandFocusSharedState>>,
+}
+
+impl WaylandFocusCache {
+    pub fn new() -> Self {
+        let shared = Arc::new(Mutex::new(WaylandFocusSharedState::default()));
+        let shared_for_worker = Arc::clone(&shared);
+        if thread::Builder::new()
+            .name("parakeet-wayland-focus".to_string())
+            .spawn(move || run_wayland_focus_worker(shared_for_worker))
+            .is_err()
+        {
+            if let Ok(mut state) = shared.lock() {
+                state.connected = false;
+                state.protocols_supported = false;
+            }
+        }
+        Self { shared }
+    }
+
+    pub fn observe(&self, stale_ms: u64, transition_grace_ms: u64) -> WaylandFocusObservation {
+        let snapshot = self
+            .shared
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        if !snapshot.connected {
+            return WaylandFocusObservation::Unavailable {
+                reason: "wayland_cache_disconnected",
+                cache_age_ms: snapshot
+                    .last_commit_at
+                    .map(|ts| ts.elapsed().as_millis() as u64),
+            };
+        }
+        if !snapshot.protocols_supported {
+            return WaylandFocusObservation::Unavailable {
+                reason: "wayland_protocols_unavailable",
+                cache_age_ms: None,
+            };
+        }
+
+        let Some(last_commit_at) = snapshot.last_commit_at else {
+            return WaylandFocusObservation::Unavailable {
+                reason: "wayland_cache_uninitialized",
+                cache_age_ms: None,
+            };
+        };
+
+        let cache_age_ms = last_commit_at.elapsed().as_millis() as u64;
+        if cache_age_ms > stale_ms.max(1) {
+            return WaylandFocusObservation::Unavailable {
+                reason: "wayland_cache_stale",
+                cache_age_ms: Some(cache_age_ms),
+            };
+        }
+
+        if let Some(active) = snapshot.active.as_ref() {
+            return WaylandFocusObservation::Fresh {
+                snapshot: active.to_focus_snapshot(true),
+                cache_age_ms,
+            };
+        }
+
+        if snapshot.activated_count > 1 {
+            return WaylandFocusObservation::Unavailable {
+                reason: "wayland_ambiguous_activated",
+                cache_age_ms: Some(cache_age_ms),
+            };
+        }
+
+        let grace = transition_grace_ms.max(1);
+        if let (Some(last_activated), Some(last_activated_at)) = (
+            snapshot.last_activated.as_ref(),
+            snapshot.last_activated_at.as_ref(),
+        ) {
+            if last_activated_at.elapsed().as_millis() as u64 <= grace {
+                return WaylandFocusObservation::LowConfidence {
+                    snapshot: last_activated.to_focus_snapshot(false),
+                    cache_age_ms,
+                    reason: "wayland_transition_no_activated",
+                };
+            }
+        }
+
+        WaylandFocusObservation::Unavailable {
+            reason: "wayland_no_activated",
+            cache_age_ms: Some(cache_age_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WaylandFocusSharedState {
+    connected: bool,
+    protocols_supported: bool,
+    active: Option<CachedToplevel>,
+    activated_count: usize,
+    last_activated: Option<CachedToplevel>,
+    last_commit_at: Option<Instant>,
+    last_activated_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct WaylandRuntimeState {
+    shared: Arc<Mutex<WaylandFocusSharedState>>,
+    foreign_toplevel_list: Option<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1>,
+    cosmic_toplevel_info: Option<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1>,
+    toplevels: Vec<RuntimeToplevel>,
+}
+
+impl WaylandRuntimeState {
+    fn new(shared: Arc<Mutex<WaylandFocusSharedState>>) -> Self {
+        Self {
+            shared,
+            foreign_toplevel_list: None,
+            cosmic_toplevel_info: None,
+            toplevels: Vec::new(),
+        }
+    }
+
+    fn supports_focus_protocols(&self) -> bool {
+        self.foreign_toplevel_list.is_some() && self.cosmic_toplevel_info.is_some()
+    }
+
+    fn publish(&self) {
+        let now = Instant::now();
+        let activated: Vec<CachedToplevel> = self
+            .toplevels
+            .iter()
+            .filter(|entry| entry.activated)
+            .map(|entry| CachedToplevel {
+                identifier: entry.identifier.clone(),
+                app_id: entry.app_id.clone(),
+                title: entry.title.clone(),
+            })
+            .collect();
+
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.connected = true;
+            shared.protocols_supported = self.supports_focus_protocols();
+            shared.activated_count = activated.len();
+            shared.active = if activated.len() == 1 {
+                activated.first().cloned()
+            } else {
+                None
+            };
+            if let Some(active) = shared.active.clone() {
+                shared.last_activated = Some(active);
+                shared.last_activated_at = Some(now);
+            }
+            shared.last_commit_at = Some(now);
+        }
+    }
+
+    fn find_by_foreign_handle_mut(
+        &mut self,
+        handle: &ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    ) -> Option<&mut RuntimeToplevel> {
+        self.toplevels
+            .iter_mut()
+            .find(|entry| &entry.foreign == handle)
+    }
+
+    fn find_by_cosmic_handle_mut(
+        &mut self,
+        handle: &zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+    ) -> Option<&mut RuntimeToplevel> {
+        self.toplevels
+            .iter_mut()
+            .find(|entry| entry.cosmic.as_ref() == Some(handle))
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeToplevel {
+    foreign: ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    cosmic: Option<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1>,
+    identifier: Option<String>,
+    app_id: Option<String>,
+    title: Option<String>,
+    activated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedToplevel {
+    identifier: Option<String>,
+    app_id: Option<String>,
+    title: Option<String>,
+}
+
+impl CachedToplevel {
+    fn to_focus_snapshot(&self, focused: bool) -> FocusSnapshot {
+        FocusSnapshot {
+            app_name: self.app_id.clone(),
+            object_name: self.title.clone(),
+            object_path: self.identifier.clone(),
+            service_name: Some("wayland".to_string()),
+            focused,
+            active: true,
+            resolver: "wayland",
+        }
+    }
+}
+
+fn run_wayland_focus_worker(shared: Arc<Mutex<WaylandFocusSharedState>>) {
+    const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+    loop {
+        let result = run_wayland_focus_session(Arc::clone(&shared));
+        if result.is_err() {
+            if let Ok(mut guard) = shared.lock() {
+                guard.connected = false;
+            }
+        }
+        thread::sleep(RECONNECT_DELAY);
+    }
+}
+
+fn run_wayland_focus_session(shared: Arc<Mutex<WaylandFocusSharedState>>) -> Result<()> {
+    let connection =
+        Connection::connect_to_env().context("failed to connect to Wayland display")?;
+    let display = connection.display();
+    let mut event_queue = connection.new_event_queue();
+    let queue_handle = event_queue.handle();
+    let _registry = display.get_registry(&queue_handle, ());
+    let mut runtime = WaylandRuntimeState::new(shared);
+
+    event_queue
+        .roundtrip(&mut runtime)
+        .context("failed initial Wayland roundtrip")?;
+    event_queue
+        .roundtrip(&mut runtime)
+        .context("failed secondary Wayland roundtrip")?;
+    runtime.publish();
+
+    loop {
+        event_queue
+            .blocking_dispatch(&mut runtime)
+            .context("Wayland focus event dispatch failed")?;
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for WaylandRuntimeState {
+    fn event(
+        runtime: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                match interface.as_str() {
+                    "ext_foreign_toplevel_list_v1" => {
+                        let bind_version = version.min(1);
+                        runtime.foreign_toplevel_list = Some(registry.bind::<
+                        ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+                        _,
+                        _,
+                    >(name, bind_version, queue_handle, ()));
+                    }
+                    "zcosmic_toplevel_info_v1"
+                        if version >= zcosmic_toplevel_info_v1::REQ_GET_COSMIC_TOPLEVEL_SINCE =>
+                    {
+                        let bind_version = version.min(3);
+                        runtime.cosmic_toplevel_info = Some(
+                            registry.bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(
+                                name,
+                                bind_version,
+                                queue_handle,
+                                (),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            wl_registry::Event::GlobalRemove { .. } => {}
+            _ => {}
+        }
+        runtime.publish();
+    }
+}
+
+impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for WaylandRuntimeState {
+    fn event(
+        runtime: &mut Self,
+        _: &ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+        event: ext_foreign_toplevel_list_v1::Event,
+        _: &(),
+        _: &Connection,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        if let ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
+            let cosmic = runtime
+                .cosmic_toplevel_info
+                .as_ref()
+                .map(|manager| manager.get_cosmic_toplevel(&toplevel, queue_handle, ()));
+            runtime.toplevels.push(RuntimeToplevel {
+                foreign: toplevel,
+                cosmic,
+                identifier: None,
+                app_id: None,
+                title: None,
+                activated: false,
+            });
+        }
+        runtime.publish();
+    }
+
+    event_created_child!(
+        WaylandRuntimeState,
+        ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+        [
+            ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (
+                ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+                ()
+            ),
+        ]
+    );
+}
+
+impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()>
+    for WaylandRuntimeState
+{
+    fn event(
+        runtime: &mut Self,
+        handle: &ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+        event: ext_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mut publish = false;
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Title { title } => {
+                if let Some(entry) = runtime.find_by_foreign_handle_mut(handle) {
+                    entry.title = Some(title);
+                }
+            }
+            ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                if let Some(entry) = runtime.find_by_foreign_handle_mut(handle) {
+                    entry.app_id = Some(app_id);
+                }
+            }
+            ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
+                if let Some(entry) = runtime.find_by_foreign_handle_mut(handle) {
+                    entry.identifier = Some(identifier);
+                }
+            }
+            ext_foreign_toplevel_handle_v1::Event::Done => {
+                publish = true;
+            }
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                runtime.toplevels.retain(|entry| &entry.foreign != handle);
+                publish = true;
+            }
+            _ => {}
+        }
+        if publish {
+            runtime.publish();
+        }
+    }
+}
+
+impl Dispatch<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for WaylandRuntimeState {
+    fn event(
+        runtime: &mut Self,
+        _: &zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1,
+        event: zcosmic_toplevel_info_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, zcosmic_toplevel_info_v1::Event::Done) {
+            runtime.publish();
+        }
+    }
+}
+
+impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for WaylandRuntimeState {
+    fn event(
+        runtime: &mut Self,
+        handle: &zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
+        event: zcosmic_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zcosmic_toplevel_handle_v1::Event::State { state } = event {
+            if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
+                entry.activated = parse_cosmic_state_has_activated(&state);
+            }
+        }
+    }
+}
+
+fn parse_cosmic_state_has_activated(state: &[u8]) -> bool {
+    const COSMIC_STATE_ACTIVATED: u32 = 2;
+
+    state.chunks_exact(4).any(|chunk| {
+        <[u8; 4]>::try_from(chunk)
+            .ok()
+            .map(u32::from_ne_bytes)
+            .is_some_and(|value| value == COSMIC_STATE_ACTIVATED)
+    })
+}
+
 static SINGLE_QUOTED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'([^']+)'").expect("valid regex"));
 static VARIANT_STRING_RE: LazyLock<Regex> =
@@ -650,9 +1093,12 @@ static UINT32_RE: LazyLock<Regex> =
 #[cfg(test)]
 mod tests {
     use super::{
-        has_state_bit, is_high_confidence, parse_object_refs, parse_uint32_list, rank_candidate,
-        should_replace_candidate, FocusSnapshot,
+        has_state_bit, is_high_confidence, parse_cosmic_state_has_activated, parse_object_refs,
+        parse_uint32_list, rank_candidate, should_replace_candidate, CachedToplevel, FocusSnapshot,
+        WaylandFocusCache, WaylandFocusObservation, WaylandFocusSharedState,
     };
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parses_object_refs_from_gdbus_output() {
@@ -701,5 +1147,75 @@ mod tests {
         let mut not_focused = snapshot.clone();
         not_focused.focused = false;
         assert!(!is_high_confidence(Some(&(2, 1, not_focused))));
+    }
+
+    #[test]
+    fn parse_cosmic_state_detects_activated_flag() {
+        let encoded = 2u32
+            .to_ne_bytes()
+            .into_iter()
+            .chain(1u32.to_ne_bytes())
+            .collect::<Vec<u8>>();
+        assert!(parse_cosmic_state_has_activated(&encoded));
+    }
+
+    #[test]
+    fn wayland_cache_marks_stale_snapshot_as_unavailable() {
+        let active = CachedToplevel {
+            identifier: Some("abc".to_string()),
+            app_id: Some("Brave".to_string()),
+            title: Some("Title".to_string()),
+        };
+        let cache = WaylandFocusCache {
+            shared: Arc::new(Mutex::new(WaylandFocusSharedState {
+                connected: true,
+                protocols_supported: true,
+                active: Some(active.clone()),
+                activated_count: 1,
+                last_activated: Some(active),
+                last_commit_at: Some(Instant::now() - Duration::from_millis(1800)),
+                last_activated_at: Some(Instant::now() - Duration::from_millis(100)),
+            })),
+        };
+
+        let observed = cache.observe(1200, 200);
+        match observed {
+            WaylandFocusObservation::Unavailable { reason, .. } => {
+                assert_eq!(reason, "wayland_cache_stale");
+            }
+            _ => panic!("expected stale cache to be unavailable"),
+        }
+    }
+
+    #[test]
+    fn wayland_cache_uses_transition_grace_low_confidence_snapshot() {
+        let recent = CachedToplevel {
+            identifier: Some("def".to_string()),
+            app_id: Some("Code".to_string()),
+            title: Some("Editor".to_string()),
+        };
+        let cache = WaylandFocusCache {
+            shared: Arc::new(Mutex::new(WaylandFocusSharedState {
+                connected: true,
+                protocols_supported: true,
+                active: None,
+                activated_count: 0,
+                last_activated: Some(recent),
+                last_commit_at: Some(Instant::now()),
+                last_activated_at: Some(Instant::now()),
+            })),
+        };
+
+        let observed = cache.observe(1200, 200);
+        match observed {
+            WaylandFocusObservation::LowConfidence {
+                snapshot, reason, ..
+            } => {
+                assert!(!snapshot.focused);
+                assert_eq!(snapshot.resolver, "wayland");
+                assert_eq!(reason, "wayland_transition_no_activated");
+            }
+            _ => panic!("expected low-confidence transition snapshot"),
+        }
     }
 }

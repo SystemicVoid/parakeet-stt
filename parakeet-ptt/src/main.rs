@@ -149,6 +149,18 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     focus_deep_scan_max_apps: u8,
 
+    /// Focus metadata source for adaptive routing decisions.
+    #[arg(long, value_enum, default_value_t = CliFocusResolverSource::Atspi)]
+    focus_resolver_source: CliFocusResolverSource,
+
+    /// Wayland focus cache staleness threshold before fallback.
+    #[arg(long, default_value_t = 1200)]
+    focus_wayland_stale_ms: u64,
+
+    /// Wayland transition grace when no activated toplevel is reported.
+    #[arg(long, default_value_t = 200)]
+    focus_wayland_transition_grace_ms: u64,
+
     /// Behavior when selected paste backend cannot be initialized or used.
     #[arg(
         long,
@@ -300,6 +312,23 @@ impl From<CliPasteRoutingMode> for crate::config::PasteRoutingMode {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
+enum CliFocusResolverSource {
+    Atspi,
+    Wayland,
+    Hybrid,
+}
+
+impl From<CliFocusResolverSource> for crate::config::FocusResolverSource {
+    fn from(source: CliFocusResolverSource) -> Self {
+        match source {
+            CliFocusResolverSource::Atspi => crate::config::FocusResolverSource::Atspi,
+            CliFocusResolverSource::Wayland => crate::config::FocusResolverSource::Wayland,
+            CliFocusResolverSource::Hybrid => crate::config::FocusResolverSource::Hybrid,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteBackendFailurePolicy {
     CopyOnly,
     Error,
@@ -347,8 +376,11 @@ async fn main() -> Result<()> {
                 adaptive_terminal_shortcut: cli.adaptive_terminal_shortcut.into(),
                 adaptive_general_shortcut: cli.adaptive_general_shortcut.into(),
                 adaptive_unknown_shortcut: cli.adaptive_unknown_shortcut.into(),
+                focus_resolver_source: cli.focus_resolver_source.into(),
                 focus_resolve_budget_ms: cli.focus_resolve_budget_ms,
                 focus_deep_scan_max_apps: cli.focus_deep_scan_max_apps,
+                focus_wayland_stale_ms: cli.focus_wayland_stale_ms,
+                focus_wayland_transition_grace_ms: cli.focus_wayland_transition_grace_ms,
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -532,8 +564,11 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 adaptive_terminal_shortcut = ?config.clipboard.adaptive_terminal_shortcut,
                 adaptive_general_shortcut = ?config.clipboard.adaptive_general_shortcut,
                 adaptive_unknown_shortcut = ?config.clipboard.adaptive_unknown_shortcut,
+                focus_resolver_source = ?config.clipboard.focus_resolver_source,
                 focus_resolve_budget_ms = config.clipboard.focus_resolve_budget_ms,
                 focus_deep_scan_max_apps = config.clipboard.focus_deep_scan_max_apps,
+                focus_wayland_stale_ms = config.clipboard.focus_wayland_stale_ms,
+                focus_wayland_transition_grace_ms = config.clipboard.focus_wayland_transition_grace_ms,
                 uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
@@ -860,7 +895,9 @@ mod tests {
         PasteKeyBackend, PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
 
-    use super::{build_injector, shortcut_interop_warning, Cli, CliPasteStrategy};
+    use super::{
+        build_injector, shortcut_interop_warning, Cli, CliFocusResolverSource, CliPasteStrategy,
+    };
 
     fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
         ClipboardOptions {
@@ -879,8 +916,11 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            focus_resolver_source: crate::config::FocusResolverSource::Atspi,
             focus_resolve_budget_ms: 450,
             focus_deep_scan_max_apps: 1,
+            focus_wayland_stale_ms: 1200,
+            focus_wayland_transition_grace_ms: 200,
             seat: None,
             write_primary: false,
         }
@@ -923,6 +963,24 @@ mod tests {
     fn cli_accepts_explicit_always_chain_strategy() {
         let cli = Cli::parse_from(["parakeet-ptt", "--paste-strategy", "always-chain"]);
         assert!(matches!(cli.paste_strategy, CliPasteStrategy::AlwaysChain));
+    }
+
+    #[test]
+    fn cli_default_focus_resolver_source_is_atspi() {
+        let cli = Cli::parse_from(["parakeet-ptt"]);
+        assert!(matches!(
+            cli.focus_resolver_source,
+            CliFocusResolverSource::Atspi
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_hybrid_focus_resolver_source() {
+        let cli = Cli::parse_from(["parakeet-ptt", "--focus-resolver-source", "hybrid"]);
+        assert!(matches!(
+            cli.focus_resolver_source,
+            CliFocusResolverSource::Hybrid
+        ));
     }
 
     #[test]

@@ -10,9 +10,13 @@ use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
 use tracing::{debug, info, warn};
 
-use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
+use crate::config::{
+    ClipboardOptions, FocusResolverSource, PasteRestorePolicy, PasteShortcut, PasteStrategy,
+};
 use crate::routing::decide_route;
-use crate::surface_focus::{AtspiFocusResolver, FocusResolveStats};
+use crate::surface_focus::{
+    AtspiFocusResolver, FocusResolveStats, WaylandFocusCache, WaylandFocusObservation,
+};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -185,6 +189,16 @@ pub struct ClipboardInjector {
     options: ClipboardOptions,
     copy_only: bool,
     focus_resolver: AtspiFocusResolver,
+    wayland_focus_cache: Option<WaylandFocusCache>,
+}
+
+#[derive(Debug, Clone)]
+struct FocusResolutionOutcome {
+    snapshot: Option<crate::surface_focus::FocusSnapshot>,
+    atspi_stats: FocusResolveStats,
+    source_selected: &'static str,
+    wayland_cache_age_ms: Option<u64>,
+    wayland_fallback_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -213,11 +227,18 @@ impl ClipboardInjector {
     const CLIPBOARD_READY_POLL_MS: u64 = 10;
 
     pub fn new(sender: PasteKeySender, options: ClipboardOptions, copy_only: bool) -> Self {
+        let wayland_focus_cache = match options.focus_resolver_source {
+            FocusResolverSource::Atspi => None,
+            FocusResolverSource::Wayland | FocusResolverSource::Hybrid => {
+                Some(WaylandFocusCache::new())
+            }
+        };
         Self {
             sender,
             options,
             copy_only,
             focus_resolver: AtspiFocusResolver::new(),
+            wayland_focus_cache,
         }
     }
 
@@ -765,6 +786,157 @@ impl ClipboardInjector {
             }
         }
     }
+
+    fn resolve_atspi_focus(
+        &self,
+        trace_id: u64,
+    ) -> (
+        Option<crate::surface_focus::FocusSnapshot>,
+        FocusResolveStats,
+    ) {
+        let focus_resolve_started = Instant::now();
+        match self.focus_resolver.resolve_with_limits(
+            self.options.focus_resolve_budget_ms,
+            self.options.focus_deep_scan_max_apps,
+        ) {
+            Ok(result) => (result.snapshot, result.stats),
+            Err(err) => {
+                let stats = FocusResolveStats {
+                    duration_ms: focus_resolve_started.elapsed().as_millis() as u64,
+                    ..FocusResolveStats::default()
+                };
+                warn!(
+                    trace_id,
+                    error = %err,
+                    focus_resolve_ms = stats.duration_ms,
+                    focus_resolve_budget_ms = self.options.focus_resolve_budget_ms,
+                    focus_deep_scan_max_apps = self.options.focus_deep_scan_max_apps,
+                    "failed to resolve focused surface metadata via AT-SPI; adaptive routing will use unknown fallback"
+                );
+                (None, stats)
+            }
+        }
+    }
+
+    fn resolve_focus_metadata(&self, trace_id: u64) -> FocusResolutionOutcome {
+        let empty_stats = FocusResolveStats::default();
+        match self.options.focus_resolver_source {
+            FocusResolverSource::Atspi => {
+                let (snapshot, atspi_stats) = self.resolve_atspi_focus(trace_id);
+                FocusResolutionOutcome {
+                    snapshot,
+                    atspi_stats,
+                    source_selected: "atspi",
+                    wayland_cache_age_ms: None,
+                    wayland_fallback_reason: None,
+                }
+            }
+            FocusResolverSource::Wayland => {
+                let Some(cache) = self.wayland_focus_cache.as_ref() else {
+                    return FocusResolutionOutcome {
+                        snapshot: None,
+                        atspi_stats: empty_stats,
+                        source_selected: "wayland_unavailable",
+                        wayland_cache_age_ms: None,
+                        wayland_fallback_reason: Some("wayland_cache_not_initialized"),
+                    };
+                };
+                match cache.observe(
+                    self.options.focus_wayland_stale_ms,
+                    self.options.focus_wayland_transition_grace_ms,
+                ) {
+                    WaylandFocusObservation::Fresh {
+                        snapshot,
+                        cache_age_ms,
+                    } => FocusResolutionOutcome {
+                        snapshot: Some(snapshot),
+                        atspi_stats: empty_stats,
+                        source_selected: "wayland_cache",
+                        wayland_cache_age_ms: Some(cache_age_ms),
+                        wayland_fallback_reason: None,
+                    },
+                    WaylandFocusObservation::LowConfidence {
+                        snapshot,
+                        cache_age_ms,
+                        reason,
+                    } => FocusResolutionOutcome {
+                        snapshot: Some(snapshot),
+                        atspi_stats: empty_stats,
+                        source_selected: "wayland_cache_low_confidence",
+                        wayland_cache_age_ms: Some(cache_age_ms),
+                        wayland_fallback_reason: Some(reason),
+                    },
+                    WaylandFocusObservation::Unavailable {
+                        reason,
+                        cache_age_ms,
+                    } => FocusResolutionOutcome {
+                        snapshot: None,
+                        atspi_stats: empty_stats,
+                        source_selected: "wayland_unavailable",
+                        wayland_cache_age_ms: cache_age_ms,
+                        wayland_fallback_reason: Some(reason),
+                    },
+                }
+            }
+            FocusResolverSource::Hybrid => {
+                if let Some(cache) = self.wayland_focus_cache.as_ref() {
+                    match cache.observe(
+                        self.options.focus_wayland_stale_ms,
+                        self.options.focus_wayland_transition_grace_ms,
+                    ) {
+                        WaylandFocusObservation::Fresh {
+                            snapshot,
+                            cache_age_ms,
+                        } => {
+                            return FocusResolutionOutcome {
+                                snapshot: Some(snapshot),
+                                atspi_stats: empty_stats,
+                                source_selected: "wayland_cache",
+                                wayland_cache_age_ms: Some(cache_age_ms),
+                                wayland_fallback_reason: None,
+                            };
+                        }
+                        WaylandFocusObservation::LowConfidence {
+                            cache_age_ms,
+                            reason,
+                            ..
+                        } => {
+                            let (snapshot, atspi_stats) = self.resolve_atspi_focus(trace_id);
+                            return FocusResolutionOutcome {
+                                snapshot,
+                                atspi_stats,
+                                source_selected: "atspi_fallback",
+                                wayland_cache_age_ms: Some(cache_age_ms),
+                                wayland_fallback_reason: Some(reason),
+                            };
+                        }
+                        WaylandFocusObservation::Unavailable {
+                            reason,
+                            cache_age_ms,
+                        } => {
+                            let (snapshot, atspi_stats) = self.resolve_atspi_focus(trace_id);
+                            return FocusResolutionOutcome {
+                                snapshot,
+                                atspi_stats,
+                                source_selected: "atspi_fallback",
+                                wayland_cache_age_ms: cache_age_ms,
+                                wayland_fallback_reason: Some(reason),
+                            };
+                        }
+                    }
+                }
+
+                let (snapshot, atspi_stats) = self.resolve_atspi_focus(trace_id);
+                FocusResolutionOutcome {
+                    snapshot,
+                    atspi_stats,
+                    source_selected: "atspi_fallback",
+                    wayland_cache_age_ms: None,
+                    wayland_fallback_reason: Some("wayland_cache_not_initialized"),
+                }
+            }
+        }
+    }
 }
 
 impl TextInjector for ClipboardInjector {
@@ -788,6 +960,9 @@ impl TextInjector for ClipboardInjector {
             adaptive_terminal_shortcut = ?self.options.adaptive_terminal_shortcut,
             adaptive_general_shortcut = ?self.options.adaptive_general_shortcut,
             adaptive_unknown_shortcut = ?self.options.adaptive_unknown_shortcut,
+            focus_resolver_source = ?self.options.focus_resolver_source,
+            focus_wayland_stale_ms = self.options.focus_wayland_stale_ms,
+            focus_wayland_transition_grace_ms = self.options.focus_wayland_transition_grace_ms,
             seat = ?self.options.seat,
             write_primary = self.options.write_primary,
             mime_type = %self.options.mime_type,
@@ -910,33 +1085,21 @@ impl TextInjector for ClipboardInjector {
             return Ok(());
         }
 
-        let focus_resolve_started = Instant::now();
-        let (focus_snapshot, focus_resolve_stats) = match self.focus_resolver.resolve_with_limits(
-            self.options.focus_resolve_budget_ms,
-            self.options.focus_deep_scan_max_apps,
-        ) {
-            Ok(result) => (result.snapshot, result.stats),
-            Err(err) => {
-                let stats = FocusResolveStats {
-                    duration_ms: focus_resolve_started.elapsed().as_millis() as u64,
-                    ..FocusResolveStats::default()
-                };
-                warn!(
-                    trace_id,
-                    error = %err,
-                    focus_resolve_ms = stats.duration_ms,
-                    focus_resolve_budget_ms = self.options.focus_resolve_budget_ms,
-                    focus_deep_scan_max_apps = self.options.focus_deep_scan_max_apps,
-                    "failed to resolve focused surface metadata; adaptive routing will use unknown fallback"
-                );
-                (None, stats)
-            }
-        };
+        let FocusResolutionOutcome {
+            snapshot: focus_snapshot,
+            atspi_stats: focus_resolve_stats,
+            source_selected,
+            wayland_cache_age_ms,
+            wayland_fallback_reason,
+        } = self.resolve_focus_metadata(trace_id);
 
         let route = decide_route(&self.options, focus_snapshot.as_ref());
         if let Some(snapshot) = focus_snapshot.as_ref() {
             info!(
                 trace_id,
+                focus_source_selected = source_selected,
+                focus_wayland_cache_age_ms = ?wayland_cache_age_ms,
+                focus_wayland_fallback_reason = ?wayland_fallback_reason,
                 resolver = snapshot.resolver,
                 focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
                 focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
@@ -959,6 +1122,9 @@ impl TextInjector for ClipboardInjector {
         } else {
             info!(
                 trace_id,
+                focus_source_selected = source_selected,
+                focus_wayland_cache_age_ms = ?wayland_cache_age_ms,
+                focus_wayland_fallback_reason = ?wayland_fallback_reason,
                 focus_resolve_ms = focus_resolve_stats.duration_ms,
                 focus_resolve_timed_out = focus_resolve_stats.timed_out,
                 focus_resolve_gdbus_calls = focus_resolve_stats.gdbus_calls,
@@ -969,7 +1135,7 @@ impl TextInjector for ClipboardInjector {
                 route_adaptive_fallback = ?route.adaptive_fallback,
                 route_low_confidence = route.low_confidence,
                 route_reason = route.reason,
-                "no focused surface metadata available; using unknown routing fallback"
+                "no focused surface metadata available from selected focus source; using unknown routing fallback"
             );
         }
 
@@ -1117,8 +1283,8 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
-        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
-        PasteRoutingMode, PasteShortcut, PasteStrategy,
+        ClipboardOptions, FocusResolverSource, PasteBackendFailurePolicy, PasteKeyBackend,
+        PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
     use evdev::Key;
     use std::path::PathBuf;
@@ -1144,8 +1310,11 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            focus_resolver_source: FocusResolverSource::Atspi,
             focus_resolve_budget_ms: 450,
             focus_deep_scan_max_apps: 1,
+            focus_wayland_stale_ms: 1200,
+            focus_wayland_transition_grace_ms: 200,
             seat: None,
             write_primary: false,
         }
