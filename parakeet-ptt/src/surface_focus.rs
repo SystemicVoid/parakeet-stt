@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -51,7 +52,7 @@ impl AtspiFocusResolver {
             return Ok(None);
         }
 
-        let mut best: Option<(u8, FocusSnapshot)> = None;
+        let mut best: Option<(u8, usize, FocusSnapshot)> = None;
         for app in app_roots {
             let app_name = self
                 .get_name(&address, &app.service_name, &app.object_path)
@@ -61,10 +62,16 @@ impl AtspiFocusResolver {
             // Some apps expose windows as children; others only mark the root object.
             let mut candidates = self
                 .get_children(&address, &app.service_name, &app.object_path)
-                .unwrap_or_default();
-            candidates.push(app.clone());
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| (candidate, 1usize))
+                .collect::<Vec<_>>();
+            candidates.push((app.clone(), 0));
 
-            for candidate in candidates {
+            let mut app_best: Option<(u8, usize, FocusSnapshot)> = None;
+            let mut app_has_active = false;
+
+            for (candidate, depth) in candidates {
                 let state_chunks = match self.get_state_chunks(
                     &address,
                     &candidate.service_name,
@@ -76,6 +83,9 @@ impl AtspiFocusResolver {
 
                 let focused = has_state_bit(&state_chunks, ATSPI_STATE_FOCUSED);
                 let active = has_state_bit(&state_chunks, ATSPI_STATE_ACTIVE);
+                if active {
+                    app_has_active = true;
+                }
                 if !(focused || active) {
                     continue;
                 }
@@ -95,16 +105,124 @@ impl AtspiFocusResolver {
                     resolver: "atspi",
                 };
 
-                // Prefer focused objects, then active ones.
-                let score = (u8::from(focused) * 2) + u8::from(active);
-                match &best {
-                    Some((best_score, _)) if *best_score >= score => {}
-                    _ => best = Some((score, snapshot)),
+                // Prefer active apps first, then focused snapshots.
+                let score = rank_candidate(active, focused);
+                let should_replace = match &app_best {
+                    Some((best_score, best_depth, best_snapshot)) => should_replace_candidate(
+                        *best_score,
+                        *best_depth,
+                        best_snapshot.focused,
+                        score,
+                        depth,
+                        snapshot.focused,
+                    ),
+                    None => true,
+                };
+                if should_replace {
+                    app_best = Some((score, depth, snapshot));
+                }
+            }
+
+            if app_has_active {
+                if let Some((focused_ref, depth)) = self.find_focused_descendant(&address, &app)? {
+                    let object_name = self
+                        .get_name(
+                            &address,
+                            &focused_ref.service_name,
+                            &focused_ref.object_path,
+                        )
+                        .ok()
+                        .flatten();
+                    let focused_snapshot = FocusSnapshot {
+                        app_name: app_name.clone(),
+                        object_name,
+                        object_path: Some(focused_ref.object_path.clone()),
+                        service_name: Some(focused_ref.service_name.clone()),
+                        focused: true,
+                        active: true,
+                        resolver: "atspi",
+                    };
+                    let score = rank_candidate(true, true);
+                    let should_replace = match &app_best {
+                        Some((best_score, best_depth, best_snapshot)) => should_replace_candidate(
+                            *best_score,
+                            *best_depth,
+                            best_snapshot.focused,
+                            score,
+                            depth,
+                            focused_snapshot.focused,
+                        ),
+                        None => true,
+                    };
+                    if should_replace {
+                        app_best = Some((score, depth, focused_snapshot));
+                    }
+                }
+            }
+
+            if let Some((score, depth, snapshot)) = app_best {
+                let should_replace = match &best {
+                    Some((best_score, best_depth, best_snapshot)) => should_replace_candidate(
+                        *best_score,
+                        *best_depth,
+                        best_snapshot.focused,
+                        score,
+                        depth,
+                        snapshot.focused,
+                    ),
+                    None => true,
+                };
+                if should_replace {
+                    best = Some((score, depth, snapshot));
                 }
             }
         }
 
-        Ok(best.map(|(_, snapshot)| snapshot))
+        Ok(best.map(|(_, _, snapshot)| snapshot))
+    }
+
+    fn find_focused_descendant(
+        &self,
+        address: &str,
+        root: &ObjectRef,
+    ) -> Result<Option<(ObjectRef, usize)>> {
+        let mut stack: Vec<(ObjectRef, usize)> = vec![(root.clone(), 0)];
+        let mut seen = HashSet::new();
+        let mut scanned = 0usize;
+
+        while let Some((candidate, depth)) = stack.pop() {
+            if scanned >= MAX_FOCUS_SCAN_NODES {
+                break;
+            }
+            let key = (
+                candidate.service_name.clone(),
+                candidate.object_path.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            scanned += 1;
+
+            let state_chunks = match self.get_state_chunks(
+                address,
+                &candidate.service_name,
+                &candidate.object_path,
+            ) {
+                Ok(chunks) => chunks,
+                Err(_) => continue,
+            };
+            if has_state_bit(&state_chunks, ATSPI_STATE_FOCUSED) {
+                return Ok(Some((candidate, depth)));
+            }
+
+            let children =
+                self.get_children(address, &candidate.service_name, &candidate.object_path)?;
+            for child in children {
+                stack.push((child, depth + 1));
+            }
+        }
+
+        Ok(None)
     }
 
     fn atspi_address(&self) -> Result<String> {
@@ -210,7 +328,31 @@ impl AtspiFocusResolver {
 const ROOT_OBJECT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const ATSPI_STATE_ACTIVE: u32 = 1;
 const ATSPI_STATE_FOCUSED: u32 = 12;
+const MAX_FOCUS_SCAN_NODES: usize = 1024;
 const GDBUS_TIMEOUT_SECONDS: &str = "2";
+
+fn rank_candidate(active: bool, focused: bool) -> u8 {
+    (u8::from(active) * 2) + u8::from(focused)
+}
+
+fn should_replace_candidate(
+    current_rank: u8,
+    current_depth: usize,
+    current_focused: bool,
+    new_rank: u8,
+    new_depth: usize,
+    new_focused: bool,
+) -> bool {
+    if new_rank > current_rank {
+        return true;
+    }
+    if new_rank < current_rank {
+        return false;
+    }
+
+    // For equally-ranked focused candidates, prefer deeper descendants.
+    new_focused && current_focused && new_depth > current_depth
+}
 
 fn has_state_bit(chunks: &[u32], bit: u32) -> bool {
     let chunk_index = (bit / 32) as usize;
@@ -283,7 +425,10 @@ static UINT32_RE: LazyLock<Regex> =
 
 #[cfg(test)]
 mod tests {
-    use super::{has_state_bit, parse_object_refs, parse_uint32_list};
+    use super::{
+        has_state_bit, parse_object_refs, parse_uint32_list, rank_candidate,
+        should_replace_candidate,
+    };
 
     #[test]
     fn parses_object_refs_from_gdbus_output() {
@@ -302,5 +447,17 @@ mod tests {
         assert_eq!(chunks, vec![1124075776, 0]);
         assert!(has_state_bit(&chunks, 8));
         assert!(!has_state_bit(&chunks, 12));
+    }
+
+    #[test]
+    fn ranks_active_above_focused_only() {
+        assert!(rank_candidate(true, false) > rank_candidate(false, true));
+        assert!(rank_candidate(true, true) > rank_candidate(true, false));
+    }
+
+    #[test]
+    fn tie_break_prefers_deeper_focused_candidate() {
+        assert!(should_replace_candidate(3, 3, true, 3, 8, true));
+        assert!(!should_replace_candidate(3, 8, true, 3, 3, true));
     }
 }
