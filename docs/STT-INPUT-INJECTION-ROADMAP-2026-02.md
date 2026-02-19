@@ -184,9 +184,11 @@ Decision gate:
 1. Promote backend default only if matrix pass rate exceeds current default and no severe regressions are found.
 2. Otherwise ship as opt-in backend and continue hardening.
 
-Current default policy (explicit):
+Historical default policy at roadmap authoring time (2026-02-08):
 1. Keep `--paste-key-backend wtype`.
 2. Keep `--paste-backend-failure-policy copy-only`.
+
+Current defaults on `main` have since changed; see top-level `README.md` for active runtime behavior.
 
 Acceptance matrix recording template:
 

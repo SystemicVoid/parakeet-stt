@@ -1,4 +1,4 @@
-# STT helper status (updated 2026-02-08)
+# STT helper status (updated 2026-02-19)
 
 This document now has two parts:
 
@@ -26,6 +26,8 @@ This document now has two parts:
 - `auto` backend now performs runtime fallback attempts (`uinput -> ydotool -> wtype`) per shortcut execution.
 - `stt diag-injector` reports backend capability prerequisites (`wtype`, `ydotool`, `/dev/uinput` write access) before running matrix cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
+- Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
+- Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -36,8 +38,8 @@ This document now has two parts:
 - The helper reliably starts the daemon with `--no-streaming` and the daemon stays up.
 - When the helper succeeds in starting the client, PTT sessions run and return transcripts quickly (latency ~50–120 ms in logs).
 
-## What fails (intermittent client start)
-- When invoked from `stt start` (or plain `stt`), the client sometimes exits immediately. The helper then reports “Client failed to stay up” and may also report “Client rebuild failed” even though manual `cargo run` works.
+## What failed previously (resolved on 2026-02-19)
+- When invoked from `stt start` (or plain `stt`), the helper previously could report “Client failed to stay up” while `cargo run --release` compilation was still in progress.
 - In failing runs, `/tmp/parakeet-ptt.log` ended up empty because the helper truncated the log before spawning the client and the client exited before writing anything. We now keep a header and more instrumentation in the log.
 - If another process binds port 8765 (e.g., Anki), the daemon would previously crash with `address already in use`; the helper now rebinds to the next free port unless `PARAKEET_PORT` is explicitly set.
 

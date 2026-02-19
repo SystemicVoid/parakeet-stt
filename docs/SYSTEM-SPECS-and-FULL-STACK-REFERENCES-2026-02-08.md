@@ -5,6 +5,8 @@
 This document is a deep-research handoff companion to `docs/HANDOFF-clipboard-injector-2026-02-08.md`.
 It captures exact runtime/system context plus authoritative external references so another AI/engineer can run targeted research without re-discovering environment facts.
 
+This is a historical snapshot from 2026-02-08. For active runtime defaults and behavior, use the top-level `README.md` and `docs/stt-troubleshooting.md`.
+
 ## Snapshot Metadata
 
 - Snapshot time (UTC): `2026-02-08T18:41:42+00:00`
@@ -102,7 +104,7 @@ Runtime chain:
 4. tmux pane launches daemon (`uv run parakeet-stt-daemon`) and client (`parakeet-ptt`).
 5. Rust client receives `final_result` and executes clipboard + paste choreography.
 
-## Active STT Defaults in Helper (Current)
+## STT Defaults in Helper at Snapshot Time (Historical)
 
 From `scripts/stt-helper.sh` defaults:
 
