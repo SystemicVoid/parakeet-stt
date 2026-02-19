@@ -328,7 +328,7 @@ This section tracks implementation in atomic units so work can resume after cont
 - [x] T2 Fix helper cold-start false negative during `cargo run --release` compile windows.
 - [x] T3 Fix helper tmux pane selection to avoid zero-based index assumptions.
 - [x] T4 Harden adaptive routing when AT-SPI snapshot is low-confidence (`focus_focused=false`).
-- [ ] T5 Add AT-SPI `gdbus` timeout bounds to prevent routing stalls.
+- [x] T5 Add AT-SPI `gdbus` timeout bounds to prevent routing stalls.
 - [ ] T6 Run validation matrix, update docs, and close out residual risks.
 
 ### 12.2 Commit ledger
@@ -338,8 +338,8 @@ This section tracks implementation in atomic units so work can resume after cont
 | T1 | `HANDOFF-stt-cross-surface-injection-2026-02-19.md` | `27f14a9` | Done | Added checklist, task IDs, commit ledger, and validation template |
 | T2 | `scripts/stt-helper.sh`, handoff | `b18575a` | Done | Added timeout-based readiness loop with compile-aware wait extension |
 | T3 | `scripts/stt-helper.sh`, handoff | `9d9c5b1` | Done | Switched to pane-id based selection instead of `.0` target |
-| T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | pending (this commit) | Done | Route degrades to unknown when `focus_focused=false`; added confidence logging/tests |
-| T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | pending | Not started | Add explicit `gdbus` timeouts |
+| T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | `9359f59` | Done | Route degrades to unknown when `focus_focused=false`; added confidence logging/tests |
+| T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | pending (this commit) | Done | Added bounded `gdbus` timeouts (`--timeout 2`) for AT-SPI lookup calls |
 | T6 | handoff + runtime docs (if needed) | pending | Not started | Record validation outcomes and remaining risks |
 
 ## 13. Validation Log Template

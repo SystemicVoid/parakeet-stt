@@ -124,6 +124,8 @@ impl AtspiFocusResolver {
             "org.a11y.Bus",
             "--object-path",
             "/org/a11y/bus",
+            "--timeout",
+            GDBUS_TIMEOUT_SECONDS,
             "--method",
             "org.a11y.Bus.GetAddress",
         ])?;
@@ -145,6 +147,8 @@ impl AtspiFocusResolver {
             dest,
             "--object-path",
             path,
+            "--timeout",
+            GDBUS_TIMEOUT_SECONDS,
             "--method",
             "org.a11y.atspi.Accessible.GetChildren",
         ])?;
@@ -161,6 +165,8 @@ impl AtspiFocusResolver {
             dest,
             "--object-path",
             path,
+            "--timeout",
+            GDBUS_TIMEOUT_SECONDS,
             "--method",
             "org.freedesktop.DBus.Properties.Get",
             "org.a11y.atspi.Accessible",
@@ -179,6 +185,8 @@ impl AtspiFocusResolver {
             dest,
             "--object-path",
             path,
+            "--timeout",
+            GDBUS_TIMEOUT_SECONDS,
             "--method",
             "org.a11y.atspi.Accessible.GetState",
         ])?;
@@ -202,6 +210,7 @@ impl AtspiFocusResolver {
 const ROOT_OBJECT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const ATSPI_STATE_ACTIVE: u32 = 1;
 const ATSPI_STATE_FOCUSED: u32 = 12;
+const GDBUS_TIMEOUT_SECONDS: &str = "2";
 
 fn has_state_bit(chunks: &[u32], bit: u32) -> bool {
     let chunk_index = (bit / 32) as usize;
