@@ -450,3 +450,164 @@ Resume the high-signal loop:
 - Notion/Brave bar
 - COSMIC Terminal / Ghostty
 3. Compare route/focus fields and confirm whether editor failures remain purely due low-confidence `Unknown -> CtrlShiftV` behavior or require resolver patch.
+
+## 16. Resolver Deep-Scan Patch (2026-02-19 15:20 UTC)
+
+### 16.1 New root-cause evidence
+
+Additional raw AT-SPI probing showed the current resolver was too shallow:
+- Existing resolver scanned only app roots + one child level.
+- Real `focused=true` nodes can be much deeper:
+  - Brave focused descendant found at `/org/a11y/atspi/accessible/29` (depth 8)
+  - VS Code focused descendant found at `/org/a11y/atspi/accessible/530` (depth 29)
+- This mismatch explains repeated `focus_focused=false` snapshots and `Unknown -> CtrlShiftV` routing when editor surfaces were expected to use `CtrlV`.
+
+### 16.2 Implemented code changes
+
+File:
+- `parakeet-ptt/src/surface_focus.rs`
+
+Changes:
+1. Added active-first candidate ranking:
+- ranking now prioritizes `active` over `focused-only` (`active+focused > active-only > focused-only`).
+
+2. Added bounded focused-descendant probe:
+- new `find_focused_descendant()` runs a depth-first scan for `focused=true`.
+- scan is bounded (`MAX_FOCUS_SCAN_NODES=1024`) to avoid unbounded traversal.
+- deep scan is only attempted for apps that are currently active in the shallow pass.
+
+3. Added deterministic tie-break:
+- for equal-ranked focused candidates, prefer deeper descendants.
+
+4. Added unit tests:
+- active-vs-focused ranking behavior
+- focused tie-break behavior
+
+### 16.3 Automated validation
+
+Ran in `parakeet-ptt`:
+- `cargo fmt` -> pass
+- `cargo test` -> pass (`27 passed, 0 failed`)
+- `cargo clippy --all-targets --all-features -- -D warnings` -> pass
+- `cargo build --release` -> pass
+- `source scripts/stt-helper.sh && stt diag-injector` -> pass
+
+Key runtime evidence from `stt diag-injector` after release rebuild:
+- Ghostty snapshot now resolved as focused terminal descendant:
+  - `focus_object_path="/com/mitchellh/ghostty/..."`
+  - `focus_active=true`
+  - `focus_focused=true`
+  - `route_class=Terminal`
+  - `route_primary=CtrlShiftV`
+- Brave snapshot now resolved as focused browser descendant:
+  - `focus_object_path="/org/a11y/atspi/accessible/29"`
+  - `focus_active=true`
+  - `focus_focused=true`
+  - `route_class=General`
+  - `route_primary=CtrlV`
+
+### 16.4 Runtime validation still required
+
+Pending interactive matrix after rebuilding release binary:
+- rebuild: `cd parakeet-ptt && cargo build --release`
+- run surface sweep in live session:
+  - COSMIC Text Editor
+  - VS Code editor panel
+  - Notion/Brave bar
+  - COSMIC Terminal / Ghostty
+- capture whether resolver now reports focused descendants on editor targets and routes to `CtrlV` as expected.
+
+## 17. New Regression: Post-Beep Injection Latency Spikes (Observed, Not Fixed)
+
+Date observed: `2026-02-19` (post deep-scan patch)
+
+### 17.1 User symptom
+
+After cross-surface switching (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser), text still injects correctly but delay after completion beep becomes significant (often >0.5s, sometimes multi-second).
+
+### 17.2 High-signal log evidence
+
+From `/tmp/parakeet-ptt.log` in the 15:24-15:26 window:
+
+Baseline (acceptable):
+- trace `1`: `resolve_gap_ms=694`, `elapsed_ms=1415`
+- trace `2`: `resolve_gap_ms=423`, `elapsed_ms=1144`
+- trace `3`: `resolve_gap_ms=425`, `elapsed_ms=1146`
+
+Spikes (regression):
+- trace `4`: `resolve_gap_ms=3175`, `elapsed_ms=3896`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
+- trace `5`: `resolve_gap_ms=3161`, `elapsed_ms=3884`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
+- trace `6`: `resolve_gap_ms=3169`, `elapsed_ms=3890`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
+- trace `7`: `resolve_gap_ms=3426`, `elapsed_ms=4146`, `focus_object_path="/com/mitchellh/ghostty/..."`, `focus_focused=true`
+
+Important invariant:
+- `finish_gap_ms` remains ~`720ms` in all cases, which aligns with configured `post_chord_hold_ms=700`.
+- Therefore the additional delay is dominated by pre-chord resolver time (`start` -> `resolved focused surface`).
+
+### 17.3 Likely source-level cause
+
+Candidate path (current code):
+- `parakeet-ptt/src/injector.rs` resolves focus synchronously before sending paste chord (`focus_resolver.resolve()`).
+- `parakeet-ptt/src/surface_focus.rs` now performs bounded deep scan (`find_focused_descendant`) for every app marked active in the shallow pass.
+- Each `gdbus` call still has `--timeout 2`; deep traversal over large app trees (Brave/VS Code) can accumulate second-scale stalls.
+- Multiple apps can present `active=true` simultaneously in AT-SPI snapshots, so a single injection can deep-scan more than one app before route decision.
+
+Inference:
+- The new latency regression is likely resolver traversal/timeout accumulation, not paste-chord/post-hold mechanics.
+
+### 17.4 Status for next session
+
+- No behavioral fix applied in this session (documentation only, per operator request).
+- Keep this as the next optimization task after current stability checkpoint.
+
+Suggested next investigation (deferred):
+1. Add resolver timing instrumentation (total + per-app + per-`gdbus` call).
+2. Add resolver deadline budget per injection (hard cap) independent of per-call timeout.
+3. Avoid deep-scan across all active apps; short-circuit once a high-confidence candidate is found.
+4. Re-run the same cross-surface sequence and compare resolver-gap histogram pre/post change.
+
+## 17. New Issue Logged (Do Not Fix in This Session): Post-Beep Injection Latency
+
+Date logged: 2026-02-19 15:28 UTC (operator report)
+Status: Documented only; explicitly deferred to a later session after compacting.
+
+### 17.1 Operator symptom report
+
+After cross-surface testing (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser), injection begins to feel delayed after PTT release and post-release audio cue.
+
+Operator-estimated delay: often ~0.5s or higher.
+
+### 17.2 Captured evidence during this run
+
+A log extraction pass over `/tmp/parakeet-ptt.log` found variable pre-paste gaps with occasional large spikes:
+
+- Typical samples: resolve gap ~0.5s to ~0.7s
+- Spike samples: resolve gap ~3.1s to ~3.4s
+- With post-resolve/paste completion gap ~0.72s, total flow elapsed reached ~3.9s to ~4.1s in worst captured samples
+
+These spikes are materially above the expected "feels instant" interaction budget and are consistent with the reported latency perception.
+
+### 17.3 Current hypothesis (for next session)
+
+The dominant delay appears before route resolution/paste completion (not just key chord emission), suggesting intermittent latency in one or more pre-injection phases (e.g., upstream transcript finalization timing, focus-resolution path cost, or event handoff timing).
+
+No root-cause fix is implemented in this session.
+
+### 17.4 Decision record
+
+Per operator request:
+- Do not fix now.
+- Preserve current runtime behavior.
+- Carry forward as first-class next-session investigation item.
+
+### 17.5 Suggested next-session debug slice
+
+1. Add per-stage timestamps (or structured duration fields) for:
+   - PTT release event receipt
+   - final transcript received
+   - clipboard write begin/end
+   - focus resolve begin/end
+   - key injection begin/end
+2. Run focused repro loop across the transition that triggers slowdown:
+   - VS Code -> terminal -> COSMIC Text Editor -> browser
+3. Segment latency by stage to isolate the true dominant contributor before patching.
