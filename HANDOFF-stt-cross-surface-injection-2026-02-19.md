@@ -12,6 +12,24 @@ Cross-surface injection was failing because a single static paste chord cannot s
 
 This handoff now reflects **implemented changes** (not only diagnosis). The fix introduces **adaptive routing** in `parakeet-ptt` that chooses the paste chord based on focused-surface metadata, while preserving existing backend reliability controls (`uinput -> ydotool -> wtype`, clipboard readiness barrier, copy-only policy).
 
+## 1.1 Git Commit Map (Atomic Units)
+
+1. `e1113c8` `feat(ptt): add adaptive cross-surface paste routing`
+- Core Rust implementation:
+  - routing config/CLI
+  - focus resolver
+  - adaptive injector integration
+  - tests and dependency updates
+
+2. `cf59d57` `chore(helper): wire adaptive routing flags through stt start`
+- Shell helper defaults + forwarding for all new routing controls.
+
+3. `76c6c5d` `docs(runtime): document adaptive routing defaults and focus baseline`
+- Runtime docs updated for operator-facing defaults and COSMIC focus settings baseline.
+
+4. `6af47e6` `docs(handoff): publish full implementation handoff for cross-surface fix`
+- Full implementation handoff (this file).
+
 ## 2. Problem Context (Pre-Fix)
 
 Observed behavior before implementation:
