@@ -1,7 +1,7 @@
 # Handoff: STT Cross-Surface Injection Reliability
 
-Date: 2026-02-19  
-Repo: `parakeet-stt`  
+Date: 2026-02-19
+Repo: `parakeet-stt`
 Author: Codex + operator session
 
 ## 1. Executive Summary
@@ -385,3 +385,68 @@ Still required (interactive operator validation):
   - insertion success rate
   - duplicate insertion rate
   - focus churn incidents
+
+## 15. Session Continuation Handoff (2026-02-19 15:02 UTC)
+
+This section captures the exact state at the point of operator-requested agent restart.
+
+### 15.1 What changed during this diagnostic slice
+
+1. User confirmed cross-surface behavior:
+- Works in terminal/browser surfaces (Ghostty, Notion, Brave bar).
+- Still fails in editor surfaces (COSMIC Text Editor, VS Code editor panel).
+
+2. Additional outage introduced during agent-driven restart:
+- Symptom: no completion sound and no text injection anywhere.
+- Client log showed repeated:
+  - `Connection to daemon failed: ... Connection refused (os error 111)`
+- Root cause:
+  - `stt restart` was executed from a non-interactive one-shot shell.
+  - Helper `start` launches daemon as a background process of that shell.
+  - Shell exits after command completes; daemon receives SIGHUP and dies.
+  - Client remains alive in tmux and continues retry loop.
+
+3. Recovery performed:
+- Daemon relaunched inside tmux window so it survives shell exit:
+  - tmux session: `parakeet-stt`
+  - window: `daemon-fix`
+  - device override used: `PARAKEET_DEVICE=cpu`
+- Confirmed at handoff time:
+  - listener up on `127.0.0.1:8765`
+  - daemon pid `131885`
+  - client reconnected at `2026-02-19T15:02:15Z` (`Connected to daemon`)
+
+### 15.2 Critical operational note for next agent
+
+Do **not** run `stt start/restart` from a disposable one-shot shell command runner unless daemon is disowned/daemonized independently.
+
+Use persistent tmux-managed runtime for both:
+- Codex agent shell
+- STT runtime shell/session
+
+### 15.3 Recommended restart layout (next instance)
+
+1. Create/attach two tmux sessions:
+- `tmux new -As codex`
+- `tmux new -As stt-runtime`
+
+2. In `stt-runtime`, run helper interactively (not one-shot):
+- `cd ~/Documents/Engineering/parakeet-stt`
+- `source scripts/stt-helper.sh`
+- `PARAKEET_DEVICE=cpu stt start`
+
+3. Validate runtime before testing:
+- `ss -ltnp | rg 8765`
+- `tail -n 40 /tmp/parakeet-ptt.log`
+- `tail -n 40 /tmp/parakeet-daemon.log`
+
+### 15.4 Immediate next diagnostic task after restart
+
+Resume the high-signal loop:
+1. Keep live filter on injector lines only (`starting clipboard injection`, `resolved focused surface`, `clipboard injection flow finished`).
+2. Re-run surface sweep:
+- COSMIC Text Editor
+- VS Code editor panel
+- Notion/Brave bar
+- COSMIC Terminal / Ghostty
+3. Compare route/focus fields and confirm whether editor failures remain purely due low-confidence `Unknown -> CtrlShiftV` behavior or require resolver patch.
