@@ -329,7 +329,7 @@ This section tracks implementation in atomic units so work can resume after cont
 - [x] T3 Fix helper tmux pane selection to avoid zero-based index assumptions.
 - [x] T4 Harden adaptive routing when AT-SPI snapshot is low-confidence (`focus_focused=false`).
 - [x] T5 Add AT-SPI `gdbus` timeout bounds to prevent routing stalls.
-- [ ] T6 Run validation matrix, update docs, and close out residual risks.
+- [x] T6 Run validation matrix, update docs, and close out residual risks.
 
 ### 12.2 Commit ledger
 
@@ -339,8 +339,27 @@ This section tracks implementation in atomic units so work can resume after cont
 | T2 | `scripts/stt-helper.sh`, handoff | `b18575a` | Done | Added timeout-based readiness loop with compile-aware wait extension |
 | T3 | `scripts/stt-helper.sh`, handoff | `9d9c5b1` | Done | Switched to pane-id based selection instead of `.0` target |
 | T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | `9359f59` | Done | Route degrades to unknown when `focus_focused=false`; added confidence logging/tests |
-| T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | pending (this commit) | Done | Added bounded `gdbus` timeouts (`--timeout 2`) for AT-SPI lookup calls |
-| T6 | handoff + runtime docs (if needed) | pending | Not started | Record validation outcomes and remaining risks |
+| T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | `442565b` | Done | Added bounded `gdbus` timeouts (`--timeout 2`) for AT-SPI lookup calls |
+| T6 | handoff + runtime docs | pending (this commit) | Done | Recorded validation outcomes, doc updates, and remaining manual matrix |
+
+### 12.3 Validation summary (post-fix)
+
+Automated checks run:
+- `bash -n scripts/stt-helper.sh` -> pass
+- `cd parakeet-ptt && cargo test` -> pass (`25 passed, 0 failed`)
+- `cd parakeet-ptt && cargo clippy --all-targets --all-features -- -D warnings` -> pass
+- `source scripts/stt-helper.sh && stt diag-injector` -> pass (capability checks + 3 test cases)
+
+Runtime observation from `diag-injector` after `cargo build --release`:
+- When AT-SPI returns `focus_focused=false`, routing now emits:
+  - `route_class=Unknown`
+  - `route_primary=CtrlShiftV`
+  - `route_low_confidence=true`
+  - `route_reason=\"adaptive low-confidence focus snapshot (focused=false)\"`
+
+Operational note:
+- `diag-injector` prefers `target/release/parakeet-ptt` when present.
+- If the release binary is stale, diagnostics may reflect old behavior until rebuilt (`cargo build --release`).
 
 ## 13. Validation Log Template
 
@@ -349,7 +368,20 @@ Use this to capture evidence during/after T2-T6:
 | Date | Surface | Backend | Observed focus metadata | Route decision | Injection outcome | Notes |
 |---|---|---|---|---|---|---|
 | 2026-02-19 | COSMIC Terminal | auto | (fill) | (fill) | (fill) | |
-| 2026-02-19 | Ghostty | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | Ghostty | auto | `focus_app=\"Unnamed\"`, `focus_focused=false` | `Unknown -> CtrlShiftV` (`route_low_confidence=true`) | `success_assumed` | from `stt diag-injector` |
 | 2026-02-19 | VS Code | auto | (fill) | (fill) | (fill) | |
 | 2026-02-19 | COSMIC Editor | auto | (fill) | (fill) | (fill) | |
-| 2026-02-19 | Brave | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | Brave | auto | `focus_app=\"Brave Browser\"`, `focus_focused=false` | `Unknown -> CtrlShiftV` (`route_low_confidence=true`) | `success_assumed` | from `stt diag-injector` |
+
+## 14. Remaining Manual Matrix
+
+Still required (interactive operator validation):
+- 20-attempt matrix per surface for:
+  - COSMIC Terminal, Ghostty, VS Code, COSMIC Editor, Brave, Notion
+- Backends:
+  - `--paste-key-backend auto`
+  - `--paste-key-backend uinput`
+- Record:
+  - insertion success rate
+  - duplicate insertion rate
+  - focus churn incidents

@@ -82,10 +82,16 @@ Default profile:
 - `--adaptive-terminal-shortcut ctrl-shift-v`
 - `--adaptive-general-shortcut ctrl-v`
 - `--adaptive-unknown-shortcut ctrl-shift-v`
+- low-confidence focus snapshots (`focus_focused=false`) route via unknown policy (`ctrl-shift-v` by default)
 - `--paste-backend-failure-policy copy-only`
 - `--paste-restore-policy never`
 - `--paste-copy-foreground true`
 - `--uinput-dwell-ms 18`
+
+Helper readiness timing:
+
+- `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` controls client readiness wait (default `30`)
+- helper extends readiness wait when `cargo run --release` compile activity is detected
 
 COSMIC focus-navigation baseline for best adaptive behavior:
 - `Focus follows cursor = ON`

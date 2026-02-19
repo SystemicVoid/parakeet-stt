@@ -15,15 +15,17 @@ This document now has two parts:
   - `--paste-shortcut-fallback none`
   - `--paste-strategy single`
   - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
-  - `--paste-routing-mode adaptive`
-  - `--adaptive-terminal-shortcut ctrl-shift-v`
-  - `--adaptive-general-shortcut ctrl-v`
-  - `--adaptive-unknown-shortcut ctrl-shift-v`
+- `--paste-routing-mode adaptive`
+- `--adaptive-terminal-shortcut ctrl-shift-v`
+- `--adaptive-general-shortcut ctrl-v`
+- `--adaptive-unknown-shortcut ctrl-shift-v`
+- low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
 - `auto` backend now performs runtime fallback attempts (`uinput -> ydotool -> wtype`) per shortcut execution.
 - `stt diag-injector` reports backend capability prerequisites (`wtype`, `ydotool`, `/dev/uinput` write access) before running matrix cases.
+- Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 
 ## Historical notes (pre-2026 migration hardening)
 
