@@ -1,6 +1,6 @@
 # Parakeet STT – Canonical Specification (Living Document)
 
-_Last updated: 2025-11-17_
+_Last updated: 2026-02-19_
 
 This document is the single source of truth for the local, push-to-talk Parakeet speech-to-text solution on Pop!\_OS 24.04 (Wayland). Update it whenever significant design, implementation, or operational decisions are made so every agent and developer can stay in sync.
 
@@ -44,7 +44,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   2. Daemon begins streaming mic audio (already owned by the daemon) through Parakeet’s RNNT streaming API.
   3. User releases Right Ctrl → `parakeet-ptt` issues `stop_session`.
   4. Daemon finalizes decoding, returns final transcription via WebSocket.
-  5. `parakeet-ptt` injects received text into the active Wayland surface using the most capable method (virtual keyboard preferred, `wtype` fallback).
+  5. `parakeet-ptt` writes transcript text to the clipboard and executes configured paste behavior (`paste`, `type`, or `copy-only`), with adaptive shortcut routing available in paste mode.
 
 - **Networking**: localhost WebSocket (JSON frames). No audio leaves the daemon process; control messages only.
 
@@ -55,7 +55,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 ### 3.1 `parakeet-stt-daemon` (Python 3.11 via `uv`)
 
 - **Process management**
-  - Managed with `uv` virtual environment (`uv init`, `uv pip install`, `uv lock` committed).
+  - Managed with `uv` (`uv sync`, `uv lock` committed).
   - Eventually shipped as a user-level systemd service for auto-start.
 
 - **Dependencies**
@@ -105,7 +105,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Crates**
   - `tokio`, `tokio-tungstenite`, `serde`/`serde_json`, `evdev`, `anyhow`, `uuid`.
-  - Add `smithay-client-toolkit` and `wayland-protocols` to implement `virtual-keyboard-v1` once available. Provide trait `TextInjector` with implementations for virtual keyboard and `wtype`.
+  - `evdev`/`uinput` stack plus subprocess backends (`ydotool`, `wtype`) for paste chord emission.
 
 - **Hotkey handling**
   - Identify Right Ctrl (`KEY_RIGHTCTRL`, code 97). Use non-blocking event loop to avoid missed releases.
@@ -113,9 +113,11 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Provide override configuration for alternate hotkey if needed later.
 
 - **Injection pipeline**
-  - Preferred: negotiate `virtual-keyboard-v1` with compositor; send Unicode key events directly.
-  - Fallback: spawn `wtype --delay-ms 6 --text <text>`; detect command presence at startup.
-  - Add optional transliteration or macro hooks (future).
+  - Default runtime path is clipboard choreography (`wl-copy` + readiness probe) and paste chord emission.
+  - Paste backend ladder (helper default): `auto` => `uinput -> ydotool -> wtype`.
+  - Adaptive routing chooses shortcut by focused-surface class (`terminal`, `general`, `unknown`).
+  - Low-confidence AT-SPI snapshots (`focus_focused=false`) are treated as `unknown` for routing.
+  - Backend failure policy defaults to `copy-only` so transcript delivery is preserved via clipboard.
 
 - **Resilience**
   - If daemon connection fails, show notification/log and retry with exponential backoff.
