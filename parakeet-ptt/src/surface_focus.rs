@@ -1026,7 +1026,17 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()>
                 publish = true;
             }
             ext_foreign_toplevel_handle_v1::Event::Closed => {
-                runtime.toplevels.retain(|entry| &entry.foreign != handle);
+                if let Some(index) = runtime
+                    .toplevels
+                    .iter()
+                    .position(|entry| &entry.foreign == handle)
+                {
+                    let removed = runtime.toplevels.swap_remove(index);
+                    if let Some(cosmic) = removed.cosmic {
+                        cosmic.destroy();
+                    }
+                    removed.foreign.destroy();
+                }
                 publish = true;
             }
             _ => {}
