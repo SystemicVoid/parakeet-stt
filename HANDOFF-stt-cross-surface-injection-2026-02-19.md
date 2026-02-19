@@ -230,3 +230,126 @@ If adaptive routing regresses for a user:
 ## 10. Summary of Outcome
 
 This implementation closes the original cross-surface gap by making shortcut choice context-aware while preserving existing reliability hardening. It deliberately avoids an X11-comp-layer injection branch and keeps behavior observable and recoverable via explicit flags.
+
+## 11. Current State Diagnostics (2026-02-19 PM Follow-up)
+
+This section records post-implementation runtime diagnostics after additional operator repros in COSMIC Terminal/Ghostty.
+
+### 11.1 What is confirmed working
+
+1. Updated helper defaults are now loaded in fresh shells:
+- `stt start` summary includes:
+  - `Paste routing mode: adaptive`
+  - `Adaptive terminal shortcut: ctrl-shift-v`
+  - `Adaptive general shortcut: ctrl-v`
+  - `Adaptive unknown shortcut: ctrl-shift-v`
+
+2. Updated client binary now exists and exposes adaptive flags:
+- `parakeet-ptt/target/release/parakeet-ptt --help` includes:
+  - `--paste-routing-mode`
+  - `--adaptive-terminal-shortcut`
+  - `--adaptive-general-shortcut`
+  - `--adaptive-unknown-shortcut`
+
+3. Runtime adaptive mode is active in logs:
+- `Using clipboard injector ... paste_routing_mode=Adaptive ...`
+
+### 11.2 Diagnosed startup issues
+
+1. First launch after update hit stale-binary fallback + compile race:
+- `stt` fell back to `cargo run --release` (release binary check failed for new flags).
+- Log evidence:
+  - `Finished 'release' profile [optimized] target(s) in 11.79s`
+  - followed by `Running 'target/release/parakeet-ptt ... --paste-routing-mode adaptive ...'`
+
+2. Helper emitted false negative while compile was still in progress:
+- `stt` waits up to ~10s for `parakeet-ptt` PID (`20 * 0.5s` loop in helper).
+- Compile took longer (~11.79s), so helper printed:
+  - `Client did not stay up; recent client log: ...`
+- Client then started successfully once compile completed.
+
+3. `can't find pane: 0` is explained by tmux index configuration mismatch:
+- Helper targets pane `.0`.
+- User tmux config is 1-based:
+  - `set -g base-index 1`
+  - `setw -g pane-base-index 1`
+
+### 11.3 Diagnosed routing/focus mismatch during terminal repros
+
+During the latest adaptive runs, all captured route decisions resolved to Brave metadata, not terminal/editor targets:
+
+- 9/9 routing snapshots:
+  - `focus_app="Brave Browser"`
+  - `focus_object="Gemini - Brave"`
+  - `focus_active=true`
+  - `focus_focused=false`
+  - `route_class=General`
+  - `route_primary=CtrlV`
+  - `route_adaptive_fallback=Some(CtrlShiftV)`
+
+Implication:
+- When dictating while expecting terminal behavior, adaptive routing still chose `CtrlV` because focus resolver reported browser/general context.
+- This matches observed symptom where terminal received literal `ctrl+v` rather than paste.
+
+### 11.4 Remaining issues (open)
+
+1. Focus snapshot staleness/misattribution under AT-SPI:
+- Resolver frequently returns active browser object with `focus_focused=false`.
+- Needs further refinement so active dictation target is resolved more reliably for rapid cross-app switching.
+
+2. Helper UX issues:
+- PID readiness timeout is too short for a cold `cargo run --release` compile.
+- Pane selection should not assume zero-based pane index on user tmux setups.
+
+### 11.5 Next diagnostics to run (before code changes)
+
+1. Capture focused-surface logs while intentionally dictating in:
+- COSMIC Terminal
+- Ghostty
+- VS Code
+- COSMIC Editor
+
+2. For each run, record:
+- `focus_app`, `focus_object`, `focus_active`, `focus_focused`
+- `route_class`, `route_primary`, `route_reason`
+- observed insertion behavior in target app
+
+3. Confirm whether misroutes correlate with:
+- `focus_focused=false` snapshots
+- stale active app metadata from previous surface
+
+## 12. Execution Plan and Progress Ledger (Post-Diagnostics)
+
+This section tracks implementation in atomic units so work can resume after context loss.
+
+### 12.1 Task checklist
+
+- [ ] T1 Add checklist/ledger scaffolding and validation template in this handoff.
+- [ ] T2 Fix helper cold-start false negative during `cargo run --release` compile windows.
+- [ ] T3 Fix helper tmux pane selection to avoid zero-based index assumptions.
+- [ ] T4 Harden adaptive routing when AT-SPI snapshot is low-confidence (`focus_focused=false`).
+- [ ] T5 Add AT-SPI `gdbus` timeout bounds to prevent routing stalls.
+- [ ] T6 Run validation matrix, update docs, and close out residual risks.
+
+### 12.2 Commit ledger
+
+| Task | Scope | Commit | Status | Notes |
+|---|---|---|---|---|
+| T1 | `HANDOFF-stt-cross-surface-injection-2026-02-19.md` | pending | In progress | Add persistent execution metadata scaffold |
+| T2 | `scripts/stt-helper.sh`, handoff | pending | Not started | Replace fixed PID wait with timeout-based readiness |
+| T3 | `scripts/stt-helper.sh`, handoff | pending | Not started | Remove `.0` pane assumption |
+| T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | pending | Not started | Degrade low-confidence focus to unknown route |
+| T5 | `parakeet-ptt/src/surface_focus.rs`, tests, handoff | pending | Not started | Add explicit `gdbus` timeouts |
+| T6 | handoff + runtime docs (if needed) | pending | Not started | Record validation outcomes and remaining risks |
+
+## 13. Validation Log Template
+
+Use this to capture evidence during/after T2-T6:
+
+| Date | Surface | Backend | Observed focus metadata | Route decision | Injection outcome | Notes |
+|---|---|---|---|---|---|---|
+| 2026-02-19 | COSMIC Terminal | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | Ghostty | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | VS Code | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | COSMIC Editor | auto | (fill) | (fill) | (fill) | |
+| 2026-02-19 | Brave | auto | (fill) | (fill) | (fill) | |
