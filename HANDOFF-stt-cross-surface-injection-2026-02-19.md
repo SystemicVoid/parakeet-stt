@@ -517,97 +517,61 @@ Pending interactive matrix after rebuilding release binary:
   - COSMIC Terminal / Ghostty
 - capture whether resolver now reports focused descendants on editor targets and routes to `CtrlV` as expected.
 
-## 17. New Regression: Post-Beep Injection Latency Spikes (Observed, Not Fixed)
+## 17. Latency Regression Follow-up (Fixed, 2026-02-19 15:45 UTC)
 
-Date observed: `2026-02-19` (post deep-scan patch)
+### 17.1 Root cause recap
 
-### 17.1 User symptom
+The multi-second post-beep delay was in pre-chord focus resolution (`start` -> `resolved focused surface`), not in paste hold/chord completion.
 
-After cross-surface switching (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser), text still injects correctly but delay after completion beep becomes significant (often >0.5s, sometimes multi-second).
+Primary contributors:
+- resolver deep-scanned every app that reported `active=true`
+- per-call `gdbus` timeout was `2s`, allowing timeout accumulation across scans
+- resolution happened synchronously in injection path
 
-### 17.2 High-signal log evidence
+### 17.2 Fix implemented
 
-From `/tmp/parakeet-ptt.log` in the 15:24-15:26 window:
+Code paths updated:
+- `parakeet-ptt/src/surface_focus.rs`
+- `parakeet-ptt/src/injector.rs`
+- `parakeet-ptt/src/config.rs`
+- `parakeet-ptt/src/main.rs`
+- `scripts/stt-helper.sh`
 
-Baseline (acceptable):
-- trace `1`: `resolve_gap_ms=694`, `elapsed_ms=1415`
-- trace `2`: `resolve_gap_ms=423`, `elapsed_ms=1144`
-- trace `3`: `resolve_gap_ms=425`, `elapsed_ms=1146`
+Behavior changes:
+1. Added resolver controls:
+   - `--focus-resolve-budget-ms` (default `450`)
+   - `--focus-deep-scan-max-apps` (default `1`)
+2. Deep scan now runs for at most one ranked active app (default), instead of fan-out across all active apps.
+3. Added timeout-aware resolver stats:
+   - `focus_resolve_ms`
+   - `focus_resolve_timed_out`
+   - `focus_resolve_gdbus_calls`
+   - `focus_resolve_deep_scan_apps`
+   - `focus_resolve_deep_scan_nodes`
+4. Reduced `MAX_FOCUS_SCAN_NODES` from `1024` to `256`.
+5. Reduced per-call `gdbus` timeout from `2s` to `1s`.
+6. Helper/start paths now forward and print new focus resolver controls.
 
-Spikes (regression):
-- trace `4`: `resolve_gap_ms=3175`, `elapsed_ms=3896`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
-- trace `5`: `resolve_gap_ms=3161`, `elapsed_ms=3884`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
-- trace `6`: `resolve_gap_ms=3169`, `elapsed_ms=3890`, `focus_object_path="/org/a11y/atspi/accessible/1"`, `focus_focused=false`
-- trace `7`: `resolve_gap_ms=3426`, `elapsed_ms=4146`, `focus_object_path="/com/mitchellh/ghostty/..."`, `focus_focused=true`
+### 17.3 Validation (this session)
 
-Important invariant:
-- `finish_gap_ms` remains ~`720ms` in all cases, which aligns with configured `post_chord_hold_ms=700`.
-- Therefore the additional delay is dominated by pre-chord resolver time (`start` -> `resolved focused surface`).
+Build/test gates:
+- `cargo fmt`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test` (`28 passed`)
+- `bash -n scripts/stt-helper.sh`
 
-### 17.3 Likely source-level cause
+Runtime checks:
+1. `stt restart` confirms active defaults:
+   - `Focus resolve budget (ms): 450`
+   - `Focus deep-scan max apps: 1`
+2. `stt diag-injector` now logs resolver stage metrics (example terminal case):
+   - `focus_resolve_ms=305`
+   - `focus_resolve_timed_out=false`
+3. 30-run tight loop with `--test-injection` (adaptive paste profile):
+   - `min=299ms`, `p50=306.5ms`, `p95=313ms`, `max=315ms`
+   - `timeouts=0`
+   - no multi-second resolver spikes observed
 
-Candidate path (current code):
-- `parakeet-ptt/src/injector.rs` resolves focus synchronously before sending paste chord (`focus_resolver.resolve()`).
-- `parakeet-ptt/src/surface_focus.rs` now performs bounded deep scan (`find_focused_descendant`) for every app marked active in the shallow pass.
-- Each `gdbus` call still has `--timeout 2`; deep traversal over large app trees (Brave/VS Code) can accumulate second-scale stalls.
-- Multiple apps can present `active=true` simultaneously in AT-SPI snapshots, so a single injection can deep-scan more than one app before route decision.
+### 17.4 Remaining caveat
 
-Inference:
-- The new latency regression is likely resolver traversal/timeout accumulation, not paste-chord/post-hold mechanics.
-
-### 17.4 Status for next session
-
-- No behavioral fix applied in this session (documentation only, per operator request).
-- Keep this as the next optimization task after current stability checkpoint.
-
-Suggested next investigation (deferred):
-1. Add resolver timing instrumentation (total + per-app + per-`gdbus` call).
-2. Add resolver deadline budget per injection (hard cap) independent of per-call timeout.
-3. Avoid deep-scan across all active apps; short-circuit once a high-confidence candidate is found.
-4. Re-run the same cross-surface sequence and compare resolver-gap histogram pre/post change.
-
-## 17. New Issue Logged (Do Not Fix in This Session): Post-Beep Injection Latency
-
-Date logged: 2026-02-19 15:28 UTC (operator report)
-Status: Documented only; explicitly deferred to a later session after compacting.
-
-### 17.1 Operator symptom report
-
-After cross-surface testing (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser), injection begins to feel delayed after PTT release and post-release audio cue.
-
-Operator-estimated delay: often ~0.5s or higher.
-
-### 17.2 Captured evidence during this run
-
-A log extraction pass over `/tmp/parakeet-ptt.log` found variable pre-paste gaps with occasional large spikes:
-
-- Typical samples: resolve gap ~0.5s to ~0.7s
-- Spike samples: resolve gap ~3.1s to ~3.4s
-- With post-resolve/paste completion gap ~0.72s, total flow elapsed reached ~3.9s to ~4.1s in worst captured samples
-
-These spikes are materially above the expected "feels instant" interaction budget and are consistent with the reported latency perception.
-
-### 17.3 Current hypothesis (for next session)
-
-The dominant delay appears before route resolution/paste completion (not just key chord emission), suggesting intermittent latency in one or more pre-injection phases (e.g., upstream transcript finalization timing, focus-resolution path cost, or event handoff timing).
-
-No root-cause fix is implemented in this session.
-
-### 17.4 Decision record
-
-Per operator request:
-- Do not fix now.
-- Preserve current runtime behavior.
-- Carry forward as first-class next-session investigation item.
-
-### 17.5 Suggested next-session debug slice
-
-1. Add per-stage timestamps (or structured duration fields) for:
-   - PTT release event receipt
-   - final transcript received
-   - clipboard write begin/end
-   - focus resolve begin/end
-   - key injection begin/end
-2. Run focused repro loop across the transition that triggers slowdown:
-   - VS Code -> terminal -> COSMIC Text Editor -> browser
-3. Segment latency by stage to isolate the true dominant contributor before patching.
+The exact user repro sequence (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser) still needs an interactive operator pass in a live desktop focus flow to fully close the loop, but the prior 3s+ resolver outlier class was not reproduced in automated high-frequency validation.
