@@ -936,6 +936,7 @@ impl TextInjector for ClipboardInjector {
                 route_class = ?route.class,
                 route_primary = ?route.primary,
                 route_adaptive_fallback = ?route.adaptive_fallback,
+                route_low_confidence = route.low_confidence,
                 route_reason = route.reason,
                 "resolved focused surface for adaptive routing"
             );
@@ -945,6 +946,7 @@ impl TextInjector for ClipboardInjector {
                 route_class = ?route.class,
                 route_primary = ?route.primary,
                 route_adaptive_fallback = ?route.adaptive_fallback,
+                route_low_confidence = route.low_confidence,
                 route_reason = route.reason,
                 "no focused surface metadata available; using unknown routing fallback"
             );

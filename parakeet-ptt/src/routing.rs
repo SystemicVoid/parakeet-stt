@@ -13,6 +13,7 @@ pub struct RouteDecision {
     pub class: SurfaceClass,
     pub primary: PasteShortcut,
     pub adaptive_fallback: Option<PasteShortcut>,
+    pub low_confidence: bool,
     pub reason: &'static str,
 }
 
@@ -54,8 +55,19 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
             class: SurfaceClass::Unknown,
             primary: options.paste_shortcut,
             adaptive_fallback: None,
+            low_confidence: false,
             reason: "routing_mode=static",
         };
+    }
+
+    if let Some(snapshot) = focus {
+        if !snapshot.focused {
+            return unknown_route(
+                options,
+                "adaptive low-confidence focus snapshot (focused=false)",
+                true,
+            );
+        }
     }
 
     let class = classify_surface(focus);
@@ -67,6 +79,7 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
                 options.adaptive_terminal_shortcut,
                 options.adaptive_general_shortcut,
             ),
+            low_confidence: false,
             reason: "adaptive terminal-like surface",
         },
         SurfaceClass::General => RouteDecision {
@@ -76,22 +89,30 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
                 options.adaptive_general_shortcut,
                 options.adaptive_terminal_shortcut,
             ),
+            low_confidence: false,
             reason: "adaptive editor/browser-like surface",
         },
-        SurfaceClass::Unknown => {
-            let alternate =
-                if options.adaptive_unknown_shortcut != options.adaptive_general_shortcut {
-                    options.adaptive_general_shortcut
-                } else {
-                    options.adaptive_terminal_shortcut
-                };
-            RouteDecision {
-                class,
-                primary: options.adaptive_unknown_shortcut,
-                adaptive_fallback: dedup_fallback(options.adaptive_unknown_shortcut, alternate),
-                reason: "adaptive unknown surface",
-            }
-        }
+        SurfaceClass::Unknown => unknown_route(options, "adaptive unknown surface", false),
+    }
+}
+
+fn unknown_route(
+    options: &ClipboardOptions,
+    reason: &'static str,
+    low_confidence: bool,
+) -> RouteDecision {
+    let alternate = if options.adaptive_unknown_shortcut != options.adaptive_general_shortcut {
+        options.adaptive_general_shortcut
+    } else {
+        options.adaptive_terminal_shortcut
+    };
+
+    RouteDecision {
+        class: SurfaceClass::Unknown,
+        primary: options.adaptive_unknown_shortcut,
+        adaptive_fallback: dedup_fallback(options.adaptive_unknown_shortcut, alternate),
+        low_confidence,
+        reason,
     }
 }
 
@@ -149,13 +170,18 @@ mod tests {
         }
     }
 
-    fn snapshot(app_name: &str, object_name: &str, object_path: &str) -> FocusSnapshot {
+    fn snapshot(
+        app_name: &str,
+        object_name: &str,
+        object_path: &str,
+        focused: bool,
+    ) -> FocusSnapshot {
         FocusSnapshot {
             app_name: Some(app_name.to_string()),
             object_name: Some(object_name.to_string()),
             object_path: Some(object_path.to_string()),
             service_name: Some(":1.42".to_string()),
-            focused: false,
+            focused,
             active: true,
             resolver: "test",
         }
@@ -163,7 +189,7 @@ mod tests {
 
     #[test]
     fn classifies_terminal_surface() {
-        let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc");
+        let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", false);
         assert_eq!(classify_surface(Some(&focus)), SurfaceClass::Terminal);
     }
 
@@ -173,24 +199,42 @@ mod tests {
             "Brave Browser",
             "Codex - Brave",
             "/org/a11y/atspi/accessible/1",
+            false,
         );
         assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
     }
 
     #[test]
     fn unknown_surface_defaults_to_unknown() {
-        let focus = snapshot("SomeApp", "random", "/org/example");
+        let focus = snapshot("SomeApp", "random", "/org/example", false);
         assert_eq!(classify_surface(Some(&focus)), SurfaceClass::Unknown);
     }
 
     #[test]
     fn adaptive_route_prefers_terminal_shortcut_for_terminals() {
         let opts = options();
-        let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc");
+        let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", true);
         let decision = decide_route(&opts, Some(&focus));
         assert_eq!(decision.class, SurfaceClass::Terminal);
         assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
         assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
+        assert!(!decision.low_confidence);
+    }
+
+    #[test]
+    fn adaptive_route_uses_unknown_when_snapshot_is_not_focused() {
+        let opts = options();
+        let focus = snapshot(
+            "Brave Browser",
+            "Codex - Brave",
+            "/org/a11y/atspi/accessible/1",
+            false,
+        );
+        let decision = decide_route(&opts, Some(&focus));
+        assert_eq!(decision.class, SurfaceClass::Unknown);
+        assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
+        assert!(decision.low_confidence);
     }
 
     #[test]
