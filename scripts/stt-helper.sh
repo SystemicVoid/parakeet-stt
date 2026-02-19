@@ -955,6 +955,9 @@ PY
                 if [ -x ./target/release/parakeet-ptt ] \
                     && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-strategy" \
                     && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-key-backend" \
+                    && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-resolver-source" \
+                    && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-stale-ms" \
+                    && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--focus-wayland-transition-grace-ms" \
                     && ./target/release/parakeet-ptt --help 2>&1 | grep -q -- "--paste-backend-failure-policy"; then
                     runner_bin="./target/release/parakeet-ptt"
                 fi
