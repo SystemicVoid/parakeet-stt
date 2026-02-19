@@ -45,6 +45,7 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
+    local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
     if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
@@ -127,6 +128,49 @@ PY
             sleep 0.5
         done
         return 1
+    }
+
+    _client_build_in_progress() {
+        [ -f "$LOG_CLIENT" ] || return 1
+        grep -Fq "[helper] running cargo run --release" "$LOG_CLIENT" || return 1
+        grep -Eq 'Compiling |Finished `release` profile' "$LOG_CLIENT" || return 1
+        grep -Fq 'Running `target/release/parakeet-ptt' "$LOG_CLIENT" && return 1
+        return 0
+    }
+
+    _wait_for_client_ready() {
+        local timeout_seconds="${1:-30}"
+        local started_at="$SECONDS"
+        local max_wait="$timeout_seconds"
+        local pid
+
+        while true; do
+            pid=$(pgrep -n "[p]arakeet-ptt" || true)
+            if [ -n "$pid" ]; then
+                echo "$pid" > "$CLIENT_PID_FILE"
+                return 0
+            fi
+
+            if [ -f "$LOG_CLIENT" ] && grep -Eq "Starting hotkey loop; press Right Ctrl to talk|Hotkey listeners started for KEY_RIGHTCTRL|Connected to daemon" "$LOG_CLIENT"; then
+                pid=$(pgrep -n "[p]arakeet-ptt" || true)
+                if [ -n "$pid" ]; then
+                    echo "$pid" > "$CLIENT_PID_FILE"
+                fi
+                return 0
+            fi
+
+            if [ $((SECONDS - started_at)) -ge "$max_wait" ]; then
+                if _client_build_in_progress; then
+                    max_wait=$((max_wait + timeout_seconds))
+                    echo "   - Client compile still running; extending readiness wait to ${max_wait}s."
+                    _log_client "client readiness wait extended to ${max_wait}s while cargo compile is active"
+                else
+                    return 1
+                fi
+            fi
+
+            sleep 0.5
+        done
     }
 
     _stop_pid() {
@@ -224,6 +268,7 @@ PY
             local completion_sound="$default_completion_sound"
             local completion_sound_path="$default_completion_sound_path"
             local completion_sound_volume="$default_completion_sound_volume"
+            local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --paste)
@@ -422,6 +467,11 @@ PY
                 esac
             done
 
+            if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
+                echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
+                client_ready_timeout_seconds=30
+            fi
+
             echo ">>> Starting Parakeet STT (detached tmux)..."
             echo "   - Injection mode: $injection_mode"
             echo "   - Paste shortcut: $paste_shortcut"
@@ -445,6 +495,7 @@ PY
             echo "   - Completion sound: $completion_sound"
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
+            echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
 
             if ! _resolve_port; then
                 return 1
@@ -583,20 +634,12 @@ PY
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             tmux select-pane -t "$TMUX_SESSION:$TMUX_WINDOW.0"
 
-            local client_ok=0
-            for _ in $(seq 1 20); do
-                local pid
-                pid=$(pgrep -n "parakeet-ptt" || true)
-                if [ -n "$pid" ]; then
-                    echo "$pid" > "$CLIENT_PID_FILE"
-                    client_ok=1
-                    break
+            if ! _wait_for_client_ready "$client_ready_timeout_seconds"; then
+                if _client_build_in_progress; then
+                    echo "   - Client compile still in progress after timeout window; recent client log:"
+                else
+                    echo "   - Client did not become ready; recent client log:"
                 fi
-                sleep 0.5
-            done
-
-            if [ "$client_ok" -ne 1 ]; then
-                echo "   - Client did not stay up; recent client log:"
                 tail -n 120 "$LOG_CLIENT"
                 return 1
             fi
