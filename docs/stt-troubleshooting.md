@@ -19,6 +19,9 @@ This document now has two parts:
 - `--adaptive-terminal-shortcut ctrl-shift-v`
 - `--adaptive-general-shortcut ctrl-v`
 - `--adaptive-unknown-shortcut ctrl-shift-v`
+- `--focus-resolver-source atspi` (default rollout-safe path; `hybrid` and `wayland` available for focus-signal pivot validation)
+- `--focus-wayland-stale-ms 1200`
+- `--focus-wayland-transition-grace-ms 200`
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
@@ -93,6 +96,9 @@ Paste/copy injection now exposes a strategy-driven pipeline through `stt start` 
 - `--adaptive-terminal-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
 - `--adaptive-general-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-v`)
 - `--adaptive-unknown-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
+- `--focus-resolver-source atspi|wayland|hybrid` (default: `atspi`)
+- `--focus-wayland-stale-ms <ms>` (default: `1200`)
+- `--focus-wayland-transition-grace-ms <ms>` (default: `200`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
@@ -104,6 +110,7 @@ Recommended baseline for Ghostty/COSMIC:
 ```bash
 stt start --paste \
   --paste-routing-mode adaptive \
+  --focus-resolver-source atspi \
   --adaptive-terminal-shortcut ctrl-shift-v \
   --adaptive-general-shortcut ctrl-v \
   --adaptive-unknown-shortcut ctrl-shift-v \

@@ -575,3 +575,155 @@ Runtime checks:
 ### 17.4 Remaining caveat
 
 The exact user repro sequence (VS Code -> terminal/Ghostty -> COSMIC Text Editor -> browser) still needs an interactive operator pass in a live desktop focus flow to fully close the loop, but the prior 3s+ resolver outlier class was not reproduced in automated high-frequency validation.
+
+## 18. COSMIC Focus-Signal Pivot Prep (2026-02-19 21:45 UTC)
+
+This section documents follow-up research and runtime evidence for a likely architecture pivot:
+- from: per-injection synchronous AT-SPI tree traversal
+- to: event-driven Wayland toplevel activation cache (with AT-SPI fallback)
+
+No behavior changes were implemented in this section; this is handoff context only.
+
+### 18.1 High-confidence findings (local runtime + protocol files)
+
+1. COSMIC exposes relevant Wayland globals in this live session.
+
+Evidence command:
+```bash
+WAYLAND_DEBUG=1 wlr-randr 2>&1 | sed -n '1,120p'
+```
+
+Observed globals include:
+- `zcosmic_toplevel_info_v1` (v3)
+- `ext_foreign_toplevel_list_v1` (v1)
+- `zcosmic_toplevel_manager_v1` (v4)
+- `zwp_text_input_manager_v3` (v1)
+- `zwp_input_method_manager_v2` (v1)
+- `cosmic_a11y_manager_v1` (v2)
+
+2. `ext_foreign_toplevel_list_v1` provides identity metadata, not activation state.
+
+Reference:
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-protocols-0.32.10/protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml`
+- line refs:
+  - `interface name="ext_foreign_toplevel_list_v1"`: line `54`
+  - `interface name="ext_foreign_toplevel_handle_v1"`: line `123`
+  - `event name="closed"`: line `147`
+  - `event name="done"`: line `158`
+  - `event name="title"`: line `173`
+  - `event name="app_id"`: line `183`
+  - `event name="identifier"`: line `193`
+- no activated/focused state in this protocol
+
+3. COSMIC toplevel extension adds explicit activation state.
+
+Reference:
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-protocols-0.2.0/unstable/cosmic-toplevel-info-unstable-v1.xml`
+- line refs:
+  - `interface name="zcosmic_toplevel_info_v1"`: line `30`
+  - `request name="get_cosmic_toplevel"`: line `81`
+  - `event name="done"` (manager): line `94`
+  - `interface name="zcosmic_toplevel_handle_v1"`: line `106`
+  - enum entry `activated` (`value="2"`): line `215`
+  - `event name="state"`: line `220`
+- `zcosmic_toplevel_info_v1.done` plus toplevel-handle `state` gives atomic activation snapshots after batch completion
+
+4. COSMIC a11y protocol is not a focus-stream API.
+
+Reference:
+- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-protocols-0.2.0/unstable/cosmic-a11y-unstable-v1.xml`
+- line refs:
+  - `interface name="cosmic_a11y_manager_v1"`: line `30`
+  - `event name="magnifier"`: line `35`
+  - `request name="set_magnifier"`: line `45`
+  - `event name="screen_filter2"`: line `103`
+- exposes toggles like magnifier/screen-filter
+- no per-target focus event or text-target ownership stream
+
+### 18.2 Why current resolver path is still the wrong long-term primary
+
+Code path:
+- `parakeet-ptt/src/injector.rs:914` calls `resolve_with_limits(...)` synchronously during injection.
+- `parakeet-ptt/src/injector.rs:936` derives route immediately via `decide_route(...)`.
+- `parakeet-ptt/src/routing.rs:52` + `parakeet-ptt/src/routing.rs:67` enforce low-confidence unknown fallback on `focused=false`.
+
+Recent quantified behavior from `/tmp/parakeet-ptt.log` (last 47 resolved snapshots):
+- `focused_false=36`
+- `route_class=Unknown` count `27`
+- `focus_resolve_ms`: min `293`, median `392`, max `451`
+
+Concrete mismatch examples:
+- `2026-02-19T21:23:13Z` preview=`Testing in cosmic terminal.` -> resolved `focus_app=\"Brave Browser\"`
+- `2026-02-19T21:23:25Z` preview=`Testing in VS Code.` -> resolved `focus_app=\"Brave Browser\"`
+
+Interpretation:
+- Even after resolver latency controls, wrong/stale target selection remains a major UX driver.
+
+### 18.3 DeepWiki codemap references (useful, not locally source-verified)
+
+DeepWiki reported likely compositor internals (treat as leads until validated against upstream source):
+- `mod.rs:178` `ActiveFocus::get(seat)`
+- `mod.rs:399` `ActiveFocus::set(seat, target.cloned())`
+- `mod.rs:400` `keyboard.set_focus(state, target.cloned(), serial)`
+- `toplevel_info.rs:529` pushes `States::Activated`
+- `toplevel_info.rs:625` emits `handle.send_done()`
+- `target.rs:707` maps keyboard focus target to `WaylandFocus::wl_surface(...)`
+
+These references strongly align with the external protocol evidence above, but should be verified in actual `cosmic-comp` source before implementation.
+
+### 18.4 Proposed next architecture (design intent, not implemented)
+
+Primary signal:
+- Wayland event-driven activation tracking using:
+  - `ext_foreign_toplevel_list_v1` (handles + title/app_id/identifier lifecycle)
+  - `zcosmic_toplevel_info_v1` (activated state)
+
+Client-side cache:
+- Maintain active toplevel snapshot in-memory:
+  - `identifier`, `app_id`, `title`, `activated`, `last_state_ts`
+- Use cache for immediate adaptive routing decision at injection time.
+
+Fallback hierarchy:
+1. fresh activated toplevel from Wayland cache
+2. existing AT-SPI resolver (`resolve_with_limits`) when cache unavailable/stale/ambiguous
+3. unknown routing fallback behavior as today
+
+Expected benefit:
+- remove synchronous AT-SPI scan from hot path in most injections
+- reduce stale cross-surface snapshot risk during rapid app switching
+
+### 18.5 Explicit uncertainties (do not silently assume)
+
+1. Activated toplevel may not always equal text-input target.
+- Layer-shells/popups/URL bars/IME surfaces can diverge from window-level activation.
+
+2. Transition windows may momentarily report no activated handle.
+- Need robust debounce/staleness policy in client cache.
+
+3. Protocol availability is compositor policy.
+- Available on this host now, but must handle absence/version downgrade safely.
+
+4. Cross-surface correctness still needs live matrix validation.
+- Especially: COSMIC applet editor, COSMIC text editor, VS Code editor pane, Ghostty, Brave/Notion.
+
+### 18.6 Next-agent execution starter checklist
+
+Read first:
+- `HANDOFF-stt-cross-surface-injection-2026-02-19.md` (sections 17 and 18)
+- `parakeet-ptt/src/injector.rs`
+- `parakeet-ptt/src/routing.rs`
+- `parakeet-ptt/src/surface_focus.rs`
+
+Reconfirm host protocol surface:
+```bash
+WAYLAND_DEBUG=1 wlr-randr 2>&1 | rg 'zcosmic_toplevel_info_v1|ext_foreign_toplevel_list_v1|cosmic_a11y_manager_v1'
+```
+
+Research before coding:
+- validate DeepWiki compositor references directly in upstream `cosmic-comp`
+- verify event ordering guarantees around toplevel `state` + `done`
+- define cache freshness and fallback criteria with explicit thresholds
+
+Do not remove AT-SPI path initially:
+- first implementation should be additive (feature-gated or dual-path),
+- then validated against live matrix before default switch.

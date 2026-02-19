@@ -116,6 +116,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Default runtime path is clipboard choreography (`wl-copy` + readiness probe) and paste chord emission.
   - Paste backend ladder (helper default): `auto` => `uinput -> ydotool -> wtype`.
   - Adaptive routing chooses shortcut by focused-surface class (`terminal`, `general`, `unknown`).
+  - Focus metadata source is configurable (`atspi|wayland|hybrid`); default remains `atspi` until matrix validation promotes hybrid.
   - Low-confidence AT-SPI snapshots (`focus_focused=false`) are treated as `unknown` for routing.
   - Backend failure policy defaults to `copy-only` so transcript delivery is preserved via clipboard.
 
