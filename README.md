@@ -11,7 +11,7 @@ It has two runtime components:
 Since `21d8f74` and follow-up commits, the injection path is now reliability-first:
 
 - `stt start` defaults to paste mode, not typing mode.
-- Default strategy is strict single-shot paste, no implicit fallback chaining.
+- Default routing mode is adaptive, selecting shortcut by focused surface class.
 - Default backend is `auto` with runtime ladder `uinput -> ydotool -> wtype`.
 - Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.
 - Clipboard readiness barrier and post-chord ownership timing controls are implemented.
@@ -74,14 +74,23 @@ cargo run --release -- --endpoint ws://127.0.0.1:8765/ws
 Default profile:
 
 - `--injection-mode paste`
-- `--paste-shortcut ctrl-shift-v`
+- `--paste-shortcut ctrl-shift-v` (used when `--paste-routing-mode static`)
 - `--paste-shortcut-fallback none`
 - `--paste-strategy single`
 - `--paste-key-backend auto`
+- `--paste-routing-mode adaptive`
+- `--adaptive-terminal-shortcut ctrl-shift-v`
+- `--adaptive-general-shortcut ctrl-v`
+- `--adaptive-unknown-shortcut ctrl-shift-v`
 - `--paste-backend-failure-policy copy-only`
 - `--paste-restore-policy never`
 - `--paste-copy-foreground true`
 - `--uinput-dwell-ms 18`
+
+COSMIC focus-navigation baseline for best adaptive behavior:
+- `Focus follows cursor = ON`
+- `Focus follows cursor delay = 0ms`
+- `Cursor follows focus = ON`
 
 Troubleshooting-only chaining remains available via:
 

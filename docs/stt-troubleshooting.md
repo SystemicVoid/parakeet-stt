@@ -9,12 +9,16 @@ This document now has two parts:
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
-- Default startup profile is now paste-mode with explicit single-shortcut behavior:
+- Default startup profile is now paste-mode with adaptive cross-surface shortcut routing:
   - `--injection-mode paste`
-  - `--paste-shortcut ctrl-shift-v`
+  - `--paste-shortcut ctrl-shift-v` (used when routing mode is `static`)
   - `--paste-shortcut-fallback none`
   - `--paste-strategy single`
   - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
+  - `--paste-routing-mode adaptive`
+  - `--adaptive-terminal-shortcut ctrl-shift-v`
+  - `--adaptive-general-shortcut ctrl-v`
+  - `--adaptive-unknown-shortcut ctrl-shift-v`
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
@@ -81,6 +85,10 @@ Paste/copy injection now exposes a strategy-driven pipeline through `stt start` 
 - `--paste-copy-foreground true|false` (default: `true`)
 - `--paste-mime-type text/plain;charset=utf-8` (default)
 - `--paste-key-backend wtype|ydotool|uinput|auto` (default: `auto`)
+- `--paste-routing-mode static|adaptive` (default: `adaptive`)
+- `--adaptive-terminal-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
+- `--adaptive-general-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-v`)
+- `--adaptive-unknown-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
@@ -91,7 +99,10 @@ Recommended baseline for Ghostty/COSMIC:
 
 ```bash
 stt start --paste \
-  --paste-shortcut ctrl-shift-v \
+  --paste-routing-mode adaptive \
+  --adaptive-terminal-shortcut ctrl-shift-v \
+  --adaptive-general-shortcut ctrl-v \
+  --adaptive-unknown-shortcut ctrl-shift-v \
   --paste-shortcut-fallback none \
   --paste-strategy single \
   --paste-chain-delay-ms 45 \
@@ -101,6 +112,11 @@ stt start --paste \
   --paste-restore-policy never \
   --paste-copy-foreground true
 ```
+
+COSMIC focus-navigation baseline for adaptive routing:
+- `Focus follows cursor = ON`
+- `Focus follows cursor delay = 0ms`
+- `Cursor follows focus = ON`
 
 If automatic paste is still unstable, force deterministic behavior while preserving transcript
 delivery:
