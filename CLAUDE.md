@@ -18,7 +18,7 @@ parakeet-ptt (Rust)              parakeet-stt-daemon (Python)
 
 **Control flow**: User presses Right Ctrl -> client sends `start_session` -> daemon captures audio -> user releases -> client sends `stop_session` -> daemon transcribes -> returns `final_result` -> client injects text based on configured mode (`paste`, `type`, or `copy-only`).
 
-Current default runtime profile (via `stt start`) is paste mode with strict single-shot behavior and no implicit shortcut fallback chaining.
+Current default runtime profile (via `stt start`) is paste mode with strict single-shot behavior, adaptive shortcut routing, and no implicit shortcut fallback chaining.
 
 ## Build Commands
 
@@ -130,6 +130,10 @@ See `docs/SPEC.md` for complete protocol specification.
 - `PARAKEET_PASTE_COPY_FOREGROUND` - Keep wl-copy foreground source during paste (`true` default)
 - `PARAKEET_PASTE_MIME_TYPE` - MIME type for clipboard writes (default `text/plain;charset=utf-8`)
 - `PARAKEET_PASTE_KEY_BACKEND` - `wtype|ydotool|uinput|auto` (`auto` default via helper)
+- `PARAKEET_PASTE_ROUTING_MODE` - `static|adaptive` (`adaptive` default)
+- `PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT` - terminal route shortcut (`ctrl-shift-v` default)
+- `PARAKEET_ADAPTIVE_GENERAL_SHORTCUT` - editor/browser route shortcut (`ctrl-v` default)
+- `PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT` - unknown/low-confidence route shortcut (`ctrl-shift-v` default)
 - `PARAKEET_PASTE_BACKEND_FAILURE_POLICY` - `copy-only|error` (`copy-only` default)
 - `PARAKEET_UINPUT_DWELL_MS` - uinput key dwell time (default `18`)
 - `PARAKEET_PASTE_SEAT` - Optional seat override for wl-copy/wl-paste
@@ -139,6 +143,7 @@ See `docs/SPEC.md` for complete protocol specification.
 - `PARAKEET_COMPLETION_SOUND` - Enable/disable completion sound (`true` default)
 - `PARAKEET_COMPLETION_SOUND_PATH` - Custom sound file path (uses system default if unset)
 - `PARAKEET_COMPLETION_SOUND_VOLUME` - Volume level 0-100 (`100` default)
+- `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` - helper wait before client-ready failure (`30` default; extends on active cargo compile)
 - `RUST_LOG` - Rust logging level (default: info)
 
 ## Testing

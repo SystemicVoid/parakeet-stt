@@ -30,7 +30,11 @@
   - `--paste-shortcut-fallback none`
   - `--paste-strategy single`
   - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
+  - `--paste-routing-mode adaptive`
+  - adaptive shortcuts: terminal=`ctrl-shift-v`, general=`ctrl-v`, unknown=`ctrl-shift-v`
+  - low-confidence focus snapshots (`focus_focused=false`) route as `unknown` (terminal-first)
   - `--paste-backend-failure-policy copy-only`
+- Helper client readiness wait is timeout-based and controlled by `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` (default `30`).
 - Chaining is troubleshooting-only and must be opt-in (`--paste-strategy on-error|always-chain`).
 
 ## Commit & Pull Request Guidelines
