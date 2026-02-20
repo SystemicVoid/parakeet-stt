@@ -247,8 +247,100 @@ PY
 
     _log_client() { echo "[$(date -Is)] $*" >> "$LOG_CLIENT"; }
     _log_daemon() { echo "[$(date -Is)] $*" >> "$LOG_DAEMON"; }
+    _print_help_main() {
+        cat <<EOF
+Usage:
+  stt start [options]
+  stt <command> [args]
+
+Commands:
+  start [options]        Start daemon + client (default command).
+  stop                   Stop daemon/client and remove pid/port files.
+  restart [options]      Restart with the same options as start.
+  status                 Show daemon/client/tmux status.
+  logs [client|daemon|both]
+                         Tail logs (default: both).
+  show | attach          Attach to tmux session.
+  tmux [attach|kill]     Attach/kill helper tmux session.
+  check                  Run daemon health check.
+  diag-injector          Run clipboard injector diagnostics.
+  help [start]           Show this help or detailed start help.
+
+Help shortcuts:
+  stt --help
+  stt help
+  stt help start
+  stt start --help
+EOF
+    }
+    _print_help_start() {
+        cat <<EOF
+Usage:
+  stt start [options]
+
+Injection mode:
+  --paste                Injection mode = paste (default: $default_injection_mode)
+  --type                 Injection mode = type
+  --copy-only            Injection mode = copy-only
+
+Paste and fallback:
+  --paste-shortcut <v>           (default: $default_paste_shortcut, env: PARAKEET_PASTE_SHORTCUT)
+  --paste-shortcut-fallback <v>  (default: $default_paste_shortcut_fallback, env: PARAKEET_PASTE_SHORTCUT_FALLBACK)
+  --paste-strategy <v>           (default: $default_paste_strategy, env: PARAKEET_PASTE_STRATEGY)
+  --paste-chain-delay-ms <n>     (default: $default_paste_chain_delay_ms, env: PARAKEET_PASTE_CHAIN_DELAY_MS)
+  --paste-restore-policy <v>     (default: $default_paste_restore_policy, env: PARAKEET_PASTE_RESTORE_POLICY)
+  --paste-restore-delay-ms <n>   (default: $default_paste_restore_delay_ms, env: PARAKEET_PASTE_RESTORE_DELAY_MS)
+  --paste-post-chord-hold-ms <n> (default: $default_paste_post_chord_hold_ms, env: PARAKEET_PASTE_POST_CHORD_HOLD_MS)
+  --paste-copy-foreground <v>    (default: $default_paste_copy_foreground, env: PARAKEET_PASTE_COPY_FOREGROUND)
+  --paste-mime-type <v>          (default: $default_paste_mime_type, env: PARAKEET_PASTE_MIME_TYPE)
+  --paste-write-primary <v>      (default: $default_paste_write_primary, env: PARAKEET_PASTE_WRITE_PRIMARY)
+
+Routing and focus:
+  --paste-routing-mode <v>             (default: $default_paste_routing_mode, env: PARAKEET_PASTE_ROUTING_MODE)
+  --adaptive-terminal-shortcut <v>     (default: $default_adaptive_terminal_shortcut, env: PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT)
+  --adaptive-general-shortcut <v>      (default: $default_adaptive_general_shortcut, env: PARAKEET_ADAPTIVE_GENERAL_SHORTCUT)
+  --adaptive-unknown-shortcut <v>      (default: $default_adaptive_unknown_shortcut, env: PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT)
+  --focus-resolver-source <v>          (default: $default_focus_resolver_source, env: PARAKEET_FOCUS_RESOLVER_SOURCE)
+  --focus-resolve-budget-ms <n>        (default: $default_focus_resolve_budget_ms, env: PARAKEET_FOCUS_RESOLVE_BUDGET_MS)
+  --focus-deep-scan-max-apps <n>       (default: $default_focus_deep_scan_max_apps, env: PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS)
+  --focus-wayland-stale-ms <n>         (default: $default_focus_wayland_stale_ms, env: PARAKEET_FOCUS_WAYLAND_STALE_MS)
+  --focus-wayland-transition-grace-ms <n>
+                                       (default: $default_focus_wayland_transition_grace_ms, env: PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS)
+
+Backend and sound:
+  --paste-key-backend <v>              (default: $default_paste_key_backend, env: PARAKEET_PASTE_KEY_BACKEND)
+  --paste-backend-failure-policy <v>   (default: $default_paste_backend_failure_policy, env: PARAKEET_PASTE_BACKEND_FAILURE_POLICY)
+  --uinput-dwell-ms <n>                (default: $default_uinput_dwell_ms, env: PARAKEET_UINPUT_DWELL_MS)
+  --paste-seat <v>                     (default: ${default_paste_seat:-<unset>}, env: PARAKEET_PASTE_SEAT)
+  --ydotool <path>                     (default: ${default_ydotool_path:-<auto>}, env: PARAKEET_YDOTOOL_PATH)
+  --completion-sound <v>               (default: $default_completion_sound, env: PARAKEET_COMPLETION_SOUND)
+  --completion-sound-path <path>       (default: ${default_completion_sound_path:-<system default>}, env: PARAKEET_COMPLETION_SOUND_PATH)
+  --completion-sound-volume <n>        (default: $default_completion_sound_volume, env: PARAKEET_COMPLETION_SOUND_VOLUME)
+
+Other environment overrides:
+  PARAKEET_HOST=$HOST
+  PARAKEET_PORT=$PORT
+  PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
+EOF
+    }
 
     case "$cmd" in
+        help|--help|-h)
+            case "${1:-}" in
+                ""|all)
+                    _print_help_main
+                    ;;
+                start)
+                    _print_help_start
+                    ;;
+                *)
+                    echo "Unknown help topic: $1"
+                    echo
+                    _print_help_main
+                    return 1
+                    ;;
+            esac
+            ;;
         start)
             local injection_mode="$default_injection_mode"
             local paste_shortcut="$default_paste_shortcut"
@@ -292,6 +384,10 @@ PY
                     --copy-only)
                         injection_mode="copy-only"
                         shift
+                        ;;
+                    --help|-h|help)
+                        _print_help_start
+                        return 0
                         ;;
                     --paste-shortcut)
                         if [[ $# -lt 2 ]]; then
@@ -511,7 +607,7 @@ PY
                         ;;
                     *)
                         echo "   - Unknown option for 'stt start': $1"
-                        echo "   - Run 'stt' with no args to see supported commands."
+                        echo "   - Run 'stt start --help' to see all supported start options."
                         return 1
                         ;;
                 esac
@@ -1037,7 +1133,10 @@ PY
             )
             ;;
         *)
-            echo "Usage: stt {start|stop|restart|status|logs [client|daemon],show,tmux [attach|kill],check,diag-injector}"
+            echo "Unknown command: $cmd"
+            echo
+            _print_help_main
+            return 1
             ;;
     esac
 }

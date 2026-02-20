@@ -110,6 +110,7 @@ Primary helper commands:
 - `stt logs [client|daemon|both]`
 - `stt check` (daemon health)
 - `stt diag-injector` (injection diagnostics)
+- `stt help` and `stt help start` (full helper + start flag reference)
 
 ## Testing and Validation
 
