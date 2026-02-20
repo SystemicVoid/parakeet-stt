@@ -23,7 +23,6 @@ evdev = "0.12.2"
 nix = { version = "0.27.1", features = ["user", "ioctl", "fs"] }
 reqwest = { version = "0.12.9", features = ["json", "rustls-tls"] }
 which = "6.0.1"
-regex = "1.11.1"
 wayland-client = "0.31.12"
 wayland-protocols = { version = "0.32.10", features = ["client", "staging"] }
 cosmic-protocols = { version = "0.2.0", default-features = false, features = ["client"] }

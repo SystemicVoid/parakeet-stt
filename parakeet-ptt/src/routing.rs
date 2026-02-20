@@ -129,13 +129,6 @@ fn dedup_fallback(primary: PasteShortcut, fallback: PasteShortcut) -> Option<Pas
     }
 }
 
-pub fn classify_surface(focus: Option<&FocusSnapshot>) -> SurfaceClass {
-    let Some(focus) = focus else {
-        return SurfaceClass::Unknown;
-    };
-    classify_surface_with_reason(Some(focus)).0
-}
-
 fn classify_surface_with_reason(focus: Option<&FocusSnapshot>) -> (SurfaceClass, &'static str) {
     let Some(focus) = focus else {
         return (SurfaceClass::Unknown, "adaptive unknown surface");
@@ -181,7 +174,7 @@ fn normalize_for_hint_match(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_surface, decide_route, SurfaceClass};
+    use super::{classify_surface_with_reason, decide_route, SurfaceClass};
     use crate::config::{
         ClipboardOptions, FocusResolverSource, PasteBackendFailurePolicy, PasteKeyBackend,
         PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
@@ -235,7 +228,7 @@ mod tests {
     #[test]
     fn classifies_terminal_surface() {
         let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", false);
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::Terminal);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::Terminal);
     }
 
     #[test]
@@ -246,7 +239,7 @@ mod tests {
             "/org/a11y/atspi/accessible/1",
             false,
         );
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
     }
 
     #[test]
@@ -257,7 +250,7 @@ mod tests {
             "/org/a11y/atspi/accessible/2",
             true,
         );
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
     }
 
     #[test]
@@ -268,7 +261,7 @@ mod tests {
             "/org/a11y/atspi/accessible/3",
             true,
         );
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
     }
 
     #[test]
@@ -279,13 +272,13 @@ mod tests {
             "/org/a11y/atspi/accessible/4",
             true,
         );
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
     }
 
     #[test]
     fn unknown_surface_defaults_to_unknown() {
         let focus = snapshot("SomeApp", "random", "/org/example", false);
-        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::Unknown);
+        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::Unknown);
     }
 
     #[test]
