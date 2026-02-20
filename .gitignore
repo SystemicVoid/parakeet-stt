@@ -17,3 +17,10 @@ parakeet-stt-daemon/test-run.py
 
 # Local shell helpers (keep personal aliases out of the repo)
 74-aliases-functions.bash
+
+# Wayland protocol XML scratch drops (kept under docs/protocol-references/)
+/cosmic-toplevel-info-unstable-v1.xml
+/ext-foreign-toplevel-list-v1.xml
+/text-input-unstable-v3.xml
+/xdg-activation-v1.xml
+/xdg-shell.xml
