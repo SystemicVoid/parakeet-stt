@@ -1,4 +1,4 @@
-use crate::config::{ClipboardOptions, PasteRoutingMode, PasteShortcut};
+use crate::config::PasteShortcut;
 use crate::surface_focus::FocusSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,10 @@ pub struct RouteDecision {
     pub low_confidence: bool,
     pub reason: &'static str,
 }
+
+const TERMINAL_SHORTCUT: PasteShortcut = PasteShortcut::CtrlShiftV;
+const GENERAL_SHORTCUT: PasteShortcut = PasteShortcut::CtrlV;
+const UNKNOWN_SHORTCUT: PasteShortcut = PasteShortcut::CtrlShiftV;
 
 const TERMINAL_HINTS: &[&str] = &[
     "ghostty",
@@ -54,21 +58,10 @@ const COSMIC_EDIT_HINTS: &[&str] = &[
     "cosmic text editor",
 ];
 
-pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -> RouteDecision {
-    if matches!(options.routing_mode, PasteRoutingMode::Static) {
-        return RouteDecision {
-            class: SurfaceClass::Unknown,
-            primary: options.paste_shortcut,
-            adaptive_fallback: None,
-            low_confidence: false,
-            reason: "routing_mode=static",
-        };
-    }
-
+pub fn decide_route(focus: Option<&FocusSnapshot>) -> RouteDecision {
     if let Some(snapshot) = focus {
         if !snapshot.focused {
             return unknown_route(
-                options,
                 "adaptive low-confidence focus snapshot (focused=false)",
                 true,
             );
@@ -79,43 +72,33 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
     match class {
         SurfaceClass::Terminal => RouteDecision {
             class,
-            primary: options.adaptive_terminal_shortcut,
-            adaptive_fallback: dedup_fallback(
-                options.adaptive_terminal_shortcut,
-                options.adaptive_general_shortcut,
-            ),
+            primary: TERMINAL_SHORTCUT,
+            adaptive_fallback: dedup_fallback(TERMINAL_SHORTCUT, GENERAL_SHORTCUT),
             low_confidence: false,
             reason: class_reason,
         },
         SurfaceClass::General => RouteDecision {
             class,
-            primary: options.adaptive_general_shortcut,
-            adaptive_fallback: dedup_fallback(
-                options.adaptive_general_shortcut,
-                options.adaptive_terminal_shortcut,
-            ),
+            primary: GENERAL_SHORTCUT,
+            adaptive_fallback: dedup_fallback(GENERAL_SHORTCUT, TERMINAL_SHORTCUT),
             low_confidence: false,
             reason: class_reason,
         },
-        SurfaceClass::Unknown => unknown_route(options, class_reason, false),
+        SurfaceClass::Unknown => unknown_route(class_reason, false),
     }
 }
 
-fn unknown_route(
-    options: &ClipboardOptions,
-    reason: &'static str,
-    low_confidence: bool,
-) -> RouteDecision {
-    let alternate = if options.adaptive_unknown_shortcut != options.adaptive_general_shortcut {
-        options.adaptive_general_shortcut
+fn unknown_route(reason: &'static str, low_confidence: bool) -> RouteDecision {
+    let alternate = if UNKNOWN_SHORTCUT != GENERAL_SHORTCUT {
+        GENERAL_SHORTCUT
     } else {
-        options.adaptive_terminal_shortcut
+        TERMINAL_SHORTCUT
     };
 
     RouteDecision {
         class: SurfaceClass::Unknown,
-        primary: options.adaptive_unknown_shortcut,
-        adaptive_fallback: dedup_fallback(options.adaptive_unknown_shortcut, alternate),
+        primary: UNKNOWN_SHORTCUT,
+        adaptive_fallback: dedup_fallback(UNKNOWN_SHORTCUT, alternate),
         low_confidence,
         reason,
     }
@@ -175,33 +158,8 @@ fn normalize_for_hint_match(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{classify_surface_with_reason, decide_route, SurfaceClass};
-    use crate::config::{
-        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
-        PasteRoutingMode, PasteShortcut, PasteStrategy,
-    };
+    use crate::config::PasteShortcut;
     use crate::surface_focus::FocusSnapshot;
-
-    fn options() -> ClipboardOptions {
-        ClipboardOptions {
-            paste_shortcut: PasteShortcut::CtrlShiftV,
-            shortcut_fallback: None,
-            paste_strategy: PasteStrategy::Single,
-            chain_delay_ms: 45,
-            restore_policy: PasteRestorePolicy::Never,
-            restore_delay_ms: 250,
-            post_chord_hold_ms: 700,
-            copy_foreground: true,
-            mime_type: "text/plain;charset=utf-8".to_string(),
-            key_backend: PasteKeyBackend::Auto,
-            backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
-            routing_mode: PasteRoutingMode::Adaptive,
-            adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
-            adaptive_general_shortcut: PasteShortcut::CtrlV,
-            adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
-            seat: None,
-            write_primary: false,
-        }
-    }
 
     fn snapshot(
         app_name: &str,
@@ -223,7 +181,10 @@ mod tests {
     #[test]
     fn classifies_terminal_surface() {
         let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", false);
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::Terminal);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::Terminal
+        );
     }
 
     #[test]
@@ -234,7 +195,10 @@ mod tests {
             "/org/a11y/atspi/accessible/1",
             false,
         );
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::General
+        );
     }
 
     #[test]
@@ -245,7 +209,10 @@ mod tests {
             "/org/a11y/atspi/accessible/2",
             true,
         );
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::General
+        );
     }
 
     #[test]
@@ -256,7 +223,10 @@ mod tests {
             "/org/a11y/atspi/accessible/3",
             true,
         );
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::General
+        );
     }
 
     #[test]
@@ -267,20 +237,25 @@ mod tests {
             "/org/a11y/atspi/accessible/4",
             true,
         );
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::General);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::General
+        );
     }
 
     #[test]
     fn unknown_surface_defaults_to_unknown() {
         let focus = snapshot("SomeApp", "random", "/org/example", false);
-        assert_eq!(classify_surface_with_reason(Some(&focus)).0, SurfaceClass::Unknown);
+        assert_eq!(
+            classify_surface_with_reason(Some(&focus)).0,
+            SurfaceClass::Unknown
+        );
     }
 
     #[test]
     fn adaptive_route_prefers_terminal_shortcut_for_terminals() {
-        let opts = options();
         let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", true);
-        let decision = decide_route(&opts, Some(&focus));
+        let decision = decide_route(Some(&focus));
         assert_eq!(decision.class, SurfaceClass::Terminal);
         assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
         assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
@@ -289,14 +264,13 @@ mod tests {
 
     #[test]
     fn adaptive_route_uses_unknown_when_snapshot_is_not_focused() {
-        let opts = options();
         let focus = snapshot(
             "Brave Browser",
             "Codex - Brave",
             "/org/a11y/atspi/accessible/1",
             false,
         );
-        let decision = decide_route(&opts, Some(&focus));
+        let decision = decide_route(Some(&focus));
         assert_eq!(decision.class, SurfaceClass::Unknown);
         assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
         assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
@@ -305,21 +279,10 @@ mod tests {
 
     #[test]
     fn unknown_route_remains_terminal_first() {
-        let opts = options();
         let focus = snapshot("mystery", "floating-tool", "/org/example/unknown", true);
-        let decision = decide_route(&opts, Some(&focus));
+        let decision = decide_route(Some(&focus));
         assert_eq!(decision.class, SurfaceClass::Unknown);
         assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
         assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
-    }
-
-    #[test]
-    fn static_route_uses_legacy_shortcut() {
-        let mut opts = options();
-        opts.routing_mode = PasteRoutingMode::Static;
-        opts.paste_shortcut = PasteShortcut::ShiftInsert;
-        let decision = decide_route(&opts, None);
-        assert_eq!(decision.primary, PasteShortcut::ShiftInsert);
-        assert!(decision.adaptive_fallback.is_none());
     }
 }

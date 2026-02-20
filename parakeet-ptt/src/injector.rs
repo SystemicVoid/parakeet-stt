@@ -10,11 +10,14 @@ use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
 use tracing::{debug, info, warn};
 
-use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
+use crate::config::{ClipboardOptions, PasteShortcut};
 use crate::routing::decide_route;
 use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// MIME type used for all wl-copy clipboard writes.
+const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
@@ -86,7 +89,6 @@ impl TextInjector for WtypeInjector {
 
 #[derive(Debug, Clone)]
 pub enum PasteKeySender {
-    Wtype(PathBuf),
     Ydotool(PathBuf),
     Uinput(Arc<UinputChordSender>),
     Chain(Vec<PasteKeySender>),
@@ -112,7 +114,6 @@ impl UinputChordSender {
         keys.insert(Key::KEY_LEFTCTRL);
         keys.insert(Key::KEY_LEFTSHIFT);
         keys.insert(Key::KEY_V);
-        keys.insert(Key::KEY_INSERT);
 
         let device = VirtualDeviceBuilder::new()
             .context("failed to open /dev/uinput for direct keyboard injection")?
@@ -131,13 +132,11 @@ impl UinputChordSender {
 
     fn shortcut_plan(shortcut: PasteShortcut) -> (&'static [Key], Key) {
         const CTRL: [Key; 1] = [Key::KEY_LEFTCTRL];
-        const SHIFT: [Key; 1] = [Key::KEY_LEFTSHIFT];
         const CTRL_SHIFT: [Key; 2] = [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT];
 
         match shortcut {
             PasteShortcut::CtrlV => (&CTRL, Key::KEY_V),
             PasteShortcut::CtrlShiftV => (&CTRL_SHIFT, Key::KEY_V),
-            PasteShortcut::ShiftInsert => (&SHIFT, Key::KEY_INSERT),
         }
     }
 
@@ -219,6 +218,8 @@ impl InjectionOutcome {
 impl ClipboardInjector {
     const CLIPBOARD_READY_TIMEOUT_MS: u64 = 250;
     const CLIPBOARD_READY_POLL_MS: u64 = 10;
+    const WAYLAND_STALE_MS: u64 = 30_000;
+    const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
 
     pub fn new(sender: PasteKeySender, options: ClipboardOptions, copy_only: bool) -> Self {
         Self {
@@ -259,14 +260,14 @@ impl ClipboardInjector {
             len = text.len(),
             foreground,
             primary,
-            mime_type = %options.mime_type,
+            mime_type = CLIPBOARD_MIME_TYPE,
             seat = ?options.seat,
             "setting clipboard via wl-copy"
         );
         let mut command = Command::new("wl-copy");
         command
             .arg("--type")
-            .arg(&options.mime_type)
+            .arg(CLIPBOARD_MIME_TYPE)
             .stdin(Stdio::piped());
         if let Some(seat) = options.seat.as_ref() {
             command.arg("--seat").arg(seat);
@@ -368,27 +369,15 @@ impl ClipboardInjector {
         }
     }
 
-    fn wtype_shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
-        match shortcut {
-            PasteShortcut::CtrlV => &["-M", "ctrl", "-k", "v", "-m", "ctrl"],
-            PasteShortcut::CtrlShiftV => &[
-                "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
-            ],
-            PasteShortcut::ShiftInsert => &["-M", "shift", "-k", "Insert", "-m", "shift"],
-        }
-    }
-
     fn ydotool_shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
         match shortcut {
             PasteShortcut::CtrlV => &["29:1", "47:1", "47:0", "29:0"],
             PasteShortcut::CtrlShiftV => &["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
-            PasteShortcut::ShiftInsert => &["42:1", "110:1", "110:0", "42:0"],
         }
     }
 
     fn sender_name(sender: &PasteKeySender) -> &'static str {
         match sender {
-            PasteKeySender::Wtype(_) => "wtype",
             PasteKeySender::Ydotool(_) => "ydotool",
             PasteKeySender::Uinput(_) => "uinput",
             PasteKeySender::Chain(_) => "chain",
@@ -402,35 +391,6 @@ impl ClipboardInjector {
         sender: &PasteKeySender,
     ) -> Result<()> {
         match sender {
-            PasteKeySender::Wtype(binary) => {
-                debug!(
-                    trace_id,
-                    shortcut = ?shortcut,
-                    backend = "wtype",
-                    binary = %binary.display(),
-                    args = ?Self::wtype_shortcut_args(shortcut),
-                    "sending paste chord"
-                );
-                let status = Command::new(binary)
-                    .args(Self::wtype_shortcut_args(shortcut))
-                    .status()
-                    .context("failed to spawn wtype for paste chord")?;
-
-                debug!(
-                    trace_id,
-                    ?status,
-                    backend = "wtype",
-                    "paste chord command finished"
-                );
-                if !status.success() {
-                    anyhow::bail!(
-                        "paste key chord {:?} via wtype exited with status {}",
-                        shortcut,
-                        status
-                    );
-                }
-                Ok(())
-            }
             PasteKeySender::Ydotool(binary) => {
                 debug!(
                     trace_id,
@@ -522,123 +482,6 @@ impl ClipboardInjector {
         }
     }
 
-    fn shortcut_attempt_order(
-        &self,
-        primary: PasteShortcut,
-        adaptive_fallback: Option<PasteShortcut>,
-    ) -> Vec<PasteShortcut> {
-        let mut attempts = vec![primary];
-        if matches!(self.options.paste_strategy, PasteStrategy::Single) {
-            return attempts;
-        }
-
-        if let Some(fallback) = adaptive_fallback {
-            if !attempts.contains(&fallback) {
-                attempts.push(fallback);
-            }
-        }
-
-        if let Some(fallback) = self.options.shortcut_fallback {
-            if !attempts.contains(&fallback) {
-                attempts.push(fallback);
-            }
-        }
-
-        attempts
-    }
-
-    fn run_paste_shortcuts(
-        &self,
-        trace_id: u64,
-        primary: PasteShortcut,
-        adaptive_fallback: Option<PasteShortcut>,
-    ) -> Result<()> {
-        let attempts = self.shortcut_attempt_order(primary, adaptive_fallback);
-        let mut errors = Vec::new();
-
-        match self.options.paste_strategy {
-            PasteStrategy::Single => {
-                return self.run_shortcut(trace_id, primary);
-            }
-            PasteStrategy::OnError => {
-                for (idx, shortcut) in attempts.iter().enumerate() {
-                    match self.run_shortcut(trace_id, *shortcut) {
-                        Ok(()) => {
-                            if idx > 0 {
-                                info!(
-                                    trace_id,
-                                    strategy = ?self.options.paste_strategy,
-                                    shortcut = ?shortcut,
-                                    "fallback paste shortcut succeeded"
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            warn!(
-                                trace_id,
-                                strategy = ?self.options.paste_strategy,
-                                attempt = idx + 1,
-                                total_attempts = attempts.len(),
-                                shortcut = ?shortcut,
-                                error = %err,
-                                "paste shortcut attempt failed"
-                            );
-                            errors.push(format!("{shortcut:?}: {err}"));
-                            if idx + 1 < attempts.len() {
-                                std::thread::sleep(Duration::from_millis(
-                                    self.options.chain_delay_ms,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            PasteStrategy::AlwaysChain => {
-                let mut succeeded = false;
-                for (idx, shortcut) in attempts.iter().enumerate() {
-                    match self.run_shortcut(trace_id, *shortcut) {
-                        Ok(()) => {
-                            succeeded = true;
-                            info!(
-                                trace_id,
-                                strategy = ?self.options.paste_strategy,
-                                attempt = idx + 1,
-                                total_attempts = attempts.len(),
-                                shortcut = ?shortcut,
-                                "paste shortcut executed"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                trace_id,
-                                strategy = ?self.options.paste_strategy,
-                                attempt = idx + 1,
-                                total_attempts = attempts.len(),
-                                shortcut = ?shortcut,
-                                error = %err,
-                                "paste shortcut attempt failed"
-                            );
-                            errors.push(format!("{shortcut:?}: {err}"));
-                        }
-                    }
-                    if idx + 1 < attempts.len() {
-                        std::thread::sleep(Duration::from_millis(self.options.chain_delay_ms));
-                    }
-                }
-                if succeeded {
-                    return Ok(());
-                }
-            }
-        }
-
-        anyhow::bail!(
-            "all paste shortcut attempts failed (strategy={:?}): {}",
-            self.options.paste_strategy,
-            errors.join(" | ")
-        )
-    }
-
     fn stop_foreground_source(source: &mut Option<Child>, trace_id: u64, label: &'static str) {
         let Some(mut child) = source.take() else {
             return;
@@ -725,58 +568,6 @@ impl ClipboardInjector {
         Self::stop_foreground_source(primary_source, trace_id, "primary");
     }
 
-    fn restore_clipboards(
-        &self,
-        original_clipboard: &Option<String>,
-        original_primary: &Option<String>,
-        clipboard_source: &mut Option<Child>,
-        primary_source: &mut Option<Child>,
-        trace_id: u64,
-    ) {
-        Self::stop_foreground_source(clipboard_source, trace_id, "clipboard");
-        Self::stop_foreground_source(primary_source, trace_id, "primary");
-
-        let Some(clipboard) = original_clipboard else {
-            debug!(
-                trace_id,
-                "no original clipboard captured; skipping clipboard restore"
-            );
-            return;
-        };
-
-        debug!(
-            trace_id,
-            len = clipboard.len(),
-            "restoring original clipboard"
-        );
-        if let Err(err) = Self::set_clipboard(clipboard, &self.options, false, false) {
-            warn!(trace_id, error = %err, "failed to restore original clipboard");
-        } else {
-            debug!(trace_id, "original clipboard restored");
-        }
-
-        if self.options.write_primary {
-            if let Some(primary) = original_primary {
-                debug!(
-                    trace_id,
-                    len = primary.len(),
-                    "restoring original primary selection"
-                );
-                if let Err(err) = Self::set_clipboard(primary, &self.options, false, true) {
-                    warn!(trace_id, error = %err, "failed to restore original primary selection");
-                }
-            } else {
-                debug!(
-                    trace_id,
-                    "no original primary selection captured; skipping restore"
-                );
-            }
-        }
-    }
-
-    const WAYLAND_STALE_MS: u64 = 30_000;
-    const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
-
     fn resolve_focus_metadata(&self, _trace_id: u64) -> FocusResolutionOutcome {
         let Some(cache) = self.wayland_focus_cache.as_ref() else {
             return FocusResolutionOutcome {
@@ -827,30 +618,18 @@ impl TextInjector for ClipboardInjector {
         info!(
             trace_id,
             mode = if self.copy_only { "copy-only" } else { "paste" },
-            shortcut = ?self.options.paste_shortcut,
-            shortcut_fallback = ?self.options.shortcut_fallback,
-            strategy = ?self.options.paste_strategy,
-            chain_delay_ms = self.options.chain_delay_ms,
-            restore_policy = ?self.options.restore_policy,
-            restore_delay_ms = self.options.restore_delay_ms,
-            post_chord_hold_ms = self.options.post_chord_hold_ms,
-            copy_foreground = self.options.copy_foreground,
             key_backend = ?self.options.key_backend,
-            routing_mode = ?self.options.routing_mode,
-            adaptive_terminal_shortcut = ?self.options.adaptive_terminal_shortcut,
-            adaptive_general_shortcut = ?self.options.adaptive_general_shortcut,
-            adaptive_unknown_shortcut = ?self.options.adaptive_unknown_shortcut,
+            post_chord_hold_ms = self.options.post_chord_hold_ms,
             seat = ?self.options.seat,
             write_primary = self.options.write_primary,
-            mime_type = %self.options.mime_type,
             len = text.len(),
             fingerprint = %fingerprint(text),
             preview = %preview(text),
             "starting clipboard injection"
         );
 
-        // 1. Save existing clipboard(s).
-        let original_clipboard = match Self::get_clipboard(&self.options, false) {
+        // 1. Save existing clipboard(s) — kept for diagnostic logging only.
+        let _original_clipboard = match Self::get_clipboard(&self.options, false) {
             Ok(value) => {
                 debug!(
                     trace_id,
@@ -871,7 +650,7 @@ impl TextInjector for ClipboardInjector {
             }
         };
 
-        let original_primary = if self.options.write_primary {
+        let _original_primary = if self.options.write_primary {
             match Self::get_clipboard(&self.options, true) {
                 Ok(value) => {
                     debug!(
@@ -896,7 +675,7 @@ impl TextInjector for ClipboardInjector {
             None
         };
 
-        // 2. Write transcript into clipboard.
+        // 2. Write transcript into clipboard (always foreground).
         debug!(
             trace_id,
             elapsed_ms = started.elapsed().as_millis(),
@@ -905,7 +684,7 @@ impl TextInjector for ClipboardInjector {
             "writing transcript to clipboard"
         );
         let (mut foreground_clipboard_source, mut foreground_primary_source) = self
-            .write_clipboards(text, self.options.copy_foreground)
+            .write_clipboards(text, true)
             .context("failed to set clipboard contents")?;
 
         // 2b. Wait briefly for wl-copy ownership to become readable.
@@ -969,7 +748,7 @@ impl TextInjector for ClipboardInjector {
             wayland_fallback_reason,
         } = self.resolve_focus_metadata(trace_id);
 
-        let route = decide_route(&self.options, focus_snapshot.as_ref());
+        let route = decide_route(focus_snapshot.as_ref());
         if let Some(snapshot) = focus_snapshot.as_ref() {
             info!(
                 trace_id,
@@ -1003,9 +782,8 @@ impl TextInjector for ClipboardInjector {
             );
         }
 
-        // 3. Send paste shortcut(s).
-        if let Err(err) = self.run_paste_shortcuts(trace_id, route.primary, route.adaptive_fallback)
-        {
+        // 3. Send paste shortcut.
+        if let Err(err) = self.run_shortcut(trace_id, route.primary) {
             outcome = InjectionOutcome::ChordFailed;
             warn!(
                 trace_id,
@@ -1014,22 +792,12 @@ impl TextInjector for ClipboardInjector {
                 outcome = outcome.as_str(),
                 "paste shortcut stage failed"
             );
-            if matches!(self.options.restore_policy, PasteRestorePolicy::Delayed) {
-                self.restore_clipboards(
-                    &original_clipboard,
-                    &original_primary,
-                    &mut foreground_clipboard_source,
-                    &mut foreground_primary_source,
-                    trace_id,
-                );
-            } else {
-                self.transfer_to_background_if_needed(
-                    text,
-                    &mut foreground_clipboard_source,
-                    &mut foreground_primary_source,
-                    trace_id,
-                );
-            }
+            self.transfer_to_background_if_needed(
+                text,
+                &mut foreground_clipboard_source,
+                &mut foreground_primary_source,
+                trace_id,
+            );
             return Err(err);
         }
 
@@ -1038,7 +806,7 @@ impl TextInjector for ClipboardInjector {
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),
                 hold_ms = self.options.post_chord_hold_ms,
-                "holding foreground clipboard source after paste chords"
+                "holding foreground clipboard source after paste chord"
             );
             std::thread::sleep(Duration::from_millis(self.options.post_chord_hold_ms));
         }
@@ -1077,37 +845,13 @@ impl TextInjector for ClipboardInjector {
             }
         }
 
-        match self.options.restore_policy {
-            PasteRestorePolicy::Never => {
-                self.transfer_to_background_if_needed(
-                    text,
-                    &mut foreground_clipboard_source,
-                    &mut foreground_primary_source,
-                    trace_id,
-                );
-                debug!(
-                    trace_id,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "restore policy is never; leaving transcript in clipboard"
-                );
-            }
-            PasteRestorePolicy::Delayed => {
-                debug!(
-                    trace_id,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    restore_delay_ms = self.options.restore_delay_ms,
-                    "sleeping before clipboard restore"
-                );
-                std::thread::sleep(Duration::from_millis(self.options.restore_delay_ms));
-                self.restore_clipboards(
-                    &original_clipboard,
-                    &original_primary,
-                    &mut foreground_clipboard_source,
-                    &mut foreground_primary_source,
-                    trace_id,
-                );
-            }
-        }
+        // Restore policy is Never — transfer to background and keep transcript in clipboard.
+        self.transfer_to_background_if_needed(
+            text,
+            &mut foreground_clipboard_source,
+            &mut foreground_primary_source,
+            trace_id,
+        );
 
         info!(
             trace_id,
@@ -1147,134 +891,19 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
-        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
-        PasteRoutingMode, PasteShortcut, PasteStrategy,
+        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use evdev::Key;
     use std::path::PathBuf;
 
-    fn options(
-        strategy: PasteStrategy,
-        primary: PasteShortcut,
-        fallback: Option<PasteShortcut>,
-    ) -> ClipboardOptions {
+    fn test_options() -> ClipboardOptions {
         ClipboardOptions {
-            paste_shortcut: primary,
-            shortcut_fallback: fallback,
-            paste_strategy: strategy,
-            chain_delay_ms: 45,
-            restore_policy: PasteRestorePolicy::Never,
-            restore_delay_ms: 250,
-            post_chord_hold_ms: 700,
-            copy_foreground: true,
-            mime_type: "text/plain;charset=utf-8".to_string(),
-            key_backend: PasteKeyBackend::Wtype,
+            key_backend: PasteKeyBackend::Auto,
             backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
-            routing_mode: PasteRoutingMode::Static,
-            adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
-            adaptive_general_shortcut: PasteShortcut::CtrlV,
-            adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
+            post_chord_hold_ms: 700,
             seat: None,
             write_primary: false,
         }
-    }
-
-    #[test]
-    fn single_strategy_uses_primary_only() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(
-                PasteStrategy::Single,
-                PasteShortcut::CtrlShiftV,
-                Some(PasteShortcut::CtrlV),
-            ),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
-            vec![PasteShortcut::CtrlShiftV]
-        );
-    }
-
-    #[test]
-    fn on_error_strategy_uses_explicit_fallback_only() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(
-                PasteStrategy::OnError,
-                PasteShortcut::ShiftInsert,
-                Some(PasteShortcut::CtrlShiftV),
-            ),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::ShiftInsert, None),
-            vec![PasteShortcut::ShiftInsert, PasteShortcut::CtrlShiftV]
-        );
-    }
-
-    #[test]
-    fn on_error_strategy_respects_fallback_none() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(PasteStrategy::OnError, PasteShortcut::CtrlShiftV, None),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
-            vec![PasteShortcut::CtrlShiftV]
-        );
-    }
-
-    #[test]
-    fn on_error_strategy_includes_adaptive_fallback_before_explicit_fallback() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(
-                PasteStrategy::OnError,
-                PasteShortcut::CtrlShiftV,
-                Some(PasteShortcut::ShiftInsert),
-            ),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV)),
-            vec![
-                PasteShortcut::CtrlShiftV,
-                PasteShortcut::CtrlV,
-                PasteShortcut::ShiftInsert
-            ]
-        );
-    }
-
-    #[test]
-    fn always_chain_deduplicates_identical_shortcuts() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(
-                PasteStrategy::AlwaysChain,
-                PasteShortcut::CtrlV,
-                Some(PasteShortcut::CtrlV),
-            ),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::CtrlV, None),
-            vec![PasteShortcut::CtrlV]
-        );
-    }
-
-    #[test]
-    fn always_chain_strategy_respects_fallback_none() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Disabled,
-            options(PasteStrategy::AlwaysChain, PasteShortcut::CtrlShiftV, None),
-            false,
-        );
-        assert_eq!(
-            injector.shortcut_attempt_order(PasteShortcut::CtrlShiftV, None),
-            vec![PasteShortcut::CtrlShiftV]
-        );
     }
 
     #[test]
@@ -1286,28 +915,31 @@ mod tests {
 
     #[test]
     fn chain_sender_falls_through_to_next_backend() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Chain(vec![
-                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
-                PasteKeySender::Wtype(PathBuf::from("/bin/true")),
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Chain(vec![
+                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
+                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
             ]),
-            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
-            false,
-        );
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
 
+        // ydotool /bin/true with "key" arg should succeed (it's just /bin/true ignoring args)
         assert!(injector.run_shortcut(1, PasteShortcut::CtrlV).is_ok());
     }
 
     #[test]
     fn chain_sender_reports_all_backend_failures() {
-        let injector = ClipboardInjector::new(
-            PasteKeySender::Chain(vec![
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Chain(vec![
                 PasteKeySender::Disabled,
-                PasteKeySender::Wtype(PathBuf::from("/bin/false")),
+                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
             ]),
-            options(PasteStrategy::Single, PasteShortcut::CtrlV, None),
-            false,
-        );
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
 
         let err = injector
             .run_shortcut(1, PasteShortcut::CtrlV)
@@ -1315,6 +947,6 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("all paste backend attempts failed"));
         assert!(message.contains("disabled"));
-        assert!(message.contains("wtype"));
+        assert!(message.contains("ydotool"));
     }
 }

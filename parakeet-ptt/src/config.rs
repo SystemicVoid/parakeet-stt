@@ -20,34 +20,13 @@ pub enum InjectionMode {
 pub enum PasteShortcut {
     CtrlV,
     CtrlShiftV,
-    ShiftInsert,
-}
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub enum PasteRestorePolicy {
-    Never,
-    Delayed,
-}
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub enum PasteStrategy {
-    Single,
-    OnError,
-    AlwaysChain,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum PasteKeyBackend {
-    Wtype,
     Ydotool,
     Uinput,
     Auto,
-}
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub enum PasteRoutingMode {
-    Static,
-    Adaptive,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -58,21 +37,9 @@ pub enum PasteBackendFailurePolicy {
 
 #[derive(Clone, Debug)]
 pub struct ClipboardOptions {
-    pub paste_shortcut: PasteShortcut,
-    pub shortcut_fallback: Option<PasteShortcut>,
-    pub paste_strategy: PasteStrategy,
-    pub chain_delay_ms: u64,
-    pub restore_policy: PasteRestorePolicy,
-    pub restore_delay_ms: u64,
-    pub post_chord_hold_ms: u64,
-    pub copy_foreground: bool,
-    pub mime_type: String,
     pub key_backend: PasteKeyBackend,
     pub backend_failure_policy: PasteBackendFailurePolicy,
-    pub routing_mode: PasteRoutingMode,
-    pub adaptive_terminal_shortcut: PasteShortcut,
-    pub adaptive_general_shortcut: PasteShortcut,
-    pub adaptive_unknown_shortcut: PasteShortcut,
+    pub post_chord_hold_ms: u64,
     pub seat: Option<String>,
     pub write_primary: bool,
 }
