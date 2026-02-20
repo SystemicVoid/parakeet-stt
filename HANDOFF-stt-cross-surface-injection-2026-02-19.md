@@ -790,3 +790,68 @@ Immediate next diagnostic priority:
 2. Determine whether editor failures are:
 - still route-choice mismatch (wrong shortcut for effective target), or
 - key-delivery acceptance mismatch (shortcut delivered but app rejects synthetic path).
+
+## 21. Root-Cause Closure and Compaction Plan (2026-02-20)
+
+This section captures the validated closure path after the latest operator run and the agreed API compaction strategy.
+
+### 21.1 Evidence from latest run (`/tmp/parakeet-ptt.log.clean`, session start `2026-02-20T13:42:27Z`)
+
+| Surface | Focus resolution | Route decision | Status |
+| --- | --- | --- | --- |
+| Ghostty | `focus_source_selected="wayland_cache"`, `focus_focused=true` | `route_class=Terminal`, `route_primary=CtrlShiftV` | OK |
+| VS Code editor pane | `focus_source_selected="wayland_cache"`, `focus_focused=true` | `route_class=General`, `route_primary=CtrlV` | OK |
+| Brave input field | `focus_source_selected="wayland_cache"`, `focus_focused=true` | `route_class=General`, `route_primary=CtrlV` | OK |
+| COSMIC Text Editor | `focus_app="com.system76.CosmicEdit"`, `focus_focused=true` | `route_class=Unknown`, `route_primary=CtrlShiftV` | Failing |
+
+### 21.2 Root-cause statement
+
+Remaining failure is a routing classification gap for COSMIC Text Editor identifiers (`com.system76.CosmicEdit` / `cosmicedit` / title forms), not resolver freshness or Wayland cache staleness.
+
+### 21.3 Selected defaults and policy decisions
+
+1. Unknown-route policy remains terminal-first (`Ctrl+Shift+V`).
+2. Compatibility strategy is deprecate-now, remove-next-release.
+3. Wayland cache defaults are set to:
+   - stale threshold: `30000ms`
+   - transition grace: `500ms`
+4. Primary operator profile is Wayland-first for focus metadata.
+
+### 21.4 Execution checklist
+
+1. Routing fix:
+- [x] Add COSMIC Edit hints (`com.system76.cosmicedit`, `cosmicedit`, `cosmic text editor`) to General classification.
+- [x] Normalize punctuation separators (`.`, `-`, `_`, `/`) before hint matching.
+- [x] Preserve unknown terminal-first behavior.
+- [x] Emit explicit route reason for COSMIC Edit matches.
+
+2. Default behavior updates:
+- [x] Update Wayland stale default to `30000`.
+- [x] Update Wayland transition-grace default to `500`.
+- [x] Keep fallback safety behavior intact.
+
+3. Option-surface compaction (Phase 1):
+- [x] Keep deprecated flags/env vars parse-compatible.
+- [x] Move deprecated options out of primary help into compatibility help.
+- [x] Emit deprecation warnings when deprecated compatibility knobs are explicitly used.
+- [x] Keep stable operator knobs in primary help/docs.
+
+### 21.5 Acceptance matrix template (post-change validation)
+
+For each dictation event capture:
+- `focus_source_selected`
+- `focus_wayland_cache_age_ms`
+- `focus_wayland_fallback_reason`
+- `focus_app`
+- `focus_object`
+- `focus_focused`
+- `route_class`
+- `route_primary`
+- `route_adaptive_fallback`
+- `route_reason`
+
+Expected matrix:
+1. Ghostty -> `Terminal`, `CtrlShiftV`
+2. VS Code -> `General`, `CtrlV`
+3. COSMIC Text Editor -> `General`, `CtrlV`
+4. Brave -> `General`, `CtrlV`

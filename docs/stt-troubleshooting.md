@@ -9,19 +9,11 @@ This document now has two parts:
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
-- Default startup profile is now paste-mode with adaptive cross-surface shortcut routing:
+- Default startup profile is now paste-mode with adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
-  - `--paste-shortcut ctrl-shift-v` (used when routing mode is `static`)
-  - `--paste-shortcut-fallback none`
-  - `--paste-strategy single`
   - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
-- `--paste-routing-mode adaptive`
-- `--adaptive-terminal-shortcut ctrl-shift-v`
-- `--adaptive-general-shortcut ctrl-v`
-- `--adaptive-unknown-shortcut ctrl-shift-v`
-- `--focus-resolver-source atspi` (default rollout-safe path; `hybrid` and `wayland` available for focus-signal pivot validation)
-- `--focus-wayland-stale-ms 1200`
-- `--focus-wayland-transition-grace-ms 200`
+  - `--paste-backend-failure-policy copy-only`
+  - Wayland focus cache defaults: source=`wayland`, stale=`30000ms`, transition grace=`500ms`
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
@@ -31,6 +23,7 @@ This document now has two parts:
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
+- Compatibility knobs used during routing/focus exploration are now deprecated in primary help; they remain accepted via `stt help start-compat`.
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -78,50 +71,44 @@ With the append-only logging, tmux-based client start, PID tracking, and longer 
 
 ## Clipboard injection tuning (Feb 8, 2026)
 
-Paste/copy injection now exposes a strategy-driven pipeline through `stt start` and
-`parakeet-ptt`:
+Paste/copy injection now exposes a stable operator surface through `stt start` and
+`parakeet-ptt`.
 
+Stable knobs:
 - `--injection-mode type|paste|copy-only`
-- `--paste-shortcut ctrl-v|ctrl-shift-v|shift-insert`
-- `--paste-shortcut-fallback none|ctrl-v|ctrl-shift-v|shift-insert`
-- `--paste-strategy single|on-error|always-chain` (default: `single`)
-- `--paste-chain-delay-ms <ms>` (default: `45`)
-- `--paste-post-chord-hold-ms <ms>` (default: `700`)
-- `--paste-restore-policy never|delayed` (default: `never`)
-- `--paste-restore-delay-ms <ms>` (default: `250`)
-- `--paste-copy-foreground true|false` (default: `true`)
-- `--paste-mime-type text/plain;charset=utf-8` (default)
 - `--paste-key-backend wtype|ydotool|uinput|auto` (default: `auto`)
-- `--paste-routing-mode static|adaptive` (default: `adaptive`)
-- `--adaptive-terminal-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
-- `--adaptive-general-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-v`)
-- `--adaptive-unknown-shortcut ctrl-v|ctrl-shift-v|shift-insert` (default: `ctrl-shift-v`)
-- `--focus-resolver-source atspi|wayland|hybrid` (default: `atspi`)
-- `--focus-wayland-stale-ms <ms>` (default: `1200`)
-- `--focus-wayland-transition-grace-ms <ms>` (default: `200`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
 - `--paste-write-primary true|false` (default: `false`)
 - `--ydotool <path>` (optional explicit path override)
 
+Deprecated compatibility knobs (still accepted in this release):
+- `--paste-shortcut`
+- `--paste-shortcut-fallback`
+- `--paste-strategy`
+- `--paste-chain-delay-ms`
+- `--paste-post-chord-hold-ms`
+- `--paste-restore-policy`
+- `--paste-restore-delay-ms`
+- `--paste-copy-foreground`
+- `--paste-mime-type`
+- `--paste-routing-mode`
+- `--adaptive-terminal-shortcut`
+- `--adaptive-general-shortcut`
+- `--adaptive-unknown-shortcut`
+- `--focus-resolver-source`
+- `--focus-resolve-budget-ms`
+- `--focus-deep-scan-max-apps`
+- `--focus-wayland-stale-ms`
+- `--focus-wayland-transition-grace-ms`
+
 Recommended baseline for Ghostty/COSMIC:
 
 ```bash
 stt start --paste \
-  --paste-routing-mode adaptive \
-  --focus-resolver-source atspi \
-  --adaptive-terminal-shortcut ctrl-shift-v \
-  --adaptive-general-shortcut ctrl-v \
-  --adaptive-unknown-shortcut ctrl-shift-v \
-  --paste-shortcut-fallback none \
-  --paste-strategy single \
-  --paste-chain-delay-ms 45 \
-  --paste-post-chord-hold-ms 700 \
   --paste-key-backend auto \
-  --paste-backend-failure-policy copy-only \
-  --paste-restore-policy never \
-  --paste-copy-foreground true
+  --paste-backend-failure-policy copy-only
 ```
 
 COSMIC focus-navigation baseline for adaptive routing:
