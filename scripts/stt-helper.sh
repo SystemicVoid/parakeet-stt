@@ -22,27 +22,28 @@ stt() {
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
+    local -a ignored_compat_requests=()
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
-    local default_paste_shortcut="${PARAKEET_PASTE_SHORTCUT:-ctrl-shift-v}"
-    local default_paste_shortcut_fallback="${PARAKEET_PASTE_SHORTCUT_FALLBACK:-none}"
-    local default_paste_strategy="${PARAKEET_PASTE_STRATEGY:-single}"
-    local default_paste_chain_delay_ms="${PARAKEET_PASTE_CHAIN_DELAY_MS:-45}"
-    local default_paste_restore_policy="${PARAKEET_PASTE_RESTORE_POLICY:-never}"
-    local default_paste_restore_delay_ms="${PARAKEET_PASTE_RESTORE_DELAY_MS:-250}"
-    local default_paste_post_chord_hold_ms="${PARAKEET_PASTE_POST_CHORD_HOLD_MS:-700}"
-    local default_paste_copy_foreground="${PARAKEET_PASTE_COPY_FOREGROUND:-true}"
-    local default_paste_mime_type="${PARAKEET_PASTE_MIME_TYPE:-text/plain;charset=utf-8}"
+    local default_paste_shortcut="ctrl-shift-v"
+    local default_paste_shortcut_fallback="none"
+    local default_paste_strategy="single"
+    local default_paste_chain_delay_ms="45"
+    local default_paste_restore_policy="never"
+    local default_paste_restore_delay_ms="250"
+    local default_paste_post_chord_hold_ms="700"
+    local default_paste_copy_foreground="true"
+    local default_paste_mime_type="text/plain;charset=utf-8"
     local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
-    local default_paste_routing_mode="${PARAKEET_PASTE_ROUTING_MODE:-adaptive}"
-    local default_adaptive_terminal_shortcut="${PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}"
-    local default_adaptive_general_shortcut="${PARAKEET_ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}"
-    local default_adaptive_unknown_shortcut="${PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}"
-    local default_focus_resolver_source="${PARAKEET_FOCUS_RESOLVER_SOURCE:-wayland}"
-    local default_focus_resolve_budget_ms="${PARAKEET_FOCUS_RESOLVE_BUDGET_MS:-450}"
-    local default_focus_deep_scan_max_apps="${PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS:-1}"
-    local default_focus_wayland_stale_ms="${PARAKEET_FOCUS_WAYLAND_STALE_MS:-30000}"
-    local default_focus_wayland_transition_grace_ms="${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-500}"
+    local default_paste_routing_mode="adaptive"
+    local default_adaptive_terminal_shortcut="ctrl-shift-v"
+    local default_adaptive_general_shortcut="ctrl-v"
+    local default_adaptive_unknown_shortcut="ctrl-shift-v"
+    local default_focus_resolver_source="wayland"
+    local default_focus_resolve_budget_ms="450"
+    local default_focus_deep_scan_max_apps="1"
+    local default_focus_wayland_stale_ms="30000"
+    local default_focus_wayland_transition_grace_ms="500"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -138,7 +139,8 @@ stt() {
             IFS='|' read -r opt_name _ _ env_name option_group _ _ _ _ <<<"$row"
             [ "$option_group" = "Compatibility (deprecated)" ] || continue
             if [ "${!env_name+x}" = "x" ]; then
-                echo "   - Warning: env $env_name (maps to --$opt_name) is deprecated and will be removed in a future release."
+                ignored_compat_requests+=("env:$env_name=${!env_name}")
+                echo "   - Warning: env $env_name is deprecated and ignored; robust defaults remain active." >&2
             fi
         done
     }
@@ -146,10 +148,14 @@ stt() {
     _set_start_option_value() {
         local target="$1"
         local value="$2"
-        local row opt_name var_name
+        local row opt_name var_name option_group
         for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ <<<"$row"
+            IFS='|' read -r opt_name var_name _ _ option_group _ _ _ _ <<<"$row"
             if [ "$opt_name" = "$target" ]; then
+                if [ "$option_group" = "Compatibility (deprecated)" ]; then
+                    ignored_compat_requests+=("--$target=$value")
+                    return 0
+                fi
                 printf -v "$var_name" "%s" "$value"
                 return 0
             fi
@@ -166,11 +172,15 @@ stt() {
     }
 
     _apply_legacy_override_vars() {
-        local row var_name legacy_name
+        local row opt_name var_name legacy_name option_group
         for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r _ var_name _ _ <<<"$row"
+            IFS='|' read -r opt_name var_name _ _ option_group _ _ _ _ <<<"$row"
             legacy_name="$(tr '[:lower:]' '[:upper:]' <<<"$var_name")"
             if [ "${!legacy_name+x}" = "x" ]; then
+                if [ "$option_group" = "Compatibility (deprecated)" ]; then
+                    ignored_compat_requests+=("legacy:$legacy_name=${!legacy_name}")
+                    continue
+                fi
                 printf -v "$var_name" "%s" "${!legacy_name}"
             fi
         done
@@ -213,35 +223,20 @@ stt() {
     _build_ptt_args() {
         local -n out_ref="$1"
         local include_endpoint="${2:-yes}"
-        local row opt_name var_name env_name include_policy baseline_default
+        local row opt_name var_name include_policy
         out_ref=()
         if [ "$include_endpoint" = "yes" ]; then
             out_ref+=(--endpoint "$DEFAULT_ENDPOINT")
         fi
         for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ env_name _ _ _ include_policy baseline_default <<<"$row"
+            IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
+            if [ "$include_policy" = "compat" ]; then
+                continue
+            fi
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
                 continue
             fi
-            if [ "$include_policy" = "compat" ]; then
-                if [ "${!env_name+x}" != "x" ] && [ "${!var_name}" = "$baseline_default" ]; then
-                    continue
-                fi
-            fi
             out_ref+=("--$opt_name" "${!var_name}")
-        done
-    }
-
-    _collect_active_compat_options() {
-        local -n out_ref="$1"
-        local row opt_name var_name env_name option_group baseline_default
-        out_ref=()
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ env_name option_group _ _ _ baseline_default <<<"$row"
-            [ "$option_group" = "Compatibility (deprecated)" ] || continue
-            if [ "${!env_name+x}" = "x" ] || [ "${!var_name}" != "$baseline_default" ]; then
-                out_ref+=("--$opt_name=${!var_name}")
-            fi
         done
     }
 
@@ -309,7 +304,7 @@ stt() {
                         return 1
                     fi
                     if _is_deprecated_start_option "$opt_name"; then
-                        echo "   - Warning: --$opt_name is deprecated and will be removed in a future release."
+                        echo "   - Warning: --$opt_name is deprecated and ignored; robust defaults remain active." >&2
                     fi
                     _set_start_option_value "$opt_name" "$2"
                     shift 2
@@ -538,7 +533,7 @@ EOF
         _print_start_option_group "Stable controls"
         cat <<EOF
 
-Deprecated compatibility options are still accepted but hidden from primary help.
+Deprecated compatibility options are hidden from primary help and ignored at runtime.
 Show them with:
   stt help start-compat
 
@@ -553,7 +548,7 @@ EOF
 Usage:
   stt start [deprecated-compat-options]
 
-Compatibility options (deprecated; supported for migration only):
+Compatibility options are parsed for compatibility but ignored.
 EOF
         _print_start_option_group "Compatibility (deprecated)"
     }
@@ -673,9 +668,6 @@ EOF
 
             _warn_deprecated_env_overrides
 
-            local -a active_compat_overrides
-            _collect_active_compat_options active_compat_overrides
-
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
                 client_ready_timeout_seconds=30
@@ -692,9 +684,9 @@ EOF
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
-            if [ "${#active_compat_overrides[@]}" -gt 0 ]; then
-                echo "   - Deprecated compatibility overrides active:"
-                printf '     %s\n' "${active_compat_overrides[@]}"
+            if [ "${#ignored_compat_requests[@]}" -gt 0 ]; then
+                echo "   - Deprecated compatibility overrides ignored:"
+                printf '     %s\n' "${ignored_compat_requests[@]}"
             fi
 
             if ! _resolve_port; then

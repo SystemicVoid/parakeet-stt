@@ -27,13 +27,22 @@ assert_option_value() {
     fail "missing option token $flag"
 }
 
+assert_option_missing() {
+    local flag="$1"
+    local -n tokens_ref="$2"
+    local token
+    for token in "${tokens_ref[@]}"; do
+        if [ "$token" = "$flag" ]; then
+            fail "unexpected option token $flag"
+        fi
+    done
+}
+
 bash -n "$repo_root/scripts/stt-helper.sh"
 
 # shellcheck source=./stt-helper.sh
 source "$repo_root/scripts/stt-helper.sh"
 
-mapfile -t start_options < <(stt __start-option-names)
-[ "${#start_options[@]}" -gt 0 ] || fail "no metadata options were returned"
 mapfile -t stable_options < <(stt __start-option-names-stable)
 [ "${#stable_options[@]}" -gt 0 ] || fail "no stable metadata options were returned"
 mapfile -t deprecated_options < <(stt __start-option-names-deprecated)
@@ -62,10 +71,16 @@ if ! printf "%s\n" "${default_args[@]}" | grep -Fxq -- "--endpoint"; then
     fail "__start-args output is missing --endpoint"
 fi
 
-for opt in "${start_options[@]}"; do
+for opt in "${stable_options[@]}"; do
     sample="ci_${opt//[^a-zA-Z0-9]/_}"
     mapfile -t override_args < <(stt __start-args "--$opt" "$sample")
     assert_option_value "--$opt" "$sample" override_args
+done
+
+for opt in "${deprecated_options[@]}"; do
+    sample="ci_${opt//[^a-zA-Z0-9]/_}"
+    mapfile -t override_args < <(stt __start-args "--$opt" "$sample" 2>/dev/null)
+    assert_option_missing "--$opt" override_args
 done
 
 mapfile -t alias_args < <(stt __start-args --type)

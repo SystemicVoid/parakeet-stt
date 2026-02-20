@@ -123,7 +123,7 @@ struct Cli {
     paste_mime_type: String,
 
     /// Keyboard injection backend for paste shortcut(s).
-    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Wtype)]
+    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Auto)]
     paste_key_backend: CliPasteKeyBackend,
 
     /// Routing mode for choosing paste shortcut(s).
@@ -386,17 +386,39 @@ fn warn_deprecated_cli_flags(flags: &[&'static str]) {
 
     warn!(
         deprecated_flags = %flags.join(", "),
-        "deprecated compatibility flags are in use and will be removed in a future release"
+        "deprecated compatibility flags are ignored and will be removed in a future release"
     );
+}
+
+fn apply_robust_profile_over_deprecated_flags(cli: &mut Cli) {
+    cli.paste_shortcut = CliPasteShortcut::CtrlShiftV;
+    cli.paste_shortcut_fallback = CliPasteShortcutFallback::None;
+    cli.paste_strategy = CliPasteStrategy::Single;
+    cli.paste_chain_delay_ms = 45;
+    cli.paste_restore_delay_ms = 250;
+    cli.paste_post_chord_hold_ms = 700;
+    cli.paste_restore_policy = CliPasteRestorePolicy::Never;
+    cli.paste_copy_foreground = true;
+    cli.paste_mime_type = "text/plain;charset=utf-8".to_string();
+    cli.paste_routing_mode = CliPasteRoutingMode::Adaptive;
+    cli.adaptive_terminal_shortcut = CliPasteShortcut::CtrlShiftV;
+    cli.adaptive_general_shortcut = CliPasteShortcut::CtrlV;
+    cli.adaptive_unknown_shortcut = CliPasteShortcut::CtrlShiftV;
+    cli.focus_resolver_source = CliFocusResolverSource::Wayland;
+    cli.focus_resolve_budget_ms = 450;
+    cli.focus_deep_scan_max_apps = 1;
+    cli.focus_wayland_stale_ms = 30_000;
+    cli.focus_wayland_transition_grace_ms = 500;
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let deprecated_cli_flags = collect_deprecated_cli_flags(raw_args.get(1..).unwrap_or(&[]));
-    let cli = Cli::parse_from(raw_args);
+    let mut cli = Cli::parse_from(raw_args);
     init_tracing();
     warn_deprecated_cli_flags(&deprecated_cli_flags);
+    apply_robust_profile_over_deprecated_flags(&mut cli);
 
     let config = ClientConfig::new(
         &cli.endpoint,
@@ -944,7 +966,9 @@ mod tests {
     };
 
     use super::{
-        build_injector, shortcut_interop_warning, Cli, CliFocusResolverSource, CliPasteStrategy,
+        apply_robust_profile_over_deprecated_flags, build_injector, shortcut_interop_warning, Cli,
+        CliFocusResolverSource, CliPasteKeyBackend, CliPasteRoutingMode, CliPasteShortcut,
+        CliPasteShortcutFallback, CliPasteStrategy,
     };
 
     fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
@@ -1008,6 +1032,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_default_paste_key_backend_is_auto() {
+        let cli = Cli::parse_from(["parakeet-ptt"]);
+        assert!(matches!(cli.paste_key_backend, CliPasteKeyBackend::Auto));
+    }
+
+    #[test]
+    fn cli_default_routing_profile_matches_robust_wayland_path() {
+        let cli = Cli::parse_from(["parakeet-ptt"]);
+        assert!(matches!(
+            cli.paste_routing_mode,
+            CliPasteRoutingMode::Adaptive
+        ));
+        assert!(matches!(
+            cli.adaptive_terminal_shortcut,
+            CliPasteShortcut::CtrlShiftV
+        ));
+        assert!(matches!(
+            cli.adaptive_general_shortcut,
+            CliPasteShortcut::CtrlV
+        ));
+        assert!(matches!(
+            cli.adaptive_unknown_shortcut,
+            CliPasteShortcut::CtrlShiftV
+        ));
+    }
+
+    #[test]
     fn cli_accepts_explicit_always_chain_strategy() {
         let cli = Cli::parse_from(["parakeet-ptt", "--paste-strategy", "always-chain"]);
         assert!(matches!(cli.paste_strategy, CliPasteStrategy::AlwaysChain));
@@ -1029,6 +1080,13 @@ mod tests {
             cli.focus_resolver_source,
             CliFocusResolverSource::Hybrid
         ));
+    }
+
+    #[test]
+    fn cli_default_wayland_thresholds_match_robust_profile() {
+        let cli = Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.focus_wayland_stale_ms, 30_000);
+        assert_eq!(cli.focus_wayland_transition_grace_ms, 500);
     }
 
     #[test]
@@ -1120,5 +1178,72 @@ mod tests {
         assert!(flags.contains(&"--paste-shortcut"));
         assert!(flags.contains(&"--focus-wayland-stale-ms"));
         assert!(!flags.contains(&"--completion-sound"));
+    }
+
+    #[test]
+    fn robust_profile_ignores_deprecated_cli_overrides() {
+        let mut cli = Cli::parse_from([
+            "parakeet-ptt",
+            "--paste-shortcut",
+            "ctrl-v",
+            "--paste-shortcut-fallback",
+            "shift-insert",
+            "--paste-strategy",
+            "always-chain",
+            "--paste-chain-delay-ms",
+            "999",
+            "--paste-restore-delay-ms",
+            "999",
+            "--paste-post-chord-hold-ms",
+            "999",
+            "--paste-restore-policy",
+            "delayed",
+            "--paste-copy-foreground",
+            "false",
+            "--paste-mime-type",
+            "text/plain",
+            "--paste-routing-mode",
+            "static",
+            "--adaptive-terminal-shortcut",
+            "ctrl-v",
+            "--adaptive-general-shortcut",
+            "ctrl-shift-v",
+            "--adaptive-unknown-shortcut",
+            "ctrl-v",
+            "--focus-resolver-source",
+            "hybrid",
+            "--focus-resolve-budget-ms",
+            "123",
+            "--focus-deep-scan-max-apps",
+            "9",
+            "--focus-wayland-stale-ms",
+            "100",
+            "--focus-wayland-transition-grace-ms",
+            "42",
+        ]);
+
+        apply_robust_profile_over_deprecated_flags(&mut cli);
+
+        assert!(matches!(cli.paste_shortcut, CliPasteShortcut::CtrlShiftV));
+        assert!(matches!(
+            cli.paste_shortcut_fallback,
+            CliPasteShortcutFallback::None
+        ));
+        assert!(matches!(cli.paste_strategy, CliPasteStrategy::Single));
+        assert_eq!(cli.paste_chain_delay_ms, 45);
+        assert_eq!(cli.paste_restore_delay_ms, 250);
+        assert_eq!(cli.paste_post_chord_hold_ms, 700);
+        assert!(matches!(
+            cli.paste_routing_mode,
+            CliPasteRoutingMode::Adaptive
+        ));
+        assert!(matches!(
+            cli.focus_resolver_source,
+            CliFocusResolverSource::Wayland
+        ));
+        assert_eq!(cli.focus_resolve_budget_ms, 450);
+        assert_eq!(cli.focus_deep_scan_max_apps, 1);
+        assert_eq!(cli.focus_wayland_stale_ms, 30_000);
+        assert_eq!(cli.focus_wayland_transition_grace_ms, 500);
     }
 }

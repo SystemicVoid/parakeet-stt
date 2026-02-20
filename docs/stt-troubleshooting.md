@@ -23,7 +23,7 @@ This document now has two parts:
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
-- Compatibility knobs used during routing/focus exploration are now deprecated in primary help; they remain accepted via `stt help start-compat`.
+- Compatibility knobs used during routing/focus exploration are now deprecated in primary help; when provided they are ignored and robust defaults remain active. See `stt help start-compat`.
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -83,7 +83,7 @@ Stable knobs:
 - `--paste-write-primary true|false` (default: `false`)
 - `--ydotool <path>` (optional explicit path override)
 
-Deprecated compatibility knobs (still accepted in this release):
+Deprecated compatibility knobs (parsed for compatibility but ignored in runtime):
 - `--paste-shortcut`
 - `--paste-shortcut-fallback`
 - `--paste-strategy`

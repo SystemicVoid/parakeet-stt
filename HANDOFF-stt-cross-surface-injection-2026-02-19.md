@@ -831,9 +831,9 @@ Remaining failure is a routing classification gap for COSMIC Text Editor identif
 - [x] Keep fallback safety behavior intact.
 
 3. Option-surface compaction (Phase 1):
-- [x] Keep deprecated flags/env vars parse-compatible.
+- [x] Keep deprecated flags/env vars parse-compatible but runtime-ignored (robust defaults pinned).
 - [x] Move deprecated options out of primary help into compatibility help.
-- [x] Emit deprecation warnings when deprecated compatibility knobs are explicitly used.
+- [x] Emit warnings when deprecated compatibility knobs are explicitly used.
 - [x] Keep stable operator knobs in primary help/docs.
 
 ### 21.5 Acceptance matrix template (post-change validation)
