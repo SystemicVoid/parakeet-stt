@@ -130,7 +130,7 @@ stt diag-injector
 ## Docs Map
 
 - Protocol contract: `docs/SPEC.md`
-- Troubleshooting: `docs/stt-troubleshooting.md`
-- Detailed migration handoff: `docs/HANDOFF-clipboard-injector-2026-02-08.md`
+- Troubleshooting (canonical operator source): `docs/stt-troubleshooting.md`
+- Historical injector handoff archive (non-canonical): `docs/HANDOFF-clipboard-injector-2026-02-08.md`
 - Injection implementation roadmap: `docs/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
 - UX roadmap (new): `ROADMAP.md`

@@ -98,13 +98,30 @@ Acceptance:
 - Users can tell whether failure is ASR, clipboard, backend init, or target-app acceptance.
 - First-run experience requires minimal tuning for common apps.
 
+## Phase 5: Dictation Error Correction Loop (Low Priority)
+
+Scope:
+- Add a lightweight, user-curated correction layer for recurring dictation mistakes.
+- Keep corrections grounded in observed errors captured during daily use.
+- Avoid speculative rewrites or broad automatic "cleanup" that can hallucinate intent.
+
+Implementation direction:
+- Start with a local corrections file (jargon/substitution style) and apply deterministic replacements.
+- Keep the workflow append-only and incremental: add one correction when a pattern repeats.
+- Prefer narrow phrase-level mappings over aggressive regex-style transforms.
+
+Acceptance:
+- Users can maintain recurring corrections over time without changing core ASR/injection behavior.
+- Correction behavior is predictable, explainable, and easy to disable for troubleshooting.
+
 ## Delivery Strategy (Atomic)
 
 1. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
 2. Add Phase 1 tests and update docs.
 3. Ship TUI skeleton with existing state only.
 4. Extend TUI with injection outcomes.
-5. Prototype GUI after TUI reaches stable daily use.
+5. Add incremental dictation error correction loop behind an opt-in switch.
+6. Prototype GUI after TUI reaches stable daily use.
 
 ## Metrics to Track
 
@@ -112,6 +129,7 @@ Acceptance:
 - Paste success rate per backend and app surface.
 - Fallback/copy-only event rate.
 - User-reported "had to check logs" frequency.
+- Recurring dictation-error correction hit rate (matches applied vs reverted).
 
 ## Streaming-Dependent Features (Blocked)
 

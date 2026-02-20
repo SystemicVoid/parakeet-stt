@@ -5,6 +5,11 @@ This document now has two parts:
 1. **Current truth (2026 migration branch)** for day-to-day operations.
 2. **Historical investigation notes** from earlier debugging passes.
 
+Canonical-source policy:
+- This file is the canonical operator source of truth for runtime behavior and troubleshooting.
+- `scripts/stt-helper.sh` (`start_option_rows`) is the canonical source for helper start flags/defaults/env wiring.
+- `docs/HANDOFF-clipboard-injector-2026-02-08.md` is historical context only and not operational guidance.
+
 ## Current truth (2026 migration branch)
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
@@ -114,4 +119,4 @@ Use the new helper matrix command:
 stt diag-injector
 ```
 
-It prints backend capability checks and then runs three `--test-injection` shortcut combinations with injector debug logging.
+It prints backend capability checks and then runs three `--test-injection` backend cases (`auto`, `uinput`, `ydotool`) with injector debug logging.

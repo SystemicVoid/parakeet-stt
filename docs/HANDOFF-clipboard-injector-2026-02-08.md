@@ -1,5 +1,18 @@
 # Clipboard Injector Handoff (2026-02-08)
 
+## Status of this document
+
+This file is preserved as a historical investigation archive.
+
+- Do not use this file as operational guidance for current flags/defaults.
+- Canonical runtime/troubleshooting guidance lives in `docs/stt-troubleshooting.md`.
+- Canonical helper flag/default wiring lives in `scripts/stt-helper.sh` (`start_option_rows`).
+
+Still-useful content in this archive:
+- Root-cause analysis patterns for paste/injection race conditions.
+- Logging and verification strategies that can be reused for future regressions.
+- Tradeoff analysis around backend fallback behavior and copy-only safety nets.
+
 ## Canonical roadmap
 
 For implementation strategy and phased execution, start with:
@@ -37,19 +50,14 @@ This section is the canonical quick state for current branch behavior.
 
 ### Current operational default recommendation
 
-Until app-matrix evidence justifies default promotion, keep conservative defaults:
+Use the canonical guidance in `docs/stt-troubleshooting.md`.
+
+Quick baseline (kept in sync with current helper/client surface):
 
 ```bash
 stt start --paste \
-  --paste-key-backend wtype \
-  --paste-backend-failure-policy copy-only \
-  --paste-shortcut ctrl-shift-v \
-  --paste-shortcut-fallback shift-insert \
-  --paste-strategy always-chain \
-  --paste-chain-delay-ms 45 \
-  --paste-post-chord-hold-ms 700 \
-  --paste-restore-policy never \
-  --paste-copy-foreground true
+  --paste-key-backend auto \
+  --paste-backend-failure-policy copy-only
 ```
 
 ## Update (systematic implementation pass)
