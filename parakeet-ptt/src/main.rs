@@ -667,6 +667,9 @@ mod tests {
     #[test]
     fn cli_default_paste_key_backend_is_auto() {
         let cli = super::Cli::parse_from(["parakeet-ptt"]);
-        assert!(matches!(cli.paste_key_backend, super::CliPasteKeyBackend::Auto));
+        assert!(matches!(
+            cli.paste_key_backend,
+            super::CliPasteKeyBackend::Auto
+        ));
     }
 }
