@@ -12,6 +12,18 @@ Cross-surface injection was failing because a single static paste chord cannot s
 
 This handoff now reflects **implemented changes** (not only diagnosis). The fix introduces **adaptive routing** in `parakeet-ptt` that chooses the paste chord based on focused-surface metadata, while preserving existing backend reliability controls (`uinput -> ydotool -> wtype`, clipboard readiness barrier, copy-only policy).
 
+Current reality check (2026-02-20):
+- terminal/browser paths are still materially better than editor paths.
+- VS Code editor and COSMIC Text Editor remain unreliable in latest operator tests.
+- current failures are no longer explained by daemon/ASR/session health; they remain focus-resolution/routing-path failures.
+
+## 1.2 Current Status Override (2026-02-20)
+
+Treat this handoff as **ongoing remediation**, not closed implementation:
+- Adaptive routing and Wayland focus cache infrastructure are implemented.
+- Cross-surface correctness is still unresolved for editor targets in real desktop use.
+- Latest operator observation: Chromium continues to accept injection in cases where VS Code and COSMIC Text Editor do not.
+
 ## 1.1 Git Commit Map (Atomic Units)
 
 1. `e1113c8` `feat(ptt): add adaptive cross-surface paste routing`
@@ -727,3 +739,54 @@ Research before coding:
 Do not remove AT-SPI path initially:
 - first implementation should be additive (feature-gated or dual-path),
 - then validated against live matrix before default switch.
+
+## 19. Deep Research Distill (Archived From Scratch Notes)
+
+This section captures durable conclusions from the ad-hoc deep research notes and replaces those scratch files.
+
+### 19.1 Protocol truth table
+
+1. `ext_foreign_toplevel_list_v1`:
+- Provides toplevel identity/lifecycle metadata (`title`, `app_id`, `identifier`, `done`, `closed`).
+- Does **not** carry activated/focused state.
+
+2. `zcosmic_toplevel_info_v1` + `zcosmic_toplevel_handle_v1`:
+- `state` carries activation (`activated=2`).
+- manager `done` is an atomicity boundary for batched updates.
+
+3. `zwp_text_input_v3` / `zwp_input_method_v2`:
+- Most authoritative text-target signal in principle (`enter/leave` + `enable/disable`).
+- Not broadly consumable by ordinary third-party clients without operating as IME/input-method role.
+
+4. COSMIC a11y manager protocol:
+- Not a per-target focus stream.
+
+### 19.2 Practical architecture conclusions
+
+1. Keep event-driven cache as primary for latency and hot-path safety.
+2. Keep AT-SPI as required fallback path while Wayland activation semantics are still imperfect in edge transitions.
+3. Avoid synchronous full-tree scans on injection path; prefer event cache + bounded verification.
+4. Treat terminal and editor targets as separate policy classes; unknown classification remains high-risk for editor insertion.
+
+### 19.3 Known ecosystem caveats impacting this project
+
+1. Chromium/Electron accessibility/focus signaling can be conditional and inconsistent by launch/runtime context.
+2. Ghostty and some terminal-class apps may expose limited accessibility fidelity.
+3. Layer-shell and transient focus transitions can create short windows where active toplevel != effective text target.
+
+## 20. Latest Operator Runtime State (2026-02-20)
+
+Observed by operator after latest patches and `hybrid` run:
+- COSMIC Terminal/Ghostty: still mostly working.
+- Chromium: still working (including scenarios accepting `Ctrl+Shift+V`).
+- VS Code editor panel: still broken.
+- COSMIC Text Editor: still broken.
+
+Implication:
+- Existing route/focus improvements reduced some stale-cache classes but did not close editor-target failures.
+
+Immediate next diagnostic priority:
+1. Capture per-injection route lines for failing editor attempts (`focus_source_selected`, `route_class`, `route_primary`, `focus_*`).
+2. Determine whether editor failures are:
+- still route-choice mismatch (wrong shortcut for effective target), or
+- key-delivery acceptance mismatch (shortcut delivered but app rejects synthetic path).
