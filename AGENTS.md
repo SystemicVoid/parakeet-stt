@@ -37,6 +37,11 @@
 - Helper client readiness wait is timeout-based and controlled by `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` (default `30`).
 - Chaining is troubleshooting-only and must be opt-in (`--paste-strategy on-error|always-chain`).
 
+## STT Helper Flag Policy
+- Single source of truth: `scripts/stt-helper.sh` `start_option_rows`.
+- Do not hardcode `stt start` flag lists in parser/help/client args/diagnostics; derive behavior from metadata helpers.
+- After any helper flag/default/env change, run `scripts/check-stt-helper-flags.sh` locally.
+
 ## Commit & Pull Request Guidelines
 - Commits are short, present-tense summaries (see log: “Default mic to pulse and fix UUID serialization”). Group unrelated changes separately.
 - PRs: include a brief description, linked issue (if any), manual/automated test output, and notes on GPU/index flags used. Update `docs/SPEC.md` or systemd units in `deploy/` when protocol/config shape changes, and mention any user-visible CLI flag additions.

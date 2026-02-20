@@ -73,6 +73,11 @@ stt diag-injector                # Capability checks + injection test matrix
 
 Logs: `/tmp/parakeet-daemon.log`, `/tmp/parakeet-ptt.log`
 
+Helper flag maintenance policy:
+- Use `scripts/stt-helper.sh` `start_option_rows` as the single metadata source for `stt start` flags/defaults/env mapping.
+- Do not add parallel hardcoded flag lists in parser/help/launch/diagnostic paths.
+- Run `scripts/check-stt-helper-flags.sh` after changing helper flags or defaults.
+
 ## Key Source Files
 
 ### Daemon (`parakeet-stt-daemon/src/parakeet_stt_daemon/`)
