@@ -9,7 +9,7 @@ Turn Parakeet STT from "works with logs" into a premium local dictation experien
 ## Current Baseline
 
 - Core STT loop is operational and low-latency.
-- Injection stack has robust controls (`paste` strategy/backends/failure policy).
+- Injection stack has robust controls (`paste` mode, key backend, failure policy).
 - Main UX gap is user feedback: state is visible in logs, not in an obvious UI channel.
 
 ## UX Principles
@@ -26,7 +26,7 @@ Scope:
   - ready
   - listening start
   - listening stop
-  - transcript injected ✓ (implemented 2026-02-11, but see limitation below)
+  - transcript injected
   - injection fallback/copy-only
   - hard error
 - Add optional desktop notification summaries for error/fallback events.
@@ -36,12 +36,11 @@ Implementation direction:
 - Configurable cue backend (`none|sound|notify|sound+notify`).
 - Keep defaults lightweight and local-only.
 
-**Known limitation (completion sound):**
-Current completion sound plays *after* button release because offline mode only
-transcribes once `stop_session` is received. The sound confirms completion but
-cannot signal "ready to release" during long utterances. Fixing this requires
-streaming mode where partial results arrive while holding, enabling a "settled"
-detection (no new words for N ms) to trigger a release-ready cue.
+Known limitation (completion sound):
+Current completion sound plays after button release because offline mode only transcribes once
+`stop_session` is received. The sound confirms completion but cannot signal "ready to release"
+during long utterances. Fixing this requires streaming mode where partial results arrive while
+holding, enabling a "settled" detection (no new words for N ms) to trigger a release-ready cue.
 
 Acceptance:
 - User can run one dictation cycle without looking at logs and correctly infer system state.
@@ -54,7 +53,7 @@ Scope:
   - connection status
   - hotkey state (`Idle`, `Listening`, `WaitingResult`)
   - last transcript preview (truncated)
-  - injection backend used (`uinput|ydotool|wtype|copy-only`)
+  - injection backend used (`uinput|ydotool|copy-only`)
   - last outcome class (`success_assumed`, `copy_only`, etc.)
 
 Implementation direction:
@@ -91,6 +90,10 @@ Scope:
   - "Paste command sent, app may have rejected"
 - Add lightweight per-app profile presets (terminal/browser/general).
 
+Implementation direction:
+- Keep profile logic local and deterministic.
+- Start with opt-in presets that map to existing runtime behavior.
+
 Acceptance:
 - Users can tell whether failure is ASR, clipboard, backend init, or target-app acceptance.
 - First-run experience requires minimal tuning for common apps.
@@ -114,20 +117,16 @@ Acceptance:
 
 The following UX improvements require streaming mode to be stable and default:
 
-1. **"Ready to release" audio cue** - Play sound when transcription settles (no new
-   words for N ms) while user is still holding, signaling they can release without
-   truncation. Current offline mode cannot provide this because transcription only
-   starts after button release.
+1. "Ready to release" audio cue: Play a sound when transcription settles (no new words for
+N ms) while the user is still holding, signaling they can release without truncation.
 
-2. **Live transcript preview** - Show partial transcription in TUI/GUI overlay as
-   user speaks. Requires streaming partial results.
+2. Live transcript preview: Show partial transcription in TUI/GUI overlay as the user speaks.
 
-3. **Confidence-based early termination** - Detect silence + high confidence to
-   auto-stop session without waiting for button release.
+3. Confidence-based early termination: Detect silence plus high confidence to auto-stop
+session without waiting for button release.
 
-Streaming mode exists (`--streaming`) but is not yet default due to architectural
-differences in how audio chunks are processed. Stabilizing streaming is a
-prerequisite for these features.
+Streaming mode exists (`--streaming`) but is not yet default due to architectural differences
+in how audio chunks are processed. Stabilizing streaming is a prerequisite for these features.
 
 ## Non-Goals (Near-Term)
 
