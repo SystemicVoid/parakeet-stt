@@ -716,17 +716,24 @@ impl WaylandFocusCache {
         };
 
         let cache_age_ms = last_commit_at.elapsed().as_millis() as u64;
+        if let Some(active) = snapshot.active.as_ref() {
+            if cache_age_ms > stale_ms.max(1) {
+                return WaylandFocusObservation::LowConfidence {
+                    snapshot: active.to_focus_snapshot(true),
+                    cache_age_ms,
+                    reason: "wayland_cache_stale",
+                };
+            }
+            return WaylandFocusObservation::Fresh {
+                snapshot: active.to_focus_snapshot(true),
+                cache_age_ms,
+            };
+        }
+
         if cache_age_ms > stale_ms.max(1) {
             return WaylandFocusObservation::Unavailable {
                 reason: "wayland_cache_stale",
                 cache_age_ms: Some(cache_age_ms),
-            };
-        }
-
-        if let Some(active) = snapshot.active.as_ref() {
-            return WaylandFocusObservation::Fresh {
-                snapshot: active.to_focus_snapshot(true),
-                cache_age_ms,
             };
         }
 
@@ -1071,10 +1078,15 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for Wayla
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let mut publish = false;
         if let zcosmic_toplevel_handle_v1::Event::State { state } = event {
             if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
                 entry.activated = parse_cosmic_state_has_activated(&state);
+                publish = true;
             }
+        }
+        if publish {
+            runtime.publish();
         }
     }
 }
@@ -1170,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn wayland_cache_marks_stale_snapshot_as_unavailable() {
+    fn wayland_cache_marks_stale_active_snapshot_as_low_confidence() {
         let active = CachedToplevel {
             identifier: Some("abc".to_string()),
             app_id: Some("Brave".to_string()),
@@ -1190,10 +1202,14 @@ mod tests {
 
         let observed = cache.observe(1200, 200);
         match observed {
-            WaylandFocusObservation::Unavailable { reason, .. } => {
+            WaylandFocusObservation::LowConfidence {
+                snapshot, reason, ..
+            } => {
+                assert!(snapshot.focused);
+                assert_eq!(snapshot.resolver, "wayland");
                 assert_eq!(reason, "wayland_cache_stale");
             }
-            _ => panic!("expected stale cache to be unavailable"),
+            _ => panic!("expected stale active cache to be low confidence"),
         }
     }
 
