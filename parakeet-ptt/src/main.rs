@@ -8,6 +8,7 @@ mod routing;
 mod state;
 mod surface_focus;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -150,15 +151,15 @@ struct Cli {
     focus_deep_scan_max_apps: u8,
 
     /// Focus metadata source for adaptive routing decisions.
-    #[arg(long, value_enum, default_value_t = CliFocusResolverSource::Atspi)]
+    #[arg(long, value_enum, default_value_t = CliFocusResolverSource::Wayland)]
     focus_resolver_source: CliFocusResolverSource,
 
     /// Wayland focus cache staleness threshold before fallback.
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = 30_000)]
     focus_wayland_stale_ms: u64,
 
     /// Wayland transition grace when no activated toplevel is reported.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 500)]
     focus_wayland_transition_grace_ms: u64,
 
     /// Behavior when selected paste backend cannot be initialized or used.
@@ -345,10 +346,57 @@ impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePo
     }
 }
 
+const DEPRECATED_COMPAT_FLAGS: &[&str] = &[
+    "--paste-shortcut",
+    "--paste-shortcut-fallback",
+    "--paste-strategy",
+    "--paste-chain-delay-ms",
+    "--paste-restore-policy",
+    "--paste-restore-delay-ms",
+    "--paste-post-chord-hold-ms",
+    "--paste-copy-foreground",
+    "--paste-mime-type",
+    "--paste-routing-mode",
+    "--adaptive-terminal-shortcut",
+    "--adaptive-general-shortcut",
+    "--adaptive-unknown-shortcut",
+    "--focus-resolver-source",
+    "--focus-resolve-budget-ms",
+    "--focus-deep-scan-max-apps",
+    "--focus-wayland-stale-ms",
+    "--focus-wayland-transition-grace-ms",
+];
+
+fn collect_deprecated_cli_flags(args: &[String]) -> Vec<&'static str> {
+    let mut used = BTreeSet::new();
+    for arg in args {
+        for flag in DEPRECATED_COMPAT_FLAGS {
+            if arg == *flag || arg.starts_with(&format!("{flag}=")) {
+                used.insert(*flag);
+            }
+        }
+    }
+    used.into_iter().collect()
+}
+
+fn warn_deprecated_cli_flags(flags: &[&'static str]) {
+    if flags.is_empty() {
+        return;
+    }
+
+    warn!(
+        deprecated_flags = %flags.join(", "),
+        "deprecated compatibility flags are in use and will be removed in a future release"
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let deprecated_cli_flags = collect_deprecated_cli_flags(raw_args.get(1..).unwrap_or(&[]));
+    let cli = Cli::parse_from(raw_args);
     init_tracing();
+    warn_deprecated_cli_flags(&deprecated_cli_flags);
 
     let config = ClientConfig::new(
         &cli.endpoint,
@@ -919,8 +967,8 @@ mod tests {
             focus_resolver_source: crate::config::FocusResolverSource::Atspi,
             focus_resolve_budget_ms: 450,
             focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 1200,
-            focus_wayland_transition_grace_ms: 200,
+            focus_wayland_stale_ms: 30_000,
+            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }
@@ -966,11 +1014,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_focus_resolver_source_is_atspi() {
+    fn cli_default_focus_resolver_source_is_wayland() {
         let cli = Cli::parse_from(["parakeet-ptt"]);
         assert!(matches!(
             cli.focus_resolver_source,
-            CliFocusResolverSource::Atspi
+            CliFocusResolverSource::Wayland
         ));
     }
 
@@ -1057,5 +1105,20 @@ mod tests {
         config.clipboard.shortcut_fallback = None;
 
         assert!(shortcut_interop_warning(&config).is_none());
+    }
+
+    #[test]
+    fn collect_deprecated_cli_flags_detects_short_and_equals_forms() {
+        let args = vec![
+            "--paste-shortcut".to_string(),
+            "ctrl-v".to_string(),
+            "--focus-wayland-stale-ms=30000".to_string(),
+            "--completion-sound".to_string(),
+            "true".to_string(),
+        ];
+        let flags = super::collect_deprecated_cli_flags(&args);
+        assert!(flags.contains(&"--paste-shortcut"));
+        assert!(flags.contains(&"--focus-wayland-stale-ms"));
+        assert!(!flags.contains(&"--completion-sound"));
     }
 }

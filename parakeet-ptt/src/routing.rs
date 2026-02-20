@@ -19,7 +19,7 @@ pub struct RouteDecision {
 
 const TERMINAL_HINTS: &[&str] = &[
     "ghostty",
-    "cosmic-term",
+    "cosmic term",
     "cosmic terminal",
     "terminal",
     "alacritty",
@@ -42,11 +42,16 @@ const GENERAL_HINTS: &[&str] = &[
     "chrome",
     "firefox",
     "notion",
-    "cosmic-edit",
     "cosmic edit",
     "gedit",
     "kate",
     "obsidian",
+];
+
+const COSMIC_EDIT_HINTS: &[&str] = &[
+    "com system76 cosmicedit",
+    "cosmicedit",
+    "cosmic text editor",
 ];
 
 pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -> RouteDecision {
@@ -70,7 +75,7 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
         }
     }
 
-    let class = classify_surface(focus);
+    let (class, class_reason) = classify_surface_with_reason(focus);
     match class {
         SurfaceClass::Terminal => RouteDecision {
             class,
@@ -80,7 +85,7 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
                 options.adaptive_general_shortcut,
             ),
             low_confidence: false,
-            reason: "adaptive terminal-like surface",
+            reason: class_reason,
         },
         SurfaceClass::General => RouteDecision {
             class,
@@ -90,9 +95,9 @@ pub fn decide_route(options: &ClipboardOptions, focus: Option<&FocusSnapshot>) -
                 options.adaptive_terminal_shortcut,
             ),
             low_confidence: false,
-            reason: "adaptive editor/browser-like surface",
+            reason: class_reason,
         },
-        SurfaceClass::Unknown => unknown_route(options, "adaptive unknown surface", false),
+        SurfaceClass::Unknown => unknown_route(options, class_reason, false),
     }
 }
 
@@ -128,15 +133,50 @@ pub fn classify_surface(focus: Option<&FocusSnapshot>) -> SurfaceClass {
     let Some(focus) = focus else {
         return SurfaceClass::Unknown;
     };
-    let haystack = focus.haystack();
+    classify_surface_with_reason(Some(focus)).0
+}
 
-    if TERMINAL_HINTS.iter().any(|hint| haystack.contains(hint)) {
-        return SurfaceClass::Terminal;
+fn classify_surface_with_reason(focus: Option<&FocusSnapshot>) -> (SurfaceClass, &'static str) {
+    let Some(focus) = focus else {
+        return (SurfaceClass::Unknown, "adaptive unknown surface");
+    };
+
+    let haystack = normalize_for_hint_match(&focus.haystack());
+    if contains_any_hint(&haystack, TERMINAL_HINTS) {
+        return (SurfaceClass::Terminal, "adaptive terminal-like surface");
     }
-    if GENERAL_HINTS.iter().any(|hint| haystack.contains(hint)) {
-        return SurfaceClass::General;
+    if contains_any_hint(&haystack, COSMIC_EDIT_HINTS) {
+        return (SurfaceClass::General, "adaptive cosmic edit surface");
     }
-    SurfaceClass::Unknown
+    if contains_any_hint(&haystack, GENERAL_HINTS) {
+        return (
+            SurfaceClass::General,
+            "adaptive editor/browser-like surface",
+        );
+    }
+
+    (SurfaceClass::Unknown, "adaptive unknown surface")
+}
+
+fn contains_any_hint(haystack: &str, hints: &[&str]) -> bool {
+    hints.iter().any(|hint| haystack.contains(hint))
+}
+
+fn normalize_for_hint_match(raw: &str) -> String {
+    let mut normalized = String::with_capacity(raw.len());
+    let mut in_gap = false;
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            normalized.push(lower);
+            in_gap = false;
+        } else if !in_gap {
+            normalized.push(' ');
+            in_gap = true;
+        }
+    }
+
+    normalized.trim().to_string()
 }
 
 #[cfg(test)]
@@ -168,8 +208,8 @@ mod tests {
             focus_resolver_source: FocusResolverSource::Atspi,
             focus_resolve_budget_ms: 450,
             focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 1200,
-            focus_wayland_transition_grace_ms: 200,
+            focus_wayland_stale_ms: 30_000,
+            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }
@@ -210,6 +250,39 @@ mod tests {
     }
 
     #[test]
+    fn classifies_cosmic_edit_app_id_as_general() {
+        let focus = snapshot(
+            "com.system76.CosmicEdit",
+            "Untitled",
+            "/org/a11y/atspi/accessible/2",
+            true,
+        );
+        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+    }
+
+    #[test]
+    fn classifies_cosmic_text_editor_title_as_general() {
+        let focus = snapshot(
+            "Some app",
+            "New document - COSMIC Text Editor",
+            "/org/a11y/atspi/accessible/3",
+            true,
+        );
+        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+    }
+
+    #[test]
+    fn normalization_handles_dot_dash_underscore_forms() {
+        let focus = snapshot(
+            "com.system76.cosmic_edit",
+            "cosmic-edit",
+            "/org/a11y/atspi/accessible/4",
+            true,
+        );
+        assert_eq!(classify_surface(Some(&focus)), SurfaceClass::General);
+    }
+
+    #[test]
     fn unknown_surface_defaults_to_unknown() {
         let focus = snapshot("SomeApp", "random", "/org/example", false);
         assert_eq!(classify_surface(Some(&focus)), SurfaceClass::Unknown);
@@ -240,6 +313,16 @@ mod tests {
         assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
         assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
         assert!(decision.low_confidence);
+    }
+
+    #[test]
+    fn unknown_route_remains_terminal_first() {
+        let opts = options();
+        let focus = snapshot("mystery", "floating-tool", "/org/example/unknown", true);
+        let decision = decide_route(&opts, Some(&focus));
+        assert_eq!(decision.class, SurfaceClass::Unknown);
+        assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
     }
 
     #[test]

@@ -1313,8 +1313,8 @@ mod tests {
             focus_resolver_source: FocusResolverSource::Atspi,
             focus_resolve_budget_ms: 450,
             focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 1200,
-            focus_wayland_transition_grace_ms: 200,
+            focus_wayland_stale_ms: 30_000,
+            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }
