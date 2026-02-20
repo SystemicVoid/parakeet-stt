@@ -22,28 +22,9 @@ stt() {
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
-    local -a ignored_compat_requests=()
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
-    local default_paste_shortcut="ctrl-shift-v"
-    local default_paste_shortcut_fallback="none"
-    local default_paste_strategy="single"
-    local default_paste_chain_delay_ms="45"
-    local default_paste_restore_policy="never"
-    local default_paste_restore_delay_ms="250"
-    local default_paste_post_chord_hold_ms="700"
-    local default_paste_copy_foreground="true"
-    local default_paste_mime_type="text/plain;charset=utf-8"
     local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
-    local default_paste_routing_mode="adaptive"
-    local default_adaptive_terminal_shortcut="ctrl-shift-v"
-    local default_adaptive_general_shortcut="ctrl-v"
-    local default_adaptive_unknown_shortcut="ctrl-shift-v"
-    local default_focus_resolver_source="wayland"
-    local default_focus_resolve_budget_ms="450"
-    local default_focus_deep_scan_max_apps="1"
-    local default_focus_wayland_stale_ms="30000"
-    local default_focus_wayland_transition_grace_ms="500"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -54,24 +35,6 @@ stt() {
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
-        "paste-shortcut|paste_shortcut|default_paste_shortcut|PARAKEET_PASTE_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
-        "paste-shortcut-fallback|paste_shortcut_fallback|default_paste_shortcut_fallback|PARAKEET_PASTE_SHORTCUT_FALLBACK|Compatibility (deprecated)|<v>|none|compat|none"
-        "paste-strategy|paste_strategy|default_paste_strategy|PARAKEET_PASTE_STRATEGY|Compatibility (deprecated)|<v>|single|compat|single"
-        "paste-chain-delay-ms|paste_chain_delay_ms|default_paste_chain_delay_ms|PARAKEET_PASTE_CHAIN_DELAY_MS|Compatibility (deprecated)|<n>|45|compat|45"
-        "paste-restore-policy|paste_restore_policy|default_paste_restore_policy|PARAKEET_PASTE_RESTORE_POLICY|Compatibility (deprecated)|<v>|never|compat|never"
-        "paste-restore-delay-ms|paste_restore_delay_ms|default_paste_restore_delay_ms|PARAKEET_PASTE_RESTORE_DELAY_MS|Compatibility (deprecated)|<n>|250|compat|250"
-        "paste-post-chord-hold-ms|paste_post_chord_hold_ms|default_paste_post_chord_hold_ms|PARAKEET_PASTE_POST_CHORD_HOLD_MS|Compatibility (deprecated)|<n>|700|compat|700"
-        "paste-copy-foreground|paste_copy_foreground|default_paste_copy_foreground|PARAKEET_PASTE_COPY_FOREGROUND|Compatibility (deprecated)|<v>|true|compat|true"
-        "paste-mime-type|paste_mime_type|default_paste_mime_type|PARAKEET_PASTE_MIME_TYPE|Compatibility (deprecated)|<v>|text/plain;charset=utf-8|compat|text/plain;charset=utf-8"
-        "paste-routing-mode|paste_routing_mode|default_paste_routing_mode|PARAKEET_PASTE_ROUTING_MODE|Compatibility (deprecated)|<v>|adaptive|compat|adaptive"
-        "adaptive-terminal-shortcut|adaptive_terminal_shortcut|default_adaptive_terminal_shortcut|PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
-        "adaptive-general-shortcut|adaptive_general_shortcut|default_adaptive_general_shortcut|PARAKEET_ADAPTIVE_GENERAL_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-v|compat|ctrl-v"
-        "adaptive-unknown-shortcut|adaptive_unknown_shortcut|default_adaptive_unknown_shortcut|PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
-        "focus-resolver-source|focus_resolver_source|default_focus_resolver_source|PARAKEET_FOCUS_RESOLVER_SOURCE|Compatibility (deprecated)|<v>|wayland|compat|wayland"
-        "focus-resolve-budget-ms|focus_resolve_budget_ms|default_focus_resolve_budget_ms|PARAKEET_FOCUS_RESOLVE_BUDGET_MS|Compatibility (deprecated)|<n>|450|compat|450"
-        "focus-deep-scan-max-apps|focus_deep_scan_max_apps|default_focus_deep_scan_max_apps|PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS|Compatibility (deprecated)|<n>|1|compat|1"
-        "focus-wayland-stale-ms|focus_wayland_stale_ms|default_focus_wayland_stale_ms|PARAKEET_FOCUS_WAYLAND_STALE_MS|Compatibility (deprecated)|<n>|30000|compat|30000"
-        "focus-wayland-transition-grace-ms|focus_wayland_transition_grace_ms|default_focus_wayland_transition_grace_ms|PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS|Compatibility (deprecated)|<n>|500|compat|500"
         "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|auto|always|auto"
         "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"
         "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Stable controls|<n>|18|always|18"
@@ -121,41 +84,13 @@ stt() {
         return 1
     }
 
-    _is_deprecated_start_option() {
-        local target="$1"
-        local row opt_name option_group
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name _ _ _ option_group _ _ _ _ <<<"$row"
-            [ "$opt_name" = "$target" ] || continue
-            [ "$option_group" = "Compatibility (deprecated)" ]
-            return $?
-        done
-        return 1
-    }
-
-    _warn_deprecated_env_overrides() {
-        local row opt_name env_name option_group
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name _ _ env_name option_group _ _ _ _ <<<"$row"
-            [ "$option_group" = "Compatibility (deprecated)" ] || continue
-            if [ "${!env_name+x}" = "x" ]; then
-                ignored_compat_requests+=("env:$env_name=${!env_name}")
-                echo "   - Warning: env $env_name is deprecated and ignored; robust defaults remain active." >&2
-            fi
-        done
-    }
-
     _set_start_option_value() {
         local target="$1"
         local value="$2"
-        local row opt_name var_name option_group
+        local row opt_name var_name
         for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ _ option_group _ _ _ _ <<<"$row"
+            IFS='|' read -r opt_name var_name _ <<<"$row"
             if [ "$opt_name" = "$target" ]; then
-                if [ "$option_group" = "Compatibility (deprecated)" ]; then
-                    ignored_compat_requests+=("--$target=$value")
-                    return 0
-                fi
                 printf -v "$var_name" "%s" "$value"
                 return 0
             fi
@@ -168,21 +103,6 @@ stt() {
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r _ var_name default_var_name _ <<<"$row"
             printf -v "$var_name" "%s" "${!default_var_name}"
-        done
-    }
-
-    _apply_legacy_override_vars() {
-        local row opt_name var_name legacy_name option_group
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ _ option_group _ _ _ _ <<<"$row"
-            legacy_name="$(tr '[:lower:]' '[:upper:]' <<<"$var_name")"
-            if [ "${!legacy_name+x}" = "x" ]; then
-                if [ "$option_group" = "Compatibility (deprecated)" ]; then
-                    ignored_compat_requests+=("legacy:$legacy_name=${!legacy_name}")
-                    continue
-                fi
-                printf -v "$var_name" "%s" "${!legacy_name}"
-            fi
         done
     }
 
@@ -210,16 +130,6 @@ stt() {
         done
     }
 
-    _print_start_option_names_by_group() {
-        local group_name="$1"
-        local row opt_name option_group
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name _ _ _ option_group _ _ _ _ <<<"$row"
-            [ "$option_group" = "$group_name" ] || continue
-            printf "%s\n" "$opt_name"
-        done
-    }
-
     _build_ptt_args() {
         local -n out_ref="$1"
         local include_endpoint="${2:-yes}"
@@ -230,9 +140,6 @@ stt() {
         fi
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
-            if [ "$include_policy" = "compat" ]; then
-                continue
-            fi
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
                 continue
             fi
@@ -284,10 +191,6 @@ stt() {
                     injection_mode="copy-only"
                     shift
                     ;;
-                --help-compat)
-                    _print_help_start_compat
-                    return 2
-                    ;;
                 --help|-h|help)
                     _print_help_start
                     return 2
@@ -302,9 +205,6 @@ stt() {
                     if [[ $# -lt 2 ]]; then
                         echo "   - Missing value for $1"
                         return 1
-                    fi
-                    if _is_deprecated_start_option "$opt_name"; then
-                        echo "   - Warning: --$opt_name is deprecated and ignored; robust defaults remain active." >&2
                     fi
                     _set_start_option_value "$opt_name" "$2"
                     shift 2
@@ -505,16 +405,7 @@ Commands:
   tmux [attach|kill]     Attach/kill helper tmux session.
   check                  Run daemon health check.
   diag-injector          Run clipboard injector diagnostics.
-  help [start|start-compat]
-                         Show this help, stable start help, or deprecated compat flags.
-
-Help shortcuts:
-  stt --help
-  stt help
-  stt help start
-  stt help start-compat
-  stt start --help
-  stt start --help-compat
+  help [start]           Show this help or start help.
 EOF
     }
     _print_help_start() {
@@ -533,24 +424,41 @@ EOF
         _print_start_option_group "Stable controls"
         cat <<EOF
 
-Deprecated compatibility options are hidden from primary help and ignored at runtime.
-Show them with:
-  stt help start-compat
-
 Other environment overrides:
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
 EOF
     }
-    _print_help_start_compat() {
-        cat <<EOF
-Usage:
-  stt start [deprecated-compat-options]
 
-Compatibility options are parsed for compatibility but ignored.
-EOF
-        _print_start_option_group "Compatibility (deprecated)"
+    _declare_start_vars() {
+        # Declare all start option local variables at once.
+        local row var_name
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r _ var_name _ <<<"$row"
+            local "$var_name"
+        done
+    }
+
+    _build_client_cmd() {
+        cat <<'CLIENTCMD'
+                set -e
+                runner_bin=""
+                if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
+                    runner_bin="./target/release/parakeet-ptt"
+                else
+                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                fi
+
+                eval "set -- $PTT_ARGS_SHELL"
+                args=("$@")
+
+                if [ -n "$runner_bin" ]; then
+                    "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                else
+                    cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                fi
+CLIENTCMD
     }
 
     case "$cmd" in
@@ -562,9 +470,6 @@ EOF
                 start)
                     _print_help_start
                     ;;
-                start-compat)
-                    _print_help_start_compat
-                    ;;
                 *)
                     echo "Unknown help topic: $1"
                     echo
@@ -573,45 +478,13 @@ EOF
                     ;;
             esac
             ;;
-        __start-option-names-stable)
-            _print_start_option_names_by_group "Injection mode"
-            _print_start_option_names_by_group "Stable controls"
-            ;;
-        __start-option-names-deprecated)
-            _print_start_option_names_by_group "Compatibility (deprecated)"
-            ;;
         __start-option-names)
             _print_start_option_names
             ;;
         __start-args)
-            local injection_mode
-            local paste_shortcut
-            local paste_shortcut_fallback
-            local paste_strategy
-            local paste_chain_delay_ms
-            local paste_restore_policy
-            local paste_restore_delay_ms
-            local paste_post_chord_hold_ms
-            local paste_copy_foreground
-            local paste_mime_type
-            local paste_key_backend
-            local paste_backend_failure_policy
-            local paste_routing_mode
-            local adaptive_terminal_shortcut
-            local adaptive_general_shortcut
-            local adaptive_unknown_shortcut
-            local focus_resolver_source
-            local focus_resolve_budget_ms
-            local focus_deep_scan_max_apps
-            local focus_wayland_stale_ms
-            local focus_wayland_transition_grace_ms
-            local uinput_dwell_ms
-            local paste_seat
-            local paste_write_primary
-            local ydotool_path
-            local completion_sound
-            local completion_sound_path
-            local completion_sound_volume
+            local injection_mode paste_key_backend paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local completion_sound completion_sound_path completion_sound_volume
             local -a ptt_args
             _load_start_vars_from_defaults
 
@@ -627,34 +500,9 @@ EOF
             printf "%s\n" "${ptt_args[@]}"
             ;;
         start)
-            local injection_mode
-            local paste_shortcut
-            local paste_shortcut_fallback
-            local paste_strategy
-            local paste_chain_delay_ms
-            local paste_restore_policy
-            local paste_restore_delay_ms
-            local paste_post_chord_hold_ms
-            local paste_copy_foreground
-            local paste_mime_type
-            local paste_key_backend
-            local paste_backend_failure_policy
-            local paste_routing_mode
-            local adaptive_terminal_shortcut
-            local adaptive_general_shortcut
-            local adaptive_unknown_shortcut
-            local focus_resolver_source
-            local focus_resolve_budget_ms
-            local focus_deep_scan_max_apps
-            local focus_wayland_stale_ms
-            local focus_wayland_transition_grace_ms
-            local uinput_dwell_ms
-            local paste_seat
-            local paste_write_primary
-            local ydotool_path
-            local completion_sound
-            local completion_sound_path
-            local completion_sound_volume
+            local injection_mode paste_key_backend paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local completion_sound completion_sound_path completion_sound_volume
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             _load_start_vars_from_defaults
 
@@ -665,8 +513,6 @@ EOF
             elif [ "$parse_status" -ne 0 ]; then
                 return "$parse_status"
             fi
-
-            _warn_deprecated_env_overrides
 
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
@@ -684,10 +530,6 @@ EOF
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
-            if [ "${#ignored_compat_requests[@]}" -gt 0 ]; then
-                echo "   - Deprecated compatibility overrides ignored:"
-                printf '     %s\n' "${ignored_compat_requests[@]}"
-            fi
 
             if ! _resolve_port; then
                 return 1
@@ -758,24 +600,7 @@ EOF
             fi
 
             local client_cmd
-            client_cmd='
-                set -e
-                runner_bin=""
-                if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
-                    runner_bin="./target/release/parakeet-ptt"
-                else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
-                fi
-
-                eval "set -- $PTT_ARGS_SHELL"
-                args=("$@")
-
-                if [ -n "$runner_bin" ]; then
-                    "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
-                else
-                    cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
-                fi
-            '
+            client_cmd="$(_build_client_cmd)"
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
                 "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
@@ -906,36 +731,11 @@ EOF
             echo "${HOST}:${PORT}" > "$PORT_FILE"
 
             local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --no-streaming >> \"$LOG_DAEMON\" 2>&1"
-            local injection_mode
-            local paste_shortcut
-            local paste_shortcut_fallback
-            local paste_strategy
-            local paste_chain_delay_ms
-            local paste_restore_policy
-            local paste_restore_delay_ms
-            local paste_post_chord_hold_ms
-            local paste_copy_foreground
-            local paste_mime_type
-            local paste_key_backend
-            local paste_backend_failure_policy
-            local paste_routing_mode
-            local adaptive_terminal_shortcut
-            local adaptive_general_shortcut
-            local adaptive_unknown_shortcut
-            local focus_resolver_source
-            local focus_resolve_budget_ms
-            local focus_deep_scan_max_apps
-            local focus_wayland_stale_ms
-            local focus_wayland_transition_grace_ms
-            local uinput_dwell_ms
-            local paste_seat
-            local paste_write_primary
-            local ydotool_path
-            local completion_sound
-            local completion_sound_path
-            local completion_sound_volume
+
+            local injection_mode paste_key_backend paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local completion_sound completion_sound_path completion_sound_volume
             _load_start_vars_from_defaults
-            _apply_legacy_override_vars
 
             local -a ptt_args
             _build_ptt_args ptt_args
@@ -994,7 +794,6 @@ EOF
                     echo "   - release binary missing expected start flags; using cargo run --release"
                 fi
 
-                echo "   - capability: wtype=$(command -v wtype >/dev/null 2>&1 && echo yes || echo no)"
                 echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
                 if [ -e /dev/uinput ]; then
                     if [ -w /dev/uinput ]; then
@@ -1007,45 +806,18 @@ EOF
                 fi
 
                 run_case() {
-                    local shortcut="$1"
-                    local fallback="$2"
-                    local injection_mode
-                    local paste_shortcut
-                    local paste_shortcut_fallback
-                    local paste_strategy
-                    local paste_chain_delay_ms
-                    local paste_restore_policy
-                    local paste_restore_delay_ms
-                    local paste_post_chord_hold_ms
-                    local paste_copy_foreground
-                    local paste_mime_type
-                    local paste_key_backend
-                    local paste_backend_failure_policy
-                    local paste_routing_mode
-                    local adaptive_terminal_shortcut
-                    local adaptive_general_shortcut
-                    local adaptive_unknown_shortcut
-                    local focus_resolver_source
-                    local focus_resolve_budget_ms
-                    local focus_deep_scan_max_apps
-                    local focus_wayland_stale_ms
-                    local focus_wayland_transition_grace_ms
-                    local uinput_dwell_ms
-                    local paste_seat
-                    local paste_write_primary
-                    local ydotool_path
-                    local completion_sound
-                    local completion_sound_path
-                    local completion_sound_volume
+                    local backend="$1"
+                    local injection_mode paste_key_backend paste_backend_failure_policy
+                    local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+                    local completion_sound completion_sound_path completion_sound_volume
                     local -a ptt_args
 
                     _load_start_vars_from_defaults
                     injection_mode="paste"
-                    paste_shortcut="$shortcut"
-                    paste_shortcut_fallback="$fallback"
+                    paste_key_backend="$backend"
                     _build_ptt_args ptt_args no
 
-                    echo "   - case shortcut=$shortcut fallback=$fallback"
+                    echo "   - case backend=$backend"
                     if [ -n "$runner_bin" ]; then
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
                             "$runner_bin" --test-injection "${ptt_args[@]}"
@@ -1055,9 +827,9 @@ EOF
                     fi
                 }
 
-                run_case "ctrl-shift-v" "shift-insert"
-                run_case "shift-insert" "ctrl-v"
-                run_case "ctrl-v" "shift-insert"
+                run_case "auto"
+                run_case "uinput"
+                run_case "ydotool"
             )
             ;;
         *)
