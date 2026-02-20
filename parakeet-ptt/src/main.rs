@@ -142,26 +142,6 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliPasteShortcut::CtrlShiftV)]
     adaptive_unknown_shortcut: CliPasteShortcut,
 
-    /// Global budget for AT-SPI focus resolution before falling back.
-    #[arg(long, default_value_t = 450)]
-    focus_resolve_budget_ms: u64,
-
-    /// Maximum number of active apps to deep-scan for focused descendants.
-    #[arg(long, default_value_t = 1)]
-    focus_deep_scan_max_apps: u8,
-
-    /// Focus metadata source for adaptive routing decisions.
-    #[arg(long, value_enum, default_value_t = CliFocusResolverSource::Wayland)]
-    focus_resolver_source: CliFocusResolverSource,
-
-    /// Wayland focus cache staleness threshold before fallback.
-    #[arg(long, default_value_t = 30_000)]
-    focus_wayland_stale_ms: u64,
-
-    /// Wayland transition grace when no activated toplevel is reported.
-    #[arg(long, default_value_t = 500)]
-    focus_wayland_transition_grace_ms: u64,
-
     /// Behavior when selected paste backend cannot be initialized or used.
     #[arg(
         long,
@@ -313,23 +293,6 @@ impl From<CliPasteRoutingMode> for crate::config::PasteRoutingMode {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
-enum CliFocusResolverSource {
-    Atspi,
-    Wayland,
-    Hybrid,
-}
-
-impl From<CliFocusResolverSource> for crate::config::FocusResolverSource {
-    fn from(source: CliFocusResolverSource) -> Self {
-        match source {
-            CliFocusResolverSource::Atspi => crate::config::FocusResolverSource::Atspi,
-            CliFocusResolverSource::Wayland => crate::config::FocusResolverSource::Wayland,
-            CliFocusResolverSource::Hybrid => crate::config::FocusResolverSource::Hybrid,
-        }
-    }
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteBackendFailurePolicy {
     CopyOnly,
     Error,
@@ -360,11 +323,6 @@ const DEPRECATED_COMPAT_FLAGS: &[&str] = &[
     "--adaptive-terminal-shortcut",
     "--adaptive-general-shortcut",
     "--adaptive-unknown-shortcut",
-    "--focus-resolver-source",
-    "--focus-resolve-budget-ms",
-    "--focus-deep-scan-max-apps",
-    "--focus-wayland-stale-ms",
-    "--focus-wayland-transition-grace-ms",
 ];
 
 fn collect_deprecated_cli_flags(args: &[String]) -> Vec<&'static str> {
@@ -404,11 +362,6 @@ fn apply_robust_profile_over_deprecated_flags(cli: &mut Cli) {
     cli.adaptive_terminal_shortcut = CliPasteShortcut::CtrlShiftV;
     cli.adaptive_general_shortcut = CliPasteShortcut::CtrlV;
     cli.adaptive_unknown_shortcut = CliPasteShortcut::CtrlShiftV;
-    cli.focus_resolver_source = CliFocusResolverSource::Wayland;
-    cli.focus_resolve_budget_ms = 450;
-    cli.focus_deep_scan_max_apps = 1;
-    cli.focus_wayland_stale_ms = 30_000;
-    cli.focus_wayland_transition_grace_ms = 500;
 }
 
 #[tokio::main]
@@ -446,11 +399,6 @@ async fn main() -> Result<()> {
                 adaptive_terminal_shortcut: cli.adaptive_terminal_shortcut.into(),
                 adaptive_general_shortcut: cli.adaptive_general_shortcut.into(),
                 adaptive_unknown_shortcut: cli.adaptive_unknown_shortcut.into(),
-                focus_resolver_source: cli.focus_resolver_source.into(),
-                focus_resolve_budget_ms: cli.focus_resolve_budget_ms,
-                focus_deep_scan_max_apps: cli.focus_deep_scan_max_apps,
-                focus_wayland_stale_ms: cli.focus_wayland_stale_ms,
-                focus_wayland_transition_grace_ms: cli.focus_wayland_transition_grace_ms,
                 seat: cli.paste_seat.clone(),
                 write_primary: cli.paste_write_primary,
             },
@@ -634,11 +582,6 @@ fn build_injector(config: &ClientConfig) -> Box<dyn TextInjector> {
                 adaptive_terminal_shortcut = ?config.clipboard.adaptive_terminal_shortcut,
                 adaptive_general_shortcut = ?config.clipboard.adaptive_general_shortcut,
                 adaptive_unknown_shortcut = ?config.clipboard.adaptive_unknown_shortcut,
-                focus_resolver_source = ?config.clipboard.focus_resolver_source,
-                focus_resolve_budget_ms = config.clipboard.focus_resolve_budget_ms,
-                focus_deep_scan_max_apps = config.clipboard.focus_deep_scan_max_apps,
-                focus_wayland_stale_ms = config.clipboard.focus_wayland_stale_ms,
-                focus_wayland_transition_grace_ms = config.clipboard.focus_wayland_transition_grace_ms,
                 uinput_dwell_ms = config.uinput_dwell_ms,
                 paste_seat = ?config.clipboard.seat,
                 paste_write_primary = config.clipboard.write_primary,
@@ -967,8 +910,8 @@ mod tests {
 
     use super::{
         apply_robust_profile_over_deprecated_flags, build_injector, shortcut_interop_warning, Cli,
-        CliFocusResolverSource, CliPasteKeyBackend, CliPasteRoutingMode, CliPasteShortcut,
-        CliPasteShortcutFallback, CliPasteStrategy,
+        CliPasteKeyBackend, CliPasteRoutingMode, CliPasteShortcut, CliPasteShortcutFallback,
+        CliPasteStrategy,
     };
 
     fn clipboard_options(policy: PasteBackendFailurePolicy) -> ClipboardOptions {
@@ -988,11 +931,6 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
-            focus_resolver_source: crate::config::FocusResolverSource::Atspi,
-            focus_resolve_budget_ms: 450,
-            focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 30_000,
-            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }
@@ -1062,31 +1000,6 @@ mod tests {
     fn cli_accepts_explicit_always_chain_strategy() {
         let cli = Cli::parse_from(["parakeet-ptt", "--paste-strategy", "always-chain"]);
         assert!(matches!(cli.paste_strategy, CliPasteStrategy::AlwaysChain));
-    }
-
-    #[test]
-    fn cli_default_focus_resolver_source_is_wayland() {
-        let cli = Cli::parse_from(["parakeet-ptt"]);
-        assert!(matches!(
-            cli.focus_resolver_source,
-            CliFocusResolverSource::Wayland
-        ));
-    }
-
-    #[test]
-    fn cli_accepts_hybrid_focus_resolver_source() {
-        let cli = Cli::parse_from(["parakeet-ptt", "--focus-resolver-source", "hybrid"]);
-        assert!(matches!(
-            cli.focus_resolver_source,
-            CliFocusResolverSource::Hybrid
-        ));
-    }
-
-    #[test]
-    fn cli_default_wayland_thresholds_match_robust_profile() {
-        let cli = Cli::parse_from(["parakeet-ptt"]);
-        assert_eq!(cli.focus_wayland_stale_ms, 30_000);
-        assert_eq!(cli.focus_wayland_transition_grace_ms, 500);
     }
 
     #[test]
@@ -1170,13 +1083,13 @@ mod tests {
         let args = vec![
             "--paste-shortcut".to_string(),
             "ctrl-v".to_string(),
-            "--focus-wayland-stale-ms=30000".to_string(),
+            "--paste-routing-mode=adaptive".to_string(),
             "--completion-sound".to_string(),
             "true".to_string(),
         ];
         let flags = super::collect_deprecated_cli_flags(&args);
         assert!(flags.contains(&"--paste-shortcut"));
-        assert!(flags.contains(&"--focus-wayland-stale-ms"));
+        assert!(flags.contains(&"--paste-routing-mode"));
         assert!(!flags.contains(&"--completion-sound"));
     }
 
@@ -1210,16 +1123,6 @@ mod tests {
             "ctrl-shift-v",
             "--adaptive-unknown-shortcut",
             "ctrl-v",
-            "--focus-resolver-source",
-            "hybrid",
-            "--focus-resolve-budget-ms",
-            "123",
-            "--focus-deep-scan-max-apps",
-            "9",
-            "--focus-wayland-stale-ms",
-            "100",
-            "--focus-wayland-transition-grace-ms",
-            "42",
         ]);
 
         apply_robust_profile_over_deprecated_flags(&mut cli);
@@ -1237,13 +1140,5 @@ mod tests {
             cli.paste_routing_mode,
             CliPasteRoutingMode::Adaptive
         ));
-        assert!(matches!(
-            cli.focus_resolver_source,
-            CliFocusResolverSource::Wayland
-        ));
-        assert_eq!(cli.focus_resolve_budget_ms, 450);
-        assert_eq!(cli.focus_deep_scan_max_apps, 1);
-        assert_eq!(cli.focus_wayland_stale_ms, 30_000);
-        assert_eq!(cli.focus_wayland_transition_grace_ms, 500);
     }
 }

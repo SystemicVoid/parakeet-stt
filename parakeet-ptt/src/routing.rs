@@ -176,8 +176,8 @@ fn normalize_for_hint_match(raw: &str) -> String {
 mod tests {
     use super::{classify_surface_with_reason, decide_route, SurfaceClass};
     use crate::config::{
-        ClipboardOptions, FocusResolverSource, PasteBackendFailurePolicy, PasteKeyBackend,
-        PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
+        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
+        PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
     use crate::surface_focus::FocusSnapshot;
 
@@ -198,11 +198,6 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
-            focus_resolver_source: FocusResolverSource::Atspi,
-            focus_resolve_budget_ms: 450,
-            focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 30_000,
-            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }

@@ -10,9 +10,7 @@ use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
 use tracing::{debug, info, warn};
 
-use crate::config::{
-    ClipboardOptions, FocusResolverSource, PasteRestorePolicy, PasteShortcut, PasteStrategy,
-};
+use crate::config::{ClipboardOptions, PasteRestorePolicy, PasteShortcut, PasteStrategy};
 use crate::routing::decide_route;
 use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 
@@ -223,17 +221,11 @@ impl ClipboardInjector {
     const CLIPBOARD_READY_POLL_MS: u64 = 10;
 
     pub fn new(sender: PasteKeySender, options: ClipboardOptions, copy_only: bool) -> Self {
-        let wayland_focus_cache = match options.focus_resolver_source {
-            FocusResolverSource::Atspi => None,
-            FocusResolverSource::Wayland | FocusResolverSource::Hybrid => {
-                Some(WaylandFocusCache::new())
-            }
-        };
         Self {
             sender,
             options,
             copy_only,
-            wayland_focus_cache,
+            wayland_focus_cache: Some(WaylandFocusCache::new()),
         }
     }
 
@@ -782,6 +774,9 @@ impl ClipboardInjector {
         }
     }
 
+    const WAYLAND_STALE_MS: u64 = 30_000;
+    const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
+
     fn resolve_focus_metadata(&self, _trace_id: u64) -> FocusResolutionOutcome {
         let Some(cache) = self.wayland_focus_cache.as_ref() else {
             return FocusResolutionOutcome {
@@ -791,10 +786,7 @@ impl ClipboardInjector {
                 wayland_fallback_reason: Some("wayland_cache_not_initialized"),
             };
         };
-        match cache.observe(
-            self.options.focus_wayland_stale_ms,
-            self.options.focus_wayland_transition_grace_ms,
-        ) {
+        match cache.observe(Self::WAYLAND_STALE_MS, Self::WAYLAND_TRANSITION_GRACE_MS) {
             WaylandFocusObservation::Fresh {
                 snapshot,
                 cache_age_ms,
@@ -848,9 +840,6 @@ impl TextInjector for ClipboardInjector {
             adaptive_terminal_shortcut = ?self.options.adaptive_terminal_shortcut,
             adaptive_general_shortcut = ?self.options.adaptive_general_shortcut,
             adaptive_unknown_shortcut = ?self.options.adaptive_unknown_shortcut,
-            focus_resolver_source = ?self.options.focus_resolver_source,
-            focus_wayland_stale_ms = self.options.focus_wayland_stale_ms,
-            focus_wayland_transition_grace_ms = self.options.focus_wayland_transition_grace_ms,
             seat = ?self.options.seat,
             write_primary = self.options.write_primary,
             mime_type = %self.options.mime_type,
@@ -1158,8 +1147,8 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
-        ClipboardOptions, FocusResolverSource, PasteBackendFailurePolicy, PasteKeyBackend,
-        PasteRestorePolicy, PasteRoutingMode, PasteShortcut, PasteStrategy,
+        ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteRestorePolicy,
+        PasteRoutingMode, PasteShortcut, PasteStrategy,
     };
     use evdev::Key;
     use std::path::PathBuf;
@@ -1185,11 +1174,6 @@ mod tests {
             adaptive_terminal_shortcut: PasteShortcut::CtrlShiftV,
             adaptive_general_shortcut: PasteShortcut::CtrlV,
             adaptive_unknown_shortcut: PasteShortcut::CtrlShiftV,
-            focus_resolver_source: FocusResolverSource::Atspi,
-            focus_resolve_budget_ms: 450,
-            focus_deep_scan_max_apps: 1,
-            focus_wayland_stale_ms: 30_000,
-            focus_wayland_transition_grace_ms: 500,
             seat: None,
             write_primary: false,
         }

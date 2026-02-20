@@ -51,13 +51,6 @@ pub enum PasteRoutingMode {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub enum FocusResolverSource {
-    Atspi,
-    Wayland,
-    Hybrid,
-}
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum PasteBackendFailurePolicy {
     CopyOnly,
     Error,
@@ -80,11 +73,6 @@ pub struct ClipboardOptions {
     pub adaptive_terminal_shortcut: PasteShortcut,
     pub adaptive_general_shortcut: PasteShortcut,
     pub adaptive_unknown_shortcut: PasteShortcut,
-    pub focus_resolver_source: FocusResolverSource,
-    pub focus_resolve_budget_ms: u64,
-    pub focus_deep_scan_max_apps: u8,
-    pub focus_wayland_stale_ms: u64,
-    pub focus_wayland_transition_grace_ms: u64,
     pub seat: Option<String>,
     pub write_primary: bool,
 }
