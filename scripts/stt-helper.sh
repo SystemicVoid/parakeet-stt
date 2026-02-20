@@ -38,11 +38,11 @@ stt() {
     local default_adaptive_terminal_shortcut="${PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT:-ctrl-shift-v}"
     local default_adaptive_general_shortcut="${PARAKEET_ADAPTIVE_GENERAL_SHORTCUT:-ctrl-v}"
     local default_adaptive_unknown_shortcut="${PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT:-ctrl-shift-v}"
-    local default_focus_resolver_source="${PARAKEET_FOCUS_RESOLVER_SOURCE:-atspi}"
+    local default_focus_resolver_source="${PARAKEET_FOCUS_RESOLVER_SOURCE:-wayland}"
     local default_focus_resolve_budget_ms="${PARAKEET_FOCUS_RESOLVE_BUDGET_MS:-450}"
     local default_focus_deep_scan_max_apps="${PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS:-1}"
-    local default_focus_wayland_stale_ms="${PARAKEET_FOCUS_WAYLAND_STALE_MS:-1200}"
-    local default_focus_wayland_transition_grace_ms="${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-200}"
+    local default_focus_wayland_stale_ms="${PARAKEET_FOCUS_WAYLAND_STALE_MS:-30000}"
+    local default_focus_wayland_transition_grace_ms="${PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS:-500}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
@@ -52,34 +52,34 @@ stt() {
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
     local -a start_option_rows=(
-        "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always"
-        "paste-shortcut|paste_shortcut|default_paste_shortcut|PARAKEET_PASTE_SHORTCUT|Paste and fallback|<v>|<unset>|always"
-        "paste-shortcut-fallback|paste_shortcut_fallback|default_paste_shortcut_fallback|PARAKEET_PASTE_SHORTCUT_FALLBACK|Paste and fallback|<v>|none|always"
-        "paste-strategy|paste_strategy|default_paste_strategy|PARAKEET_PASTE_STRATEGY|Paste and fallback|<v>|single|always"
-        "paste-chain-delay-ms|paste_chain_delay_ms|default_paste_chain_delay_ms|PARAKEET_PASTE_CHAIN_DELAY_MS|Paste and fallback|<n>|45|always"
-        "paste-restore-policy|paste_restore_policy|default_paste_restore_policy|PARAKEET_PASTE_RESTORE_POLICY|Paste and fallback|<v>|never|always"
-        "paste-restore-delay-ms|paste_restore_delay_ms|default_paste_restore_delay_ms|PARAKEET_PASTE_RESTORE_DELAY_MS|Paste and fallback|<n>|250|always"
-        "paste-post-chord-hold-ms|paste_post_chord_hold_ms|default_paste_post_chord_hold_ms|PARAKEET_PASTE_POST_CHORD_HOLD_MS|Paste and fallback|<n>|700|always"
-        "paste-copy-foreground|paste_copy_foreground|default_paste_copy_foreground|PARAKEET_PASTE_COPY_FOREGROUND|Paste and fallback|<v>|true|always"
-        "paste-mime-type|paste_mime_type|default_paste_mime_type|PARAKEET_PASTE_MIME_TYPE|Paste and fallback|<v>|text/plain;charset=utf-8|always"
-        "paste-routing-mode|paste_routing_mode|default_paste_routing_mode|PARAKEET_PASTE_ROUTING_MODE|Routing and focus|<v>|adaptive|always"
-        "adaptive-terminal-shortcut|adaptive_terminal_shortcut|default_adaptive_terminal_shortcut|PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT|Routing and focus|<v>|ctrl-shift-v|always"
-        "adaptive-general-shortcut|adaptive_general_shortcut|default_adaptive_general_shortcut|PARAKEET_ADAPTIVE_GENERAL_SHORTCUT|Routing and focus|<v>|ctrl-v|always"
-        "adaptive-unknown-shortcut|adaptive_unknown_shortcut|default_adaptive_unknown_shortcut|PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT|Routing and focus|<v>|ctrl-shift-v|always"
-        "focus-resolver-source|focus_resolver_source|default_focus_resolver_source|PARAKEET_FOCUS_RESOLVER_SOURCE|Routing and focus|<v>|atspi|always"
-        "focus-resolve-budget-ms|focus_resolve_budget_ms|default_focus_resolve_budget_ms|PARAKEET_FOCUS_RESOLVE_BUDGET_MS|Routing and focus|<n>|450|always"
-        "focus-deep-scan-max-apps|focus_deep_scan_max_apps|default_focus_deep_scan_max_apps|PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS|Routing and focus|<n>|1|always"
-        "focus-wayland-stale-ms|focus_wayland_stale_ms|default_focus_wayland_stale_ms|PARAKEET_FOCUS_WAYLAND_STALE_MS|Routing and focus|<n>|1200|always"
-        "focus-wayland-transition-grace-ms|focus_wayland_transition_grace_ms|default_focus_wayland_transition_grace_ms|PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS|Routing and focus|<n>|200|always"
-        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Backend and sound|<v>|auto|always"
-        "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Backend and sound|<v>|copy-only|always"
-        "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Backend and sound|<n>|18|always"
-        "paste-seat|paste_seat|default_paste_seat|PARAKEET_PASTE_SEAT|Backend and sound|<v>|<unset>|nonempty"
-        "paste-write-primary|paste_write_primary|default_paste_write_primary|PARAKEET_PASTE_WRITE_PRIMARY|Backend and sound|<v>|false|always"
-        "ydotool|ydotool_path|default_ydotool_path|PARAKEET_YDOTOOL_PATH|Backend and sound|<path>|<auto>|nonempty"
-        "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Backend and sound|<v>|true|always"
-        "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Backend and sound|<path>|<system default>|nonempty"
-        "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Backend and sound|<n>|100|always"
+        "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
+        "paste-shortcut|paste_shortcut|default_paste_shortcut|PARAKEET_PASTE_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
+        "paste-shortcut-fallback|paste_shortcut_fallback|default_paste_shortcut_fallback|PARAKEET_PASTE_SHORTCUT_FALLBACK|Compatibility (deprecated)|<v>|none|compat|none"
+        "paste-strategy|paste_strategy|default_paste_strategy|PARAKEET_PASTE_STRATEGY|Compatibility (deprecated)|<v>|single|compat|single"
+        "paste-chain-delay-ms|paste_chain_delay_ms|default_paste_chain_delay_ms|PARAKEET_PASTE_CHAIN_DELAY_MS|Compatibility (deprecated)|<n>|45|compat|45"
+        "paste-restore-policy|paste_restore_policy|default_paste_restore_policy|PARAKEET_PASTE_RESTORE_POLICY|Compatibility (deprecated)|<v>|never|compat|never"
+        "paste-restore-delay-ms|paste_restore_delay_ms|default_paste_restore_delay_ms|PARAKEET_PASTE_RESTORE_DELAY_MS|Compatibility (deprecated)|<n>|250|compat|250"
+        "paste-post-chord-hold-ms|paste_post_chord_hold_ms|default_paste_post_chord_hold_ms|PARAKEET_PASTE_POST_CHORD_HOLD_MS|Compatibility (deprecated)|<n>|700|compat|700"
+        "paste-copy-foreground|paste_copy_foreground|default_paste_copy_foreground|PARAKEET_PASTE_COPY_FOREGROUND|Compatibility (deprecated)|<v>|true|compat|true"
+        "paste-mime-type|paste_mime_type|default_paste_mime_type|PARAKEET_PASTE_MIME_TYPE|Compatibility (deprecated)|<v>|text/plain;charset=utf-8|compat|text/plain;charset=utf-8"
+        "paste-routing-mode|paste_routing_mode|default_paste_routing_mode|PARAKEET_PASTE_ROUTING_MODE|Compatibility (deprecated)|<v>|adaptive|compat|adaptive"
+        "adaptive-terminal-shortcut|adaptive_terminal_shortcut|default_adaptive_terminal_shortcut|PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
+        "adaptive-general-shortcut|adaptive_general_shortcut|default_adaptive_general_shortcut|PARAKEET_ADAPTIVE_GENERAL_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-v|compat|ctrl-v"
+        "adaptive-unknown-shortcut|adaptive_unknown_shortcut|default_adaptive_unknown_shortcut|PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT|Compatibility (deprecated)|<v>|ctrl-shift-v|compat|ctrl-shift-v"
+        "focus-resolver-source|focus_resolver_source|default_focus_resolver_source|PARAKEET_FOCUS_RESOLVER_SOURCE|Compatibility (deprecated)|<v>|wayland|compat|wayland"
+        "focus-resolve-budget-ms|focus_resolve_budget_ms|default_focus_resolve_budget_ms|PARAKEET_FOCUS_RESOLVE_BUDGET_MS|Compatibility (deprecated)|<n>|450|compat|450"
+        "focus-deep-scan-max-apps|focus_deep_scan_max_apps|default_focus_deep_scan_max_apps|PARAKEET_FOCUS_DEEP_SCAN_MAX_APPS|Compatibility (deprecated)|<n>|1|compat|1"
+        "focus-wayland-stale-ms|focus_wayland_stale_ms|default_focus_wayland_stale_ms|PARAKEET_FOCUS_WAYLAND_STALE_MS|Compatibility (deprecated)|<n>|30000|compat|30000"
+        "focus-wayland-transition-grace-ms|focus_wayland_transition_grace_ms|default_focus_wayland_transition_grace_ms|PARAKEET_FOCUS_WAYLAND_TRANSITION_GRACE_MS|Compatibility (deprecated)|<n>|500|compat|500"
+        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|auto|always|auto"
+        "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"
+        "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Stable controls|<n>|18|always|18"
+        "paste-seat|paste_seat|default_paste_seat|PARAKEET_PASTE_SEAT|Stable controls|<v>|<unset>|nonempty|"
+        "paste-write-primary|paste_write_primary|default_paste_write_primary|PARAKEET_PASTE_WRITE_PRIMARY|Stable controls|<v>|false|always|false"
+        "ydotool|ydotool_path|default_ydotool_path|PARAKEET_YDOTOOL_PATH|Stable controls|<path>|<auto>|nonempty|"
+        "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Stable controls|<v>|true|always|true"
+        "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Stable controls|<path>|<system default>|nonempty|"
+        "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
     )
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
@@ -118,6 +118,29 @@ stt() {
             fi
         done
         return 1
+    }
+
+    _is_deprecated_start_option() {
+        local target="$1"
+        local row opt_name option_group
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name _ _ _ option_group _ _ _ _ <<<"$row"
+            [ "$opt_name" = "$target" ] || continue
+            [ "$option_group" = "Compatibility (deprecated)" ]
+            return $?
+        done
+        return 1
+    }
+
+    _warn_deprecated_env_overrides() {
+        local row opt_name env_name option_group
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name _ _ env_name option_group _ _ _ _ <<<"$row"
+            [ "$option_group" = "Compatibility (deprecated)" ] || continue
+            if [ "${!env_name+x}" = "x" ]; then
+                echo "   - Warning: env $env_name (maps to --$opt_name) is deprecated and will be removed in a future release."
+            fi
+        done
     }
 
     _set_start_option_value() {
@@ -177,20 +200,48 @@ stt() {
         done
     }
 
+    _print_start_option_names_by_group() {
+        local group_name="$1"
+        local row opt_name option_group
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name _ _ _ option_group _ _ _ _ <<<"$row"
+            [ "$option_group" = "$group_name" ] || continue
+            printf "%s\n" "$opt_name"
+        done
+    }
+
     _build_ptt_args() {
         local -n out_ref="$1"
         local include_endpoint="${2:-yes}"
-        local row opt_name var_name include_policy
+        local row opt_name var_name env_name include_policy baseline_default
         out_ref=()
         if [ "$include_endpoint" = "yes" ]; then
             out_ref+=(--endpoint "$DEFAULT_ENDPOINT")
         fi
         for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy <<<"$row"
+            IFS='|' read -r opt_name var_name _ env_name _ _ _ include_policy baseline_default <<<"$row"
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
                 continue
             fi
+            if [ "$include_policy" = "compat" ]; then
+                if [ "${!env_name+x}" != "x" ] && [ "${!var_name}" = "$baseline_default" ]; then
+                    continue
+                fi
+            fi
             out_ref+=("--$opt_name" "${!var_name}")
+        done
+    }
+
+    _collect_active_compat_options() {
+        local -n out_ref="$1"
+        local row opt_name var_name env_name option_group baseline_default
+        out_ref=()
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name var_name _ env_name option_group _ _ _ baseline_default <<<"$row"
+            [ "$option_group" = "Compatibility (deprecated)" ] || continue
+            if [ "${!env_name+x}" = "x" ] || [ "${!var_name}" != "$baseline_default" ]; then
+                out_ref+=("--$opt_name=${!var_name}")
+            fi
         done
     }
 
@@ -238,6 +289,10 @@ stt() {
                     injection_mode="copy-only"
                     shift
                     ;;
+                --help-compat)
+                    _print_help_start_compat
+                    return 2
+                    ;;
                 --help|-h|help)
                     _print_help_start
                     return 2
@@ -252,6 +307,9 @@ stt() {
                     if [[ $# -lt 2 ]]; then
                         echo "   - Missing value for $1"
                         return 1
+                    fi
+                    if _is_deprecated_start_option "$opt_name"; then
+                        echo "   - Warning: --$opt_name is deprecated and will be removed in a future release."
                     fi
                     _set_start_option_value "$opt_name" "$2"
                     shift 2
@@ -452,13 +510,16 @@ Commands:
   tmux [attach|kill]     Attach/kill helper tmux session.
   check                  Run daemon health check.
   diag-injector          Run clipboard injector diagnostics.
-  help [start]           Show this help or detailed start help.
+  help [start|start-compat]
+                         Show this help, stable start help, or deprecated compat flags.
 
 Help shortcuts:
   stt --help
   stt help
   stt help start
+  stt help start-compat
   stt start --help
+  stt start --help-compat
 EOF
     }
     _print_help_start() {
@@ -473,21 +534,28 @@ Injection mode:
 EOF
         _print_start_option_group "Injection mode"
         echo
-        echo "Paste and fallback:"
-        _print_start_option_group "Paste and fallback"
-        echo
-        echo "Routing and focus:"
-        _print_start_option_group "Routing and focus"
-        echo
-        echo "Backend and sound:"
-        _print_start_option_group "Backend and sound"
+        echo "Stable controls:"
+        _print_start_option_group "Stable controls"
         cat <<EOF
+
+Deprecated compatibility options are still accepted but hidden from primary help.
+Show them with:
+  stt help start-compat
 
 Other environment overrides:
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
 EOF
+    }
+    _print_help_start_compat() {
+        cat <<EOF
+Usage:
+  stt start [deprecated-compat-options]
+
+Compatibility options (deprecated; supported for migration only):
+EOF
+        _print_start_option_group "Compatibility (deprecated)"
     }
 
     case "$cmd" in
@@ -499,6 +567,9 @@ EOF
                 start)
                     _print_help_start
                     ;;
+                start-compat)
+                    _print_help_start_compat
+                    ;;
                 *)
                     echo "Unknown help topic: $1"
                     echo
@@ -506,6 +577,13 @@ EOF
                     return 1
                     ;;
             esac
+            ;;
+        __start-option-names-stable)
+            _print_start_option_names_by_group "Injection mode"
+            _print_start_option_names_by_group "Stable controls"
+            ;;
+        __start-option-names-deprecated)
+            _print_start_option_names_by_group "Compatibility (deprecated)"
             ;;
         __start-option-names)
             _print_start_option_names
@@ -593,6 +671,11 @@ EOF
                 return "$parse_status"
             fi
 
+            _warn_deprecated_env_overrides
+
+            local -a active_compat_overrides
+            _collect_active_compat_options active_compat_overrides
+
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
                 client_ready_timeout_seconds=30
@@ -600,26 +683,8 @@ EOF
 
             echo ">>> Starting Parakeet STT (detached tmux)..."
             echo "   - Injection mode: $injection_mode"
-            echo "   - Paste shortcut: $paste_shortcut"
-            echo "   - Paste shortcut fallback: $paste_shortcut_fallback"
-            echo "   - Paste strategy: $paste_strategy"
-            echo "   - Paste chain delay (ms): $paste_chain_delay_ms"
-            echo "   - Paste restore policy: $paste_restore_policy"
-            echo "   - Paste restore delay (ms): $paste_restore_delay_ms"
-            echo "   - Paste post-chord hold (ms): $paste_post_chord_hold_ms"
-            echo "   - Paste copy foreground: $paste_copy_foreground"
-            echo "   - Paste MIME type: $paste_mime_type"
             echo "   - Paste key backend: $paste_key_backend"
             echo "   - Paste backend failure policy: $paste_backend_failure_policy"
-            echo "   - Paste routing mode: $paste_routing_mode"
-            echo "   - Adaptive terminal shortcut: $adaptive_terminal_shortcut"
-            echo "   - Adaptive general shortcut: $adaptive_general_shortcut"
-            echo "   - Adaptive unknown shortcut: $adaptive_unknown_shortcut"
-            echo "   - Focus resolver source: $focus_resolver_source"
-            echo "   - Focus resolve budget (ms): $focus_resolve_budget_ms"
-            echo "   - Focus deep-scan max apps: $focus_deep_scan_max_apps"
-            echo "   - Focus wayland stale (ms): $focus_wayland_stale_ms"
-            echo "   - Focus wayland transition grace (ms): $focus_wayland_transition_grace_ms"
             echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
             echo "   - Paste write primary: $paste_write_primary"
@@ -627,6 +692,10 @@ EOF
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
+            if [ "${#active_compat_overrides[@]}" -gt 0 ]; then
+                echo "   - Deprecated compatibility overrides active:"
+                printf '     %s\n' "${active_compat_overrides[@]}"
+            fi
 
             if ! _resolve_port; then
                 return 1

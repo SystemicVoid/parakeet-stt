@@ -34,11 +34,26 @@ source "$repo_root/scripts/stt-helper.sh"
 
 mapfile -t start_options < <(stt __start-option-names)
 [ "${#start_options[@]}" -gt 0 ] || fail "no metadata options were returned"
+mapfile -t stable_options < <(stt __start-option-names-stable)
+[ "${#stable_options[@]}" -gt 0 ] || fail "no stable metadata options were returned"
+mapfile -t deprecated_options < <(stt __start-option-names-deprecated)
 
 start_help="$(stt start --help)"
-for opt in "${start_options[@]}"; do
+for opt in "${stable_options[@]}"; do
     if ! grep -Fq -- "--$opt " <<<"$start_help"; then
         fail "help output is missing --$opt"
+    fi
+done
+for opt in "${deprecated_options[@]}"; do
+    if grep -Fq -- "--$opt " <<<"$start_help"; then
+        fail "stable help unexpectedly includes deprecated --$opt"
+    fi
+done
+
+compat_help="$(stt start --help-compat)"
+for opt in "${deprecated_options[@]}"; do
+    if ! grep -Fq -- "--$opt " <<<"$compat_help"; then
+        fail "compat help output is missing --$opt"
     fi
 done
 
