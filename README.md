@@ -112,6 +112,9 @@ Primary helper commands:
 - `stt diag-injector` (injection diagnostics)
 - `stt help` and `stt help start` (full helper + start flag reference)
 
+`stt start` flag parsing/help/runtime args are driven by a single metadata table in
+`scripts/stt-helper.sh` (`start_option_rows`).
+
 ## Testing and Validation
 
 Client checks:
@@ -134,6 +137,11 @@ uv run parakeet-stt-daemon --check
 Manual injector validation:
 ```bash
 stt diag-injector
+```
+
+Local helper drift check:
+```bash
+scripts/check-stt-helper-flags.sh
 ```
 
 ## Docs Map
