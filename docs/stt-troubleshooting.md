@@ -11,19 +11,19 @@ This document now has two parts:
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
 - Default startup profile is now paste-mode with adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
-  - `--paste-key-backend auto` (`uinput -> ydotool -> wtype`)
+  - `--paste-key-backend auto` (ladder: uinput → ydotool)
   - `--paste-backend-failure-policy copy-only`
-  - Wayland focus cache defaults: source=`wayland`, stale=`30000ms`, transition grace=`500ms`
+  - Wayland focus cache with 30s stale threshold, 500ms transition grace
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
-- `auto` backend now performs runtime fallback attempts (`uinput -> ydotool -> wtype`) per shortcut execution.
-- `stt diag-injector` reports backend capability prerequisites (`wtype`, `ydotool`, `/dev/uinput` write access) before running matrix cases.
+- `auto` backend now performs runtime fallback attempts (uinput → ydotool) per shortcut execution.
+- `stt diag-injector` reports backend capability prerequisites (`ydotool`, `/dev/uinput` write access) before running matrix cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
-- Compatibility knobs used during routing/focus exploration are now deprecated in primary help; when provided they are ignored and robust defaults remain active. See `stt help start-compat`.
+- Routing shortcuts (Terminal→CtrlShiftV, General→CtrlV, Unknown→CtrlShiftV), clipboard MIME type, and copy-foreground behavior are hardcoded constants — no longer configurable via CLI.
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -74,34 +74,17 @@ With the append-only logging, tmux-based client start, PID tracking, and longer 
 Paste/copy injection now exposes a stable operator surface through `stt start` and
 `parakeet-ptt`.
 
-Stable knobs:
+Client knobs:
 - `--injection-mode type|paste|copy-only`
-- `--paste-key-backend wtype|ydotool|uinput|auto` (default: `auto`)
+- `--paste-key-backend ydotool|uinput|auto` (default: `auto`, ladder: uinput→ydotool)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
 - `--paste-write-primary true|false` (default: `false`)
 - `--ydotool <path>` (optional explicit path override)
-
-Deprecated compatibility knobs (parsed for compatibility but ignored in runtime):
-- `--paste-shortcut`
-- `--paste-shortcut-fallback`
-- `--paste-strategy`
-- `--paste-chain-delay-ms`
-- `--paste-post-chord-hold-ms`
-- `--paste-restore-policy`
-- `--paste-restore-delay-ms`
-- `--paste-copy-foreground`
-- `--paste-mime-type`
-- `--paste-routing-mode`
-- `--adaptive-terminal-shortcut`
-- `--adaptive-general-shortcut`
-- `--adaptive-unknown-shortcut`
-- `--focus-resolver-source`
-- `--focus-resolve-budget-ms`
-- `--focus-deep-scan-max-apps`
-- `--focus-wayland-stale-ms`
-- `--focus-wayland-transition-grace-ms`
+- `--completion-sound true|false` (default: `true`)
+- `--completion-sound-path <path>` (optional)
+- `--completion-sound-volume <0-100>` (default: `100`)
 
 Recommended baseline for Ghostty/COSMIC:
 

@@ -76,7 +76,6 @@ Logs: `/tmp/parakeet-daemon.log`, `/tmp/parakeet-ptt.log`
 Helper flag maintenance policy:
 - Use `scripts/stt-helper.sh` `start_option_rows` as the single metadata source for `stt start` flags/defaults/env mapping.
 - Do not add parallel hardcoded flag lists in parser/help/launch/diagnostic paths.
-- Run `scripts/check-stt-helper-flags.sh` after changing helper flags or defaults.
 
 ## Key Source Files
 
@@ -91,7 +90,7 @@ Helper flag maintenance policy:
 ### Client (`parakeet-ptt/src/`)
 - `main.rs` - CLI entry, hotkey loop, WebSocket message handling
 - `hotkey.rs` - evdev Right Ctrl detection
-- `injector.rs` - `WtypeInjector`, `ClipboardInjector`, uinput/ydotool/wtype backend ladder
+- `injector.rs` - `ClipboardInjector`, uinput/ydotool backend ladder, adaptive paste routing
 - `audio_feedback.rs` - Completion sound playback via pw-play/paplay
 - `client.rs` - WebSocket connection wrapper
 - `protocol.rs` - Message types matching daemon protocol
@@ -122,33 +121,27 @@ See `docs/SPEC.md` for complete protocol specification.
 
 ## Environment Variables
 
+### Daemon
 - `PARAKEET_HOST` / `PARAKEET_PORT` - Daemon bind address (default: 127.0.0.1:8765)
-- `PARAKEET_ROOT` - Override repo root for helper script
-- `PARAKEET_INJECTION_MODE` - Default injection mode (`paste` default)
-- `PARAKEET_PASTE_SHORTCUT` - Paste chord (`ctrl-shift-v` default)
-- `PARAKEET_PASTE_SHORTCUT_FALLBACK` - Fallback chord (`none` default)
-- `PARAKEET_PASTE_STRATEGY` - `single|on-error|always-chain` (`single` default)
-- `PARAKEET_PASTE_CHAIN_DELAY_MS` - Delay between chained shortcuts (`45` default)
-- `PARAKEET_PASTE_RESTORE_POLICY` - `never` or `delayed` (default `never`)
-- `PARAKEET_PASTE_RESTORE_DELAY_MS` - Delay before restore when using delayed policy
-- `PARAKEET_PASTE_POST_CHORD_HOLD_MS` - Keep ownership after chord (`700` default)
-- `PARAKEET_PASTE_COPY_FOREGROUND` - Keep wl-copy foreground source during paste (`true` default)
-- `PARAKEET_PASTE_MIME_TYPE` - MIME type for clipboard writes (default `text/plain;charset=utf-8`)
-- `PARAKEET_PASTE_KEY_BACKEND` - `wtype|ydotool|uinput|auto` (`auto` default via helper)
-- `PARAKEET_PASTE_ROUTING_MODE` - `static|adaptive` (`adaptive` default)
-- `PARAKEET_ADAPTIVE_TERMINAL_SHORTCUT` - terminal route shortcut (`ctrl-shift-v` default)
-- `PARAKEET_ADAPTIVE_GENERAL_SHORTCUT` - editor/browser route shortcut (`ctrl-v` default)
-- `PARAKEET_ADAPTIVE_UNKNOWN_SHORTCUT` - unknown/low-confidence route shortcut (`ctrl-shift-v` default)
-- `PARAKEET_PASTE_BACKEND_FAILURE_POLICY` - `copy-only|error` (`copy-only` default)
-- `PARAKEET_UINPUT_DWELL_MS` - uinput key dwell time (default `18`)
-- `PARAKEET_PASTE_SEAT` - Optional seat override for wl-copy/wl-paste
-- `PARAKEET_PASTE_WRITE_PRIMARY` - Mirror transcript to PRIMARY selection (`false` default)
-- `PARAKEET_YDOTOOL_PATH` - Optional path override for ydotool binary
 - `PARAKEET_SILENCE_FLOOR_DB` - Silence trim threshold
-- `PARAKEET_COMPLETION_SOUND` - Enable/disable completion sound (`true` default)
+
+### Client (injection)
+- `PARAKEET_INJECTION_MODE` - `paste|type|copy-only` (default: `paste`)
+- `PARAKEET_PASTE_KEY_BACKEND` - `ydotool|uinput|auto` (default: `auto`, ladder: uinput→ydotool)
+- `PARAKEET_PASTE_BACKEND_FAILURE_POLICY` - `copy-only|error` (default: `copy-only`)
+- `PARAKEET_UINPUT_DWELL_MS` - uinput key dwell time (default: `18`)
+- `PARAKEET_PASTE_SEAT` - Optional seat override for wl-copy/wl-paste
+- `PARAKEET_PASTE_WRITE_PRIMARY` - Mirror transcript to PRIMARY selection (default: `false`)
+- `PARAKEET_YDOTOOL_PATH` - Optional path override for ydotool binary
+
+### Client (audio feedback)
+- `PARAKEET_COMPLETION_SOUND` - Enable/disable completion sound (default: `true`)
 - `PARAKEET_COMPLETION_SOUND_PATH` - Custom sound file path (uses system default if unset)
-- `PARAKEET_COMPLETION_SOUND_VOLUME` - Volume level 0-100 (`100` default)
-- `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` - helper wait before client-ready failure (`30` default; extends on active cargo compile)
+- `PARAKEET_COMPLETION_SOUND_VOLUME` - Volume level 0-100 (default: `100`)
+
+### Helper / general
+- `PARAKEET_ROOT` - Override repo root for helper script
+- `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` - helper wait before client-ready failure (default: `30`; extends on active cargo compile)
 - `RUST_LOG` - Rust logging level (default: info)
 
 ## Testing
