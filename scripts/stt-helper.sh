@@ -33,6 +33,9 @@ stt() {
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
+    # Local-only default: optimize for this workstation (Zen5 + AVX512), not portable builds.
+    local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
+    local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
         "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|auto|always|auto"
@@ -169,11 +172,27 @@ stt() {
 
     _select_client_runner_mode() {
         local binary="$1"
-        if [ -x "$binary" ] && _ptt_binary_supports_start_flags "$binary"; then
-            printf "release"
-        else
-            printf "cargo"
-        fi
+        local runner_preference="$2"
+
+        case "$runner_preference" in
+            cargo)
+                printf "cargo"
+                return 0
+                ;;
+            release)
+                if [ -x "$binary" ] && _ptt_binary_supports_start_flags "$binary"; then
+                    printf "release"
+                    return 0
+                fi
+                printf "cargo"
+                return 0
+                ;;
+            *)
+                # Defensive fallback for unknown values.
+                printf "cargo"
+                return 0
+                ;;
+        esac
     }
 
     _parse_start_options() {
@@ -428,6 +447,8 @@ Other environment overrides:
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
+  PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
+  PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
 EOF
     }
 
@@ -456,7 +477,7 @@ EOF
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 else
-                    cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 fi
 CLIENTCMD
     }
@@ -504,6 +525,8 @@ CLIENTCMD
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
+            local ptt_rustflags="$default_ptt_rustflags"
+            local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
 
             local parse_status=0
@@ -530,6 +553,13 @@ CLIENTCMD
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
+            echo "   - PTT runner preference: $ptt_runner_preference"
+            echo "   - PTT RUSTFLAGS: $ptt_rustflags"
+
+            if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
+                echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
+                ptt_runner_preference="cargo"
+            fi
 
             if ! _resolve_port; then
                 return 1
@@ -594,8 +624,8 @@ CLIENTCMD
             ptt_args_shell="$(_args_to_shell_words ptt_args)"
 
             local runner_mode
-            runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt")"
-            if [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
+            runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
+            if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
             fi
 
@@ -603,7 +633,7 @@ CLIENTCMD
             client_cmd="$(_build_client_cmd)"
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             local primary_pane
@@ -735,7 +765,14 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume
+            local ptt_rustflags="$default_ptt_rustflags"
+            local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
+
+            if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
+                echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
+                ptt_runner_preference="cargo"
+            fi
 
             local -a ptt_args
             _build_ptt_args ptt_args
@@ -743,8 +780,8 @@ CLIENTCMD
             ptt_args_shell="$(_args_to_shell_words ptt_args)"
 
             local runner_mode
-            runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt")"
-            if [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
+            runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
+            if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
             fi
 
@@ -763,12 +800,12 @@ CLIENTCMD
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 else
-                    cargo run --release -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 fi
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
@@ -786,7 +823,14 @@ CLIENTCMD
                 cd "$CLIENT_DIR" || exit 1
                 set -e
                 local runner_mode runner_bin
-                runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt")"
+                local ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
+                local ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
+                if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
+                    echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
+                    ptt_runner_preference="cargo"
+                fi
+
+                runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
                 runner_bin=""
                 if [ "$runner_mode" = "release" ]; then
                     runner_bin="./target/release/parakeet-ptt"
@@ -823,7 +867,7 @@ CLIENTCMD
                             "$runner_bin" --test-injection "${ptt_args[@]}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            cargo run --release -- --test-injection "${ptt_args[@]}"
+                            RUSTFLAGS="$ptt_rustflags" cargo run --release -- --test-injection "${ptt_args[@]}"
                     fi
                 }
 
