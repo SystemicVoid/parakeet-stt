@@ -24,15 +24,6 @@ pub trait TextInjector: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
-pub struct NoopInjector;
-
-impl TextInjector for NoopInjector {
-    fn inject(&self, _text: &str) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct FailInjector {
     message: Arc<str>,
 }
@@ -48,42 +39,6 @@ impl FailInjector {
 impl TextInjector for FailInjector {
     fn inject(&self, _text: &str) -> Result<()> {
         anyhow::bail!("{}", self.message)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WtypeInjector {
-    binary: PathBuf,
-    delay_ms: u64,
-}
-
-impl WtypeInjector {
-    pub fn new(binary: PathBuf, delay_ms: u64) -> Self {
-        Self { binary, delay_ms }
-    }
-}
-
-impl TextInjector for WtypeInjector {
-    fn inject(&self, text: &str) -> Result<()> {
-        debug!(
-            mode = "type",
-            len = text.len(),
-            preview = %preview(text),
-            fingerprint = %fingerprint(text),
-            "injecting via wtype"
-        );
-
-        let status = Command::new(&self.binary)
-            .arg("-d")
-            .arg(self.delay_ms.to_string())
-            .arg(text)
-            .status()
-            .context("failed to spawn wtype")?;
-
-        if !status.success() {
-            anyhow::bail!("wtype exited with status {status}");
-        }
-        Ok(())
     }
 }
 
@@ -482,6 +437,54 @@ impl ClipboardInjector {
         }
     }
 
+    fn run_route_shortcuts(
+        &self,
+        trace_id: u64,
+        primary: PasteShortcut,
+        adaptive_fallback: Option<PasteShortcut>,
+    ) -> Result<()> {
+        let mut attempts = vec![("primary", primary)];
+        if let Some(fallback) = adaptive_fallback {
+            attempts.push(("adaptive_fallback", fallback));
+        }
+
+        let mut errors = Vec::new();
+        for (index, (attempt_name, shortcut)) in attempts.iter().enumerate() {
+            if index > 0 {
+                info!(
+                    trace_id,
+                    route_attempt = *attempt_name,
+                    route_shortcut = ?shortcut,
+                    "attempting adaptive route fallback shortcut"
+                );
+            }
+
+            match self.run_shortcut(trace_id, *shortcut) {
+                Ok(()) => {
+                    debug!(
+                        trace_id,
+                        route_attempt = *attempt_name,
+                        route_shortcut = ?shortcut,
+                        "route shortcut attempt succeeded"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        trace_id,
+                        route_attempt = *attempt_name,
+                        route_shortcut = ?shortcut,
+                        error = %err,
+                        "route shortcut attempt failed"
+                    );
+                    errors.push(format!("{attempt_name}({shortcut:?}): {err}"));
+                }
+            }
+        }
+
+        anyhow::bail!("all route shortcut attempts failed: {}", errors.join(" | "))
+    }
+
     fn stop_foreground_source(source: &mut Option<Child>, trace_id: u64, label: &'static str) {
         let Some(mut child) = source.take() else {
             return;
@@ -782,15 +785,16 @@ impl TextInjector for ClipboardInjector {
             );
         }
 
-        // 3. Send paste shortcut.
-        if let Err(err) = self.run_shortcut(trace_id, route.primary) {
+        // 3. Send routed paste shortcut(s).
+        if let Err(err) = self.run_route_shortcuts(trace_id, route.primary, route.adaptive_fallback)
+        {
             outcome = InjectionOutcome::ChordFailed;
             warn!(
                 trace_id,
                 error = %err,
                 elapsed_ms = started.elapsed().as_millis(),
                 outcome = outcome.as_str(),
-                "paste shortcut stage failed"
+                "all routed paste shortcut attempts failed"
             );
             self.transfer_to_background_if_needed(
                 text,
@@ -894,6 +898,8 @@ mod tests {
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use evdev::Key;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn test_options() -> ClipboardOptions {
@@ -948,5 +954,60 @@ mod tests {
         assert!(message.contains("all paste backend attempts failed"));
         assert!(message.contains("disabled"));
         assert!(message.contains("ydotool"));
+    }
+
+    fn make_test_ydotool(content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-injector-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, content).expect("test helper script should be writable");
+        let mut perms = fs::metadata(&path)
+            .expect("test helper script should exist")
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).expect("test helper script should be executable");
+        path
+    }
+
+    #[test]
+    fn route_fallback_attempt_uses_adaptive_shortcut_after_primary_failure() {
+        let script = make_test_ydotool(
+            "#!/usr/bin/env bash\nif [ \"$#\" -eq 7 ]; then exit 1; fi\nexit 0\n",
+        );
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Ydotool(script.clone()),
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+
+        let result =
+            injector.run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV));
+        fs::remove_file(&script).expect("test helper script should be removable");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn route_fallback_failure_reports_attempt_details() {
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Disabled,
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+
+        let err = injector
+            .run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV))
+            .expect_err("expected route fallback failure");
+        let message = format!("{err:#}");
+        assert!(message.contains("all route shortcut attempts failed"));
+        assert!(message.contains("primary"));
+        assert!(message.contains("adaptive_fallback"));
     }
 }

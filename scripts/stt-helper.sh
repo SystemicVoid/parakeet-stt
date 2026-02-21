@@ -202,10 +202,6 @@ stt() {
                     injection_mode="paste"
                     shift
                     ;;
-                --type)
-                    injection_mode="type"
-                    shift
-                    ;;
                 --copy-only)
                     injection_mode="copy-only"
                     shift
@@ -434,7 +430,6 @@ Usage:
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
-  --type                               Alias for --injection-mode type
   --copy-only                          Alias for --injection-mode copy-only
 EOF
         _print_start_option_group "Injection mode"

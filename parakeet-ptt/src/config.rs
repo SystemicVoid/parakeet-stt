@@ -11,7 +11,6 @@ pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum InjectionMode {
-    Type,
     Paste,
     CopyOnly,
 }
@@ -46,9 +45,7 @@ pub struct ClipboardOptions {
 
 #[derive(Clone, Debug)]
 pub struct InjectionConfig {
-    pub wtype_path: Option<PathBuf>,
     pub ydotool_path: Option<PathBuf>,
-    pub wtype_delay_ms: u64,
     pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -59,9 +56,7 @@ pub struct ClientConfig {
     pub endpoint: Url,
     pub shared_secret: Option<String>,
     pub hotkey: String,
-    pub wtype_path: Option<PathBuf>,
     pub ydotool_path: Option<PathBuf>,
-    pub wtype_delay_ms: u64,
     pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -82,9 +77,7 @@ impl ClientConfig {
             endpoint,
             shared_secret,
             hotkey,
-            wtype_path: injection.wtype_path,
             ydotool_path: injection.ydotool_path,
-            wtype_delay_ms: injection.wtype_delay_ms,
             uinput_dwell_ms: injection.uinput_dwell_ms,
             injection_mode: injection.injection_mode,
             clipboard: injection.clipboard,
