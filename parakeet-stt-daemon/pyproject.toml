@@ -13,18 +13,16 @@ dependencies = [
   "uvicorn[standard]>=0.32.1",
   "pydantic>=2.9.2",
   "pydantic-settings>=2.6.1",
-  "websockets>=13.1",
   "numpy>=1.24,<2",
   "sounddevice>=0.4.7",
   "loguru>=0.7.2",
-  "l>=0.11.0",
   "nemo-toolkit[asr]>=2.5.3",
 ]
 
 [project.optional-dependencies]
 inference = [
   "torch>=2.5.1",
-  "nemo_toolkit[asr]>=2.0.0",
+  "nemo-toolkit[asr]>=2.5.3",
 ]
 
 [project.scripts]
