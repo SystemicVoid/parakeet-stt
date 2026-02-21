@@ -80,7 +80,7 @@ Paste/copy injection now exposes a stable operator surface through `stt start` a
 `parakeet-ptt`.
 
 Client knobs:
-- `--injection-mode type|paste|copy-only`
+- `--injection-mode paste|copy-only`
 - `--paste-key-backend ydotool|uinput|auto` (default: `auto`, ladder: uinput→ydotool)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)

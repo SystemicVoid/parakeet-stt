@@ -4,13 +4,19 @@ Date: 2026-02-19
 Repo: `parakeet-stt`
 Author: Codex + operator session
 
+## Status Update (2026-02-21)
+
+- Active runtime no longer includes `wtype`/`type` injection paths.
+- Current backend ladder is `uinput -> ydotool` with `copy-only` failure policy.
+- Keep this handoff for historical investigation context; use `README.md`, `docs/SPEC.md`, and `docs/stt-troubleshooting.md` for current operator truth.
+
 ## 1. Executive Summary
 
 Cross-surface injection was failing because a single static paste chord cannot satisfy both terminal-class and editor/browser-class targets on COSMIC Wayland:
 - terminal/TUI surfaces generally require `Ctrl+Shift+V`
 - editor/browser/notion-like surfaces generally require `Ctrl+V`
 
-This handoff now reflects **implemented changes** (not only diagnosis). The fix introduces **adaptive routing** in `parakeet-ptt` that chooses the paste chord based on focused-surface metadata, while preserving existing backend reliability controls (`uinput -> ydotool -> wtype`, clipboard readiness barrier, copy-only policy).
+This handoff now reflects **implemented changes** (not only diagnosis). The fix introduces **adaptive routing** in `parakeet-ptt` that chooses the paste chord based on focused-surface metadata, while preserving existing backend reliability controls (`uinput -> ydotool`, clipboard readiness barrier, copy-only policy).
 
 Current reality check (2026-02-20):
 - terminal/browser paths are still materially better than editor paths.

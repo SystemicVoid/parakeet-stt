@@ -10,7 +10,7 @@ It has two runtime components:
 
 Since `21d8f74` and follow-up commits, the injection path is now reliability-first:
 
-- `stt start` defaults to paste mode, not typing mode.
+- Runtime injection surface is now `paste` or `copy-only` (legacy `type` mode removed).
 - Default routing mode is adaptive, selecting shortcut by focused surface class.
 - Default backend is `auto` with runtime ladder `uinput → ydotool`.
 - Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.

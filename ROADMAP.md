@@ -19,6 +19,24 @@ Turn Parakeet STT from "works with logs" into a premium local dictation experien
 - Failure states must be explicit and recoverable.
 - Advanced tuning remains available, but defaults stay minimal and reliable.
 
+## P0: Injection Architecture Hardening (Highest Priority)
+
+Scope:
+- Keep the consolidated runtime path (`paste` + `copy-only`) reliable before adding new UX features.
+- Remove hot-path blocking and hidden fallback ambiguity in injector execution.
+- Add clearer per-stage timing and failure observability for routing, clipboard, and chord emission.
+
+Implementation direction:
+- Move blocking injection work off async message handling paths.
+- Keep route semantics deterministic (primary + adaptive fallback) and fully logged.
+- Introduce a dedicated injector worker/channel and richer metrics as the next refactor step.
+- Investigate reducing subprocess churn (`wl-paste`/`wl-copy` probing) while preserving correctness.
+
+Acceptance:
+- No measurable event-loop stalls attributable to injection calls.
+- Failures are attributable to a specific stage (`clipboard_ready`, `route_shortcut`, `backend`).
+- Regression matrix remains stable across terminal + browser + editor targets.
+
 ## Phase 1: Immediate Feedback Layer (Sound + Notification)
 
 Scope:
@@ -116,12 +134,13 @@ Acceptance:
 
 ## Delivery Strategy (Atomic)
 
-1. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
-2. Add Phase 1 tests and update docs.
-3. Ship TUI skeleton with existing state only.
-4. Extend TUI with injection outcomes.
-5. Add incremental dictation error correction loop behind an opt-in switch.
-6. Prototype GUI after TUI reaches stable daily use.
+1. Complete P0 injection architecture hardening and lock reliability baselines.
+2. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
+3. Add Phase 1 tests and update docs.
+4. Ship TUI skeleton with existing state only.
+5. Extend TUI with injection outcomes.
+6. Add incremental dictation error correction loop behind an opt-in switch.
+7. Prototype GUI after TUI reaches stable daily use.
 
 ## Metrics to Track
 

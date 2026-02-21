@@ -1,6 +1,6 @@
 # Parakeet STT – Canonical Specification (Living Document)
 
-_Last updated: 2026-02-19_
+_Last updated: 2026-02-21_
 
 This document is the single source of truth for the local, push-to-talk Parakeet speech-to-text solution on Pop!\_OS 24.04 (Wayland). Update it whenever significant design, implementation, or operational decisions are made so every agent and developer can stay in sync.
 
@@ -44,7 +44,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   2. Daemon begins streaming mic audio (already owned by the daemon) through Parakeet’s RNNT streaming API.
   3. User releases Right Ctrl → `parakeet-ptt` issues `stop_session`.
   4. Daemon finalizes decoding, returns final transcription via WebSocket.
-  5. `parakeet-ptt` writes transcript text to the clipboard and executes configured paste behavior (`paste`, `type`, or `copy-only`), with adaptive shortcut routing available in paste mode.
+  5. `parakeet-ptt` writes transcript text to the clipboard and executes configured injection behavior (`paste` or `copy-only`), with adaptive shortcut routing available in paste mode.
 
 - **Networking**: localhost WebSocket (JSON frames). No audio leaves the daemon process; control messages only.
 
@@ -59,7 +59,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Eventually shipped as a user-level systemd service for auto-start.
 
 - **Dependencies**
-  - `nemo_toolkit[asr]`, `torch==2.x` (cu121 build for Pop!\_OS 24.04), `sounddevice`, `numpy`, `websockets` (or `fastapi[all]` + `uvicorn`), `pydantic` for configs, `loguru` (optional).
+  - `nemo_toolkit[asr]`, `torch==2.x` (cu121 build for Pop!\_OS 24.04), `sounddevice`, `numpy`, `fastapi` + `uvicorn`, `pydantic` for configs, `loguru` (optional).
   - Keep versions pinned in `pyproject.toml` and lock via `uv`.
 
 - **Audio capture**
@@ -105,7 +105,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Crates**
   - `tokio`, `tokio-tungstenite`, `serde`/`serde_json`, `evdev`, `anyhow`, `uuid`.
-  - `evdev`/`uinput` stack plus subprocess backends (`ydotool`, `wtype`) for paste chord emission.
+  - `evdev`/`uinput` stack plus `ydotool` subprocess fallback for paste chord emission.
 
 - **Hotkey handling**
   - Identify Right Ctrl (`KEY_RIGHTCTRL`, code 97). Use non-blocking event loop to avoid missed releases.
@@ -114,10 +114,10 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Injection pipeline**
   - Default runtime path is clipboard choreography (`wl-copy` + readiness probe) and paste chord emission.
-  - Paste backend ladder (helper default): `auto` => `uinput -> ydotool -> wtype`.
+  - Paste backend ladder (helper default): `auto` => `uinput -> ydotool`.
   - Adaptive routing chooses shortcut by focused-surface class (`terminal`, `general`, `unknown`).
-  - Focus metadata source is configurable (`atspi|wayland|hybrid`); default remains `atspi` until matrix validation promotes hybrid.
-  - Low-confidence AT-SPI snapshots (`focus_focused=false`) are treated as `unknown` for routing.
+  - Focus metadata source is Wayland toplevel cache observations (with low-confidence handling on transition/staleness paths).
+  - Low-confidence focus snapshots (`focus_focused=false`) are treated as `unknown` for routing.
   - Backend failure policy defaults to `copy-only` so transcript delivery is preserved via clipboard.
 
 - **Resilience**
@@ -239,8 +239,8 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
    - Return transcription as log (no injection yet).
 
 3. **M2 – Text Injection**
-   - Integrate `wtype` fallback; type transcriptions into focused window.
-   - Add configurables (delay, trimming).
+   - Harden clipboard + adaptive routing path across target app classes.
+   - Keep `uinput -> ydotool` fallback behavior observable and deterministic.
 
 4. **M3 – Hardening**
    - Error handling, reconnection logic, systemd units, metrics endpoint.

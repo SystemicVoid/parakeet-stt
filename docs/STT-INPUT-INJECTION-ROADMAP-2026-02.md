@@ -3,6 +3,17 @@
 Date: 2026-02-08  
 Repository: `parakeet-stt`
 
+## Status Note (2026-02-21)
+
+This roadmap is retained as historical planning context from early February 2026.
+Current runtime behavior has moved on:
+
+- Legacy `wtype`/`type` injection routes have been removed.
+- Active backend ladder is `uinput -> ydotool` with `copy-only` safety fallback.
+- Canonical current-state docs are `README.md`, `docs/SPEC.md`, and `docs/stt-troubleshooting.md`.
+
+Any `wtype` references below should be read as historical, not current runtime policy.
+
 ## 1. Purpose
 
 This document synthesizes all current AI-generated research with the actual codebase state and runtime evidence, then defines a decision-complete roadmap for the next implementation cycle.
