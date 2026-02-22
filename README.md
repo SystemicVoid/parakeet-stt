@@ -14,8 +14,10 @@ Since `21d8f74` and follow-up commits, the injection path is now reliability-fir
 - Default routing mode is adaptive, selecting shortcut by focused surface class.
 - Default backend is `auto` with runtime ladder `uinput → ydotool`.
 - Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.
+- Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
 - Clipboard readiness barrier and post-chord ownership timing controls are implemented.
 - `stt diag-injector` reports capability prechecks and runs reproducible injection tests.
+- Event-loop lag summaries are derived from Tokio tick scheduling (not a drifting baseline), so percentile windows recover after transient stalls.
 
 This keeps the system usable now while uinput behavior is hardened across app surfaces.
 
@@ -112,6 +114,13 @@ cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
+
+Local hardware-optimized release build (Zen 5):
+```bash
+cd parakeet-ptt
+RUSTFLAGS="-C target-cpu=znver5" cargo build --release
+```
+`target-cpu=znver5` already enables the relevant AVX-512 feature set on this host; no manual `target-feature=+avx512...` list is required.
 
 Daemon checks:
 ```bash
