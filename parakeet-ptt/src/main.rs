@@ -285,16 +285,14 @@ fn spawn_event_loop_lag_monitor() {
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let mut expected = TokioInstant::now() + tick;
         let mut last_log = TokioInstant::now();
         let mut lag_samples_ms = Vec::<u64>::with_capacity(4096);
 
         loop {
-            interval.tick().await;
+            let scheduled = interval.tick().await;
             let now = TokioInstant::now();
-            let lag_ms = now.saturating_duration_since(expected).as_millis() as u64;
+            let lag_ms = now.saturating_duration_since(scheduled).as_millis() as u64;
             lag_samples_ms.push(lag_ms);
-            expected += tick;
 
             if last_log.elapsed() >= TokioDuration::from_secs(EVENT_LOOP_LAG_LOG_INTERVAL_SECS) {
                 lag_samples_ms.sort_unstable();
