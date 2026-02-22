@@ -37,7 +37,14 @@ Acceptance:
 - Failures are attributable to a specific stage (`clipboard_ready`, `route_shortcut`, `backend`).
 - Regression matrix remains stable across terminal + browser + editor targets.
 
-REVIEW UNCOMMITTED CHANGES
+Session closeout notes (2026-02-22):
+- Cross-surface validation passed in active use (Ghostty, Brave navigation bar, COSMIC Text Editor).
+- Recent runtime telemetry remained healthy during repeated dictation cycles:
+  - `backend_failure_total=0`
+  - `queue_wait_ms=0`
+  - event-loop lag windows `p99=2ms` vs target `20ms`
+- Known minor issue: startup device scan can emit `failed to open "/dev/input/eventX": Permission denied` while still finding enough readable devices and starting hotkey listeners.
+  - Follow-up candidate (low priority): suppress/downgrade per-device permission-denied noise unless no eligible hotkey devices are discovered.
 
 ## Phase 1: Immediate Feedback Layer (Sound + Notification)
 
