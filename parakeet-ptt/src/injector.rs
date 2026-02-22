@@ -568,7 +568,21 @@ impl ClipboardInjector {
                     .arg("key")
                     .args(Self::ydotool_shortcut_args(shortcut))
                     .status()
-                    .context("stage=backend failed to spawn ydotool for paste chord")?;
+                    .context("stage=backend failed to spawn ydotool for paste chord");
+                let status = match status {
+                    Ok(status) => status,
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        Self::stage_failure(
+                            trace_id,
+                            InjectionStage::Backend,
+                            stage_started,
+                            &message,
+                            "backend shortcut emission failed",
+                        );
+                        return Err(err);
+                    }
+                };
 
                 debug!(
                     trace_id,
@@ -1321,7 +1335,7 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
+    use super::{injector_metrics_snapshot, ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
@@ -1453,6 +1467,43 @@ mod tests {
             .expect_err("disabled backend should fail");
         let message = format!("{err:#}");
         assert!(message.contains("stage=backend"));
+    }
+
+    #[test]
+    fn ydotool_spawn_failures_are_counted_as_backend_stage_failures() {
+        let missing_binary = std::env::temp_dir().join(format!(
+            "parakeet-ptt-missing-ydotool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Ydotool(missing_binary),
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+        let attempts = 12;
+        let baseline = injector_metrics_snapshot().backend_failure_total;
+
+        for trace_id in 1..=attempts {
+            let err = injector
+                .run_shortcut(trace_id, PasteShortcut::CtrlV)
+                .expect_err("missing ydotool binary should fail to spawn");
+            let message = format!("{err:#}");
+            assert!(message.contains("failed to spawn ydotool"));
+            assert!(message.contains("stage=backend"));
+        }
+
+        let observed_delta = injector_metrics_snapshot()
+            .backend_failure_total
+            .saturating_sub(baseline);
+        assert!(
+            observed_delta >= attempts,
+            "expected at least {attempts} backend failures recorded, observed {observed_delta}",
+        );
     }
 
     #[test]
