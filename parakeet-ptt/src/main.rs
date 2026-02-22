@@ -9,6 +9,7 @@ mod state;
 mod surface_focus;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,17 +18,303 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration as TokioDuration};
+use tokio::time::{
+    sleep, timeout, Duration as TokioDuration, Instant as TokioInstant, MissedTickBehavior,
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::config::{ClientConfig, ClipboardOptions, InjectionConfig, DEFAULT_ENDPOINT};
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
-use crate::injector::TextInjector;
+use crate::injector::{injector_metrics_snapshot, TextInjector};
 use crate::protocol::{start_message, stop_message, ServerMessage};
 use crate::state::PttState;
+
+const INJECTION_QUEUE_CAPACITY: usize = 32;
+const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
+const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
+const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
+
+#[derive(Debug, Clone)]
+struct InjectionJob {
+    session_id: Uuid,
+    text: String,
+    daemon_latency_ms: u64,
+    daemon_audio_ms: u64,
+    enqueued_at: TokioInstant,
+}
+
+impl InjectionJob {
+    fn new(session_id: Uuid, text: String, daemon_latency_ms: u64, daemon_audio_ms: u64) -> Self {
+        Self {
+            session_id,
+            text,
+            daemon_latency_ms,
+            daemon_audio_ms,
+            enqueued_at: TokioInstant::now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InjectionReport {
+    session_id: Uuid,
+    daemon_latency_ms: u64,
+    daemon_audio_ms: u64,
+    queue_wait_ms: u64,
+    run_ms: u64,
+    total_worker_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InjectorQueueMetrics {
+    queued_total: AtomicU64,
+    enqueue_blocked_total: AtomicU64,
+    enqueue_timeout_total: AtomicU64,
+    enqueue_worker_gone_total: AtomicU64,
+    worker_success_total: AtomicU64,
+    worker_failure_total: AtomicU64,
+    worker_queue_wait_ms_total: AtomicU64,
+    worker_run_ms_total: AtomicU64,
+    queue_depth_high_water: AtomicU64,
+}
+
+impl InjectorQueueMetrics {
+    fn note_queued(&self, queue_depth: usize) {
+        self.queued_total.fetch_add(1, Ordering::Relaxed);
+        let depth = queue_depth as u64;
+        let mut current = self.queue_depth_high_water.load(Ordering::Relaxed);
+        while depth > current {
+            match self.queue_depth_high_water.compare_exchange_weak(
+                current,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn note_blocked(&self) {
+        self.enqueue_blocked_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_timeout(&self) {
+        self.enqueue_timeout_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_worker_gone(&self) {
+        self.enqueue_worker_gone_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_report(&self, report: &InjectionReport) {
+        self.worker_queue_wait_ms_total
+            .fetch_add(report.queue_wait_ms, Ordering::Relaxed);
+        self.worker_run_ms_total
+            .fetch_add(report.run_ms, Ordering::Relaxed);
+        if report.error.is_some() {
+            self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.worker_success_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn log_summary(&self) {
+        info!(
+            queue_queued_total = self.queued_total.load(Ordering::Relaxed),
+            queue_enqueue_blocked_total = self.enqueue_blocked_total.load(Ordering::Relaxed),
+            queue_enqueue_timeout_total = self.enqueue_timeout_total.load(Ordering::Relaxed),
+            queue_enqueue_worker_gone_total =
+                self.enqueue_worker_gone_total.load(Ordering::Relaxed),
+            worker_success_total = self.worker_success_total.load(Ordering::Relaxed),
+            worker_failure_total = self.worker_failure_total.load(Ordering::Relaxed),
+            worker_queue_wait_ms_total = self.worker_queue_wait_ms_total.load(Ordering::Relaxed),
+            worker_run_ms_total = self.worker_run_ms_total.load(Ordering::Relaxed),
+            queue_depth_high_water = self.queue_depth_high_water.load(Ordering::Relaxed),
+            "injector worker queue metrics summary"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueFailure {
+    Timeout,
+    WorkerGone,
+}
+
+#[derive(Clone)]
+struct InjectorWorkerHandle {
+    sender: mpsc::Sender<InjectionJob>,
+    metrics: Arc<InjectorQueueMetrics>,
+}
+
+impl InjectorWorkerHandle {
+    async fn enqueue(&self, job: InjectionJob) -> std::result::Result<(), EnqueueFailure> {
+        let current_depth = self.sender.max_capacity() - self.sender.capacity();
+        let job = match self.sender.try_send(job) {
+            Ok(()) => {
+                self.metrics.note_queued(current_depth + 1);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.note_worker_gone();
+                return Err(EnqueueFailure::WorkerGone);
+            }
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                self.metrics.note_blocked();
+                job
+            }
+        };
+
+        match timeout(
+            TokioDuration::from_millis(INJECTION_ENQUEUE_TIMEOUT_MS),
+            self.sender.send(job),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                let new_depth = self.sender.max_capacity() - self.sender.capacity();
+                self.metrics.note_queued(new_depth);
+                Ok(())
+            }
+            Ok(Err(_)) => {
+                self.metrics.note_worker_gone();
+                Err(EnqueueFailure::WorkerGone)
+            }
+            Err(_) => {
+                self.metrics.note_timeout();
+                Err(EnqueueFailure::Timeout)
+            }
+        }
+    }
+
+    fn metrics(&self) -> &Arc<InjectorQueueMetrics> {
+        &self.metrics
+    }
+}
+
+fn spawn_injector_worker_with_capacity(
+    injector: Arc<dyn TextInjector>,
+    capacity: usize,
+) -> (
+    InjectorWorkerHandle,
+    mpsc::UnboundedReceiver<InjectionReport>,
+) {
+    let (job_tx, mut job_rx) = mpsc::channel::<InjectionJob>(capacity.max(1));
+    let (report_tx, report_rx) = mpsc::unbounded_channel::<InjectionReport>();
+    let metrics = Arc::new(InjectorQueueMetrics::default());
+    let worker_injector = Arc::clone(&injector);
+
+    tokio::spawn(async move {
+        while let Some(job) = job_rx.recv().await {
+            let InjectionJob {
+                session_id,
+                text,
+                daemon_latency_ms,
+                daemon_audio_ms,
+                enqueued_at,
+            } = job;
+
+            let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+            let worker_started = TokioInstant::now();
+            let injector_for_job = Arc::clone(&worker_injector);
+            let result = tokio::task::spawn_blocking(move || injector_for_job.inject(&text)).await;
+            let run_ms = worker_started.elapsed().as_millis() as u64;
+            let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
+
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("{err:#}")),
+                Err(err) => Some(format!("injector worker task failed: {err}")),
+            };
+            let report = InjectionReport {
+                session_id,
+                daemon_latency_ms,
+                daemon_audio_ms,
+                queue_wait_ms,
+                run_ms,
+                total_worker_ms,
+                error,
+            };
+
+            if report_tx.send(report).is_err() {
+                break;
+            }
+        }
+    });
+
+    (
+        InjectorWorkerHandle {
+            sender: job_tx,
+            metrics,
+        },
+        report_rx,
+    )
+}
+
+fn spawn_injector_worker(
+    injector: Arc<dyn TextInjector>,
+) -> (
+    InjectorWorkerHandle,
+    mpsc::UnboundedReceiver<InjectionReport>,
+) {
+    spawn_injector_worker_with_capacity(injector, INJECTION_QUEUE_CAPACITY)
+}
+
+fn percentile_value(sorted_samples: &[u64], percentile: u64) -> u64 {
+    if sorted_samples.is_empty() {
+        return 0;
+    }
+
+    let pct = percentile.min(100) as usize;
+    let len = sorted_samples.len();
+    let idx = ((len - 1) * pct) / 100;
+    sorted_samples[idx]
+}
+
+fn spawn_event_loop_lag_monitor() {
+    tokio::spawn(async move {
+        let tick = TokioDuration::from_millis(EVENT_LOOP_LAG_TICK_MS.max(1));
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut expected = TokioInstant::now() + tick;
+        let mut last_log = TokioInstant::now();
+        let mut lag_samples_ms = Vec::<u64>::with_capacity(4096);
+
+        loop {
+            interval.tick().await;
+            let now = TokioInstant::now();
+            let lag_ms = now.saturating_duration_since(expected).as_millis() as u64;
+            lag_samples_ms.push(lag_ms);
+            expected += tick;
+
+            if last_log.elapsed() >= TokioDuration::from_secs(EVENT_LOOP_LAG_LOG_INTERVAL_SECS) {
+                lag_samples_ms.sort_unstable();
+                let p50 = percentile_value(&lag_samples_ms, 50);
+                let p95 = percentile_value(&lag_samples_ms, 95);
+                let p99 = percentile_value(&lag_samples_ms, 99);
+                info!(
+                    sample_count = lag_samples_ms.len(),
+                    lag_p50_ms = p50,
+                    lag_p95_ms = p95,
+                    lag_p99_ms = p99,
+                    target_p99_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                    "event loop lag window summary"
+                );
+                lag_samples_ms.clear();
+                last_log = TokioInstant::now();
+            }
+        }
+    });
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -318,13 +605,6 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
     ))
 }
 
-async fn inject_text_async(injector: Arc<dyn TextInjector>, text: String) -> Result<()> {
-    tokio::task::spawn_blocking(move || injector.inject(&text))
-        .await
-        .context("injector worker task failed")?
-        .context("failed to inject text into focused surface")
-}
-
 async fn run_demo(
     config: ClientConfig,
     override_text: Option<String>,
@@ -333,6 +613,7 @@ async fn run_demo(
     info!(endpoint = %config.endpoint, "Connecting to parakeet-stt-daemon");
     let mut client = WsClient::connect(&config).await?;
     let injector = build_injector(&config);
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
 
     let mut state = PttState::new();
     let Some(session_id) = state.begin_listening() else {
@@ -368,7 +649,21 @@ async fn run_demo(
                     "final result received"
                 );
                 audio_feedback.play_completion();
-                inject_text_async(Arc::clone(&injector), to_inject).await?;
+                injector_worker
+                    .enqueue(InjectionJob::new(
+                        session_id, to_inject, latency_ms, audio_ms,
+                    ))
+                    .await
+                    .map_err(|failure| {
+                        anyhow!("failed to enqueue demo injection job: {:?}", failure)
+                    })?;
+                let report = timeout(TokioDuration::from_secs(5), injection_reports.recv())
+                    .await
+                    .context("timed out waiting for demo injection report")?
+                    .ok_or_else(|| anyhow!("demo injection worker dropped before reporting"))?;
+                if let Some(error) = report.error {
+                    return Err(anyhow!("demo injection failed: {error}"));
+                }
                 state.reset();
                 break;
             }
@@ -398,6 +693,8 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
     );
     ensure_input_access()?;
     let injector = build_injector(&config);
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    spawn_event_loop_lag_monitor();
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
@@ -444,7 +741,7 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
                                         match msg {
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
                                                 match serde_json::from_str::<ServerMessage>(&txt) {
-                                                    Ok(message) => handle_server_message(message, &mut state, Arc::clone(&injector), &audio_feedback).await?,
+                                                    Ok(message) => handle_server_message(message, &mut state, &injector_worker, &audio_feedback).await?,
                                                     Err(err) => warn!("failed to decode server message: {}", err),
                                                 }
                                             }
@@ -467,6 +764,9 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
                                         break;
                                     }
                                 }
+                            }
+                            Some(report) = injection_reports.recv() => {
+                                handle_injection_report(&injector_worker, report);
                             }
                         }
                     }
@@ -504,10 +804,66 @@ async fn send_message(
         .context("failed to send message")
 }
 
+fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionReport) {
+    worker.metrics().note_report(&report);
+    match report.error {
+        Some(error) => {
+            warn!(
+                session = %report.session_id,
+                daemon_latency_ms = report.daemon_latency_ms,
+                daemon_audio_ms = report.daemon_audio_ms,
+                queue_wait_ms = report.queue_wait_ms,
+                run_ms = report.run_ms,
+                total_worker_ms = report.total_worker_ms,
+                error = %error,
+                "injector worker reported failure"
+            );
+        }
+        None => {
+            info!(
+                session = %report.session_id,
+                daemon_latency_ms = report.daemon_latency_ms,
+                daemon_audio_ms = report.daemon_audio_ms,
+                queue_wait_ms = report.queue_wait_ms,
+                run_ms = report.run_ms,
+                total_worker_ms = report.total_worker_ms,
+                "injector worker completed job"
+            );
+        }
+    }
+
+    let processed = worker
+        .metrics()
+        .worker_success_total
+        .load(Ordering::Relaxed)
+        + worker
+            .metrics()
+            .worker_failure_total
+            .load(Ordering::Relaxed);
+    if processed.is_multiple_of(25) && processed > 0 {
+        worker.metrics().log_summary();
+        let snapshot = injector_metrics_snapshot();
+        info!(
+            clipboard_ready_success_total = snapshot.clipboard_ready_success_total,
+            clipboard_ready_failure_total = snapshot.clipboard_ready_failure_total,
+            clipboard_ready_duration_ms_total = snapshot.clipboard_ready_duration_ms_total,
+            route_shortcut_success_total = snapshot.route_shortcut_success_total,
+            route_shortcut_failure_total = snapshot.route_shortcut_failure_total,
+            route_shortcut_duration_ms_total = snapshot.route_shortcut_duration_ms_total,
+            backend_success_total = snapshot.backend_success_total,
+            backend_failure_total = snapshot.backend_failure_total,
+            backend_duration_ms_total = snapshot.backend_duration_ms_total,
+            wl_copy_spawn_total = snapshot.wl_copy_spawn_total,
+            wl_paste_spawn_total = snapshot.wl_paste_spawn_total,
+            "injector stage metrics summary"
+        );
+    }
+}
+
 async fn handle_server_message(
     message: ServerMessage,
     state: &mut PttState,
-    injector: Arc<dyn TextInjector>,
+    injector_worker: &InjectorWorkerHandle,
     audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
@@ -528,7 +884,28 @@ async fn handle_server_message(
                 "final result received"
             );
             audio_feedback.play_completion();
-            inject_text_async(injector, text).await?;
+            match injector_worker
+                .enqueue(InjectionJob::new(session_id, text, latency_ms, audio_ms))
+                .await
+            {
+                Ok(()) => {
+                    debug!(session = %session_id, "final result queued for injector worker");
+                }
+                Err(EnqueueFailure::Timeout) => {
+                    warn!(
+                        session = %session_id,
+                        queue_capacity = INJECTION_QUEUE_CAPACITY,
+                        enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                        "injector queue remained full; dropping final result injection job"
+                    );
+                }
+                Err(EnqueueFailure::WorkerGone) => {
+                    warn!(
+                        session = %session_id,
+                        "injector worker unavailable; dropping final result injection job"
+                    );
+                }
+            }
             state.reset();
         }
         ServerMessage::Error {
@@ -591,16 +968,57 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use std::time::Instant;
 
+    use anyhow::Result;
     use clap::Parser;
+    use tokio::task::yield_now;
+    use tokio::time::timeout;
+    use uuid::Uuid;
 
+    use crate::audio_feedback::AudioFeedback;
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
         PasteKeyBackend,
     };
+    use crate::injector::TextInjector;
+    use crate::protocol::ServerMessage;
+    use crate::state::PttState;
 
-    use super::build_injector;
+    use super::{
+        build_injector, handle_server_message, spawn_injector_worker_with_capacity, EnqueueFailure,
+        InjectionJob,
+    };
+
+    struct SlowInjector {
+        calls: Arc<AtomicU64>,
+        sleep_ms: u64,
+    }
+
+    impl TextInjector for SlowInjector {
+        fn inject(&self, _text: &str) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+            Ok(())
+        }
+    }
+
+    struct RecordingInjector {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TextInjector for RecordingInjector {
+        fn inject(&self, text: &str) -> Result<()> {
+            self.seen
+                .lock()
+                .expect("recording lock should be available")
+                .push(text.to_string());
+            Ok(())
+        }
+    }
 
     #[test]
     fn backend_failure_policy_error_returns_injector_error() {
@@ -640,5 +1058,119 @@ mod tests {
             cli.paste_key_backend,
             super::CliPasteKeyBackend::Auto
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let slow_injector = Arc::new(SlowInjector {
+            calls: Arc::clone(&calls),
+            sleep_ms: 120,
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(slow_injector, 8);
+
+        let mut state = PttState::new();
+        let session_id = state.begin_listening().expect("state should start");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+        let message = ServerMessage::FinalResult {
+            session_id,
+            text: "hello from daemon".to_string(),
+            latency_ms: 60,
+            audio_ms: 1900,
+            lang: Some("en".to_string()),
+            confidence: Some(0.99),
+        };
+
+        let started = Instant::now();
+        handle_server_message(message, &mut state, &worker, &feedback)
+            .await
+            .expect("server message should enqueue successfully");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "handle_server_message should not wait for blocking injection, elapsed={elapsed:?}"
+        );
+        assert!(matches!(state, PttState::Idle));
+
+        let report = timeout(Duration::from_secs(2), reports.recv())
+            .await
+            .expect("worker should report")
+            .expect("report stream should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injector_worker_preserves_fifo_order() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+
+        worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "one".to_string(), 10, 20))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "two".to_string(), 11, 21))
+            .await
+            .expect("second enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "three".to_string(),
+                12,
+                22,
+            ))
+            .await
+            .expect("third enqueue should pass");
+
+        for _ in 0..3 {
+            let report = timeout(Duration::from_secs(1), reports.recv())
+                .await
+                .expect("each report should arrive")
+                .expect("worker should keep report channel open");
+            assert!(report.error.is_none());
+        }
+
+        let ordered = seen
+            .lock()
+            .expect("recording lock should be available")
+            .clone();
+        assert_eq!(ordered, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enqueue_times_out_when_queue_remains_saturated() {
+        let slow = Arc::new(SlowInjector {
+            calls: Arc::new(AtomicU64::new(0)),
+            sleep_ms: 200,
+        });
+        let (worker, _reports) = spawn_injector_worker_with_capacity(slow, 1);
+
+        worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "first".to_string(), 1, 1))
+            .await
+            .expect("first enqueue should pass");
+
+        yield_now().await;
+
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "second".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should fill queue");
+
+        let third = worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "third".to_string(), 3, 3))
+            .await;
+        assert_eq!(third, Err(EnqueueFailure::Timeout));
     }
 }

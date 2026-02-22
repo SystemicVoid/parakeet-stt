@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,6 +18,136 @@ static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// MIME type used for all wl-copy clipboard writes.
 const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
+const STAGE_CLIPBOARD_READY: &str = "clipboard_ready";
+const STAGE_ROUTE_SHORTCUT: &str = "route_shortcut";
+const STAGE_BACKEND: &str = "backend";
+
+#[derive(Debug, Clone, Copy)]
+enum InjectionStage {
+    ClipboardReady,
+    RouteShortcut,
+    Backend,
+}
+
+impl InjectionStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClipboardReady => STAGE_CLIPBOARD_READY,
+            Self::RouteShortcut => STAGE_ROUTE_SHORTCUT,
+            Self::Backend => STAGE_BACKEND,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct InjectorMetrics {
+    clipboard_ready_success_total: AtomicU64,
+    clipboard_ready_failure_total: AtomicU64,
+    clipboard_ready_duration_ms_total: AtomicU64,
+    route_shortcut_success_total: AtomicU64,
+    route_shortcut_failure_total: AtomicU64,
+    route_shortcut_duration_ms_total: AtomicU64,
+    backend_success_total: AtomicU64,
+    backend_failure_total: AtomicU64,
+    backend_duration_ms_total: AtomicU64,
+    wl_copy_spawn_total: AtomicU64,
+    wl_paste_spawn_total: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InjectorMetricsSnapshot {
+    pub clipboard_ready_success_total: u64,
+    pub clipboard_ready_failure_total: u64,
+    pub clipboard_ready_duration_ms_total: u64,
+    pub route_shortcut_success_total: u64,
+    pub route_shortcut_failure_total: u64,
+    pub route_shortcut_duration_ms_total: u64,
+    pub backend_success_total: u64,
+    pub backend_failure_total: u64,
+    pub backend_duration_ms_total: u64,
+    pub wl_copy_spawn_total: u64,
+    pub wl_paste_spawn_total: u64,
+}
+
+impl InjectorMetrics {
+    fn note_stage_success(&self, stage: InjectionStage, duration_ms: u64) {
+        match stage {
+            InjectionStage::ClipboardReady => {
+                self.clipboard_ready_success_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.clipboard_ready_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+            InjectionStage::RouteShortcut => {
+                self.route_shortcut_success_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.route_shortcut_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+            InjectionStage::Backend => {
+                self.backend_success_total.fetch_add(1, Ordering::Relaxed);
+                self.backend_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn note_stage_failure(&self, stage: InjectionStage, duration_ms: u64) {
+        match stage {
+            InjectionStage::ClipboardReady => {
+                self.clipboard_ready_failure_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.clipboard_ready_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+            InjectionStage::RouteShortcut => {
+                self.route_shortcut_failure_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.route_shortcut_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+            InjectionStage::Backend => {
+                self.backend_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.backend_duration_ms_total
+                    .fetch_add(duration_ms, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> InjectorMetricsSnapshot {
+        InjectorMetricsSnapshot {
+            clipboard_ready_success_total: self
+                .clipboard_ready_success_total
+                .load(Ordering::Relaxed),
+            clipboard_ready_failure_total: self
+                .clipboard_ready_failure_total
+                .load(Ordering::Relaxed),
+            clipboard_ready_duration_ms_total: self
+                .clipboard_ready_duration_ms_total
+                .load(Ordering::Relaxed),
+            route_shortcut_success_total: self.route_shortcut_success_total.load(Ordering::Relaxed),
+            route_shortcut_failure_total: self.route_shortcut_failure_total.load(Ordering::Relaxed),
+            route_shortcut_duration_ms_total: self
+                .route_shortcut_duration_ms_total
+                .load(Ordering::Relaxed),
+            backend_success_total: self.backend_success_total.load(Ordering::Relaxed),
+            backend_failure_total: self.backend_failure_total.load(Ordering::Relaxed),
+            backend_duration_ms_total: self.backend_duration_ms_total.load(Ordering::Relaxed),
+            wl_copy_spawn_total: self.wl_copy_spawn_total.load(Ordering::Relaxed),
+            wl_paste_spawn_total: self.wl_paste_spawn_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static INJECTOR_METRICS: OnceLock<InjectorMetrics> = OnceLock::new();
+
+fn injector_metrics() -> &'static InjectorMetrics {
+    INJECTOR_METRICS.get_or_init(InjectorMetrics::default)
+}
+
+pub fn injector_metrics_snapshot() -> InjectorMetricsSnapshot {
+    injector_metrics().snapshot()
+}
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
@@ -150,6 +280,15 @@ struct FocusResolutionOutcome {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ShortcutAttemptContext {
+    route_attempt_name: &'static str,
+    route_attempt_index: usize,
+    route_attempt_total: usize,
+    backend_attempt_index: usize,
+    backend_attempt_total: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum InjectionOutcome {
     SuccessAssumed,
     ClipboardNotReady,
@@ -172,7 +311,7 @@ impl InjectionOutcome {
 
 impl ClipboardInjector {
     const CLIPBOARD_READY_TIMEOUT_MS: u64 = 250;
-    const CLIPBOARD_READY_POLL_MS: u64 = 10;
+    const CLIPBOARD_READY_SCHEDULE_MS: [u64; 8] = [5, 10, 15, 20, 30, 40, 50, 70];
     const WAYLAND_STALE_MS: u64 = 30_000;
     const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
 
@@ -186,6 +325,9 @@ impl ClipboardInjector {
     }
 
     fn get_clipboard(options: &ClipboardOptions, primary: bool) -> Result<String> {
+        injector_metrics()
+            .wl_paste_spawn_total
+            .fetch_add(1, Ordering::Relaxed);
         let mut command = Command::new("wl-paste");
         command.arg("--no-newline"); // Don't add newline if not present.
         if let Some(seat) = options.seat.as_ref() {
@@ -211,6 +353,9 @@ impl ClipboardInjector {
         foreground: bool,
         primary: bool,
     ) -> Result<Option<Child>> {
+        injector_metrics()
+            .wl_copy_spawn_total
+            .fetch_add(1, Ordering::Relaxed);
         debug!(
             len = text.len(),
             foreground,
@@ -291,19 +436,20 @@ impl ClipboardInjector {
         options: &ClipboardOptions,
         expected: &str,
         timeout: Duration,
-        poll: Duration,
         trace_id: u64,
-    ) -> (bool, Option<String>) {
+    ) -> (bool, Option<String>, u64) {
         let started = Instant::now();
         let mut last_observed = None;
+        let mut probe_count = 0_u64;
 
         loop {
+            probe_count += 1;
             match Self::get_clipboard(options, false) {
                 Ok(value) => {
                     let matches = value == expected;
                     last_observed = Some(value);
                     if matches {
-                        return (true, last_observed);
+                        return (true, last_observed, probe_count);
                     }
                 }
                 Err(err) => {
@@ -317,11 +463,20 @@ impl ClipboardInjector {
             }
 
             if started.elapsed() >= timeout {
-                return (false, last_observed);
+                return (false, last_observed, probe_count);
             }
 
-            std::thread::sleep(poll);
+            let sleep_ms = Self::next_clipboard_ready_sleep_ms(probe_count);
+            std::thread::sleep(Duration::from_millis(sleep_ms));
         }
+    }
+
+    fn next_clipboard_ready_sleep_ms(probe_count: u64) -> u64 {
+        let idx = probe_count.saturating_sub(1) as usize;
+        Self::CLIPBOARD_READY_SCHEDULE_MS
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| *Self::CLIPBOARD_READY_SCHEDULE_MS.last().unwrap_or(&70))
     }
 
     fn ydotool_shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
@@ -340,15 +495,69 @@ impl ClipboardInjector {
         }
     }
 
+    fn stage_start(trace_id: u64, stage: InjectionStage, detail: &str) -> Instant {
+        debug!(
+            trace_id,
+            stage = stage.as_str(),
+            status = "start",
+            "{detail}"
+        );
+        Instant::now()
+    }
+
+    fn stage_success(trace_id: u64, stage: InjectionStage, started: Instant, detail: &str) {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        injector_metrics().note_stage_success(stage, duration_ms);
+        debug!(
+            trace_id,
+            stage = stage.as_str(),
+            status = "ok",
+            duration_ms,
+            "{detail}"
+        );
+    }
+
+    fn stage_failure(
+        trace_id: u64,
+        stage: InjectionStage,
+        started: Instant,
+        error: &str,
+        detail: &str,
+    ) {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        injector_metrics().note_stage_failure(stage, duration_ms);
+        warn!(
+            trace_id,
+            stage = stage.as_str(),
+            status = "fail",
+            duration_ms,
+            error,
+            "{detail}"
+        );
+    }
+
     fn run_shortcut_with_sender(
         trace_id: u64,
         shortcut: PasteShortcut,
         sender: &PasteKeySender,
+        attempt: ShortcutAttemptContext,
     ) -> Result<()> {
+        let backend_name = Self::sender_name(sender);
+        let stage_started = Self::stage_start(
+            trace_id,
+            InjectionStage::Backend,
+            "starting backend shortcut emission",
+        );
         match sender {
             PasteKeySender::Ydotool(binary) => {
                 debug!(
                     trace_id,
+                    stage = STAGE_BACKEND,
+                    route_attempt_name = attempt.route_attempt_name,
+                    route_attempt_index = attempt.route_attempt_index,
+                    route_attempt_total = attempt.route_attempt_total,
+                    backend_attempt_index = attempt.backend_attempt_index,
+                    backend_attempt_total = attempt.backend_attempt_total,
                     shortcut = ?shortcut,
                     backend = "ydotool",
                     binary = %binary.display(),
@@ -359,82 +568,203 @@ impl ClipboardInjector {
                     .arg("key")
                     .args(Self::ydotool_shortcut_args(shortcut))
                     .status()
-                    .context("failed to spawn ydotool for paste chord")?;
+                    .context("stage=backend failed to spawn ydotool for paste chord")?;
 
                 debug!(
                     trace_id,
+                    stage = STAGE_BACKEND,
+                    route_attempt_name = attempt.route_attempt_name,
+                    route_attempt_index = attempt.route_attempt_index,
+                    route_attempt_total = attempt.route_attempt_total,
+                    backend_attempt_index = attempt.backend_attempt_index,
+                    backend_attempt_total = attempt.backend_attempt_total,
                     ?status,
                     backend = "ydotool",
                     "paste chord command finished"
                 );
                 if !status.success() {
-                    anyhow::bail!(
-                        "paste key chord {:?} via ydotool exited with status {}",
-                        shortcut,
-                        status
+                    let message = format!(
+                        "stage=backend paste key chord {:?} via ydotool exited with status {}",
+                        shortcut, status
                     );
+                    Self::stage_failure(
+                        trace_id,
+                        InjectionStage::Backend,
+                        stage_started,
+                        &message,
+                        "backend shortcut emission failed",
+                    );
+                    anyhow::bail!("{message}");
                 }
-                Ok(())
+                Self::stage_success(
+                    trace_id,
+                    InjectionStage::Backend,
+                    stage_started,
+                    "backend shortcut emission succeeded",
+                );
+                Result::<()>::Ok(())
             }
             PasteKeySender::Uinput(sender) => {
                 debug!(
                     trace_id,
+                    stage = STAGE_BACKEND,
+                    route_attempt_name = attempt.route_attempt_name,
+                    route_attempt_index = attempt.route_attempt_index,
+                    route_attempt_total = attempt.route_attempt_total,
+                    backend_attempt_index = attempt.backend_attempt_index,
+                    backend_attempt_total = attempt.backend_attempt_total,
                     shortcut = ?shortcut,
                     backend = "uinput",
                     dwell_ms = sender.dwell_ms(),
                     "sending paste chord"
                 );
-                sender.send_shortcut(shortcut).with_context(|| {
-                    format!("failed to emit paste key chord {:?} via uinput", shortcut)
-                })?;
-                debug!(trace_id, backend = "uinput", "paste chord command finished");
-                Ok(())
+                if let Err(err) = sender.send_shortcut(shortcut).with_context(|| {
+                    format!(
+                        "stage=backend failed to emit paste key chord {:?} via uinput",
+                        shortcut
+                    )
+                }) {
+                    let message = format!("{err:#}");
+                    Self::stage_failure(
+                        trace_id,
+                        InjectionStage::Backend,
+                        stage_started,
+                        &message,
+                        "backend shortcut emission failed",
+                    );
+                    return Err(err);
+                }
+                debug!(
+                    trace_id,
+                    stage = STAGE_BACKEND,
+                    backend = "uinput",
+                    "paste chord command finished"
+                );
+                Self::stage_success(
+                    trace_id,
+                    InjectionStage::Backend,
+                    stage_started,
+                    "backend shortcut emission succeeded",
+                );
+                Result::<()>::Ok(())
             }
-            PasteKeySender::Chain(_) => anyhow::bail!("nested sender chain is not supported"),
-            PasteKeySender::Disabled => anyhow::bail!("paste key sender is disabled"),
+            PasteKeySender::Chain(_) => {
+                let message = "stage=backend nested sender chain is not supported".to_string();
+                Self::stage_failure(
+                    trace_id,
+                    InjectionStage::Backend,
+                    stage_started,
+                    &message,
+                    "backend shortcut emission failed",
+                );
+                anyhow::bail!("{message}")
+            }
+            PasteKeySender::Disabled => {
+                let message = "stage=backend paste key sender is disabled".to_string();
+                Self::stage_failure(
+                    trace_id,
+                    InjectionStage::Backend,
+                    stage_started,
+                    &message,
+                    "backend shortcut emission failed",
+                );
+                anyhow::bail!("{message}")
+            }
         }
+        .with_context(|| {
+            format!(
+                "stage=backend backend={} route_attempt={}[{}/{}] backend_attempt={}/{}",
+                backend_name,
+                attempt.route_attempt_name,
+                attempt.route_attempt_index,
+                attempt.route_attempt_total,
+                attempt.backend_attempt_index,
+                attempt.backend_attempt_total,
+            )
+        })
     }
 
-    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
+    fn run_shortcut_for_route(
+        &self,
+        trace_id: u64,
+        route_attempt_name: &'static str,
+        route_attempt_index: usize,
+        route_attempt_total: usize,
+        shortcut: PasteShortcut,
+    ) -> Result<()> {
         match &self.sender {
             PasteKeySender::Chain(backends) => {
                 let mut errors = Vec::new();
                 for (idx, backend) in backends.iter().enumerate() {
-                    if idx > 0 {
+                    let backend_attempt_index = idx + 1;
+                    let backend_attempt_total = backends.len();
+                    let attempt = ShortcutAttemptContext {
+                        route_attempt_name,
+                        route_attempt_index,
+                        route_attempt_total,
+                        backend_attempt_index,
+                        backend_attempt_total,
+                    };
+                    if backend_attempt_index > 1 {
                         info!(
                             trace_id,
-                            shortcut = ?shortcut,
+                            stage = STAGE_BACKEND,
+                            route_attempt_name,
+                            route_attempt_index,
+                            route_attempt_total,
+                            route_shortcut = ?shortcut,
                             backend = Self::sender_name(backend),
-                            attempt = idx + 1,
-                            total_attempts = backends.len(),
+                            backend_attempt_index,
+                            backend_attempt_total,
                             "attempting paste backend fallback"
                         );
                     }
-                    match Self::run_shortcut_with_sender(trace_id, shortcut, backend) {
+                    match Self::run_shortcut_with_sender(trace_id, shortcut, backend, attempt) {
                         Ok(()) => return Ok(()),
                         Err(err) => {
+                            let err_text = format!("{err:#}");
                             warn!(
                                 trace_id,
-                                shortcut = ?shortcut,
+                                stage = STAGE_BACKEND,
+                                route_attempt_name,
+                                route_attempt_index,
+                                route_attempt_total,
+                                route_shortcut = ?shortcut,
                                 backend = Self::sender_name(backend),
-                                attempt = idx + 1,
-                                total_attempts = backends.len(),
-                                error = %err,
+                                backend_attempt_index,
+                                backend_attempt_total,
+                                error = %err_text,
                                 "paste backend attempt failed"
                             );
-                            errors.push(format!("{}: {}", Self::sender_name(backend), err));
+                            errors.push(format!("{}: {}", Self::sender_name(backend), err_text));
                         }
                     }
                 }
 
                 anyhow::bail!(
-                    "all paste backend attempts failed for shortcut {:?}: {}",
+                    "stage=backend all paste backend attempts failed for shortcut {:?}: {}",
                     shortcut,
                     errors.join(" | ")
                 )
             }
-            sender => Self::run_shortcut_with_sender(trace_id, shortcut, sender),
+            sender => Self::run_shortcut_with_sender(
+                trace_id,
+                shortcut,
+                sender,
+                ShortcutAttemptContext {
+                    route_attempt_name,
+                    route_attempt_index,
+                    route_attempt_total,
+                    backend_attempt_index: 1,
+                    backend_attempt_total: 1,
+                },
+            ),
         }
+    }
+
+    #[cfg(test)]
+    fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
+        self.run_shortcut_for_route(trace_id, "primary", 1, 1, shortcut)
     }
 
     fn run_route_shortcuts(
@@ -448,41 +778,81 @@ impl ClipboardInjector {
             attempts.push(("adaptive_fallback", fallback));
         }
 
+        let stage_started = Self::stage_start(
+            trace_id,
+            InjectionStage::RouteShortcut,
+            "starting routed shortcut stage",
+        );
         let mut errors = Vec::new();
+        let total = attempts.len();
         for (index, (attempt_name, shortcut)) in attempts.iter().enumerate() {
+            let route_attempt_index = index + 1;
             if index > 0 {
                 info!(
                     trace_id,
+                    stage = STAGE_ROUTE_SHORTCUT,
                     route_attempt = *attempt_name,
+                    route_attempt_index,
+                    route_attempt_total = total,
                     route_shortcut = ?shortcut,
                     "attempting adaptive route fallback shortcut"
                 );
             }
 
-            match self.run_shortcut(trace_id, *shortcut) {
+            match self.run_shortcut_for_route(
+                trace_id,
+                attempt_name,
+                route_attempt_index,
+                total,
+                *shortcut,
+            ) {
                 Ok(()) => {
                     debug!(
                         trace_id,
+                        stage = STAGE_ROUTE_SHORTCUT,
                         route_attempt = *attempt_name,
+                        route_attempt_index,
+                        route_attempt_total = total,
                         route_shortcut = ?shortcut,
                         "route shortcut attempt succeeded"
+                    );
+                    Self::stage_success(
+                        trace_id,
+                        InjectionStage::RouteShortcut,
+                        stage_started,
+                        "routed shortcut stage succeeded",
                     );
                     return Ok(());
                 }
                 Err(err) => {
+                    let err_text = format!("{err:#}");
                     warn!(
                         trace_id,
+                        stage = STAGE_ROUTE_SHORTCUT,
                         route_attempt = *attempt_name,
+                        route_attempt_index,
+                        route_attempt_total = total,
                         route_shortcut = ?shortcut,
-                        error = %err,
+                        error = %err_text,
                         "route shortcut attempt failed"
                     );
-                    errors.push(format!("{attempt_name}({shortcut:?}): {err}"));
+                    errors.push(format!("{attempt_name}({shortcut:?}): {err_text}"));
                 }
             }
         }
 
-        anyhow::bail!("all route shortcut attempts failed: {}", errors.join(" | "))
+        let message = format!(
+            "stage=route_shortcut all route shortcut attempts failed: {}",
+            errors.join(" | ")
+        );
+        Self::stage_failure(
+            trace_id,
+            InjectionStage::RouteShortcut,
+            stage_started,
+            &message,
+            "routed shortcut stage failed",
+        );
+        anyhow::bail!("{message}")
     }
 
     fn stop_foreground_source(source: &mut Option<Child>, trace_id: u64, label: &'static str) {
@@ -691,17 +1061,29 @@ impl TextInjector for ClipboardInjector {
             .context("failed to set clipboard contents")?;
 
         // 2b. Wait briefly for wl-copy ownership to become readable.
-        let (ready, observed) = Self::wait_for_clipboard_value(
+        let clipboard_ready_started = Self::stage_start(
+            trace_id,
+            InjectionStage::ClipboardReady,
+            "starting clipboard readiness probe",
+        );
+        let (ready, observed, probe_count) = Self::wait_for_clipboard_value(
             &self.options,
             text,
             Duration::from_millis(Self::CLIPBOARD_READY_TIMEOUT_MS),
-            Duration::from_millis(Self::CLIPBOARD_READY_POLL_MS),
             trace_id,
         );
 
         let mut outcome = if ready {
+            Self::stage_success(
+                trace_id,
+                InjectionStage::ClipboardReady,
+                clipboard_ready_started,
+                "clipboard readiness probe succeeded",
+            );
             debug!(
                 trace_id,
+                stage = STAGE_CLIPBOARD_READY,
+                probes = probe_count,
                 elapsed_ms = started.elapsed().as_millis(),
                 stored_len = observed.as_ref().map_or(0, |value| value.len()),
                 stored_fingerprint = %observed
@@ -712,8 +1094,21 @@ impl TextInjector for ClipboardInjector {
             );
             InjectionOutcome::SuccessAssumed
         } else {
+            let stage_error = format!(
+                "clipboard did not match requested text before timeout (timeout_ms={})",
+                Self::CLIPBOARD_READY_TIMEOUT_MS
+            );
+            Self::stage_failure(
+                trace_id,
+                InjectionStage::ClipboardReady,
+                clipboard_ready_started,
+                &stage_error,
+                "clipboard readiness probe failed",
+            );
             warn!(
                 trace_id,
+                stage = STAGE_CLIPBOARD_READY,
+                probes = probe_count,
                 elapsed_ms = started.elapsed().as_millis(),
                 requested_len = text.len(),
                 requested_fingerprint = %fingerprint(text),
@@ -723,7 +1118,7 @@ impl TextInjector for ClipboardInjector {
                     .map(|value| fingerprint(value))
                     .unwrap_or_else(|| "none".to_string()),
                 timeout_ms = Self::CLIPBOARD_READY_TIMEOUT_MS,
-                "clipboard did not match requested text before timeout; continuing"
+                "clipboard did not match requested text before timeout; continuing in degraded mode"
             );
             InjectionOutcome::ClipboardNotReady
         };
@@ -738,6 +1133,7 @@ impl TextInjector for ClipboardInjector {
             info!(
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),
+                stage = STAGE_CLIPBOARD_READY,
                 outcome = InjectionOutcome::CopyOnly.as_str(),
                 "clipboard copy-only injection finished"
             );
@@ -789,9 +1185,16 @@ impl TextInjector for ClipboardInjector {
         if let Err(err) = self.run_route_shortcuts(trace_id, route.primary, route.adaptive_fallback)
         {
             outcome = InjectionOutcome::ChordFailed;
+            let err_text = format!("{err:#}");
+            let stage = if err_text.contains("stage=backend") {
+                STAGE_BACKEND
+            } else {
+                STAGE_ROUTE_SHORTCUT
+            };
             warn!(
                 trace_id,
-                error = %err,
+                stage,
+                error = %err_text,
                 elapsed_ms = started.elapsed().as_millis(),
                 outcome = outcome.as_str(),
                 "all routed paste shortcut attempts failed"
@@ -802,7 +1205,7 @@ impl TextInjector for ClipboardInjector {
                 &mut foreground_primary_source,
                 trace_id,
             );
-            return Err(err);
+            return Err(anyhow::anyhow!("{err_text}"));
         }
 
         if self.options.post_chord_hold_ms > 0 {
@@ -860,7 +1263,32 @@ impl TextInjector for ClipboardInjector {
         info!(
             trace_id,
             elapsed_ms = started.elapsed().as_millis(),
+            stage = STAGE_BACKEND,
             outcome = outcome.as_str(),
+            clipboard_ready_success_total = injector_metrics()
+                .clipboard_ready_success_total
+                .load(Ordering::Relaxed),
+            clipboard_ready_failure_total = injector_metrics()
+                .clipboard_ready_failure_total
+                .load(Ordering::Relaxed),
+            route_shortcut_success_total = injector_metrics()
+                .route_shortcut_success_total
+                .load(Ordering::Relaxed),
+            route_shortcut_failure_total = injector_metrics()
+                .route_shortcut_failure_total
+                .load(Ordering::Relaxed),
+            backend_success_total = injector_metrics()
+                .backend_success_total
+                .load(Ordering::Relaxed),
+            backend_failure_total = injector_metrics()
+                .backend_failure_total
+                .load(Ordering::Relaxed),
+            wl_copy_spawn_total = injector_metrics()
+                .wl_copy_spawn_total
+                .load(Ordering::Relaxed),
+            wl_paste_spawn_total = injector_metrics()
+                .wl_paste_spawn_total
+                .load(Ordering::Relaxed),
             "clipboard injection flow finished"
         );
 
@@ -1009,5 +1437,49 @@ mod tests {
         assert!(message.contains("all route shortcut attempts failed"));
         assert!(message.contains("primary"));
         assert!(message.contains("adaptive_fallback"));
+    }
+
+    #[test]
+    fn backend_failures_are_stage_tagged() {
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Disabled,
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+
+        let err = injector
+            .run_shortcut(1, PasteShortcut::CtrlV)
+            .expect_err("disabled backend should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("stage=backend"));
+    }
+
+    #[test]
+    fn route_failures_are_stage_tagged() {
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Disabled,
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+
+        let err = injector
+            .run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV))
+            .expect_err("disabled backend should fail route stage");
+        let message = format!("{err:#}");
+        assert!(message.contains("stage=route_shortcut"));
+    }
+
+    #[test]
+    fn clipboard_ready_schedule_uses_progressive_backoff() {
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(1), 5);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(2), 10);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(3), 15);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(4), 20);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(7), 50);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(8), 70);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(9), 70);
+        assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(128), 70);
     }
 }
