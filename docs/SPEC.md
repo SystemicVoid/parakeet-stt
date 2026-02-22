@@ -114,10 +114,12 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Injection pipeline**
   - Default runtime path is clipboard choreography (`wl-copy` + readiness probe) and paste chord emission.
+  - Injection execution is serialized through a dedicated bounded worker queue (`capacity=32`) so websocket/hotkey async paths do not run blocking clipboard/chord calls inline.
   - Paste backend ladder (helper default): `auto` => `uinput -> ydotool`.
   - Adaptive routing chooses shortcut by focused-surface class (`terminal`, `general`, `unknown`).
   - Focus metadata source is Wayland toplevel cache observations (with low-confidence handling on transition/staleness paths).
   - Low-confidence focus snapshots (`focus_focused=false`) are treated as `unknown` for routing.
+  - Stage-attributed observability is emitted for `clipboard_ready`, `route_shortcut`, and `backend` with per-stage durations and totals.
   - Backend failure policy defaults to `copy-only` so transcript delivery is preserved via clipboard.
 
 - **Resilience**

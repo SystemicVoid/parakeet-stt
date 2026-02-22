@@ -1,4 +1,4 @@
-# STT helper status (updated 2026-02-19)
+# STT helper status (updated 2026-02-21)
 
 This document now has two parts:
 
@@ -24,6 +24,11 @@ Canonical-source policy:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
 - `auto` backend now performs runtime fallback attempts (uinput → ydotool) per shortcut execution.
+- Final-result injection is now enqueued to a dedicated bounded worker queue (`capacity=32`) so hotkey/websocket handling paths do not await blocking clipboard/chord execution inline.
+- Worker enqueue backpressure is timeout-limited (`20ms`) with explicit dropped-job warnings when the queue stays saturated.
+- Injector logs now tag stage outcomes and durations with `stage=<clipboard_ready|route_shortcut|backend>` and `status=<start|ok|fail>`.
+- Queue and stage metric summaries are emitted periodically from the client loop (`injector worker queue metrics summary`, `injector stage metrics summary`).
+- Event-loop lag summaries are emitted every 30 seconds (`event loop lag window summary`) with p50/p95/p99 fields.
 - `stt diag-injector` reports backend capability prerequisites (`ydotool`, `/dev/uinput` write access) before running matrix cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
