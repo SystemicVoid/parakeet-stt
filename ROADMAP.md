@@ -37,6 +37,8 @@ Acceptance:
 - Failures are attributable to a specific stage (`clipboard_ready`, `route_shortcut`, `backend`).
 - Regression matrix remains stable across terminal + browser + editor targets.
 
+REVIEW UNCOMMITTED CHANGES
+
 ## Phase 1: Immediate Feedback Layer (Sound + Notification)
 
 Scope:
