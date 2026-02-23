@@ -1,0 +1,60 @@
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+
+repos:
+  - repo: local
+    hooks:
+      - id: python-ruff-format
+        name: python ruff format
+        entry: uv run --project parakeet-stt-daemon ruff format --config parakeet-stt-daemon/pyproject.toml
+        language: system
+        files: ^parakeet-stt-daemon/.*\.pyi?$
+        stages: [pre-commit]
+
+      - id: python-ruff-check
+        name: python ruff check
+        entry: uv run --project parakeet-stt-daemon ruff check --fix --config parakeet-stt-daemon/pyproject.toml
+        language: system
+        files: ^parakeet-stt-daemon/.*\.pyi?$
+        stages: [pre-commit]
+
+      - id: python-ty-check
+        name: python ty check
+        entry: ty check --project parakeet-stt-daemon
+        language: system
+        pass_filenames: false
+        files: ^parakeet-stt-daemon/(pyproject\.toml|.*\.pyi?)$
+        stages: [pre-commit]
+
+      - id: rust-fmt
+        name: rust cargo fmt
+        entry: cargo fmt --manifest-path parakeet-ptt/Cargo.toml
+        language: system
+        pass_filenames: false
+        files: ^parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs)$
+        stages: [pre-commit]
+
+      - id: python-pytest
+        name: python pytest
+        entry: uv run --project parakeet-stt-daemon pytest -q
+        language: system
+        pass_filenames: false
+        files: ^parakeet-stt-daemon/(pyproject\.toml|tests/.*\.py|src/.*\.py)$
+        stages: [pre-push]
+
+      - id: rust-clippy
+        name: rust cargo clippy
+        entry: cargo clippy --manifest-path parakeet-ptt/Cargo.toml --all-targets --all-features -- -D warnings
+        language: system
+        pass_filenames: false
+        files: ^parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs)$
+        stages: [pre-push]
+
+      - id: rust-test
+        name: rust cargo test
+        entry: cargo test --manifest-path parakeet-ptt/Cargo.toml -q
+        language: system
+        pass_filenames: false
+        files: ^parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs)$
+        stages: [pre-push]
