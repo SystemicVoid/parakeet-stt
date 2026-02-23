@@ -110,9 +110,7 @@ class DaemonServer:
             try:
                 await self._send_error(websocket, None, "UNEXPECTED", str(exc))
             except Exception as send_exc:  # noqa: BLE001
-                logger.debug(
-                    "Failed to send error after websocket handler exception: {}", send_exc
-                )
+                logger.debug("Failed to send error after websocket handler exception: {}", send_exc)
 
     async def _dispatch(self, websocket: WebSocket, parsed: ParsedMessage) -> None:
         if parsed.kind is ClientMessageType.START_SESSION:

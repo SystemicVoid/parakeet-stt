@@ -224,7 +224,7 @@ Fields beyond `state` and `sessions_active` in `status` should be treated as opt
    - Rust: standard `cargo` commands; consider workspace layout early.
 
 2. **Coding standards**
-   - Python: type hints, `ruff` + `black` for lint/format (invoked via `uv run`).
+   - Python: type hints, `ruff` for lint/format (invoked via `uv run`).
    - Rust: `cargo fmt`, `cargo clippy --all-targets`.
 
 3. **Security & permissions**

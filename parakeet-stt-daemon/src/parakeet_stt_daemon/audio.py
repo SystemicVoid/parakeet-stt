@@ -118,8 +118,10 @@ class AudioInput:
             tail = self._stream_buffer.copy()
             self._stream_ready = []
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
-        audio = np.concatenate(chunks).astype(self.dtype, copy=False) if chunks else np.zeros(
-            (0,), dtype=self.dtype
+        audio = (
+            np.concatenate(chunks).astype(self.dtype, copy=False)
+            if chunks
+            else np.zeros((0,), dtype=self.dtype)
         )
         return audio, ready, tail
 

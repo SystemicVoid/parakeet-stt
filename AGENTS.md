@@ -9,12 +9,12 @@
 ## Build, Test, and Development Commands
 - Daemon (without GPU stack): `cd parakeet-stt-daemon && uv sync --dev` then `uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`.
 - Daemon (with inference extras): add `--extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match` to `uv sync`/`uv run` when CUDA is available.
-- Daemon lint/type-check: `uv run ruff check .`, `uv run black --check .`, `uv run --no-project ty check`.
+- Daemon lint/type-check: `uv run ruff check .`, `uv run ruff format --check .`, `uv run --no-project ty check`.
 - Client: `cd parakeet-ptt && cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test`. Run locally with `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`.
 - Helper (recommended runtime): `source scripts/stt-helper.sh && stt start`.
 
 ## Coding Style & Naming Conventions
-- Python: Black + Ruff enforce 100-col width; keep modules/functions snake_case; prefer type hints and Pydantic settings objects. Maintain lazy imports in `model.py` to avoid GPU dependencies for protocol work. Use structured logging (`loguru`) and environment variables prefixed `PARAKEET_` for overrides.
+- Python: Ruff enforces linting/formatting with 100-col width; keep modules/functions snake_case; prefer type hints and Pydantic settings objects. Maintain lazy imports in `model.py` to avoid GPU dependencies for protocol work. Use structured logging (`loguru`) and environment variables prefixed `PARAKEET_` for overrides.
 - Rust: Let `cargo fmt` drive formatting; address all Clippy warnings. Stick with `anyhow::Result` for fallible flows and `thiserror` for typed errors. Use `tracing` macros for logs; avoid `unwrap`/`expect` in async paths.
 - Naming: binaries remain `parakeet-stt-daemon` and `parakeet-ptt`; config flags match protocol and injector surfaces (`shared_secret`, `endpoint`, `hotkey`, `paste_*`).
 

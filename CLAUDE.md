@@ -48,7 +48,7 @@ cargo run -- --help              # Show all options
 # Daemon
 cd parakeet-stt-daemon
 uv run ruff check .
-uv run black --check .
+uv run ruff format --check .
 uv run --no-project ty check
 
 # Client
@@ -107,7 +107,7 @@ See `docs/SPEC.md` for complete protocol specification.
 ## Coding Conventions
 
 ### Python
-- Black + Ruff, 100-char line width
+- Ruff lint + format, 100-char line width
 - Type hints everywhere, Pydantic for settings/messages
 - Lazy imports in `model.py` to avoid GPU deps when not needed
 - Structured logging via `loguru`

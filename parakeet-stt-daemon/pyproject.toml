@@ -31,7 +31,6 @@ parakeet-stt-daemon = "parakeet_stt_daemon.__main__:main"
 [dependency-groups]
 dev = [
   "ruff>=0.14.0",
-  "black>=25.12.0",
   "pytest>=8.4.0",
 ]
 
@@ -40,10 +39,6 @@ packages = ["src/parakeet_stt_daemon"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/parakeet_stt_daemon", "README.md", "pyproject.toml"]
-
-[tool.black]
-line-length = 100
-target-version = ["py311"]
 
 [tool.ruff]
 line-length = 100
