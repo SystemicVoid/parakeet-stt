@@ -4,6 +4,12 @@ Date: 2026-02-19
 Repo: `parakeet-stt`
 Author: Codex + operator session
 
+## Archive Status (2026-02-23)
+
+- Incident is closed.
+- This handoff is archived in `docs/` for historical implementation context.
+- Use `README.md`, `docs/SPEC.md`, and `docs/stt-troubleshooting.md` for current runtime guidance.
+
 ## Status Update (2026-02-21)
 
 - Active runtime no longer includes `wtype`/`type` injection paths.
@@ -25,7 +31,7 @@ Current reality check (2026-02-20):
 
 ## 1.2 Current Status Override (2026-02-20)
 
-Treat this handoff as **ongoing remediation**, not closed implementation:
+Historical note at that point in time:
 - Adaptive routing and Wayland focus cache infrastructure are implemented.
 - Cross-surface correctness is still unresolved for editor targets in real desktop use.
 - Latest operator observation: Chromium continues to accept injection in cases where VS Code and COSMIC Text Editor do not.
@@ -353,7 +359,7 @@ This section tracks implementation in atomic units so work can resume after cont
 
 | Task | Scope | Commit | Status | Notes |
 |---|---|---|---|---|
-| T1 | `HANDOFF-stt-cross-surface-injection-2026-02-19.md` | `27f14a9` | Done | Added checklist, task IDs, commit ledger, and validation template |
+| T1 | `docs/HANDOFF-stt-cross-surface-injection-2026-02-19.md` | `27f14a9` | Done | Added checklist, task IDs, commit ledger, and validation template |
 | T2 | `scripts/stt-helper.sh`, handoff | `b18575a` | Done | Added timeout-based readiness loop with compile-aware wait extension |
 | T3 | `scripts/stt-helper.sh`, handoff | `9d9c5b1` | Done | Switched to pane-id based selection instead of `.0` target |
 | T4 | `parakeet-ptt/src/routing.rs`, `parakeet-ptt/src/injector.rs`, tests, handoff | `9359f59` | Done | Route degrades to unknown when `focus_focused=false`; added confidence logging/tests |
@@ -727,7 +733,7 @@ Expected benefit:
 ### 18.6 Next-agent execution starter checklist
 
 Read first:
-- `HANDOFF-stt-cross-surface-injection-2026-02-19.md` (sections 17 and 18)
+- `docs/HANDOFF-stt-cross-surface-injection-2026-02-19.md` (sections 17 and 18)
 - `parakeet-ptt/src/injector.rs`
 - `parakeet-ptt/src/routing.rs`
 - `parakeet-ptt/src/surface_focus.rs`
