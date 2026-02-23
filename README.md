@@ -64,7 +64,7 @@ Manual two-terminal start is still supported:
 ```bash
 # Terminal A
 cd parakeet-stt-daemon
-uv run parakeet-stt-daemon
+PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon
 
 # Terminal B
 cd parakeet-ptt

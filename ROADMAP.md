@@ -28,7 +28,7 @@ Scope:
 - Fix configuration precedence for booleans (`CLI explicit > ENV > defaults`).
 - Make daemon truth visible (`requested` vs `effective` runtime state for device and streaming engine).
 - Add daemon test coverage for lifecycle and config regressions.
-- Keep reliability-first runtime defaults while adding an explicit streaming profile for validation.
+- Keep helper/runtime defaults aligned with streaming-enabled operation, while retaining an explicit offline override profile.
 
 Implementation direction:
 - Add one cleanup path used by disconnect, exception, stop, and abort handling.
@@ -36,7 +36,7 @@ Implementation direction:
 - Parse CLI booleans with explicit intent (no implicit override when flags are omitted).
 - Enrich `/status` and startup logs with hard runtime truth signals and fallback reasons.
 - Add `pytest` plus focused tests for session lifecycle, precedence, and protocol mapping.
-- Keep helper default path offline-first; expose a clear opt-in streaming start profile for soak runs.
+- Keep helper default path streaming-enabled; retain a clear offline override profile for troubleshooting/soak runs.
 
 Acceptance:
 - Forced disconnect during active listening leaves `sessions_active=0` with no continued audio accumulation.
@@ -192,8 +192,8 @@ Status legend: `todo` | `in-progress` | `done` | `blocked`
 3. `A3` — status: `done` (2026-02-23); owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`) plus disconnect-path session ownership guard.
 4. `A4` — status: `in-progress`; owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
 5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
-6. `A6` — status: `todo`; owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
-7. `A7` — status: `todo`; owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): keep default reliability profile offline-first, add explicit streaming validation profile.
+6. `A6` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
+7. `A7` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): default helper launch now streaming-enabled with explicit offline override (`PARAKEET_STREAMING_ENABLED=false`).
 
 ## Metrics to Track
 
@@ -218,8 +218,8 @@ N ms) while the user is still holding, signaling they can release without trunca
 3. Confidence-based early termination: Detect silence plus high confidence to auto-stop
 session without waiting for button release.
 
-Current default policy remains reliability-first (`stt start` offline profile) until streaming
-passes lifecycle + soak gates. Use an explicit streaming profile for validation and iterative hardening.
+Current default policy uses streaming-enabled helper launch (`stt start`) with an explicit
+offline override (`PARAKEET_STREAMING_ENABLED=false`) for targeted validation and troubleshooting.
 
 ## Non-Goals (Near-Term)
 

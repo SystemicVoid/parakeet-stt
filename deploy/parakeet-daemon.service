@@ -8,7 +8,7 @@ WorkingDirectory=/path/to/parakeet-stt/parakeet-stt-daemon
 ExecStart=/usr/bin/env uv run parakeet-stt-daemon
 Environment=PARAKEET_DEVICE=cuda
 Environment=PARAKEET_MIC_DEVICE=pulse
-Environment=PARAKEET_STREAMING_ENABLED=false
+Environment=PARAKEET_STREAMING_ENABLED=true
 Restart=always
 RestartSec=2
 

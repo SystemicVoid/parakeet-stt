@@ -814,7 +814,7 @@ CLIENTCMD
             echo ">>> Health check (daemon --check)..."
             (
                 cd "$DAEMON_DIR" || exit 1
-                UV_CACHE_DIR="$REPO_ROOT/.uv-cache" uv run parakeet-stt-daemon --check
+                PARAKEET_STREAMING_ENABLED="$default_daemon_streaming_enabled" UV_CACHE_DIR="$REPO_ROOT/.uv-cache" uv run parakeet-stt-daemon --check
             )
             ;;
         diag-injector)

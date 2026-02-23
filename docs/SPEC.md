@@ -290,7 +290,7 @@ Fields beyond `state` and `sessions_active` in `status` should be treated as opt
 | Authentication | Decide whether to enforce shared secret or rely on localhost isolation. |
 | Multi-language hints | Add config to pin language or rely on auto-detect per user preference. |
 | Partial result overlay | Deferred; document design when prioritized. |
-| Streaming default policy | Keep reliability-first offline helper default until streaming profile passes soak + lifecycle gates. |
+| Streaming default policy | Use streaming-enabled helper default (`stt start`) and keep `PARAKEET_STREAMING_ENABLED=false` as an explicit offline override path. |
 | GPU stack refresh timing | Run staged update lane after streaming API integration is validated on current lock baseline. |
 
 ---
