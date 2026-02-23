@@ -460,7 +460,11 @@ def create_app(settings: ServerSettings) -> FastAPI:
             await asyncio.to_thread(server.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
-        logger.info(
+        streaming_degraded = (
+            server.settings.streaming_enabled and not server._stream_helper_active()
+        )
+        _log = logger.warning if streaming_degraded else logger.info
+        _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
             "stream_helper_active={}, stream_fallback_reason={}",
             server._requested_device,

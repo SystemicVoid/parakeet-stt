@@ -147,11 +147,21 @@ class ParakeetStreamingSession:
         if not self._chunks:
             return ""
         combined = np.concatenate(self._chunks)
-        if self._parent.chunk_helper is not None:
+        helper = self._parent.chunk_helper
+        iter_cls = self._parent._audio_feature_iter_cls
+        if helper is not None and iter_cls is not None:
             try:
-                return self._parent.chunk_helper.transcribe([combined])[0]
+                frame_reader = iter_cls(
+                    combined,
+                    helper.frame_len,
+                    helper.raw_preprocessor,
+                    helper.asr_model.device,
+                )
+                helper.set_frame_reader(frame_reader)
+                result = helper.transcribe()
+                return result.strip() if isinstance(result, str) else str(result).strip()
             except Exception as exc:  # pragma: no cover - fallback path
-                logger.warning("Chunk helper failed, falling back to offline: {}", exc)
+                logger.warning("Streaming helper failed during finalization: {}", exc)
         return self._parent._transcribe_offline(combined, self.sample_rate)
 
 
@@ -174,6 +184,8 @@ class ParakeetStreamingTranscriber:
         self.batch_size = int(batch_size)
         self.chunk_helper: Any | None = None
         self.fallback_reason: str | None = None
+        self._audio_feature_iter_cls: type | None = None
+        self._helper_class_name: str | None = None
 
         self.offline = ParakeetTranscriber(model)
         self._init_helper()
@@ -184,35 +196,41 @@ class ParakeetStreamingTranscriber:
 
     def _init_helper(self) -> None:
         try:
-            # ChunkedRNNTInfer may not exist in all NeMo versions; ignore missing stubs
             from nemo.collections.asr.parts.utils.streaming_utils import (
-                ChunkedRNNTInfer,  # type: ignore[attr-defined]
+                AudioFeatureIterator,
+                FrameBatchChunkedRNNT,
             )
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            logger.warning("NeMo streaming utilities unavailable; using offline fallback: {}", exc)
+            self.chunk_helper = None
+            self.fallback_reason = f"import_failed:{exc.__class__.__name__}"
+            return
 
-            cfg = getattr(self.model, "cfg", getattr(self.model, "_cfg", None))
-            sample_rate = getattr(cfg, "sample_rate", 16_000)
-            decoder_delay_ms = getattr(cfg, "decoder_delay_in_ms", 0)
-            self.chunk_helper = ChunkedRNNTInfer(
-                model=self.model,
-                decoder_delay_in_ms=decoder_delay_ms,
-                chunk_len_in_secs=self.chunk_secs,
-                chunk_batch_size=self.batch_size,
-                right_context_len_in_secs=self.right_context_secs,
-                left_context_len_in_secs=self.left_context_secs,
-                audio_sample_rate=sample_rate,
+        total_buffer_secs = self.chunk_secs + self.right_context_secs
+        try:
+            # NeMo's FrameBatchChunkedRNNT defaults suggest int params but
+            # the parent FrameBatchASR accepts float; suppress the mismatch.
+            self.chunk_helper = FrameBatchChunkedRNNT(
+                asr_model=self.model,
+                frame_len=self.chunk_secs,  # type: ignore[reportArgumentType]
+                total_buffer=total_buffer_secs,  # type: ignore[reportArgumentType]
+                batch_size=self.batch_size,
             )
+            self._audio_feature_iter_cls = AudioFeatureIterator
+            self._helper_class_name = "FrameBatchChunkedRNNT"
             logger.info(
-                "Streaming helper initialised (chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}, sample_rate={})",  # noqa: E501
+                "Streaming helper initialised via {} "
+                "(frame_len={}, total_buffer={}, batch_size={})",
+                self._helper_class_name,
                 self.chunk_secs,
-                self.right_context_secs,
-                self.left_context_secs,
+                total_buffer_secs,
                 self.batch_size,
-                sample_rate,
             )
             self.fallback_reason = None
         except Exception as exc:  # pragma: no cover - environment dependent
-            logger.warning("Chunked streaming helper unavailable; using offline fallback: {}", exc)
+            logger.warning("Streaming helper init failed; using offline fallback: {}", exc)
             self.chunk_helper = None
+            self._audio_feature_iter_cls = None
             self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
 
     def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
@@ -222,6 +240,7 @@ class ParakeetStreamingTranscriber:
             except Exception as exc:  # pragma: no cover
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
                 self.chunk_helper = None
+                self._audio_feature_iter_cls = None
                 self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"
         return ParakeetStreamingSession(self, sample_rate)
 

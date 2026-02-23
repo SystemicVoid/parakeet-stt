@@ -171,13 +171,28 @@ def run_checks(settings: ServerSettings) -> None:
         logger.warning("Failed to list audio devices: {}", exc)
 
     logger.info(
-        "Streaming enabled: {}, chunk_secs={}, right_context_secs={}, left_context_secs={}, batch_size={}",  # noqa: E501
+        "Streaming config: enabled={}, chunk_secs={}, right_context_secs={}, "
+        "left_context_secs={}, batch_size={}",
         settings.streaming_enabled,
         settings.chunk_secs,
         settings.right_context_secs,
         settings.left_context_secs,
         settings.batch_size,
     )
+    if settings.streaming_enabled:
+        helper_active = server._stream_helper_active()
+        fallback_reason = server._stream_fallback_reason()
+        helper_class = getattr(server.streaming_transcriber, "_helper_class_name", None)
+        if helper_active:
+            logger.info(
+                "Streaming helper: ACTIVE (class={})",
+                helper_class,
+            )
+        else:
+            logger.warning(
+                "Streaming helper: INACTIVE (reason={}). Transcription will use offline fallback.",
+                fallback_reason,
+            )
 
 
 if __name__ == "__main__":
