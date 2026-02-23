@@ -21,14 +21,56 @@ This report was originally authored before the core hardening tranche landed. Cu
 - `A1` done: active-session cleanup is unified and wired into disconnect, handler-exception, and abort flows via `_cleanup_active_session(...)`.
 - `A2` done: boolean precedence now follows `CLI explicit > ENV > defaults` for `status_enabled` and `streaming_enabled`.
 - `A3` done: `start_session` now uses transactional rollback semantics; post-allocation failures in audio start, stream init, drain-loop startup, or session-start response send all rollback to idle.
+- `A3+` done: websocket disconnect cleanup now snapshots active-session ownership and requires session-match, preventing cross-session teardown after start-path disconnect rollback.
 - `A5` bootstrap done: daemon pytest harness exists, with focused lifecycle + precedence tests.
+- `B2/C1` partial done: status/startup/completion now expose runtime truth fields (`requested/effective device`, helper active/fallback reason) plus last-stage timing fields (`audio/infer/send`).
 
 Validation snapshot for this tranche:
 
-- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py` -> `13 passed`
-- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
-- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
-- `cd parakeet-stt-daemon && uv run --no-project ty check` -> pass
+- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py` -> `16 passed`
+- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+- `cd parakeet-stt-daemon && ty check .` -> pass
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+
+## Handoff For Next Agent (Atomic-Commit Continuation)
+
+Merged in this lane (2026-02-23):
+
+1. `c2d1420` — `fix(daemon): guard disconnect cleanup with session ownership`
+   - Adds strict `require_session_match` semantics to `_cleanup_active_session(...)`.
+   - `handle_websocket` disconnect path now snapshots active session id and uses match-required cleanup.
+   - Adds lifecycle regressions for websocket disconnect interleaving and streaming send-failure rollback teardown.
+2. `6462df3` — `feat(daemon): expose runtime truth and stage timing metrics`
+   - Adds status fields: `effective_device`, `stream_helper_active`, `stream_fallback_reason`, `active_session_age_ms`, `last_audio_ms`, `last_infer_ms`, `last_send_ms`.
+   - Tracks effective model device at load time and stream-helper fallback reasons.
+   - Emits runtime truth at startup and richer completion telemetry.
+
+Remaining highest-priority execution order:
+
+1. `B1/A6` (owner `Owner-S2`): replace brittle `ChunkedRNNTInfer` integration with supported NeMo API or pin supported NeMo version explicitly.
+2. Finish `B2/C1`: optional `gpu_mem_mb` truth and tighten stage timing taxonomy (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`) with stable naming.
+3. `B3` (owner `Owner-S3`): error taxonomy expansion + daemon/client backward-compat mapping.
+
+Non-negotiable constraints for continuation:
+
+- Keep reliability-first behavior and protocol compatibility unless explicitly approved.
+- Preserve cleanup ownership invariant introduced in `c2d1420`; do not reintroduce unscoped disconnect cleanup.
+- Keep commits atomic by fix area; do not combine streaming integration + protocol taxonomy in one commit.
+
+Suggested next atomic commits:
+
+1. `fix(daemon): align streaming helper with supported nemo api` (model/server only + focused tests).
+2. `feat(daemon): expose gpu memory and finalized stage timing taxonomy` (status/logs/tests/docs).
+3. `feat(protocol): add explicit session error taxonomy with client compatibility` (daemon + ptt + spec).
+
+Verification commands to run after each commit:
+
+- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py`
+- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
+- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
+- `cd parakeet-stt-daemon && ty check .`
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
 
 Current highest-priority unresolved items for follow-up agents:
 
