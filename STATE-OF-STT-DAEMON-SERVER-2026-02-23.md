@@ -14,6 +14,28 @@ Top conclusions:
 
 Net: this is a strong candidate for a daemon hardening sprint before adding higher-level UX features that depend on reliable streaming semantics.
 
+## Status Update (2026-02-23, Post A1/A2/A3)
+
+This report was originally authored before the core hardening tranche landed. Current code state now differs for several high-risk findings:
+
+- `A1` done: active-session cleanup is unified and wired into disconnect, handler-exception, and abort flows via `_cleanup_active_session(...)`.
+- `A2` done: boolean precedence now follows `CLI explicit > ENV > defaults` for `status_enabled` and `streaming_enabled`.
+- `A3` done: `start_session` now uses transactional rollback semantics; post-allocation failures in audio start, stream init, drain-loop startup, or session-start response send all rollback to idle.
+- `A5` bootstrap done: daemon pytest harness exists, with focused lifecycle + precedence tests.
+
+Validation snapshot for this tranche:
+
+- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py` -> `13 passed`
+- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+- `cd parakeet-stt-daemon && uv run --no-project ty check` -> pass
+
+Current highest-priority unresolved items for follow-up agents:
+
+1. `B1/A6`: streaming engine integration against supported NeMo API with explicit fallback signaling.
+2. `B2/C1`: runtime truth fields and observability in `/status` and startup logs.
+3. `B3`: precise error taxonomy and client compatibility mapping.
+
 ## Scope and Canonical Sources
 
 Per request, this report treats code/runtime as source of truth and docs as secondary drift signals.
@@ -55,6 +77,8 @@ Important lockfile facts:
 - `nemo-toolkit` entry present at `parakeet-stt-daemon/uv.lock:1351`
 
 ## Findings (Ranked)
+
+Note: findings below represent the pre-hardening snapshot. Use the status update above as canonical state for what is already resolved.
 
 ## Critical
 
