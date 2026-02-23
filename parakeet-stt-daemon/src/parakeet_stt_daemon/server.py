@@ -134,18 +134,43 @@ class DaemonServer:
                 websocket, message.session_id, "SESSION_BUSY", "A session is already active"
             )
             return
-        self.audio.start_session()
-        if self.streaming_transcriber:
-            self._active_stream = self.streaming_transcriber.start_session(self.audio.sample_rate)
-            self._start_stream_drain_loop()
+        try:
+            self.audio.start_session()
+            if self.streaming_transcriber:
+                self._active_stream = self.streaming_transcriber.start_session(
+                    self.audio.sample_rate
+                )
+                self._start_stream_drain_loop()
 
-        response = SessionStarted(
-            session_id=message.session_id,
-            ts=datetime.now(tz=UTC),
-            mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
-            lang=message.preferred_lang,
-        )
-        await websocket.send_json(response.model_dump(mode="json"))
+            response = SessionStarted(
+                session_id=message.session_id,
+                ts=datetime.now(tz=UTC),
+                mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
+                lang=message.preferred_lang,
+            )
+            await websocket.send_json(response.model_dump(mode="json"))
+        except WebSocketDisconnect:
+            await self._cleanup_active_session(
+                "start_session websocket disconnected",
+                expected_session_id=message.session_id,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to start session {}: {}", message.session_id, exc)
+            await self._cleanup_active_session(
+                f"start_session rollback: {exc.__class__.__name__}",
+                expected_session_id=message.session_id,
+            )
+            try:
+                await self._send_error(
+                    websocket,
+                    message.session_id,
+                    "UNEXPECTED",
+                    "Failed to start session",
+                )
+            except Exception as send_exc:  # noqa: BLE001
+                logger.debug("Failed to send start_session error response: {}", send_exc)
+            return
         logger.info("Session {} started", session.session_id)
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
