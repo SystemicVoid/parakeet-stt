@@ -91,6 +91,10 @@ def _start_message(session_id: UUID) -> StartSession:
     )
 
 
+def _start_event(session_id: UUID) -> dict[str, object]:
+    return _start_message(session_id).model_dump(mode="json")
+
+
 def _build_server() -> DaemonServer:
     server = cast(Any, DaemonServer.__new__(DaemonServer))
     server.settings = ServerSettings(device="cpu", status_enabled=True, streaming_enabled=False)
@@ -279,6 +283,40 @@ def test_start_session_rolls_back_when_session_started_send_fails() -> None:
     asyncio.run(scenario())
 
 
+def test_start_session_streaming_send_failure_stops_drain_loop() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
+        session_id = uuid4()
+        websocket = FakeWebSocket([])
+
+        send_attempts = 0
+
+        async def fail_first_send(payload: dict) -> None:
+            nonlocal send_attempts
+            send_attempts += 1
+            if send_attempts == 1:
+                raise RuntimeError("send failed")
+            websocket.sent_json.append(payload)
+
+        websocket.send_json = fail_first_send  # type: ignore[method-assign]
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.sleep(0)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        assert server._active_stream is None
+        assert server._stream_drain_task is None
+        assert server._stream_drain_running is False
+        assert send_attempts == 2
+        assert websocket.sent_json
+        assert websocket.sent_json[-1]["type"] == "error"
+        assert websocket.sent_json[-1]["code"] == "UNEXPECTED"
+
+    asyncio.run(scenario())
+
+
 def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
     async def scenario() -> None:
         server = _build_server()
@@ -301,5 +339,47 @@ def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
         assert audio.abort_calls == 1
         assert server._active_stream is None
         assert not websocket.sent_json
+
+    asyncio.run(scenario())
+
+
+def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        start_session_id = uuid4()
+        replacement_session_id = uuid4()
+        websocket = FakeWebSocket([_start_event(start_session_id)])
+
+        async def raise_disconnect(_payload: dict) -> None:
+            raise WebSocketDisconnect()
+
+        websocket.send_json = raise_disconnect  # type: ignore[method-assign]
+        original_cleanup = server._cleanup_active_session
+        cleanup_calls = 0
+
+        async def cleanup_with_interleaving(
+            reason: str,
+            expected_session_id: UUID | None = None,
+            *,
+            require_session_match: bool = False,
+        ) -> bool:
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_calls == 2:
+                await server.sessions.start_session(replacement_session_id)
+            return await original_cleanup(
+                reason,
+                expected_session_id=expected_session_id,
+                require_session_match=require_session_match,
+            )
+
+        server._cleanup_active_session = cleanup_with_interleaving  # type: ignore[method-assign]
+        await server.handle_websocket(cast(Any, websocket))
+
+        assert cleanup_calls == 2
+        assert audio.abort_calls == 1
+        assert server.sessions.active is not None
+        assert server.sessions.active.session_id == replacement_session_id
 
     asyncio.run(scenario())

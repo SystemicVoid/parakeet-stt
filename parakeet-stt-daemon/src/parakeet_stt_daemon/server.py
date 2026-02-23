@@ -101,7 +101,13 @@ class DaemonServer:
                 await self._dispatch(websocket, parsed)
         except WebSocketDisconnect:
             logger.info("WebSocket client disconnected: {}", websocket.client)
-            await self._cleanup_active_session("websocket disconnected")
+            active = self.sessions.active
+            expected_session_id = active.session_id if active else None
+            await self._cleanup_active_session(
+                "websocket disconnected",
+                expected_session_id=expected_session_id,
+                require_session_match=True,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error in WebSocket handler: {}", exc)
             await self._cleanup_active_session(
@@ -250,11 +256,31 @@ class DaemonServer:
         )
 
     async def _cleanup_active_session(
-        self, reason: str, expected_session_id: UUID | None = None
+        self,
+        reason: str,
+        expected_session_id: UUID | None = None,
+        *,
+        require_session_match: bool = False,
     ) -> bool:
         """Reset all runtime state tied to an active session."""
         async with self._transcribe_lock:
             active = self.sessions.active
+            if require_session_match:
+                if expected_session_id is None and active is not None:
+                    logger.debug(
+                        "Skipping cleanup with no expected session (active session is {})",
+                        active.session_id,
+                    )
+                    return False
+                if expected_session_id is not None and (
+                    active is None or active.session_id != expected_session_id
+                ):
+                    logger.debug(
+                        "Skipping cleanup for session {} (active session is {})",
+                        expected_session_id,
+                        active.session_id if active else None,
+                    )
+                    return False
             if (
                 active is not None
                 and expected_session_id is not None
