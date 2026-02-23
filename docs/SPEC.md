@@ -207,7 +207,11 @@ All messages are JSON objects with a `type` string.
       "effective_device": "cuda",
       "streaming_enabled": true,
       "stream_helper_active": true,
-      "active_session_age_ms": 0
+      "stream_fallback_reason": null,
+      "active_session_age_ms": 0,
+      "last_audio_ms": 2300,
+      "last_infer_ms": 120,
+      "last_send_ms": 5
     }
     ```
 

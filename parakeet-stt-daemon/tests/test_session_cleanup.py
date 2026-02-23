@@ -46,8 +46,10 @@ class DummyDrainTask:
 
 
 class FakeStreamingTranscriber:
-    def __init__(self, raise_on_start: bool = False) -> None:
+    def __init__(self, raise_on_start: bool = False, *, helper_active: bool = True) -> None:
         self.raise_on_start = raise_on_start
+        self.helper_active = helper_active
+        self.fallback_reason: str | None = None if helper_active else "init_failed:ImportError"
 
     def start_session(self, _sample_rate: int) -> object:
         if self.raise_on_start:
@@ -107,6 +109,11 @@ def _build_server() -> DaemonServer:
     server._active_stream = object()
     server._stream_drain_task = None
     server._stream_drain_running = False
+    server._requested_device = "cpu"
+    server._effective_device = "cpu"
+    server._last_audio_ms = None
+    server._last_infer_ms = None
+    server._last_send_ms = None
     return cast(DaemonServer, server)
 
 
@@ -381,5 +388,34 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
         assert audio.abort_calls == 1
         assert server.sessions.active is not None
         assert server.sessions.active.session_id == replacement_session_id
+
+    asyncio.run(scenario())
+
+
+def test_status_reports_runtime_truth_and_last_timings() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        server.settings = ServerSettings(device="cuda", status_enabled=True, streaming_enabled=True)
+        server._requested_device = "cuda"
+        server._effective_device = "cpu"
+        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber(helper_active=False))
+        server._last_audio_ms = 1200
+        server._last_infer_ms = 85
+        server._last_send_ms = 4
+        session_id = uuid4()
+        await server.sessions.start_session(session_id)
+
+        status = server.status()
+
+        assert status.device == "cuda"
+        assert status.effective_device == "cpu"
+        assert status.streaming_enabled is True
+        assert status.stream_helper_active is False
+        assert status.stream_fallback_reason == "init_failed:ImportError"
+        assert status.last_audio_ms == 1200
+        assert status.last_infer_ms == 85
+        assert status.last_send_ms == 4
+        assert status.active_session_age_ms is not None
+        assert status.active_session_age_ms >= 0
 
     asyncio.run(scenario())

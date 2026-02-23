@@ -60,6 +60,10 @@ class DaemonServer:
         )
         self.model = load_parakeet_model(device=settings.device)
         self.transcriber = ParakeetTranscriber(self.model)
+        self._requested_device = str(settings.device)
+        self._effective_device = str(
+            getattr(self.model, "_parakeet_effective_device", self._requested_device)
+        )
         self._transcribe_lock = asyncio.Lock()
         self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
             ParakeetStreamingTranscriber(
@@ -75,6 +79,9 @@ class DaemonServer:
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
+        self._last_audio_ms: int | None = None
+        self._last_infer_ms: int | None = None
+        self._last_send_ms: int | None = None
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
@@ -224,22 +231,31 @@ class DaemonServer:
                 lang=self.settings.language,
                 confidence=None,
             )
+            send_started = datetime.now(tz=UTC)
             await websocket.send_json(completion.model_dump(mode="json"))
+            send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
             await self.sessions.clear(session.session_id)
+            self._last_audio_ms = audio_ms
+            self._last_infer_ms = infer_ms
+            self._last_send_ms = send_ms
 
             # Diagnostic logging for truncation investigation
             text_len = len(text)
             chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
             logger.info(
                 "Session {} completed: audio_raw={:.2f}s, audio_ms={}, latency_ms={}, infer_ms={}, "
-                "text_len={}, chars_per_sec={:.1f}",
+                "send_ms={}, text_len={}, chars_per_sec={:.1f}, stream_helper_active={}, "
+                "stream_fallback_reason={}",
                 session.session_id,
                 audio_duration_raw,
                 audio_ms,
                 latency_ms,
                 infer_ms,
+                send_ms,
                 text_len,
                 chars_per_sec,
+                self._stream_helper_active(),
+                self._stream_fallback_reason(),
             )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
@@ -314,14 +330,37 @@ class DaemonServer:
     def status(self) -> StatusMessage:
         active = self.sessions.active
         state = active.state if active else SessionState.IDLE
+        requested_device = getattr(self, "_requested_device", str(self.settings.device))
+        effective_device = getattr(self, "_effective_device", requested_device)
         return StatusMessage(
             state=state.value,
             sessions_active=int(active is not None),
             gpu_mem_mb=None,
-            device=str(self.settings.device),
+            device=requested_device,
+            effective_device=effective_device,
             streaming_enabled=self.settings.streaming_enabled,
+            stream_helper_active=self._stream_helper_active(),
+            stream_fallback_reason=self._stream_fallback_reason(),
             chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
+            active_session_age_ms=active.audio_duration_ms if active else None,
+            last_audio_ms=getattr(self, "_last_audio_ms", None),
+            last_infer_ms=getattr(self, "_last_infer_ms", None),
+            last_send_ms=getattr(self, "_last_send_ms", None),
         )
+
+    def _stream_helper_active(self) -> bool:
+        if not self.settings.streaming_enabled:
+            return False
+        if self.streaming_transcriber is None:
+            return False
+        return self.streaming_transcriber.helper_active
+
+    def _stream_fallback_reason(self) -> str | None:
+        if not self.settings.streaming_enabled:
+            return None
+        if self.streaming_transcriber is None:
+            return "streaming_transcriber_unavailable"
+        return self.streaming_transcriber.fallback_reason
 
     def _write_wav(self, samples: np.ndarray) -> Path:
         path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
@@ -421,6 +460,15 @@ def create_app(settings: ServerSettings) -> FastAPI:
             await asyncio.to_thread(server.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
+        logger.info(
+            "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
+            "stream_helper_active={}, stream_fallback_reason={}",
+            server._requested_device,
+            server._effective_device,
+            server.settings.streaming_enabled,
+            server._stream_helper_active(),
+            server._stream_fallback_reason(),
+        )
         yield
         logger.info("Stopping audio capture")
         server.audio.stop()

@@ -101,8 +101,15 @@ class StatusMessage(BaseModel):
     sessions_active: int
     gpu_mem_mb: int | None = None
     device: str | None = None
+    effective_device: str | None = None
     streaming_enabled: bool | None = None
+    stream_helper_active: bool | None = None
+    stream_fallback_reason: str | None = None
     chunk_secs: float | None = None
+    active_session_age_ms: int | None = None
+    last_audio_ms: int | None = None
+    last_infer_ms: int | None = None
+    last_send_ms: int | None = None
 
 
 ServerMessage = SessionStarted | FinalResult | ErrorMessage | StatusMessage

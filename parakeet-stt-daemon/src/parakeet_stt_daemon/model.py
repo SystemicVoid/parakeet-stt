@@ -87,6 +87,7 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("Failed to adjust attention window: {}", exc)
 
+    object.__setattr__(model, "_parakeet_effective_device", resolved_device)
     return model
 
 
@@ -172,9 +173,14 @@ class ParakeetStreamingTranscriber:
         self.left_context_secs = float(left_context_secs)
         self.batch_size = int(batch_size)
         self.chunk_helper: Any | None = None
+        self.fallback_reason: str | None = None
 
         self.offline = ParakeetTranscriber(model)
         self._init_helper()
+
+    @property
+    def helper_active(self) -> bool:
+        return self.chunk_helper is not None
 
     def _init_helper(self) -> None:
         try:
@@ -203,9 +209,11 @@ class ParakeetStreamingTranscriber:
                 self.batch_size,
                 sample_rate,
             )
+            self.fallback_reason = None
         except Exception as exc:  # pragma: no cover - environment dependent
             logger.warning("Chunked streaming helper unavailable; using offline fallback: {}", exc)
             self.chunk_helper = None
+            self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
 
     def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
         if self.chunk_helper is not None:
@@ -214,6 +222,7 @@ class ParakeetStreamingTranscriber:
             except Exception as exc:  # pragma: no cover
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
                 self.chunk_helper = None
+                self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"
         return ParakeetStreamingSession(self, sample_rate)
 
     def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
