@@ -25,13 +25,23 @@ This report was originally authored before the core hardening tranche landed. Cu
 - `A5` bootstrap done: daemon pytest harness exists, with focused lifecycle + precedence tests.
 - `B2/C1` partial done: status/startup/completion now expose runtime truth fields (`requested/effective device`, helper active/fallback reason) plus last-stage timing fields (`audio/infer/send`).
 
-Validation snapshot for this tranche:
+## Status Update (2026-02-23, Post B1/A6)
 
-- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py` -> `16 passed`
-- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
-- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
-- `cd parakeet-stt-daemon && ty check .` -> pass
-- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py` -> pass
+- `B1/A6` done: streaming helper aligned with supported NeMo 2.5.3 API.
+  - Replaced non-existent `ChunkedRNNTInfer` import with `FrameBatchChunkedRNNT` + `AudioFeatureIterator` from `nemo.collections.asr.parts.utils.streaming_utils`.
+  - `finalize()` now uses frame-reader-based call pattern: `AudioFeatureIterator(samples, ...) → set_frame_reader() → transcribe()`.
+  - `--check` and startup logs now report streaming helper truth (ACTIVE with class name, or INACTIVE with fallback reason).
+  - Startup log promoted to WARNING when streaming is enabled but helper inactive.
+  - `total_buffer_secs = chunk_secs + right_context_secs`; `left_context_secs` retained in config but managed internally by `FrameBatchASR` frame buffering.
+  - 11 new streaming truth tests cover the full state matrix: disabled-by-config, enabled+active, enabled+inactive (import/init/reset failure), transcriber-unavailable, timing fields, session age.
+
+Validation snapshot for B1/A6:
+
+- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py tests/test_streaming_truth.py` -> `27 passed`
+- `cd parakeet-stt-daemon && uv run ruff check .` -> pass
+- `cd parakeet-stt-daemon && uv run ruff format --check .` -> pass
+- `cd parakeet-stt-daemon && ty check .` -> pass (2 warnings: pyright-specific type: ignore not recognized by ty)
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py src/parakeet_stt_daemon/__main__.py tests/` -> pass
 
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
@@ -45,12 +55,19 @@ Merged in this lane (2026-02-23):
    - Adds status fields: `effective_device`, `stream_helper_active`, `stream_fallback_reason`, `active_session_age_ms`, `last_audio_ms`, `last_infer_ms`, `last_send_ms`.
    - Tracks effective model device at load time and stream-helper fallback reasons.
    - Emits runtime truth at startup and richer completion telemetry.
+3. `b7503c2` — `fix(daemon): align streaming helper with supported NeMo API`
+   - Replaces non-existent `ChunkedRNNTInfer` with `FrameBatchChunkedRNNT` + `AudioFeatureIterator`.
+   - Adapts finalize() to frame-reader-based NeMo streaming call pattern.
+   - `--check` and startup logs report explicit helper truth (ACTIVE/INACTIVE + reason).
+   - Startup log promoted to WARNING when streaming enabled but helper inactive.
+4. `759c107` — `test(daemon): cover streaming helper active/fallback truth paths`
+   - 11 tests covering streaming truth state matrix and observability contracts.
 
 Remaining highest-priority execution order:
 
-1. `B1/A6` (owner `Owner-S2`): replace brittle `ChunkedRNNTInfer` integration with supported NeMo API or pin supported NeMo version explicitly.
-2. Finish `B2/C1`: optional `gpu_mem_mb` truth and tighten stage timing taxonomy (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`) with stable naming.
-3. `B3` (owner `Owner-S3`): error taxonomy expansion + daemon/client backward-compat mapping.
+1. Finish `B2/C1`: optional `gpu_mem_mb` truth and tighten stage timing taxonomy (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`) with stable naming.
+2. `B3` (owner `Owner-S3`): error taxonomy expansion + daemon/client backward-compat mapping.
+3. Streaming quality validation: run `--check` with streaming enabled on GPU to verify `FrameBatchChunkedRNNT` produces correct transcriptions. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
 
 Non-negotiable constraints for continuation:
 
@@ -60,23 +77,22 @@ Non-negotiable constraints for continuation:
 
 Suggested next atomic commits:
 
-1. `fix(daemon): align streaming helper with supported nemo api` (model/server only + focused tests).
-2. `feat(daemon): expose gpu memory and finalized stage timing taxonomy` (status/logs/tests/docs).
-3. `feat(protocol): add explicit session error taxonomy with client compatibility` (daemon + ptt + spec).
+1. `feat(daemon): expose gpu memory and finalized stage timing taxonomy` (status/logs/tests/docs).
+2. `feat(protocol): add explicit session error taxonomy with client compatibility` (daemon + ptt + spec).
 
 Verification commands to run after each commit:
 
-- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py`
-- `cd parakeet-stt-daemon && uv run ruff check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
-- `cd parakeet-stt-daemon && uv run ruff format --check src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
+- `cd parakeet-stt-daemon && uv run pytest -q tests/`
+- `cd parakeet-stt-daemon && uv run ruff check .`
+- `cd parakeet-stt-daemon && uv run ruff format --check .`
 - `cd parakeet-stt-daemon && ty check .`
-- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py tests/test_session_cleanup.py tests/test_cli_precedence.py`
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/ tests/`
 
 Current highest-priority unresolved items for follow-up agents:
 
-1. `B1/A6`: streaming engine integration against supported NeMo API with explicit fallback signaling.
-2. `B2/C1`: runtime truth fields and observability in `/status` and startup logs.
-3. `B3`: precise error taxonomy and client compatibility mapping.
+1. `B2/C1`: runtime truth fields and observability in `/status` and startup logs (gpu_mem_mb, timing taxonomy).
+2. `B3`: precise error taxonomy and client compatibility mapping.
+3. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
 
 ## Scope and Canonical Sources
 
