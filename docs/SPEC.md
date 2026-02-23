@@ -1,6 +1,6 @@
 # Parakeet STT – Canonical Specification (Living Document)
 
-_Last updated: 2026-02-21_
+_Last updated: 2026-02-23_
 
 This document is the single source of truth for the local, push-to-talk Parakeet speech-to-text solution on Pop!\_OS 24.04 (Wayland). Update it whenever significant design, implementation, or operational decisions are made so every agent and developer can stay in sync.
 
@@ -15,6 +15,8 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Keep the pipeline simple yet performant (KISS) with clear separation between ML responsibilities (Python) and OS-facing UX/integration (Rust).
   - Fast end-to-end latency (<150 ms from key release to text injection for typical utterances).
   - Privacy-first: all processing local; no cloud dependencies.
+  - Runtime truth must be explicit: status/log signals must reflect effective device and streaming activation, not just configured intent.
+  - Session lifecycle invariants are mandatory: disconnect/error paths must not leave orphaned active capture state.
 
 - **Non-Goals (v1)**
   - On-screen transcription overlays or editing UI.
@@ -41,9 +43,9 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Control flow**
   1. User presses Right Ctrl → `parakeet-ptt` sends `start_session` to daemon.
-  2. Daemon begins streaming mic audio (already owned by the daemon) through Parakeet’s RNNT streaming API.
+  2. Daemon begins session capture and, when streaming engine activation succeeds, performs incremental RNNT decode.
   3. User releases Right Ctrl → `parakeet-ptt` issues `stop_session`.
-  4. Daemon finalizes decoding, returns final transcription via WebSocket.
+  4. Daemon finalizes decoding (streaming finalization if active, otherwise explicit offline fallback), returns final transcription via WebSocket.
   5. `parakeet-ptt` writes transcript text to the clipboard and executes configured injection behavior (`paste` or `copy-only`), with adaptive shortcut routing available in paste mode.
 
 - **Networking**: localhost WebSocket (JSON frames). No audio leaves the daemon process; control messages only.
@@ -59,34 +61,39 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Eventually shipped as a user-level systemd service for auto-start.
 
 - **Dependencies**
-  - `nemo_toolkit[asr]`, `torch==2.x` (cu121 build for Pop!\_OS 24.04), `sounddevice`, `numpy`, `fastapi` + `uvicorn`, `pydantic` for configs, `loguru` (optional).
-  - Keep versions pinned in `pyproject.toml` and lock via `uv`.
+  - Core daemon/runtime: `fastapi`, `uvicorn`, `pydantic`, `sounddevice`, `numpy`, `loguru`.
+  - Inference/runtime lane: `torch` + `nemo-toolkit[asr]` pinned and resolved in `uv.lock` with an explicit CUDA wheel index strategy.
+  - Optional performance lane: `cuda-python` for CUDA-graphs optimization, feature-gated and observable at runtime.
+  - Keep versions pinned in `pyproject.toml`, lock with `uv lock`, and deploy with `uv sync --frozen`.
 
 - **Audio capture**
   - Sample rate 16 kHz mono, 16‑bit PCM.
-  - Use `sounddevice.RawInputStream` with callback writing into a lock-free ring buffer (~2 s). Stream remains open; push-to-talk simply toggles whether frames are fed into the model.
-  - Optional: capture 200 ms pre-roll on session start.
-  - Streaming defaults (HF-aligned): chunk 2.0 s, right context 2.0 s, left context 10 s, batch size 32; falling back to offline transcription is acceptable when streaming helper is unavailable.
+  - Use `sounddevice.InputStream` callback writing into a rolling pre-roll buffer (currently 2.5 s) plus per-session accumulation.
+  - Input stream remains open; push-to-talk toggles whether callback frames are attached to the active session.
+  - Streaming defaults: chunk 2.0 s, right context 2.0 s, left context 10 s, batch size 32.
+  - Offline fallback remains allowed only when explicitly signaled in startup logs and `/status`.
 
 - **Streaming inference**
-  - Load `FastConformerTransducerModel` from NeMo with `model.enable_streaming()` (or equivalent) per HF config (`att_context_size=[256,256]`, chunk length 320 samples, stride 160).
-  - On session start: reset RNNT states (`model.reset_states()`).
-  - Feed 20 ms frames continuously. If eventual partial results are desired, expose them via `partial_result`.
-  - On session stop: flush remaining frames, finalize RNNT decoding, normalize punctuation (model already auto-punctuates), package text.
+  - Target documented NeMo streaming APIs for RNNT/conformer flows (cache-aware per-session stepping), not brittle internal helper imports.
+  - On session start: allocate streaming state transactionally; if any downstream setup fails, rollback to idle.
+  - Feed chunked frames continuously while the session is active; preserve room for future partials without requiring protocol churn in v1.
+  - On session stop: flush remaining frames and finalize using streaming state when active; keep explicit offline finalization as guarded fallback.
   - Warm-up pass executed at daemon startup to eliminate first-use latency.
 
 - **API server**
   - WebSocket endpoint on `127.0.0.1:8765`.
-  - Accepts JSON control messages (spec below). Gracefully handles one active session; return error if new session requested while another is live.
+  - Accepts JSON control messages (spec below). Supports one active session and enforces cleanup invariants across disconnect/error paths.
   - Only local connections allowed; optional shared secret environment variable for defense in depth.
-  - `/status` HTTP endpoint (optional) exposing GPU memory usage, average latency, current state.
+  - `/status` HTTP endpoint (optional) exposes state and runtime truth (configured/effective device, streaming activation state, and optional diagnostic fields).
 
 - **Configuration**
-  - TOML/YAML file or env vars for: preferred language hint, microphone device ID, WebSocket port, GPU device index.
+  - Env vars + CLI flags for preferred language hint, microphone device ID, WebSocket host/port, and device selection.
+  - Precedence contract: **CLI explicit > ENV > defaults**.
   - Provide CLI `uv run python -m parakeet_stt_daemon --check` for diagnostics (lists microphones, verifies GPU, runs 1‑second test).
 
 - **Observability**
-  - Structured logs for each session: durations, frames processed, GPU ms, output length.
+  - Structured logs for each session: durations, frames processed, infer ms, output length, and failure stage attribution.
+  - Startup logs must include streaming truth signals (`requested`, `active/fallback`, fallback reason) and effective runtime device.
   - Metrics aggregator (future) to feed UI/waybar when needed.
   - Quick smoke (from any directory):
     - `repo=$HOME/Documents/Engineering/parakeet-stt`
@@ -149,7 +156,12 @@ All messages are JSON objects with a `type` string.
     ```
   - `abort_session`
     ```json
-    { "type": "abort_session", "session_id": "<uuid>", "reason": "timeout|user|error" }
+    {
+      "type": "abort_session",
+      "session_id": "<uuid>",
+      "reason": "timeout|user|error",
+      "timestamp": "<iso8601>"
+    }
     ```
 
 - **Server → Client**
@@ -180,7 +192,7 @@ All messages are JSON objects with a `type` string.
     {
       "type": "error",
       "session_id": "<uuid>",
-      "code": "SESSION_BUSY|AUDIO_DEVICE|MODEL",
+      "code": "SESSION_BUSY|SESSION_NOT_FOUND|SESSION_ABORTED|AUDIO_DEVICE|MODEL|INVALID_REQUEST|UNEXPECTED",
       "message": "<human friendly>"
     }
     ```
@@ -190,18 +202,25 @@ All messages are JSON objects with a `type` string.
       "type": "status",
       "state": "idle|listening|processing",
       "sessions_active": 0,
-      "gpu_mem_mb": 1320
+      "gpu_mem_mb": 1320,
+      "device": "cuda",
+      "effective_device": "cuda",
+      "streaming_enabled": true,
+      "stream_helper_active": true,
+      "active_session_age_ms": 0
     }
     ```
 
 Future messages (like `partial_result`) must be backward compatible; clients should ignore unknown `type`s.
+Clients must also tolerate unknown error codes and unknown additional fields.
+Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
 
 ---
 
 ## 5. Implementation Guidelines
 
 1. **Use uv & cargo consistently**
-   - Python: `uv run`, `uv pip`, `uv lock`. No `pip install` without uv.
+   - Python: `uv run`, `uv sync`, `uv add`, `uv lock`. No direct `pip install` and no `uv pip install`.
    - Rust: standard `cargo` commands; consider workspace layout early.
 
 2. **Coding standards**
@@ -218,7 +237,7 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
    - Measure and log latency on every session to detect regressions.
 
 5. **Testing**
-   - Python: unit tests for streaming state machine, mocked audio input, and WebSocket handlers.
+   - Python: unit tests for session lifecycle invariants (disconnect/error cleanup + transactional start), streaming state machine, mocked audio input, and WebSocket handlers.
    - Integration: CLI script feeding a short WAV file to ensure deterministic output.
    - Rust: mock daemon responses to verify state transitions and injection calls; property-based tests for key event handling.
 
@@ -245,6 +264,7 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
    - Keep `uinput -> ydotool` fallback behavior observable and deterministic.
 
 4. **M3 – Hardening**
+   - Daemon hardening gate: session cleanup invariants, start rollback semantics, config precedence tests, runtime truth status fields.
    - Error handling, reconnection logic, systemd units, metrics endpoint.
    - Permission setup script/instructions.
 
@@ -264,6 +284,8 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
 | Authentication | Decide whether to enforce shared secret or rely on localhost isolation. |
 | Multi-language hints | Add config to pin language or rely on auto-detect per user preference. |
 | Partial result overlay | Deferred; document design when prioritized. |
+| Streaming default policy | Keep reliability-first offline helper default until streaming profile passes soak + lifecycle gates. |
+| GPU stack refresh timing | Run staged update lane after streaming API integration is validated on current lock baseline. |
 
 ---
 

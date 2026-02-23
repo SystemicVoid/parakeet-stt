@@ -1,6 +1,6 @@
 # Parakeet STT Product Roadmap
 
-Date: 2026-02-08
+Date: 2026-02-23
 
 ## Goal
 
@@ -10,6 +10,7 @@ Turn Parakeet STT from "works with logs" into a premium local dictation experien
 
 - Core STT loop is operational and low-latency.
 - Injection stack has robust controls (`paste` mode, key backend, failure policy).
+- Daemon hardening gaps are now explicitly identified (disconnect cleanup invariants, CLI/env precedence, and streaming truthfulness).
 - Main UX gap is user feedback: state is visible in logs, not in an obvious UI channel.
 
 ## UX Principles
@@ -19,7 +20,32 @@ Turn Parakeet STT from "works with logs" into a premium local dictation experien
 - Failure states must be explicit and recoverable.
 - Advanced tuning remains available, but defaults stay minimal and reliable.
 
-## P0: Injection Architecture Hardening (Highest Priority)
+## P-1: Daemon Hardening Gate (Release Blocker for Streaming UX)
+
+Scope:
+- Enforce session lifecycle invariants on websocket disconnect and handler errors.
+- Make start-session transactional so partial failures always roll back to idle.
+- Fix configuration precedence for booleans (`CLI explicit > ENV > defaults`).
+- Make daemon truth visible (`requested` vs `effective` runtime state for device and streaming engine).
+- Add daemon test coverage for lifecycle and config regressions.
+- Keep reliability-first runtime defaults while adding an explicit streaming profile for validation.
+
+Implementation direction:
+- Add one cleanup path used by disconnect, exception, stop, and abort handling.
+- Add rollback guards around post-allocation start-session steps.
+- Parse CLI booleans with explicit intent (no implicit override when flags are omitted).
+- Enrich `/status` and startup logs with hard runtime truth signals and fallback reasons.
+- Add `pytest` plus focused tests for session lifecycle, precedence, and protocol mapping.
+- Keep helper default path offline-first; expose a clear opt-in streaming start profile for soak runs.
+
+Acceptance:
+- Forced disconnect during active listening leaves `sessions_active=0` with no continued audio accumulation.
+- Env-only control of streaming/status works when CLI flags are omitted.
+- Startup and `/status` clearly report whether streaming is truly active or in offline fallback.
+- Daemon lifecycle and precedence tests pass locally in CI-equivalent runs.
+- Streaming validation profile can run repeated dictation cycles without leaked session state.
+
+## P0: Injection Architecture Hardening (After P-1)
 
 Scope:
 - Keep the consolidated runtime path (`paste` + `copy-only`) reliable before adding new UX features.
@@ -143,13 +169,24 @@ Acceptance:
 
 ## Delivery Strategy (Atomic)
 
-1. Complete P0 injection architecture hardening and lock reliability baselines.
-2. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
-3. Add Phase 1 tests and update docs.
-4. Ship TUI skeleton with existing state only.
-5. Extend TUI with injection outcomes.
-6. Add incremental dictation error correction loop behind an opt-in switch.
-7. Prototype GUI after TUI reaches stable daily use.
+1. Complete P-1 daemon hardening gate and lock lifecycle/config invariants with tests.
+2. Complete P0 injection architecture hardening and lock reliability baselines.
+3. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
+4. Add Phase 1 tests and update docs.
+5. Ship TUI skeleton with existing state only.
+6. Extend TUI with injection outcomes.
+7. Add incremental dictation error correction loop behind an opt-in switch.
+8. Prototype GUI after TUI reaches stable daily use.
+
+## Daemon Hardening Action Board (2026-02-23)
+
+1. `A1`: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`).
+2. `A2`: CLI/env precedence fix for `status_enabled` and `streaming_enabled` (`parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py`).
+3. `A3`: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`).
+4. `A4`: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
+5. `A5`: Daemon test harness and focused lifecycle/config/protocol tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
+6. `A6`: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
+7. `A7`: Helper policy and operator profiles (`scripts/stt-helper.sh`): keep default reliability profile offline-first, add explicit streaming validation profile.
 
 ## Metrics to Track
 
@@ -158,10 +195,13 @@ Acceptance:
 - Fallback/copy-only event rate.
 - User-reported "had to check logs" frequency.
 - Recurring dictation-error correction hit rate (matches applied vs reverted).
+- Active-session leak count after disconnect/error scenarios.
+- Stop-session finalize latency (`p50`/`p95`/`p99`) in offline and streaming profiles.
+- Streaming-active truth ratio (`streaming requested` vs `streaming engine active`).
 
 ## Streaming-Dependent Features (Blocked)
 
-The following UX improvements require streaming mode to be stable and default:
+The following UX improvements require streaming mode to be functionally active, explicitly reported, and validated by the P-1 hardening gate:
 
 1. "Ready to release" audio cue: Play a sound when transcription settles (no new words for
 N ms) while the user is still holding, signaling they can release without truncation.
@@ -171,8 +211,8 @@ N ms) while the user is still holding, signaling they can release without trunca
 3. Confidence-based early termination: Detect silence plus high confidence to auto-stop
 session without waiting for button release.
 
-Streaming mode exists (`--streaming`) but is not yet default due to architectural differences
-in how audio chunks are processed. Stabilizing streaming is a prerequisite for these features.
+Current default policy remains reliability-first (`stt start` offline profile) until streaming
+passes lifecycle + soak gates. Use an explicit streaming profile for validation and iterative hardening.
 
 ## Non-Goals (Near-Term)
 
