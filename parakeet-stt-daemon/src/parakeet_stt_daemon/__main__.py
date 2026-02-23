@@ -46,12 +46,14 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--no-status",
         dest="status_enabled",
         action="store_false",
+        default=None,
         help="Disable the /status endpoint",
     )
     parser.add_argument(
         "--no-streaming",
         dest="streaming_enabled",
         action="store_false",
+        default=None,
         help="Disable streaming path and fall back to offline transcription",
     )
     parser.add_argument("--chunk-secs", type=float, help="Chunk size (seconds) for streaming")
@@ -86,8 +88,10 @@ def _build_settings(args: argparse.Namespace) -> ServerSettings:
         kwargs["mic_device"] = args.mic_device
     if args.shared_secret is not None:
         kwargs["shared_secret"] = str(args.shared_secret)
-    kwargs["status_enabled"] = bool(args.status_enabled)
-    kwargs["streaming_enabled"] = bool(args.streaming_enabled)
+    if args.status_enabled is not None:
+        kwargs["status_enabled"] = bool(args.status_enabled)
+    if args.streaming_enabled is not None:
+        kwargs["streaming_enabled"] = bool(args.streaming_enabled)
     if args.chunk_secs is not None:
         kwargs["chunk_secs"] = float(args.chunk_secs)
     if args.right_context_secs is not None:

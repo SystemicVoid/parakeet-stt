@@ -180,13 +180,15 @@ Acceptance:
 
 ## Daemon Hardening Action Board (2026-02-23)
 
-1. `A1`: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`).
-2. `A2`: CLI/env precedence fix for `status_enabled` and `streaming_enabled` (`parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py`).
-3. `A3`: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`).
-4. `A4`: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
-5. `A5`: Daemon test harness and focused lifecycle/config/protocol tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
-6. `A6`: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
-7. `A7`: Helper policy and operator profiles (`scripts/stt-helper.sh`): keep default reliability profile offline-first, add explicit streaming validation profile.
+Status legend: `todo` | `in-progress` | `done` | `blocked`
+
+1. `A1` — status: `todo`; owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`).
+2. `A2` — status: `done` (2026-02-23); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: CLI/env precedence fix for `status_enabled` and `streaming_enabled` (`parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py`).
+3. `A3` — status: `todo`; owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`).
+4. `A4` — status: `todo`; owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
+5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
+6. `A6` — status: `todo`; owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
+7. `A7` — status: `todo`; owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): keep default reliability profile offline-first, add explicit streaming validation profile.
 
 ## Metrics to Track
 
