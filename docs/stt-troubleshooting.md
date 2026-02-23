@@ -8,8 +8,8 @@ This document now has two parts:
 Canonical-source policy:
 - This file is the canonical operator source of truth for runtime behavior and troubleshooting.
 - `scripts/stt-helper.sh` (`start_option_rows`) is the canonical source for helper start flags/defaults/env wiring.
-- `docs/HANDOFF-clipboard-injector-2026-02-08.md` is historical context only and not operational guidance.
-- `docs/HANDOFF-stt-cross-surface-injection-2026-02-19.md` is archived historical context only and not operational guidance.
+- `docs/archive/HANDOFF-clipboard-injector-2026-02-08.md` is historical context only and not operational guidance.
+- `docs/archive/HANDOFF-stt-cross-surface-injection-2026-02-19.md` is archived historical context only and not operational guidance.
 
 ## Current truth (2026 migration branch)
 

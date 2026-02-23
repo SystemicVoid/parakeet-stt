@@ -17,7 +17,7 @@ Still-useful content in this archive:
 
 For implementation strategy and phased execution, start with:
 
-- `docs/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
+- `docs/archive/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
 
 This handoff remains the detailed investigation log and runtime evidence archive.
 

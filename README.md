@@ -152,7 +152,8 @@ stt diag-injector
 
 - Protocol contract: `docs/SPEC.md`
 - Troubleshooting (canonical operator source): `docs/stt-troubleshooting.md`
-- Historical injector handoff archive (non-canonical): `docs/HANDOFF-clipboard-injector-2026-02-08.md`
-- Historical cross-surface incident handoff archive (non-canonical): `docs/HANDOFF-stt-cross-surface-injection-2026-02-19.md`
-- Injection implementation roadmap: `docs/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
+- Historical docs archive index (non-canonical): `docs/archive/README.md`
+- Historical injector handoff archive (non-canonical): `docs/archive/HANDOFF-clipboard-injector-2026-02-08.md`
+- Historical cross-surface incident handoff archive (non-canonical): `docs/archive/HANDOFF-stt-cross-surface-injection-2026-02-19.md`
+- Historical injection implementation roadmap (non-canonical): `docs/archive/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
 - UX roadmap (new): `ROADMAP.md`

@@ -262,6 +262,6 @@ Behavioral:
 
 ## 12. Cross-References
 
-1. `docs/HANDOFF-clipboard-injector-2026-02-08.md`
+1. `docs/archive/HANDOFF-clipboard-injector-2026-02-08.md`
 2. `docs/SYSTEM-SPECS-and-FULL-STACK-REFERENCES-2026-02-08.md`
 3. `docs/stt-troubleshooting.md`

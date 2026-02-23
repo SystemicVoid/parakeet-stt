@@ -1,0 +1,3 @@
+# Ignore editor/OS scratch files in archive docs.
+*.swp
+.DS_Store
