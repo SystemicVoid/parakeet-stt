@@ -60,6 +60,12 @@ The following are already present in `parakeet-ptt` and helper tooling:
 Logs show process-level injection success (`success_assumed`), but UI-level insertion remains inconsistent in some app/surface combinations (notably Ghostty/COSMIC + some browser fields).  
 Current gap: process-success telemetry is stronger than app-level semantic-success telemetry.
 
+Field note (2026-02-23):
+1. Zed editor markdown surface currently fails semantic insertion.
+- Observed behavior: paste chord triggers markdown preview toggle instead of inserting transcript text.
+- Likely mechanism: terminal-style `Ctrl+Shift+V` route conflicts with Zed markdown keybinding semantics.
+- Requirement: add app/surface-specific routing override for Zed editor surfaces (prefer `Ctrl+V` first, with explicit fallback policy), then validate with repeated runs.
+
 ## 4. Research Synthesis (Critically Filtered)
 
 ## High-confidence findings (aligned with repo evidence)
@@ -166,6 +172,7 @@ Implemented in this phase:
 Remaining in this phase:
 1. Add app-level semantic success evidence (not only command/clipboard success).
 2. Run and record repeated multi-app acceptance matrix results.
+3. Add Zed editor routing profile + semantic verification path (markdown editor must insert text, not toggle preview).
 
 Acceptance:
 1. Unit tests cover attempt ordering and fallback transitions.
@@ -189,7 +196,8 @@ Matrix (must pass in repeated runs):
 2. COSMIC Terminal prompt.
 3. Brave address bar and text field.
 4. GTK/native text entry.
-5. `copy-only` non-regression.
+5. Zed editor markdown surface (explicitly verify no preview-toggle regression).
+6. `copy-only` non-regression.
 
 Decision gate:
 1. Promote backend default only if matrix pass rate exceeds current default and no severe regressions are found.
@@ -213,6 +221,8 @@ Acceptance matrix recording template:
 | Brave address bar | uinput |  |  |  |  |
 | GTK/native text entry | wtype |  |  |  |  |
 | GTK/native text entry | uinput |  |  |  |  |
+| Zed markdown editor | uinput |  |  | semantic-no-op: preview-toggle |  |
+| Zed markdown editor | ydotool |  |  | semantic-no-op: preview-toggle |  |
 | Clipboard-only regression check | copy-only |  |  |  |  |
 
 ## Phase 5: Deferred R&D Track (Non-blocking)
