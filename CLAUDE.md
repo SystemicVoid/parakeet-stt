@@ -49,13 +49,20 @@ cargo run -- --help              # Show all options
 cd parakeet-stt-daemon
 uv run ruff check .
 uv run ruff format --check .
-uv run --no-project ty check
+ty check .
 
 # Client
 cd parakeet-ptt
 cargo fmt
 cargo clippy --all-targets --all-features -D warnings
 cargo test
+```
+
+Unified git gates (repo root):
+```bash
+prek install -t pre-commit -t pre-push
+prek run --all-files
+prek run --stage pre-push --all-files
 ```
 
 ### Helper Script (recommended workflow)

@@ -127,9 +127,20 @@ Daemon checks:
 cd parakeet-stt-daemon
 uv run ruff check .
 uv run ruff format --check .
-uv run --no-project ty check
+ty check .
 uv run parakeet-stt-daemon --check
 ```
+
+Commit and push gates (repo root):
+```bash
+prek install -t pre-commit -t pre-push
+prek run --all-files
+prek run --stage pre-push --all-files
+```
+Hook stages are split for speed:
+- `pre-commit`: `ruff format`, `ruff check`, `ty check`, `cargo fmt`
+- `pre-push`: `pytest`, `cargo clippy`, `cargo test`
+- Hooks are language-scoped, so Python checks run only for `parakeet-stt-daemon/` changes and Rust checks run only for `parakeet-ptt/` changes.
 
 Manual injector validation:
 ```bash
