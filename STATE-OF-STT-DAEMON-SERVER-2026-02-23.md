@@ -389,89 +389,16 @@ PR-specific gates:
 5. Stability soak
 - repeated dictation cycles (>=200) with no active-session leaks and stable memory trend
 
-## Deep Research Prompt (for Parallel Agent)
+## Deep Research Output
 
-Use this prompt verbatim with another agent.
-
-```markdown
-You are auditing and proposing updates for the GPU inference stack of `parakeet-stt-daemon`.
-
-## Context
-
-Project: local Linux/Wayland STT stack using Python daemon + NeMo Parakeet ASR.
-Host profile:
-- OS: Pop!_OS 24.04
-- GPU: NVIDIA GeForce RTX 5060 Ti (16GB)
-- Driver: 580.119.02
-- `nvidia-smi` CUDA runtime: 13.0
-- Python: 3.11
-
-Current project state:
-- `torch==2.9.1+cu128` installed
-- `nemo-toolkit==2.5.3`
-- daemon code currently attempts to import `ChunkedRNNTInfer` from `nemo.collections.asr.parts.utils.streaming_utils`
-- runtime warning shows import failure for `ChunkedRNNTInfer` and streaming falls back to offline
-- runtime warning also indicates missing `cuda-python>=12.3` disables CUDA graph optimization path
-
-## Your objectives
-
-1. Determine whether current stack should remain as-is or be upgraded now.
-2. Produce a **decision-ready compatibility matrix** for:
-   - torch versions (current and latest stable)
-   - CUDA wheel variants (cu128, cu130, etc.)
-   - nemo-toolkit versions likely to support Parakeet streaming on Python 3.11
-3. Identify the **correct current NeMo streaming API/classes** for chunked RNNT inference and map exactly how this daemon should integrate with them.
-4. Assess whether adding `cuda-python` is beneficial and safe for this runtime.
-5. Recommend a pinned constraints strategy (pyproject + lock), including rollback path.
-
-## Required sources
-
-Use primary sources only:
-- official PyTorch docs and wheel indexes (`pytorch.org`, `download.pytorch.org`)
-- official NeMo docs/release notes and/or package metadata (`docs.nvidia.com`, PyPI metadata)
-- package metadata from PyPI JSON where useful
-
-## Deliverables
-
-Return a report with:
-
-1. **Recommendation (Go/No-Go)** for immediate stack update.
-2. **Compatibility matrix** with exact versions and rationale.
-3. **Proposed dependency set** (production and dev), including optional extras.
-4. **Migration plan**:
-   - exact commands to create test env and lock deps
-   - exact verification script/commands
-   - rollback commands
-5. **Benchmark protocol**:
-   - test corpus/profile
-   - metrics: cold start, warm finalize latency p50/p95/p99, VRAM usage, failures, transcript correctness sanity checks
-6. **Risk register**:
-   - top failure modes and mitigations
-7. **Patch sketch** for daemon streaming integration with current NeMo API (function/class-level guidance)
-
-## Constraints
-
-- Preserve local-only operation and current websocket protocol compatibility unless explicitly justified.
-- Prefer stability-first recommendations, but quantify expected perf wins for any upgrade.
-- Be explicit about uncertainty and where additional validation is needed.
-```
-
-## External References Consulted
-
-- PyPI `nemo-toolkit` metadata: https://pypi.org/project/nemo-toolkit/
-- PyPI `torch` metadata: https://pypi.org/project/torch/
-- PyTorch wheel index root: https://download.pytorch.org/whl/
-- PyTorch `cu130` torch wheel index: https://download.pytorch.org/whl/cu130/torch/
-- PyTorch previous versions page: https://pytorch.org/get-started/previous-versions/
+See the finalized GPU stack research report in `deep-research-report.md` for the recommendation, compatibility matrix, migration/rollback commands, benchmark protocol, and risk register.
 
 ## Appendix: Key Code References
 
-- Session disconnect handling: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:102`
-- Stop path/session error mapping: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:150`
-- Abort mapping: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:207`
+The canonical source list is in "Scope and Canonical Sources" above. These are only the
+line-level hotspots referenced by top-ranked findings:
+
+- Session disconnect handling gap: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:102`
 - Transcription temp-file path: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:266`
-- Streaming helper import: `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:180`
-- Streaming fallback warning path: `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:205`
-- CLI settings merge bug location: `parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py:89`
-- Base dependency shape: `parakeet-stt-daemon/pyproject.toml:11`
-- Helper forcing offline mode: `scripts/stt-helper.sh:580`
+- Streaming helper import/fallback path: `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:180`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:205`
+- Helper default forcing offline mode: `scripts/stt-helper.sh:580`
