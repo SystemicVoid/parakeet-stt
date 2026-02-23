@@ -72,6 +72,11 @@ Session closeout notes (2026-02-22):
 - Known minor issue: startup device scan can emit `failed to open "/dev/input/eventX": Permission denied` while still finding enough readable devices and starting hotkey listeners.
   - Follow-up candidate (low priority): suppress/downgrade per-device permission-denied noise unless no eligible hotkey devices are discovered.
 
+Known cross-surface gap (2026-02-23):
+- Zed markdown editor can interpret current paste routing as a markdown preview toggle instead of text insertion.
+- Working hypothesis: terminal-style shortcut routing (`Ctrl+Shift+V`) conflicts with Zed markdown keybinding semantics on that surface.
+- Follow-up: add an app/surface override for Zed markdown contexts (`Ctrl+V` first, explicit fallback policy) and add Zed to the acceptance matrix for semantic insertion validation.
+
 ## Phase 1: Immediate Feedback Layer (Sound + Notification)
 
 Scope:
