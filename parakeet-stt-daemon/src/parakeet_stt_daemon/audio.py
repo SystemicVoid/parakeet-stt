@@ -97,6 +97,14 @@ class AudioInput:
             return np.zeros((0,), dtype=self.dtype)
         return np.concatenate(chunks).astype(self.dtype, copy=False)
 
+    def abort_session(self) -> None:
+        """Stop accumulation and discard any captured session audio."""
+        with self._lock:
+            self._session_active = False
+            self._session_chunks = []
+            self._stream_ready = []
+            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+
     def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         """Stop accumulation and return captured samples plus streaming slices.
 

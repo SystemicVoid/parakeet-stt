@@ -101,9 +101,18 @@ class DaemonServer:
                 await self._dispatch(websocket, parsed)
         except WebSocketDisconnect:
             logger.info("WebSocket client disconnected: {}", websocket.client)
+            await self._cleanup_active_session("websocket disconnected")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error in WebSocket handler: {}", exc)
-            await self._send_error(websocket, None, "UNEXPECTED", str(exc))
+            await self._cleanup_active_session(
+                f"websocket handler exception: {exc.__class__.__name__}"
+            )
+            try:
+                await self._send_error(websocket, None, "UNEXPECTED", str(exc))
+            except Exception as send_exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to send error after websocket handler exception: {}", send_exc
+                )
 
     async def _dispatch(self, websocket: WebSocket, parsed: ParsedMessage) -> None:
         if parsed.kind is ClientMessageType.START_SESSION:
@@ -206,13 +215,46 @@ class DaemonServer:
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
         logger.debug("abort_session received: {}", message)
-        await self.sessions.clear(message.session_id)
+        await self._cleanup_active_session(
+            f"abort_session requested ({message.reason})",
+            expected_session_id=message.session_id,
+        )
         await self._send_error(
             websocket,
             message.session_id,
             "SESSION_BUSY",
             f"Session aborted: {message.reason}",
         )
+
+    async def _cleanup_active_session(
+        self, reason: str, expected_session_id: UUID | None = None
+    ) -> bool:
+        """Reset all runtime state tied to an active session."""
+        async with self._transcribe_lock:
+            active = self.sessions.active
+            if (
+                active is not None
+                and expected_session_id is not None
+                and active.session_id != expected_session_id
+            ):
+                logger.debug(
+                    "Skipping cleanup for session {} (active session is {})",
+                    expected_session_id,
+                    active.session_id,
+                )
+                return False
+
+            active_session_id = active.session_id if active else None
+            if active_session_id is not None:
+                logger.warning("Cleaning up active session {} ({})", active_session_id, reason)
+            else:
+                logger.debug("Cleaning residual runtime state with no active session ({})", reason)
+            self.audio.abort_session()
+            self._stop_stream_drain_loop()
+            if active_session_id is not None:
+                await self.sessions.clear(active_session_id)
+            self._active_stream = None
+            return active_session_id is not None
 
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str

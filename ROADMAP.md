@@ -182,7 +182,7 @@ Acceptance:
 
 Status legend: `todo` | `in-progress` | `done` | `blocked`
 
-1. `A1` — status: `todo`; owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`).
+1. `A1` — status: `done` (2026-02-23); owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`, `parakeet-stt-daemon/tests/test_session_cleanup.py`).
 2. `A2` — status: `done` (2026-02-23); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: CLI/env precedence fix for `status_enabled` and `streaming_enabled` (`parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py`).
 3. `A3` — status: `todo`; owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`).
 4. `A4` — status: `todo`; owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
