@@ -156,6 +156,7 @@ class ParakeetStreamingSession:
                     helper.frame_len,
                     helper.raw_preprocessor,
                     helper.asr_model.device,
+                    pad_to_frame_len=False,
                 )
                 helper.set_frame_reader(frame_reader)
                 result = helper.transcribe()
@@ -208,12 +209,10 @@ class ParakeetStreamingTranscriber:
 
         total_buffer_secs = self.chunk_secs + self.right_context_secs
         try:
-            # NeMo's FrameBatchChunkedRNNT defaults suggest int params but
-            # the parent FrameBatchASR accepts float; suppress the mismatch.
             self.chunk_helper = FrameBatchChunkedRNNT(
                 asr_model=self.model,
-                frame_len=self.chunk_secs,  # type: ignore[reportArgumentType]
-                total_buffer=total_buffer_secs,  # type: ignore[reportArgumentType]
+                frame_len=self.chunk_secs,
+                total_buffer=total_buffer_secs,
                 batch_size=self.batch_size,
             )
             self._audio_feature_iter_cls = AudioFeatureIterator

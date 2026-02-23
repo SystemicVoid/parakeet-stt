@@ -30,14 +30,16 @@ This report was originally authored before the core hardening tranche landed. Cu
 - `B1/A6` done: streaming helper aligned with supported NeMo 2.5.3 API.
   - Replaced non-existent `ChunkedRNNTInfer` import with `FrameBatchChunkedRNNT` + `AudioFeatureIterator` from `nemo.collections.asr.parts.utils.streaming_utils`.
   - `finalize()` now uses frame-reader-based call pattern: `AudioFeatureIterator(samples, ...) → set_frame_reader() → transcribe()`.
+  - `finalize()` now explicitly sets `pad_to_frame_len=False` on `AudioFeatureIterator` to match NeMo chunked semantics and avoid synthetic zero-padded tail frames on short final chunks.
   - `--check` and startup logs now report streaming helper truth (ACTIVE with class name, or INACTIVE with fallback reason).
   - Startup log promoted to WARNING when streaming is enabled but helper inactive.
   - `total_buffer_secs = chunk_secs + right_context_secs`; `left_context_secs` retained in config but managed internally by `FrameBatchASR` frame buffering.
   - 11 new streaming truth tests cover the full state matrix: disabled-by-config, enabled+active, enabled+inactive (import/init/reset failure), transcriber-unavailable, timing fields, session age.
+  - Added dedicated regression coverage for chunked finalization padding behavior (`tests/test_streaming_chunk_padding.py`).
 
 Validation snapshot for B1/A6:
 
-- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py tests/test_streaming_truth.py` -> `27 passed`
+- `cd parakeet-stt-daemon && uv run pytest -q tests/test_session_cleanup.py tests/test_cli_precedence.py tests/test_streaming_truth.py tests/test_streaming_chunk_padding.py` -> `28 passed`
 - `cd parakeet-stt-daemon && uv run ruff check .` -> pass
 - `cd parakeet-stt-daemon && uv run ruff format --check .` -> pass
 - `cd parakeet-stt-daemon && ty check .` -> pass (2 warnings: pyright-specific type: ignore not recognized by ty)

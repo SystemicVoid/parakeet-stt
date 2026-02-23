@@ -77,6 +77,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Target documented NeMo streaming APIs for RNNT/conformer flows (cache-aware per-session stepping), not brittle internal helper imports.
   - On session start: allocate streaming state transactionally; if any downstream setup fails, rollback to idle.
   - Feed chunked frames continuously while the session is active; preserve room for future partials without requiring protocol churn in v1.
+  - For `FrameBatchChunkedRNNT` finalization, build `AudioFeatureIterator(..., pad_to_frame_len=False)` to avoid synthetic padded tail frames that can perturb utterance-end decoding.
   - On session stop: flush remaining frames and finalize using streaming state when active; keep explicit offline finalization as guarded fallback.
   - Warm-up pass executed at daemon startup to eliminate first-use latency.
 
@@ -242,6 +243,7 @@ Fields beyond `state` and `sessions_active` in `status` should be treated as opt
 
 5. **Testing**
    - Python: unit tests for session lifecycle invariants (disconnect/error cleanup + transactional start), streaming state machine, mocked audio input, and WebSocket handlers.
+   - Include regression tests for chunked streaming finalize behavior at utterance boundaries (no padded synthetic frame insertion).
    - Integration: CLI script feeding a short WAV file to ensure deterministic output.
    - Rust: mock daemon responses to verify state transitions and injection calls; property-based tests for key event handling.
 
