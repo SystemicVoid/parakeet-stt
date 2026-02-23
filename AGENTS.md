@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+The role of this file is to describe common mistakes and confusion points that agents might encounter as they work in this project. If you ever encounter something in the project that surprises you, please alert the developer working with you and indicate that this is the case in the agent MD file to help prevent future agents from having the same issue.
+
 ## Project Structure & Module Organization
 - `parakeet-stt-daemon/`: Python 3.11 FastAPI/WebSocket daemon (uv-managed). Core modules live in `src/parakeet_stt_daemon/` (`server.py`, `session.py`, `model.py`, `audio.py`, `config.py`, `messages.py`). `test-run.py` and sample audio support manual model checks. `deploy/` holds systemd units.
 - `parakeet-ptt/`: Rust tokio client/hotkey injector. Entry point is `src/main.rs` with helper modules (`client`, `protocol`, `hotkey`, `injector`, `config`, `state`). Builds to the `parakeet-ptt` binary.
