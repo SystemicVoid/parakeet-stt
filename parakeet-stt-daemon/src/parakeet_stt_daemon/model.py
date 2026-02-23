@@ -23,12 +23,12 @@ if TYPE_CHECKING:  # pragma: no cover
     import torch
     from nemo.collections.asr.models import ASRModel
 else:
-    nemo_asr = None  # type: ignore
-    ASRModel = Any  # type: ignore
+    nemo_asr = None
+    ASRModel = Any
     try:
-        import torch  # type: ignore  # noqa: F401
+        import torch  # noqa: F401
     except ImportError:  # pragma: no cover - inference extra not installed
-        torch = None  # type: ignore
+        torch = None
 
 
 def _resolve_device(requested: str) -> str:
@@ -36,7 +36,7 @@ def _resolve_device(requested: str) -> str:
         if torch is None:  # pragma: no cover - inference extra not installed
             logger.warning("CUDA requested but torch is not available; falling back to CPU")
             return "cpu"
-        if torch.cuda.is_available():  # type: ignore[union-attr]
+        if torch.cuda.is_available():
             return "cuda"
         logger.warning("CUDA requested but not available; using CPU instead")
         return "cpu"
@@ -62,8 +62,9 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
         ) from exc
 
     resolved_device = _resolve_device(device)
+    map_location = torch.device("cpu") if torch is not None else None
     model: ASRModel = nemo_asr.models.ASRModel.from_pretrained(
-        model_name=model_name, map_location="cpu"
+        model_name=model_name, map_location=map_location
     )
     try:
         model.to(resolved_device)
@@ -129,6 +130,7 @@ class ParakeetTranscriber:
             return ""
         return _extract_text(outputs[0])
 
+
 class ParakeetStreamingSession:
     """Accumulate audio chunks for a single streaming session."""
 
@@ -146,7 +148,7 @@ class ParakeetStreamingSession:
         combined = np.concatenate(self._chunks)
         if self._parent.chunk_helper is not None:
             try:
-                return self._parent.chunk_helper.transcribe([combined])[0]  # type: ignore[attr-defined,index]  # noqa: E501
+                return self._parent.chunk_helper.transcribe([combined])[0]
             except Exception as exc:  # pragma: no cover - fallback path
                 logger.warning("Chunk helper failed, falling back to offline: {}", exc)
         return self._parent._transcribe_offline(combined, self.sample_rate)
@@ -208,7 +210,7 @@ class ParakeetStreamingTranscriber:
     def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
         if self.chunk_helper is not None:
             try:
-                self.chunk_helper.reset()  # type: ignore[attr-defined]
+                self.chunk_helper.reset()
             except Exception as exc:  # pragma: no cover
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
                 self.chunk_helper = None

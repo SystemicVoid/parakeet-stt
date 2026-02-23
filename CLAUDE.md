@@ -49,7 +49,7 @@ cargo run -- --help              # Show all options
 cd parakeet-stt-daemon
 uv run ruff check .
 uv run black --check .
-uv run pyright
+uv run --no-project ty check
 
 # Client
 cd parakeet-ptt

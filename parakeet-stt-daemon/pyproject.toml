@@ -32,7 +32,6 @@ parakeet-stt-daemon = "parakeet_stt_daemon.__main__:main"
 dev = [
   "ruff>=0.14.0",
   "black>=25.12.0",
-  "pyright>=1.1.408",
   "pytest>=8.4.0",
 ]
 
@@ -53,13 +52,6 @@ extend-exclude = [".venv", ".uv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "W", "UP"]
-
-[tool.pyright]
-pythonVersion = "3.11"
-typeCheckingMode = "basic"
-venvPath = "."
-venv = ".venv"
-reportMissingImports = "warning"
 
 [tool.hatch.metadata]
 allow-direct-references = true

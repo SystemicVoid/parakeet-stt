@@ -9,7 +9,7 @@
 ## Build, Test, and Development Commands
 - Daemon (without GPU stack): `cd parakeet-stt-daemon && uv sync --dev` then `uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`.
 - Daemon (with inference extras): add `--extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match` to `uv sync`/`uv run` when CUDA is available.
-- Daemon lint/type-check: `uv run ruff check .`, `uv run black --check .`, `uv run pyright`.
+- Daemon lint/type-check: `uv run ruff check .`, `uv run black --check .`, `uv run --no-project ty check`.
 - Client: `cd parakeet-ptt && cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test`. Run locally with `cargo run --release -- --endpoint ws://127.0.0.1:8765/ws`.
 - Helper (recommended runtime): `source scripts/stt-helper.sh && stt start`.
 
