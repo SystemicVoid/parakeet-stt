@@ -32,6 +32,7 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
+    local default_daemon_streaming_enabled="${PARAKEET_STREAMING_ENABLED:-true}"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
     # Local-only default: optimize for this workstation (Zen5 + AVX512), not portable builds.
     local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
@@ -441,6 +442,7 @@ EOF
 Other environment overrides:
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
+  PARAKEET_STREAMING_ENABLED=$default_daemon_streaming_enabled
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
@@ -519,6 +521,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume
+            local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
@@ -547,6 +550,7 @@ CLIENTCMD
             echo "   - Completion sound: $completion_sound"
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
+            echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
             echo "   - PTT RUSTFLAGS: $ptt_rustflags"
@@ -574,10 +578,10 @@ CLIENTCMD
 
             if [ "$daemon_reused" -ne 1 ]; then
                 echo "   - Launching daemon..."
-                _log_daemon "launch via stt helper (--no-streaming)"
+                _log_daemon "launch via stt helper (streaming=${daemon_streaming_enabled})"
                 (
                     cd "$DAEMON_DIR" || exit 1
-                    PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" --no-streaming >> "$LOG_DAEMON" 2>&1 &
+                    PARAKEET_STREAMING_ENABLED="$daemon_streaming_enabled" PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
                     echo $! > "$DAEMON_PID_FILE"
                 )
             fi
@@ -755,7 +759,8 @@ CLIENTCMD
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
             echo "${HOST}:${PORT}" > "$PORT_FILE"
 
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --no-streaming >> \"$LOG_DAEMON\" 2>&1"
+            local daemon_streaming_enabled="$default_daemon_streaming_enabled"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
 
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
