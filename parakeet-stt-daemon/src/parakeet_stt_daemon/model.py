@@ -7,6 +7,7 @@ start the daemon for protocol testing.
 from __future__ import annotations
 
 import math
+import os
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -150,6 +151,21 @@ def _set_cfg_value(cfg: Any, key: str, value: Any) -> bool:
     return False
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name, "")
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -245,6 +261,10 @@ class ParakeetStreamingSession:
         if not self._chunks:
             return ""
         combined = np.concatenate(self._chunks)
+        raw_samples = combined.size
+        debug = _env_flag("PARAKEET_STREAMING_DEBUG")
+        extra_pad_secs = _env_float("PARAKEET_STREAMING_TAIL_PAD_SECS", 0.0)
+        extra_pad_samples = int(extra_pad_secs * self.sample_rate) if extra_pad_secs > 0 else 0
         helper = self._parent.chunk_helper
         iter_cls = self._parent._audio_feature_iter_cls
         tokens_per_chunk = self._parent._helper_tokens_per_chunk
@@ -252,15 +272,32 @@ class ParakeetStreamingSession:
         model_stride_secs = self._parent._helper_model_stride_secs
         if helper is not None and iter_cls is not None:
             try:
+                delay_pad_samples = 0
                 if (
                     tokens_per_chunk is not None
                     and delay is not None
                     and model_stride_secs is not None
                     and delay > 0
                 ):
-                    pad_samples = int(delay * model_stride_secs * self.sample_rate)
-                    if pad_samples > 0:
-                        combined = np.pad(combined, (0, pad_samples))
+                    delay_pad_samples = int(delay * model_stride_secs * self.sample_rate)
+                    if delay_pad_samples > 0:
+                        combined = np.pad(combined, (0, delay_pad_samples))
+                if extra_pad_samples > 0:
+                    combined = np.pad(combined, (0, extra_pad_samples))
+                if debug:
+                    logger.debug(
+                        "Streaming finalize: chunks={}, raw_samples={}, padded_samples={}, "
+                        "delay_pad_samples={}, extra_pad_samples={}, "
+                        "tokens_per_chunk={}, delay={}, helper={}",
+                        len(self._chunks),
+                        raw_samples,
+                        combined.size,
+                        delay_pad_samples,
+                        extra_pad_samples,
+                        tokens_per_chunk,
+                        delay,
+                        type(helper).__name__,
+                    )
                 pad_to_frame_len = tokens_per_chunk is not None and delay is not None
                 frame_reader = iter_cls(
                     combined,
