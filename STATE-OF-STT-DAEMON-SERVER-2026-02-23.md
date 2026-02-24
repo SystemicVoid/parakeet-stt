@@ -98,6 +98,25 @@ Manual dictation run (daemon log `/tmp/parakeet-daemon-streaming.log`, streaming
 - One session still logged numpy warnings about `Mean of empty slice` during finalize.
 - Operator reported perceived transcript quality worse than offline during this streaming run.
 
+## Status Update (2026-02-24, Bench Audio A/B Validation)
+
+Bench dataset (canonical location): `parakeet-stt-daemon/bench_audio/` with
+`transcripts.txt` + `sample_01.wav` .. `sample_08.wav`.
+
+Test harness: local A/B script over the bench WAVs using TDT helper (`BatchedFrameASRTDT`)
+vs offline transcription on the same files.
+
+Results (normalized WER):
+
+- Average streaming WER: `0.679`
+- Average offline WER: `0.088`
+
+Qualitative notes:
+
+- Streaming outputs are consistently truncated at the end (and occasionally the start).
+- Offline outputs are largely complete; minor normalization/casing/punctuation differences only.
+- Forcing stateful decoding on the TDT helper did not eliminate truncation in this run.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
