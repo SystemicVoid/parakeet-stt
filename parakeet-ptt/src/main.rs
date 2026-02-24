@@ -983,14 +983,26 @@ async fn fetch_status_once(config: &ClientConfig) {
         Ok(response) => match response.json::<StatusInfo>().await {
             Ok(status) => {
                 info!(
-                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, streaming={:?}, helper_active={:?}, chunk_secs={:?}, gpu_mem_mb={:?}",
+                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
+streaming={:?}, helper_active={:?}, fallback={:?}, chunk_secs={:?}, active_age_ms={:?}, \
+audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, send_ms={:?}, last_audio_ms={:?}, \
+last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
                     status.state,
                     status.sessions_active,
                     status.device,
                     status.effective_device,
                     status.streaming_enabled,
                     status.stream_helper_active,
+                    status.stream_fallback_reason,
                     status.chunk_secs,
+                    status.active_session_age_ms,
+                    status.audio_stop_ms,
+                    status.finalize_ms,
+                    status.infer_ms,
+                    status.send_ms,
+                    status.last_audio_ms,
+                    status.last_infer_ms,
+                    status.last_send_ms,
                     status.gpu_mem_mb
                 );
             }
