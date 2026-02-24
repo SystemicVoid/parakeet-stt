@@ -50,7 +50,28 @@ Validation snapshot for B1/A6:
 - `B2/C1` done: `/status` now reports `gpu_mem_mb` (CUDA reserved memory) plus stable timing taxonomy fields (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`). Completion logs now use the new timing taxonomy. `last_*` timing fields remain for compatibility.
 - `B3` done: error taxonomy expanded with `SESSION_NOT_FOUND`, `SESSION_ABORTED`, and `INVALID_REQUEST`. Stop/abort/parse paths now emit precise codes. `parakeet-ptt` logs classify error codes without breaking on unknown values.
 - SPEC and client status parsing updated to match the enriched status payload.
-- Streaming validation: `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --check` reports helper ACTIVE (`FrameBatchChunkedRNNT`). Manual dictation quality sampling still pending.
+
+## Status Update (2026-02-24, Streaming Validation Logs)
+
+Manual dictation runs captured in `tmp-last-test-logs.txt`:
+
+- Streaming run: `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
+  - Streaming helper initialised: `FrameBatchChunkedRNNT`.
+  - Every stop logged `Streaming helper failed during finalization: too many values to unpack (expected 2)` from `parakeet_stt_daemon.model:finalize:165`.
+  - After each finalize failure, offline `Transcribing` ran and sessions completed with `stream_helper_active=True` and `stream_fallback_reason=None`.
+  - numpy warnings observed during one session: `Mean of empty slice` and `invalid value encountered in divide` (multiple entries at `2026-02-24 11:28:19`).
+  - Example session timings (from log): `finalize_ms` 135–210ms, `infer_ms` 134–208ms, `latency_ms` 135–210ms, `audio_ms` 4925–8235.
+- Non-streaming run: `PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
+  - `stream_helper_active=False`, no streaming-finalize warnings.
+  - Example session timings (from log): `finalize_ms` 46–71ms, `infer_ms` 46–70ms, `latency_ms` 46–71ms, `audio_ms` 5629–7923.
+
+## Status Update (2026-02-24, Streaming Finalize Fix)
+
+- Root cause: NeMo `FrameBatchChunkedRNNT` expects `rnnt_decoder_predictions_tensor(...)` to return two values, but current NeMo returns a single list of hypotheses for Parakeet TDT, causing the streaming finalize unpack error.
+- Fix: wrapped `FrameBatchChunkedRNNT` with a compatibility `_get_batch_preds` that normalizes decoder output via `_coerce_rnnt_texts`, handling legacy tuple returns and current hypothesis lists (including N-best).
+- Regression coverage: new unit tests for `_coerce_rnnt_texts` in `tests/test_streaming_chunk_padding.py`.
+- Validation: local helper transcribe now runs without streaming-finalize warnings (silence input returns empty text without offline fallback).
+- Tests: `cd parakeet-stt-daemon && uv run pytest -q tests/` -> `34 passed`
 
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
@@ -74,7 +95,8 @@ Merged in this lane (2026-02-23):
 
 Remaining highest-priority execution order:
 
-1. Streaming quality validation: run short dictation sampling with streaming enabled to verify `FrameBatchChunkedRNNT` output quality versus offline fallback. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
+1. Streaming finalize bug: investigate and fix `Streaming helper failed during finalization: too many values to unpack (expected 2)` and confirm streaming finalization works without offline fallback.
+2. Streaming quality validation: run short dictation sampling with streaming enabled to verify `FrameBatchChunkedRNNT` output quality versus offline fallback. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
 
 Non-negotiable constraints for continuation:
 
@@ -84,7 +106,8 @@ Non-negotiable constraints for continuation:
 
 Suggested next atomic commits:
 
-1. `docs(runtime): document streaming quality validation results` (state doc + spec update if needed).
+1. `fix(daemon): resolve streaming finalize unpack error` (model + tests).
+2. `docs(runtime): document streaming quality validation results` (state doc + spec update if needed).
 
 Verification commands to run after each commit:
 
@@ -96,7 +119,8 @@ Verification commands to run after each commit:
 
 Current highest-priority unresolved items for follow-up agents:
 
-1. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU via manual dictation sampling; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
+1. Streaming finalize error: `parakeet_stt_daemon.model:finalize` throws `too many values to unpack (expected 2)` in streaming mode; fix and add regression coverage.
+2. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU via manual dictation sampling; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
 
 ## Scope and Canonical Sources
 
