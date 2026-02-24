@@ -95,8 +95,7 @@ Merged in this lane (2026-02-23):
 
 Remaining highest-priority execution order:
 
-1. Streaming finalize bug: investigate and fix `Streaming helper failed during finalization: too many values to unpack (expected 2)` and confirm streaming finalization works without offline fallback.
-2. Streaming quality validation: run short dictation sampling with streaming enabled to verify `FrameBatchChunkedRNNT` output quality versus offline fallback. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
+1. Streaming quality validation: run short dictation sampling with streaming enabled to verify `FrameBatchChunkedRNNT` output quality versus offline fallback. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
 
 Non-negotiable constraints for continuation:
 
@@ -106,8 +105,7 @@ Non-negotiable constraints for continuation:
 
 Suggested next atomic commits:
 
-1. `fix(daemon): resolve streaming finalize unpack error` (model + tests).
-2. `docs(runtime): document streaming quality validation results` (state doc + spec update if needed).
+1. `docs(runtime): document streaming quality validation results` (state doc + spec update if needed).
 
 Verification commands to run after each commit:
 
@@ -119,8 +117,7 @@ Verification commands to run after each commit:
 
 Current highest-priority unresolved items for follow-up agents:
 
-1. Streaming finalize error: `parakeet_stt_daemon.model:finalize` throws `too many values to unpack (expected 2)` in streaming mode; fix and add regression coverage.
-2. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU via manual dictation sampling; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
+1. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU via manual dictation sampling; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
 
 ## Scope and Canonical Sources
 
