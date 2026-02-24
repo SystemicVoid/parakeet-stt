@@ -52,6 +52,23 @@ def _extract_text(output: Any) -> str:
     return str(output).strip()
 
 
+def _coerce_rnnt_texts(result: Any) -> list[str]:
+    """Normalize rnnt_decoder_predictions_tensor output across NeMo versions."""
+    if isinstance(result, tuple) and result:
+        result = result[0]
+    if not isinstance(result, list):
+        return [_extract_text(result)]
+    if result and isinstance(result[0], list):
+        texts: list[str] = []
+        for group in result:
+            if not group:
+                texts.append("")
+                continue
+            texts.append(_coerce_rnnt_texts(group)[0])
+        return texts
+    return [_extract_text(item) for item in result]
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -207,9 +224,29 @@ class ParakeetStreamingTranscriber:
             self.fallback_reason = f"import_failed:{exc.__class__.__name__}"
             return
 
+        class _PatchedFrameBatchChunkedRNNT(FrameBatchChunkedRNNT):
+            @torch.no_grad()
+            def _get_batch_preds(self, keep_logits: bool = False) -> None:  # type: ignore[override]
+                device = self.asr_model.device
+                for batch in iter(self.data_loader):
+                    feat_signal, feat_signal_len = batch
+                    feat_signal, feat_signal_len = (
+                        feat_signal.to(device),
+                        feat_signal_len.to(device),
+                    )
+                    encoded, encoded_len = self.asr_model(
+                        processed_signal=feat_signal, processed_signal_length=feat_signal_len
+                    )
+                    decoded = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
+                        encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
+                    )
+                    self.all_preds.extend(_coerce_rnnt_texts(decoded))
+                    del encoded
+                    del encoded_len
+
         total_buffer_secs = self.chunk_secs + self.right_context_secs
         try:
-            self.chunk_helper = FrameBatchChunkedRNNT(
+            self.chunk_helper = _PatchedFrameBatchChunkedRNNT(
                 asr_model=self.model,
                 frame_len=self.chunk_secs,
                 total_buffer=total_buffer_secs,

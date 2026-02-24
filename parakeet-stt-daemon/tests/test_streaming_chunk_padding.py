@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
-from parakeet_stt_daemon.model import ParakeetStreamingSession
+from parakeet_stt_daemon.model import ParakeetStreamingSession, _coerce_rnnt_texts
 
 
 class _FakeIterator:
@@ -62,3 +62,26 @@ def test_finalize_disables_padding_for_chunked_iterator() -> None:
     assert parent.offline_calls == 0
     assert parent.chunk_helper.frame_reader is not None
     assert parent.chunk_helper.frame_reader.pad_to_frame_len is False
+
+
+def test_coerce_rnnt_texts_handles_hypothesis_list() -> None:
+    result = _coerce_rnnt_texts([SimpleNamespace(text="hello"), SimpleNamespace(text="world")])
+
+    assert result == ["hello", "world"]
+
+
+def test_coerce_rnnt_texts_handles_legacy_tuple() -> None:
+    result = _coerce_rnnt_texts((["best"], ["alt"]))
+
+    assert result == ["best"]
+
+
+def test_coerce_rnnt_texts_handles_nbest_lists() -> None:
+    result = _coerce_rnnt_texts(
+        [
+            [SimpleNamespace(text="best"), SimpleNamespace(text="alt")],
+            [SimpleNamespace(text="next")],
+        ]
+    )
+
+    assert result == ["best", "next"]
