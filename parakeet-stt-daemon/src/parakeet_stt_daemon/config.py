@@ -37,10 +37,10 @@ class ServerSettings(BaseSettings):
         default=False, description="Enable streaming inference path when true."
     )
     chunk_secs: float = Field(
-        default=2.0, ge=0.1, le=10.0, description="Chunk size (seconds) for streaming inference."
+        default=2.4, ge=0.1, le=10.0, description="Chunk size (seconds) for streaming inference."
     )
     right_context_secs: float = Field(
-        default=2.0,
+        default=1.6,
         ge=0.0,
         le=20.0,
         description="Right context (seconds) appended for streaming inference.",
