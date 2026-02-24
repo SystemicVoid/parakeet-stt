@@ -24,3 +24,6 @@ parakeet-stt-daemon/test-run.py
 /text-input-unstable-v3.xml
 /xdg-activation-v1.xml
 /xdg-shell.xml
+
+# Local drafts
+/BUSINESS-POSITIONING-DRAFT-2026-02-23.md
