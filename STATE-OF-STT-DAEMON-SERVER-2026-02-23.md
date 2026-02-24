@@ -150,6 +150,34 @@ Action taken: updated `ServerSettings` defaults to the best-performing config
 (`chunk_secs=2.4`, `right_context_secs=1.6`) in
 `parakeet-stt-daemon/src/parakeet_stt_daemon/config.py`.
 
+## Status Update (2026-02-24, Streaming Baseline Re-Verify)
+
+Re-ran bench A/B on `bench_audio/` using current defaults
+(`chunk_secs=2.4`, `right_context_secs=1.6`, TDT helper, `stateful_decoding=False`):
+
+- Average offline WER: `0.142`
+- Average streaming WER: `0.488`
+
+Streaming remains truncated vs offline at the new defaults.
+
+## Status Update (2026-02-24, Streaming Tail Pad Experiment)
+
+Added optional streaming tail pad to help recover end-of-utterance truncation:
+`PARAKEET_STREAMING_TAIL_PAD_SECS` (default `0.0`, no change unless set).
+
+Pad sweep on the bench set (streaming only):
+
+- `0.0s` → `0.535` average WER
+- `0.2s` → `0.483`
+- `0.4s` → `0.454`
+- `0.6s` → `0.410`
+
+Tail padding improves WER somewhat but remains far worse than offline and adds latency.
+This remains an optional diagnostic lever, not a default change.
+
+Extra debugging hook: `PARAKEET_STREAMING_DEBUG=1` logs chunk counts and pad sizes
+during streaming finalize.
+
 ## Status Update (2026-02-24, Streaming Improvement Avenues)
 
 Concise next options (tradeoffs included):
