@@ -117,6 +117,26 @@ Qualitative notes:
 - Offline outputs are largely complete; minor normalization/casing/punctuation differences only.
 - Forcing stateful decoding on the TDT helper did not eliminate truncation in this run.
 
+## Status Update (2026-02-24, TDT Helper Tuning)
+
+Follow-up bench A/B runs compared helper variants and tuning knobs on the same
+`bench_audio` dataset (`chunk_secs=2.0`, `right_context_secs=2.0`):
+
+- Offline baseline: average WER `0.071` (unchanged).
+- RNNT helper (`FrameBatchChunkedRNNT`): average WER `0.608` (truncation persists).
+- TDT helper default (stateful decoding enabled): average WER `0.686`.
+- TDT helper with `stateful_decoding=False`: average WER improved to ~`0.446`
+  (still truncated but better than stateful mode).
+- `tdt_search_boundary` sweep: `4` and `8` were similar (~`0.47` WER); `12` regressed.
+- Delay experiments: default mid-delay (`38` tokens) was best; right-context delay
+  (`25` tokens) worsened (~`0.585` WER) and half-delay (`13`) was much worse (~`0.851`).
+- `pad_to_frame_len` must stay enabled for TDT; disabling it raises shape mismatches
+  inside `BatchedFeatureFrameBufferer` for partial tail frames.
+
+Action taken: updated TDT helper init to default `stateful_decoding=False`
+(`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`) since it measurably improves
+WER on the current bench set. Truncation remains and needs further alignment work.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
