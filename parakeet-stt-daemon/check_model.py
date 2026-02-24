@@ -49,8 +49,8 @@ def run_streaming_probe(model, samples: np.ndarray) -> str:
     try:
         streamer = ParakeetStreamingTranscriber(
             model,
-            chunk_secs=0.5,
-            right_context_secs=1.0,
+            chunk_secs=1.6,
+            right_context_secs=2.4,
             left_context_secs=2.0,
             batch_size=4,
         )

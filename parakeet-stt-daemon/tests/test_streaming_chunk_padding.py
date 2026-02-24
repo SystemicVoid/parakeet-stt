@@ -44,6 +44,8 @@ class _FakeParent:
     def __init__(self) -> None:
         self.chunk_helper = _FakeChunkHelper()
         self._audio_feature_iter_cls = _FakeIterator
+        self._helper_tokens_per_chunk = None
+        self._helper_delay = None
         self.offline_calls = 0
 
     def _transcribe_offline(self, _samples: np.ndarray, _sample_rate: int) -> str:
