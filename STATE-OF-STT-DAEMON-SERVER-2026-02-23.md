@@ -89,6 +89,15 @@ Streaming validation runs (CUDA, synthetic sine input):
   - No streaming-finalize warnings; result returned via streaming helper (empty transcript on sine).
   - Numpy warnings about `Mean of empty slice` persisted during synthetic input.
 
+## Status Update (2026-02-24, Streaming Dictation Quality Check)
+
+Manual dictation run (daemon log `/tmp/parakeet-daemon-streaming.log`, streaming enabled):
+
+- Startup confirms `streaming_enabled=True`, helper active (`FrameBatchChunkedRNNT`) with `chunk_secs=2.0`.
+- Four sessions completed with `stream_helper_active=True` and `stream_fallback_reason=None` (no offline fallback).
+- One session still logged numpy warnings about `Mean of empty slice` during finalize.
+- Operator reported perceived transcript quality worse than offline during this streaming run.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
