@@ -150,6 +150,15 @@ Action taken: updated `ServerSettings` defaults to the best-performing config
 (`chunk_secs=2.4`, `right_context_secs=1.6`) in
 `parakeet-stt-daemon/src/parakeet_stt_daemon/config.py`.
 
+## Status Update (2026-02-24, Streaming Improvement Avenues)
+
+Concise next options (tradeoffs included):
+
+- LCS-based merge helper for chunk alignment to reduce boundary loss; tradeoff: more compute and alignment complexity.
+- Increase chunk/total-buffer (or right-context) for more tail coverage; tradeoff: higher latency and resource use.
+- Add tail padding or a short forced trailing-silence window before finalize; tradeoff: adds end-of-utterance lag.
+- Mirror NeMo buffered inference utilities for TDT alignment (e.g., `decoder_timestamps_utils`); tradeoff: integration risk and extra code surface.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
