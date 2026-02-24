@@ -178,6 +178,9 @@ This remains an optional diagnostic lever, not a default change.
 Extra debugging hook: `PARAKEET_STREAMING_DEBUG=1` logs chunk counts and pad sizes
 during streaming finalize.
 
+Action taken: documented and kept tail padding + debug logging as opt-in only; no
+default changes beyond recording these results.
+
 ## Status Update (2026-02-24, Streaming Improvement Avenues)
 
 Concise next options (tradeoffs included):
