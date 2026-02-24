@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import wave
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -80,6 +81,8 @@ class DaemonServer:
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
         self._last_audio_ms: int | None = None
+        self._last_audio_stop_ms: int | None = None
+        self._last_finalize_ms: int | None = None
         self._last_infer_ms: int | None = None
         self._last_send_ms: int | None = None
         if settings.streaming_enabled:
@@ -197,8 +200,10 @@ class DaemonServer:
                     websocket, message.session_id, "SESSION_BUSY", "No matching active session"
                 )
                 return
+            audio_stop_started = time.perf_counter()
             audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
             self._stop_stream_drain_loop()
+            audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
             audio_duration_raw = len(audio_samples) / self.audio.sample_rate
             audio_ms = int(audio_duration_raw * 1000)
 
@@ -209,11 +214,14 @@ class DaemonServer:
                 await self.sessions.clear(session.session_id)
                 return
 
+            finalize_ms: int | None = None
             infer_ms: int | None = None
             try:
-                infer_started = datetime.now(tz=UTC)
-                text = await self._finalise_transcription(audio_samples, ready_chunks, tail)
-                infer_ms = int((datetime.now(tz=UTC) - infer_started).total_seconds() * 1000)
+                finalize_started = time.perf_counter()
+                text, infer_ms = await self._finalise_transcription(
+                    audio_samples, ready_chunks, tail
+                )
+                finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
                 await self._send_error(
@@ -236,6 +244,8 @@ class DaemonServer:
             send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
             await self.sessions.clear(session.session_id)
             self._last_audio_ms = audio_ms
+            self._last_audio_stop_ms = audio_stop_ms
+            self._last_finalize_ms = finalize_ms
             self._last_infer_ms = infer_ms
             self._last_send_ms = send_ms
 
@@ -243,13 +253,16 @@ class DaemonServer:
             text_len = len(text)
             chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
             logger.info(
-                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, latency_ms={}, infer_ms={}, "
-                "send_ms={}, text_len={}, chars_per_sec={:.1f}, stream_helper_active={}, "
+                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
+                "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
+                "chars_per_sec={:.1f}, stream_helper_active={}, "
                 "stream_fallback_reason={}",
                 session.session_id,
                 audio_duration_raw,
                 audio_ms,
+                audio_stop_ms,
                 latency_ms,
+                finalize_ms,
                 infer_ms,
                 send_ms,
                 text_len,
@@ -335,7 +348,7 @@ class DaemonServer:
         return StatusMessage(
             state=state.value,
             sessions_active=int(active is not None),
-            gpu_mem_mb=None,
+            gpu_mem_mb=self._gpu_mem_mb(),
             device=requested_device,
             effective_device=effective_device,
             streaming_enabled=self.settings.streaming_enabled,
@@ -343,6 +356,10 @@ class DaemonServer:
             stream_fallback_reason=self._stream_fallback_reason(),
             chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
             active_session_age_ms=active.audio_duration_ms if active else None,
+            audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
+            finalize_ms=getattr(self, "_last_finalize_ms", None),
+            infer_ms=getattr(self, "_last_infer_ms", None),
+            send_ms=getattr(self, "_last_send_ms", None),
             last_audio_ms=getattr(self, "_last_audio_ms", None),
             last_infer_ms=getattr(self, "_last_infer_ms", None),
             last_send_ms=getattr(self, "_last_send_ms", None),
@@ -362,6 +379,27 @@ class DaemonServer:
             return "streaming_transcriber_unavailable"
         return self.streaming_transcriber.fallback_reason
 
+    def _gpu_mem_mb(self) -> int | None:
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - inference extra not installed
+            return None
+
+        effective_device = str(getattr(self, "_effective_device", ""))
+        if not effective_device.startswith("cuda"):
+            return None
+        if not torch.cuda.is_available():
+            return None
+
+        device_index: int | None = None
+        if ":" in effective_device:
+            _, suffix = effective_device.split(":", 1)
+            if suffix.isdigit():
+                device_index = int(suffix)
+
+        reserved_bytes = torch.cuda.memory_reserved(device_index or 0)
+        return int(reserved_bytes / (1024 * 1024))
+
     def _write_wav(self, samples: np.ndarray) -> Path:
         path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
         if sf is not None:
@@ -380,7 +418,7 @@ class DaemonServer:
 
     async def _finalise_transcription(
         self, audio_samples: np.ndarray, ready_chunks: list[np.ndarray], tail: np.ndarray
-    ) -> str:
+    ) -> tuple[str, int]:
         if self.streaming_transcriber and self._active_stream:
             try:
                 for chunk in ready_chunks:
@@ -389,7 +427,10 @@ class DaemonServer:
                     trimmed_tail = self._trim_tail_silence(tail, self.audio.sample_rate)
                     if trimmed_tail.size:
                         self._active_stream.feed(trimmed_tail)
-                return self._active_stream.finalize()
+                infer_started = time.perf_counter()
+                result = self._active_stream.finalize()
+                infer_ms = int((time.perf_counter() - infer_started) * 1000)
+                return result, infer_ms
             finally:
                 self._active_stream = None
 
@@ -397,9 +438,13 @@ class DaemonServer:
         trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
         audio_path = self._write_wav(trimmed)
         try:
-            return await asyncio.get_running_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            infer_started = time.perf_counter()
+            text = await loop.run_in_executor(
                 None, self.transcriber.transcribe_wav, str(audio_path)
             )
+            infer_ms = int((time.perf_counter() - infer_started) * 1000)
+            return text, infer_ms
         finally:
             audio_path.unlink(missing_ok=True)
 

@@ -112,6 +112,8 @@ def _build_server() -> DaemonServer:
     server._requested_device = "cpu"
     server._effective_device = "cpu"
     server._last_audio_ms = None
+    server._last_audio_stop_ms = None
+    server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
     return cast(DaemonServer, server)
@@ -400,6 +402,8 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
         server._effective_device = "cpu"
         server.streaming_transcriber = cast(Any, FakeStreamingTranscriber(helper_active=False))
         server._last_audio_ms = 1200
+        server._last_audio_stop_ms = 9
+        server._last_finalize_ms = 120
         server._last_infer_ms = 85
         server._last_send_ms = 4
         session_id = uuid4()
@@ -412,6 +416,10 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
         assert status.streaming_enabled is True
         assert status.stream_helper_active is False
         assert status.stream_fallback_reason == "init_failed:ImportError"
+        assert status.audio_stop_ms == 9
+        assert status.finalize_ms == 120
+        assert status.infer_ms == 85
+        assert status.send_ms == 4
         assert status.last_audio_ms == 1200
         assert status.last_infer_ms == 85
         assert status.last_send_ms == 4

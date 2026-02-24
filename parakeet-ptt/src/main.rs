@@ -925,9 +925,21 @@ async fn handle_server_message(
 struct StatusInfo {
     state: Option<String>,
     sessions_active: Option<u32>,
+    gpu_mem_mb: Option<u64>,
     device: Option<String>,
+    effective_device: Option<String>,
     streaming_enabled: Option<bool>,
+    stream_helper_active: Option<bool>,
+    stream_fallback_reason: Option<String>,
     chunk_secs: Option<f64>,
+    active_session_age_ms: Option<u64>,
+    audio_stop_ms: Option<u64>,
+    finalize_ms: Option<u64>,
+    infer_ms: Option<u64>,
+    send_ms: Option<u64>,
+    last_audio_ms: Option<u64>,
+    last_infer_ms: Option<u64>,
+    last_send_ms: Option<u64>,
 }
 
 async fn fetch_status_once(config: &ClientConfig) {
@@ -944,8 +956,15 @@ async fn fetch_status_once(config: &ClientConfig) {
         Ok(response) => match response.json::<StatusInfo>().await {
             Ok(status) => {
                 info!(
-                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, streaming={:?}, chunk_secs={:?}",
-                    status.state, status.sessions_active, status.device, status.streaming_enabled, status.chunk_secs
+                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, streaming={:?}, helper_active={:?}, chunk_secs={:?}, gpu_mem_mb={:?}",
+                    status.state,
+                    status.sessions_active,
+                    status.device,
+                    status.effective_device,
+                    status.streaming_enabled,
+                    status.stream_helper_active,
+                    status.chunk_secs,
+                    status.gpu_mem_mb
                 );
             }
             Err(err) => {

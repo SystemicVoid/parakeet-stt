@@ -67,6 +67,8 @@ def _build_server(
     server._requested_device = "cpu"
     server._effective_device = "cpu"
     server._last_audio_ms = None
+    server._last_audio_stop_ms = None
+    server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
     return cast(DaemonServer, server)
@@ -182,6 +184,10 @@ def test_status_last_timings_none_before_first_session() -> None:
     server = _build_server(streaming_enabled=False)
 
     status = server.status()
+    assert status.audio_stop_ms is None
+    assert status.finalize_ms is None
+    assert status.infer_ms is None
+    assert status.send_ms is None
     assert status.last_audio_ms is None
     assert status.last_infer_ms is None
     assert status.last_send_ms is None
@@ -191,10 +197,16 @@ def test_status_last_timings_populated_after_session() -> None:
     """Timing fields reflect last session values."""
     server = _build_server(streaming_enabled=False)
     server._last_audio_ms = 2500
+    server._last_audio_stop_ms = 12
+    server._last_finalize_ms = 180
     server._last_infer_ms = 120
     server._last_send_ms = 3
 
     status = server.status()
+    assert status.audio_stop_ms == 12
+    assert status.finalize_ms == 180
+    assert status.infer_ms == 120
+    assert status.send_ms == 3
     assert status.last_audio_ms == 2500
     assert status.last_infer_ms == 120
     assert status.last_send_ms == 3

@@ -107,6 +107,10 @@ class StatusMessage(BaseModel):
     stream_fallback_reason: str | None = None
     chunk_secs: float | None = None
     active_session_age_ms: int | None = None
+    audio_stop_ms: int | None = None
+    finalize_ms: int | None = None
+    infer_ms: int | None = None
+    send_ms: int | None = None
     last_audio_ms: int | None = None
     last_infer_ms: int | None = None
     last_send_ms: int | None = None

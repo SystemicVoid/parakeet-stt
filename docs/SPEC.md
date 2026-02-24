@@ -210,6 +210,10 @@ All messages are JSON objects with a `type` string.
       "stream_helper_active": true,
       "stream_fallback_reason": null,
       "active_session_age_ms": 0,
+      "audio_stop_ms": 12,
+      "finalize_ms": 180,
+      "infer_ms": 120,
+      "send_ms": 5,
       "last_audio_ms": 2300,
       "last_infer_ms": 120,
       "last_send_ms": 5
@@ -219,6 +223,9 @@ All messages are JSON objects with a `type` string.
 Future messages (like `partial_result`) must be backward compatible; clients should ignore unknown `type`s.
 Clients must also tolerate unknown error codes and unknown additional fields.
 Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
+`audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms` represent the last completed session's stage
+durations. `last_*` fields are retained for compatibility and will be deprecated after client uptake.
+`gpu_mem_mb` reports CUDA reserved memory for the daemon process when running on a CUDA device.
 
 ---
 
