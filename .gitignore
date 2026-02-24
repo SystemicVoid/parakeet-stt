@@ -27,3 +27,7 @@ parakeet-stt-daemon/test-run.py
 
 # Local drafts
 /BUSINESS-POSITIONING-DRAFT-2026-02-23.md
+
+# Local bench audio + logs (A/B streaming validation)
+/parakeet-stt-daemon/bench_audio/
+/tmp-logs-streaming-offline-comparison.txt
