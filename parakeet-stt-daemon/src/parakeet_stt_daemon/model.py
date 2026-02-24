@@ -269,7 +269,7 @@ class ParakeetStreamingSession:
         iter_cls = self._parent._audio_feature_iter_cls
         tokens_per_chunk = self._parent._helper_tokens_per_chunk
         delay = self._parent._helper_delay
-        model_stride_secs = self._parent._helper_model_stride_secs
+        model_stride_secs = getattr(self._parent, "_helper_model_stride_secs", None)
         if helper is not None and iter_cls is not None:
             try:
                 delay_pad_samples = 0
