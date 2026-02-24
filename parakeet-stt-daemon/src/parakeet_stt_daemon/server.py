@@ -44,7 +44,15 @@ from .model import (
 )
 from .session import SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 
-ErrorCode = Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
+ErrorCode = Literal[
+    "SESSION_BUSY",
+    "SESSION_NOT_FOUND",
+    "SESSION_ABORTED",
+    "AUDIO_DEVICE",
+    "MODEL",
+    "INVALID_REQUEST",
+    "UNEXPECTED",
+]
 
 
 class DaemonServer:
@@ -105,7 +113,7 @@ class DaemonServer:
                     parsed = parse_client_message(raw)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to parse client message: {}", exc)
-                    await self._send_error(websocket, None, "UNEXPECTED", str(exc))
+                    await self._send_error(websocket, None, "INVALID_REQUEST", str(exc))
                     continue
 
                 await self._dispatch(websocket, parsed)
@@ -139,7 +147,7 @@ class DaemonServer:
             assert isinstance(parsed.model, AbortSession)
             await self._handle_abort(websocket, parsed.model)
         else:  # pragma: no cover
-            await self._send_error(websocket, None, "UNEXPECTED", "Unsupported message")
+            await self._send_error(websocket, None, "INVALID_REQUEST", "Unsupported message")
 
     async def _handle_start(self, websocket: WebSocket, message: StartSession) -> None:
         logger.debug("start_session received: {}", message)
@@ -197,7 +205,7 @@ class DaemonServer:
                 session = await self.sessions.stop_session(message.session_id)
             except SessionNotFoundError:
                 await self._send_error(
-                    websocket, message.session_id, "SESSION_BUSY", "No matching active session"
+                    websocket, message.session_id, "SESSION_NOT_FOUND", "No matching active session"
                 )
                 return
             audio_stop_started = time.perf_counter()
@@ -273,16 +281,18 @@ class DaemonServer:
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
         logger.debug("abort_session received: {}", message)
-        await self._cleanup_active_session(
+        cleaned = await self._cleanup_active_session(
             f"abort_session requested ({message.reason})",
             expected_session_id=message.session_id,
+            require_session_match=True,
         )
-        await self._send_error(
-            websocket,
-            message.session_id,
-            "SESSION_BUSY",
-            f"Session aborted: {message.reason}",
-        )
+        if cleaned:
+            code = "SESSION_ABORTED"
+            error_message = f"Session aborted: {message.reason}"
+        else:
+            code = "SESSION_NOT_FOUND"
+            error_message = "No matching active session"
+        await self._send_error(websocket, message.session_id, code, error_message)
 
     async def _cleanup_active_session(
         self,

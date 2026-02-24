@@ -667,10 +667,17 @@ async fn run_demo(
             }
             ServerMessage::Error {
                 session_id,
+                code,
                 message,
-                ..
             } => {
-                warn!(session = ?session_id, "daemon error: {}", message);
+                let error_kind = classify_error_code(&code);
+                warn!(
+                    session = ?session_id,
+                    error_code = %code,
+                    error_kind,
+                    "daemon error: {}",
+                    message
+                );
                 break;
             }
             other => {
@@ -908,10 +915,17 @@ async fn handle_server_message(
         }
         ServerMessage::Error {
             session_id,
+            code,
             message,
-            ..
         } => {
-            warn!(session = ?session_id, "daemon error: {}", message);
+            let error_kind = classify_error_code(&code);
+            warn!(
+                session = ?session_id,
+                error_code = %code,
+                error_kind,
+                "daemon error: {}",
+                message
+            );
             state.reset();
         }
         other => {
@@ -919,6 +933,19 @@ async fn handle_server_message(
         }
     }
     Ok(())
+}
+
+fn classify_error_code(code: &str) -> &'static str {
+    match code {
+        "SESSION_BUSY" => "session_busy",
+        "SESSION_NOT_FOUND" => "session_not_found",
+        "SESSION_ABORTED" => "session_aborted",
+        "AUDIO_DEVICE" => "audio_device",
+        "MODEL" => "model",
+        "INVALID_REQUEST" => "invalid_request",
+        "UNEXPECTED" => "unexpected",
+        _ => "unknown",
+    }
 }
 
 #[derive(Debug, Deserialize)]

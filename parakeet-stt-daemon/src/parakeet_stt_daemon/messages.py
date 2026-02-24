@@ -89,7 +89,15 @@ class ErrorMessage(BaseModel):
 
     type: Literal[ServerMessageType.ERROR] = Field(default=ServerMessageType.ERROR)
     session_id: UUID | None = None
-    code: Literal["SESSION_BUSY", "AUDIO_DEVICE", "MODEL", "UNEXPECTED"]
+    code: Literal[
+        "SESSION_BUSY",
+        "SESSION_NOT_FOUND",
+        "SESSION_ABORTED",
+        "AUDIO_DEVICE",
+        "MODEL",
+        "INVALID_REQUEST",
+        "UNEXPECTED",
+    ]
     message: str
 
 

@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from fastapi import WebSocketDisconnect
 from parakeet_stt_daemon.config import ServerSettings
-from parakeet_stt_daemon.messages import AbortSession, ClientMessageType, StartSession
+from parakeet_stt_daemon.messages import AbortSession, ClientMessageType, StartSession, StopSession
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
 
@@ -193,6 +193,68 @@ def test_abort_only_cleans_matching_session() -> None:
         assert server.sessions.active is not None
         assert server.sessions.active.session_id == active_session_id
         assert audio.abort_calls == 0
+        assert websocket.sent_json
+        assert websocket.sent_json[-1]["type"] == "error"
+        assert websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
+
+    asyncio.run(scenario())
+
+
+def test_stop_session_missing_id_returns_not_found() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        session_id = uuid4()
+        websocket = FakeWebSocket([])
+
+        message = StopSession(
+            type=ClientMessageType.STOP_SESSION,
+            session_id=session_id,
+            timestamp=datetime.now(tz=UTC),
+        )
+        await server._handle_stop(cast(Any, websocket), message)
+
+        assert websocket.sent_json
+        assert websocket.sent_json[-1]["type"] == "error"
+        assert websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
+
+    asyncio.run(scenario())
+
+
+def test_abort_session_returns_aborted_on_match() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        session_id = uuid4()
+        await server.sessions.start_session(session_id)
+
+        message = AbortSession(
+            type=ClientMessageType.ABORT_SESSION,
+            session_id=session_id,
+            reason="user",
+            timestamp=datetime.now(tz=UTC),
+        )
+        websocket = FakeWebSocket([])
+        await server._handle_abort(cast(Any, websocket), message)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        assert websocket.sent_json
+        assert websocket.sent_json[-1]["type"] == "error"
+        assert websocket.sent_json[-1]["code"] == "SESSION_ABORTED"
+
+    asyncio.run(scenario())
+
+
+def test_invalid_request_errors_on_parse_failure() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        websocket = FakeWebSocket([{"type": "bogus"}, WebSocketDisconnect()])
+
+        await server.handle_websocket(cast(Any, websocket))
+
+        assert websocket.sent_json
+        assert websocket.sent_json[-1]["type"] == "error"
+        assert websocket.sent_json[-1]["code"] == "INVALID_REQUEST"
 
     asyncio.run(scenario())
 
