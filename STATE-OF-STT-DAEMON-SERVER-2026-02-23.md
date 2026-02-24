@@ -45,6 +45,13 @@ Validation snapshot for B1/A6:
 - `cd parakeet-stt-daemon && ty check .` -> pass (2 warnings: pyright-specific type: ignore not recognized by ty)
 - `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/server.py src/parakeet_stt_daemon/model.py src/parakeet_stt_daemon/messages.py src/parakeet_stt_daemon/__main__.py tests/` -> pass
 
+## Status Update (2026-02-24, Post B2/C1/B3)
+
+- `B2/C1` done: `/status` now reports `gpu_mem_mb` (CUDA reserved memory) plus stable timing taxonomy fields (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`). Completion logs now use the new timing taxonomy. `last_*` timing fields remain for compatibility.
+- `B3` done: error taxonomy expanded with `SESSION_NOT_FOUND`, `SESSION_ABORTED`, and `INVALID_REQUEST`. Stop/abort/parse paths now emit precise codes. `parakeet-ptt` logs classify error codes without breaking on unknown values.
+- SPEC and client status parsing updated to match the enriched status payload.
+- Streaming validation: `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --check` reports helper ACTIVE (`FrameBatchChunkedRNNT`). Manual dictation quality sampling still pending.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
@@ -67,9 +74,7 @@ Merged in this lane (2026-02-23):
 
 Remaining highest-priority execution order:
 
-1. Finish `B2/C1`: optional `gpu_mem_mb` truth and tighten stage timing taxonomy (`audio_stop_ms`, `finalize_ms`, `infer_ms`, `send_ms`) with stable naming.
-2. `B3` (owner `Owner-S3`): error taxonomy expansion + daemon/client backward-compat mapping.
-3. Streaming quality validation: run `--check` with streaming enabled on GPU to verify `FrameBatchChunkedRNNT` produces correct transcriptions. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
+1. Streaming quality validation: run short dictation sampling with streaming enabled to verify `FrameBatchChunkedRNNT` output quality versus offline fallback. Consider `BatchedFrameASRTDT` if TDT-specific alignment handling is needed for quality.
 
 Non-negotiable constraints for continuation:
 
@@ -79,8 +84,7 @@ Non-negotiable constraints for continuation:
 
 Suggested next atomic commits:
 
-1. `feat(daemon): expose gpu memory and finalized stage timing taxonomy` (status/logs/tests/docs).
-2. `feat(protocol): add explicit session error taxonomy with client compatibility` (daemon + ptt + spec).
+1. `docs(runtime): document streaming quality validation results` (state doc + spec update if needed).
 
 Verification commands to run after each commit:
 
@@ -92,9 +96,7 @@ Verification commands to run after each commit:
 
 Current highest-priority unresolved items for follow-up agents:
 
-1. `B2/C1`: runtime truth fields and observability in `/status` and startup logs (gpu_mem_mb, timing taxonomy).
-2. `B3`: precise error taxonomy and client compatibility mapping.
-3. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
+1. Streaming quality gate: validate `FrameBatchChunkedRNNT` output quality on GPU via manual dictation sampling; if TDT alignment handling is needed, switch to `BatchedFrameASRTDT` (requires `tokens_per_chunk` and `delay` computation).
 
 ## Scope and Canonical Sources
 
