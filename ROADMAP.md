@@ -77,6 +77,16 @@ Known cross-surface gap (2026-02-23):
 - Working hypothesis: terminal-style shortcut routing (`Ctrl+Shift+V`) conflicts with Zed markdown keybinding semantics on that surface.
 - Follow-up: add an app/surface override for Zed markdown contexts (`Ctrl+V` first, explicit fallback policy) and add Zed to the acceptance matrix for semantic insertion validation.
 
+ STT: compatibility > cleverness
+
+Keep fast paste path (`Ctrl+V` / `Ctrl+Shift+V`), but add reliability defaults:
+
+- keep fast paste path
+- add typing fallback as reliability default when paste fails
+- instrument failure detection per app/surface (start with Zed + VSCode parity tests)
+
+That turns weird app shortcuts from random breakage into deterministic behavior.
+
 ## Phase 1: Immediate Feedback Layer (Sound + Notification)
 
 Scope:
