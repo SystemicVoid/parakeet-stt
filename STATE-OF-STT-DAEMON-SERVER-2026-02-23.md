@@ -73,6 +73,22 @@ Manual dictation runs captured in `tmp-last-test-logs.txt`:
 - Validation: local helper transcribe now runs without streaming-finalize warnings (silence input returns empty text without offline fallback).
 - Tests: `cd parakeet-stt-daemon && uv run pytest -q tests/` -> `34 passed`
 
+## Status Update (2026-02-24, Streaming Validation)
+
+Streaming validation runs (CUDA, synthetic sine input):
+
+- `cd parakeet-stt-daemon && uv run python check_model.py --device cuda`
+  - Offline transcription: `''` (sine wave)
+  - Streaming helper initialised (frame_len=0.5, total_buffer=1.5, batch_size=4)
+  - Warning during finalize: `Kernel size can't be greater than actual input size` -> finalize fell back to offline path.
+- `cd parakeet-stt-daemon && uv run python check_model.py --device cuda --duration 8.0`
+  - Same finalize warning with `frame_len=0.5`.
+- Server-equivalent chunk test:
+  - `uv run python - <<'PY' ... chunk_secs=2.0 ... PY` (custom probe)
+  - Streaming helper initialised (frame_len=2.0, total_buffer=4.0, batch_size=32)
+  - No streaming-finalize warnings; result returned via streaming helper (empty transcript on sine).
+  - Numpy warnings about `Mean of empty slice` persisted during synthetic input.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
