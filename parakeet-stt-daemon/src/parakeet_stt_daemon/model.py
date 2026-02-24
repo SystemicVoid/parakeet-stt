@@ -420,10 +420,10 @@ class ParakeetStreamingTranscriber:
                         total_buffer=total_buffer_secs,
                         batch_size=tdt_batch_size,
                         max_steps_per_timestep=max_steps_per_timestep,
-                        stateful_decoding=True,
+                        stateful_decoding=False,
                     )
                     # BatchedFrameASRTDT doesn't pass stateful_decoding/max_steps to the base class.
-                    self.chunk_helper.stateful_decoding = True
+                    self.chunk_helper.stateful_decoding = False
                     self.chunk_helper.max_steps_per_timestep = int(max_steps_per_timestep)
                     self._audio_feature_iter_cls = AudioFeatureIterator
                     self._helper_class_name = "BatchedFrameASRTDT"
