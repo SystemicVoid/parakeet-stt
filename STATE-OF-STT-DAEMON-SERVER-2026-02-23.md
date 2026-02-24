@@ -137,6 +137,19 @@ Action taken: updated TDT helper init to default `stateful_decoding=False`
 (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`) since it measurably improves
 WER on the current bench set. Truncation remains and needs further alignment work.
 
+## Status Update (2026-02-24, Streaming Default Tuning)
+
+Grid sweep on the bench set (TDT helper, `stateful_decoding=False`) across
+`chunk_secs ∈ {1.6, 2.0, 2.4}` and `right_context_secs ∈ {1.6, 2.0, 2.4}`:
+
+- Best observed average WER: `0.346` at `chunk_secs=2.4`, `right_context_secs=1.6`
+  (total buffer `4.0s`).
+- Previous defaults (`chunk_secs=2.0`, `right_context_secs=2.0`) averaged `0.419`.
+
+Action taken: updated `ServerSettings` defaults to the best-performing config
+(`chunk_secs=2.4`, `right_context_secs=1.6`) in
+`parakeet-stt-daemon/src/parakeet_stt_daemon/config.py`.
+
 ## Handoff For Next Agent (Atomic-Commit Continuation)
 
 Merged in this lane (2026-02-23):
