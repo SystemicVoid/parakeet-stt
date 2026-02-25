@@ -14,6 +14,21 @@ Top conclusions:
 
 Net: this is a strong candidate for a daemon hardening sprint before adding higher-level UX features that depend on reliable streaming semantics.
 
+## Status Update (2026-02-25, Offline In-Memory Finalize + Benchmark Priority)
+
+- Offline finalize path now transcribes in-memory `np.ndarray` audio by default:
+  - `DaemonServer._finalise_transcription(...)` now calls `ParakeetTranscriber.transcribe_samples(...)` instead of writing a temp wav first.
+  - `ParakeetStreamingTranscriber._transcribe_offline(...)` also now uses in-memory transcription first.
+- Compatibility fallback retained:
+  - `ParakeetTranscriber.transcribe_samples(...)` falls back to temp wav transcription only if direct in-memory transcription raises.
+- Warmup no longer requires a temp wav write; it runs against in-memory silence.
+- Added regression coverage for:
+  - in-memory transcription path,
+  - temp-wav fallback path when array decode fails,
+  - server offline finalize path using in-memory transcription.
+- Prioritization update:
+  - after current hardening tasks, top next action is a committed repeatable offline benchmark harness with stable WER/timing thresholds.
+
 ## Status Update (2026-02-23, Post A1/A2/A3)
 
 This report was originally authored before the core hardening tranche landed. Current code state now differs for several high-risk findings:

@@ -29,6 +29,7 @@ Scope:
 - Make daemon truth visible (`requested` vs `effective` runtime state for device and streaming engine).
 - Add daemon test coverage for lifecycle and config regressions.
 - Keep helper/runtime defaults aligned with streaming-enabled operation, while retaining an explicit offline override profile.
+- Remove default offline finalize temp-wav roundtrip by transcribing in-memory arrays first, with a guarded temp-wav fallback path.
 
 Implementation direction:
 - Add one cleanup path used by disconnect, exception, stop, and abort handling.
@@ -37,6 +38,7 @@ Implementation direction:
 - Enrich `/status` and startup logs with hard runtime truth signals and fallback reasons.
 - Add `pytest` plus focused tests for session lifecycle, precedence, and protocol mapping.
 - Keep helper default path streaming-enabled; retain a clear offline override profile for troubleshooting/soak runs.
+- Use in-memory offline transcription as the default finalize path; keep temp-wav fallback only for compatibility failures.
 
 Acceptance:
 - Forced disconnect during active listening leaves `sessions_active=0` with no continued audio accumulation.
@@ -186,12 +188,13 @@ Acceptance:
 
 1. Complete P-1 daemon hardening gate and lock lifecycle/config invariants with tests.
 2. Complete P0 injection architecture hardening and lock reliability baselines.
-3. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
-4. Add Phase 1 tests and update docs.
-5. Ship TUI skeleton with existing state only.
-6. Extend TUI with injection outcomes.
-7. Add incremental dictation error correction loop behind an opt-in switch.
-8. Prototype GUI after TUI reaches stable daily use.
+3. Build and lock a repeatable offline benchmark harness (`bench_audio` WER + timing summaries + regression thresholds) before UX phase work.
+4. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
+5. Add Phase 1 tests and update docs.
+6. Ship TUI skeleton with existing state only.
+7. Extend TUI with injection outcomes.
+8. Add incremental dictation error correction loop behind an opt-in switch.
+9. Prototype GUI after TUI reaches stable daily use.
 
 ## Daemon Hardening Action Board (2026-02-23)
 
@@ -204,6 +207,7 @@ Status legend: `todo` | `in-progress` | `done` | `blocked`
 5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
 6. `A6` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
 7. `A7` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): default helper launch now streaming-enabled with explicit offline override (`PARAKEET_STREAMING_ENABLED=false`).
+8. `A8` — status: `todo`; owner: `Owner-M1`; branch: `agent/a8-offline-bench-harness`; scope: Committed repeatable offline benchmark harness and thresholds (`parakeet-stt-daemon/check_model.py`, `parakeet-stt-daemon/bench_audio/`, docs + baseline snapshots).
 
 ## Metrics to Track
 
