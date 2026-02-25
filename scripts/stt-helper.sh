@@ -32,7 +32,7 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
-    local default_daemon_streaming_enabled="${PARAKEET_STREAMING_ENABLED:-true}"
+    local default_daemon_streaming_enabled="${PARAKEET_STREAMING_ENABLED:-false}"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
     # Local-only default: optimize for this workstation (Zen5 + AVX512), not portable builds.
     local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
