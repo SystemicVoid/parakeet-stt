@@ -17,6 +17,7 @@ dependencies = [
   "sounddevice>=0.4.7",
   "loguru>=0.7.2",
   "nemo-toolkit[asr]>=2.5.3",
+  "cuda-python>=12.3,<13",
 ]
 
 [project.optional-dependencies]

@@ -86,7 +86,7 @@ small commits while protecting offline dictation behavior.
 | SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
 | SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | DONE |
 | SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | DONE |
-| SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | TODO |
+| SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | DONE |
 | SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
 | SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | TODO |
 | SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | TODO |
@@ -107,7 +107,7 @@ small commits while protecting offline dictation behavior.
 - [x] SA1 complete and evidence captured
 - [x] SA2+SA4 implemented with tests and bench deltas recorded
 - [x] SA5 stream-then-seal landed with integration tests
-- [ ] SA6 installed + warning removal verified
+- [x] SA6 installed + warning removal verified
 - [ ] SA8 prototype behind explicit flag
 - [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
 - [ ] SA7 opt-in VAD landed with default-off safety
@@ -161,6 +161,17 @@ small commits while protecting offline dictation behavior.
   - average offline infer latency: `68.8ms`
   - average streaming finalize latency: `53.0ms`
 - Interpretation: committed streaming final result now matches offline quality on the current bench set while preserving sub-200ms finalize latency.
+
+### SA6 Progress (Implementation Pass 1)
+
+- Added `cuda-python` runtime dependency and pinned to a NeMo-compatible major range:
+  - `cuda-python>=12.3,<13`
+- Why pinning is required: `cuda-python` 13.x no longer exposes `from cuda import cuda`, but NeMo 2.5.3's CUDA graph detection still imports that path.
+- Validation:
+  - `uv run python -c "from cuda import cuda"` succeeds (with deprecation warning from upstream package).
+  - `uv run parakeet-stt-daemon --check` no longer prints the prior NeMo warning:
+    - `No conditional node support for Cuda ... Reason: No cuda-python module`.
+- Scope: dependency/runtime optimization only; no daemon API surface changes.
 
 ---
 

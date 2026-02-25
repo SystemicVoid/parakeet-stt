@@ -329,6 +329,38 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f4/ed/78dd82e0b022ed4cb047188c0b8cead62fa0c27700737fd34e3263d83882/ctc_segmentation-1.7.4.tar.gz", hash = "sha256:19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116", size = 73584, upload-time = "2022-10-11T19:25:00.575Z" }
 
 [[package]]
+name = "cuda-bindings"
+version = "12.9.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-pathfinder" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/6c/a90efb9e83c3830f10236c51b56b436e0b78efba79364659037dc93cdbbc/cuda_bindings-12.9.5-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:14dcc3a4b7bc50a7bec0e98a815b7cc36a0cfeafa20152e484c3a05068209da5", size = 15619944, upload-time = "2025-12-18T16:30:56.452Z" },
+    { url = "https://files.pythonhosted.org/packages/34/4a/f323d52849e4a85ea7ebbff0625c9c6297e35f0e91ce5e2d1cff4731bd1b/cuda_bindings-12.9.5-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:819f38fe6f3f8ea28f772e61c2583dd10152ee81051a970a291b7f916973729e", size = 16149366, upload-time = "2025-12-18T16:30:58.942Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/07/41122c3073267645b5481f03b98d3de47848798967f64b51f25428e9d564/cuda_bindings-12.9.5-cp311-cp311-win_amd64.whl", hash = "sha256:6427fd9fef4c8cc171fbf9eb74763faeddc1fa3899882c269ff7f9b12e03b965", size = 15376641, upload-time = "2025-12-18T16:31:00.983Z" },
+]
+
+[[package]]
+name = "cuda-pathfinder"
+version = "1.3.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ca/b5/e4056e4058fb56519fcddf1face6fe3ff2398953b41615fafe9fb1540bf2/cuda_pathfinder-1.3.5-py3-none-any.whl", hash = "sha256:6c88220f8637cb35d2a75c620d72efebf683b248b923713d8fbe235844c1a4b9", size = 33711, upload-time = "2026-02-23T18:34:27.253Z" },
+]
+
+[[package]]
+name = "cuda-python"
+version = "12.9.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-bindings" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/02/ce79a804a2d6ee7dc2d1637b75b7c3f01eb90a796915d4d3a1ac42e2d6e6/cuda_python-12.9.5-py3-none-any.whl", hash = "sha256:6fbbb3be2ab617d8269ad83e5fe9d748b1da4c5e0f79257a3296408a70766b39", size = 7596, upload-time = "2025-12-18T16:45:15.973Z" },
+]
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1729,6 +1761,7 @@ name = "parakeet-stt-daemon"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cuda-python" },
     { name = "fastapi" },
     { name = "loguru" },
     { name = "nemo-toolkit", extra = ["asr"] },
@@ -1753,6 +1786,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cuda-python", specifier = ">=12.3,<13" },
     { name = "fastapi", specifier = ">=0.115.5" },
     { name = "loguru", specifier = ">=0.7.2" },
     { name = "nemo-toolkit", extras = ["asr"], specifier = ">=2.5.3" },
