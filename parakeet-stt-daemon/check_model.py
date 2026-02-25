@@ -12,6 +12,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
+
 from parakeet_stt_daemon.model import (
     DEFAULT_MODEL_NAME,
     ParakeetStreamingTranscriber,

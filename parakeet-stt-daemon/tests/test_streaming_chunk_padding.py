@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+
 from parakeet_stt_daemon.model import ParakeetStreamingSession, _coerce_rnnt_texts
 
 

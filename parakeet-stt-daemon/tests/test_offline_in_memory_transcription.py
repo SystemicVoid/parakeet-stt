@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.model import ParakeetTranscriber
 from parakeet_stt_daemon.server import DaemonServer
