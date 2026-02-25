@@ -14,6 +14,58 @@ Top conclusions:
 
 Net: this is a strong candidate for a daemon hardening sprint before adding higher-level UX features that depend on reliable streaming semantics.
 
+## Status Update (2026-02-25, External Research Synthesis — Streaming WER Gap)
+
+Two independent deep research passes (GPT and Gemini) were run against a detailed technical brief
+([`deep-research-streaming-quality.md`](deep-research-streaming-quality.md)) covering the streaming
+WER gap, root cause analysis, and both-path improvements. Full findings and action items are in
+that file. Key conclusions summarized here for operational continuity.
+
+### Confirmed Root Causes (from Research)
+
+1. **End-of-utterance drain missing (RC1 — highest confidence).** Buffered transducer decoders delay
+   token emission until right-context frames arrive. When the pipeline stops at the last real audio
+   frame those buffered tokens are never emitted. Our tail-padding experiments are direct behavioral
+   evidence: every added 0.2s of silence improved WER monotonically (0.535 → 0.410). The proper fix
+   is an explicit drain step (feed silence frames until the decoder flushes), not waveform padding.
+
+2. **`tokens_per_chunk` overflow for TDT burst emission (RC2 — high confidence).** The RNNT-derived
+   formula `ceil(chunk_secs / model_stride)` assumes linear 1:1 frame-to-token emission. TDT's
+   duration skipping + FastEmit creates dense bursts that can exceed this limit at chunk boundaries,
+   silently clipping the excess tokens. This is why grid-sweeping chunk sizes gave only marginal gains.
+
+3. **`stateful_decoding` inheritance bug in `BatchedFrameASRTDT` (RC3 — needs verification).**
+   Gemini identified that `BatchedFrameASRTDT.__init__` accepts `stateful_decoding` but never passes
+   it to `super().__init__()`. The base class always runs stateless regardless of the caller's intent.
+   Explains the paradox: `stateful_decoding=True` produced WER 0.686, *worse* than `False` (0.346).
+   Must verify against installed NeMo source before acting.
+
+### New Action Items (SA series)
+
+| ID | Item | Priority |
+|---|---|---|
+| SA1 | Verify `stateful_decoding` inheritance bug in NeMo `BatchedFrameASRTDT` source | P0 |
+| SA2 | Implement explicit EOU drain in streaming finalize (not waveform zero-padding) | P0 |
+| SA3 | Upgrade NeMo to 2.6.2 (security-justified, explicit TDT streaming fix in release notes) | P1 |
+| SA4 | Compute tail padding from model config (`hop_ms × shift_frames × 2 × sr/1000` ≈ 320ms) | P1 |
+| SA5 | Implement Stream-Then-Seal: `conformer_stream_step()` for partials + `model.transcribe()` seal | P1 |
+| SA6 | Install `cuda-python` (removes NeMo startup warning, enables CUDA graph decode) | P2 |
+| SA7 | Integrate Silero VAD v6 to replace RMS-based endpointing | P2 |
+| SA8 | Prototype `conformer_stream_step()` cache-aware streaming loop | P2 |
+| SA9 | Evaluate NeMo 2.7.x for Transducer CUDA Graphs + decoder memory leak fixes | P3 |
+| SA10 | Investigate TDT-correct `tokens_per_chunk` formula accounting for burst emission rate | P3 |
+
+### Recommended Immediate Sequence
+
+1. `SA1` (read NeMo source for the inheritance bug — diagnostic only, ~30min)
+2. `SA2 + SA4` together (EOU drain + correct padding formula — same finalize code area)
+3. `SA3` (upgrade NeMo to 2.6.2, re-run bench)
+4. `SA5` (Stream-Then-Seal as the highest-confidence path to <0.20 WER)
+
+Full rationale in `deep-research-streaming-quality.md` under "Research Synthesis".
+
+---
+
 ## Status Update (2026-02-25, Offline In-Memory Finalize + Benchmark Priority)
 
 - Offline finalize path now transcribes in-memory `np.ndarray` audio by default:
@@ -630,7 +682,7 @@ PR-specific gates:
 
 ## Deep Research Output
 
-See the finalized GPU stack research report in `deep-research-report.md` for the recommendation, compatibility matrix, migration/rollback commands, benchmark protocol, and risk register.
+See the finalized GPU stack research report in `GPU Inference Stack Audit and Upgrade Proposal for parakeet-stt-daemon-deep-research-report.md` for the recommendation, compatibility matrix, migration/rollback commands, benchmark protocol, and risk register.
 
 ## Appendix: Key Code References
 
