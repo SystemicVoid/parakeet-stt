@@ -64,7 +64,7 @@ Manual two-terminal start is still supported:
 ```bash
 # Terminal A
 cd parakeet-stt-daemon
-PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon
+PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon
 
 # Terminal B
 cd parakeet-ptt
@@ -79,7 +79,7 @@ Default profile:
 - `--paste-key-backend auto` (ladder: uinput → ydotool)
 - `--paste-backend-failure-policy copy-only`
 - `--uinput-dwell-ms 18`
-- `PARAKEET_STREAMING_ENABLED=true` for daemon launch (set `PARAKEET_STREAMING_ENABLED=false` for offline-only profile)
+- `PARAKEET_STREAMING_ENABLED=false` for daemon launch (set `PARAKEET_STREAMING_ENABLED=true` for streaming validation profile)
 - Adaptive routing: Terminal → Ctrl+Shift+V, General → Ctrl+V, Unknown → Ctrl+Shift+V
 - Wayland focus cache: 30s stale threshold, 500ms transition grace
 - Clipboard: foreground wl-copy, 700ms post-chord hold, `text/plain;charset=utf-8`

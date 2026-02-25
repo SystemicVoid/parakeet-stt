@@ -27,7 +27,7 @@ Net: this is a strong candidate for a daemon hardening sprint before adding high
   - temp-wav fallback path when array decode fails,
   - server offline finalize path using in-memory transcription.
 - Prioritization update:
-  - after current hardening tasks, top next action is a committed repeatable offline benchmark harness with stable WER/timing thresholds.
+  - delivery order now explicitly gates UX phases behind a committed repeatable offline benchmark harness with stable WER/timing thresholds.
 
 ## Status Update (2026-02-23, Post A1/A2/A3)
 
