@@ -82,9 +82,9 @@ small commits while protecting offline dictation behavior.
 | ID | Acceptance Criteria | Verification Loop | Status |
 |---|---|---|---|
 | SA1 | Confirm whether `BatchedFrameASRTDT.__init__` forwards `stateful_decoding` to base class in installed NeMo; record exact source path + line evidence. | Inspect installed NeMo source directly; copy findings into this doc. | DONE |
-| SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | TODO |
+| SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | DONE |
 | SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
-| SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | TODO |
+| SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | DONE |
 | SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | TODO |
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | TODO |
 | SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
@@ -105,7 +105,7 @@ small commits while protecting offline dictation behavior.
 ### Execution Log (2026-02-25)
 
 - [x] SA1 complete and evidence captured
-- [ ] SA2+SA4 implemented with tests and bench deltas recorded
+- [x] SA2+SA4 implemented with tests and bench deltas recorded
 - [ ] SA5 stream-then-seal landed with integration tests
 - [ ] SA6 installed + warning removal verified
 - [ ] SA8 prototype behind explicit flag
@@ -121,6 +121,30 @@ small commits while protecting offline dictation behavior.
 - `BatchedFrameASRRNNT.__init__` signature is:
   - `(..., max_steps_per_timestep: int = 5, stateful_decoding: bool = False)`
 - Conclusion: `BatchedFrameASRTDT` currently drops the caller-supplied `max_steps_per_timestep` and `stateful_decoding` during `super()` construction in installed NeMo 2.5.3. The daemon-side workaround (`self.chunk_helper.stateful_decoding = ...` and `self.chunk_helper.max_steps_per_timestep = ...`) is still required until upstream fix/upgrade.
+
+### SA2 + SA4 Progress (Implementation Pass 1)
+
+- Streaming finalize now runs in two steps for TDT helper mode:
+  1. decode real buffered audio,
+  2. run an explicit drain pass over silence frames to flush delayed end-of-utterance tokens.
+- Drain sizing now comes from model metadata first (`window_stride × shift_frames × 2 × sample_rate`), with fallback to `delay × model_stride_secs × sample_rate` when streaming shift metadata is unavailable.
+- Added regression tests:
+  - explicit drain pass executes for TDT helper (`tokens_per_chunk` + `delay` path),
+  - config-derived drain sample count (Parakeet-like values) equals 5120 samples at 16kHz,
+  - delay/stride fallback formula remains covered.
+- Bench re-run after implementation (same 8-sample bench set, `chunk_secs=2.4`, `right_context_secs=1.6`):
+  - average offline WER: `0.155`
+  - average streaming WER: `0.414`
+  - average offline infer latency: `71.2ms`
+  - average streaming finalize latency: `253.4ms`
+  - note: streaming WER improved vs prior documented `0.488` baseline, but remains far above target `<0.20`.
+- Full local quality gate run after changes:
+  - `uv run pytest -q tests/` -> `44 passed`
+  - `uv run ruff check .` -> pass
+  - `uv run ruff format --check .` -> pass
+  - `ty check .` -> pass
+  - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
+- Follow-up after SA2/SA4: move to `SA5` (Stream-Then-Seal) for reliable final-result WER target.
 
 ---
 
