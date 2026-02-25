@@ -85,7 +85,7 @@ small commits while protecting offline dictation behavior.
 | SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | DONE |
 | SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
 | SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | DONE |
-| SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | TODO |
+| SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | DONE |
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | TODO |
 | SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
 | SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | TODO |
@@ -106,7 +106,7 @@ small commits while protecting offline dictation behavior.
 
 - [x] SA1 complete and evidence captured
 - [x] SA2+SA4 implemented with tests and bench deltas recorded
-- [ ] SA5 stream-then-seal landed with integration tests
+- [x] SA5 stream-then-seal landed with integration tests
 - [ ] SA6 installed + warning removal verified
 - [ ] SA8 prototype behind explicit flag
 - [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
@@ -145,6 +145,22 @@ small commits while protecting offline dictation behavior.
   - `ty check .` -> pass
   - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
 - Follow-up after SA2/SA4: move to `SA5` (Stream-Then-Seal) for reliable final-result WER target.
+
+### SA5 Progress (Implementation Pass 1)
+
+- Added stream-then-seal finalize mode in `ParakeetStreamingSession.finalize()`:
+  - default (`PARAKEET_STREAM_THEN_SEAL=1`): return final transcript from offline `transcribe_samples()` path,
+  - opt-out (`PARAKEET_STREAM_THEN_SEAL=0`): keep helper-only finalize for streaming quality experiments.
+- Safety property: this change is still scoped to streaming sessions only; offline daemon usage path is unchanged.
+- Regression coverage added in `tests/test_streaming_chunk_padding.py`:
+  - default mode returns sealed offline text,
+  - helper-only mode remains testable for drain-path assertions.
+- Bench re-run after SA5 (same 8-sample bench set, same chunk/right-context config):
+  - average offline WER: `0.094`
+  - average streaming WER: `0.094`
+  - average offline infer latency: `68.8ms`
+  - average streaming finalize latency: `53.0ms`
+- Interpretation: committed streaming final result now matches offline quality on the current bench set while preserving sub-200ms finalize latency.
 
 ---
 
