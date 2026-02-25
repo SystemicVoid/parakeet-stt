@@ -64,6 +64,55 @@ that file. Key conclusions summarized here for operational continuity.
 
 Full rationale in `deep-research-streaming-quality.md` under "Research Synthesis".
 
+## Status Update (2026-02-25, SA Execution Checklist + Acceptance Gates)
+
+This section is the implementation checklist for SA1..SA10. It is intentionally
+written as an operator gate sheet so changes can be landed incrementally with
+small commits while protecting offline dictation behavior.
+
+### Offline Safety Contract
+
+- Default operator path remains offline because `scripts/stt-helper.sh` starts daemon with `--no-streaming`.
+- Any change in `ParakeetStreamingSession.finalize()` must not alter `ParakeetTranscriber.transcribe_samples()` behavior.
+- `SA3` (NeMo upgrade) is the only planned change that can affect offline inference semantics and requires hard pre/post benchmark gating.
+- `SA7` (VAD) must launch as opt-in (`PARAKEET_VAD_ENABLED`) with default preserving current RMS trim behavior.
+
+### Acceptance Criteria by SA Item
+
+| ID | Acceptance Criteria | Verification Loop | Status |
+|---|---|---|---|
+| SA1 | Confirm whether `BatchedFrameASRTDT.__init__` forwards `stateful_decoding` to base class in installed NeMo; record exact source path + line evidence. | Inspect installed NeMo source directly; copy findings into this doc. | IN_PROGRESS |
+| SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | TODO |
+| SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
+| SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | TODO |
+| SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | TODO |
+| SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | TODO |
+| SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
+| SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | TODO |
+| SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | TODO |
+| SA10 | TDT-correct `tokens_per_chunk` candidate formulas documented and experimentally compared (baseline vs burst-aware variants). | Bench sweep script output committed (or archived) with WER/latency deltas. | TODO |
+
+### Global Regression Gates (apply per commit where relevant)
+
+- `cd parakeet-stt-daemon && uv run pytest -q tests/`
+- `cd parakeet-stt-daemon && uv run ruff check .`
+- `cd parakeet-stt-daemon && uv run ruff format --check .`
+- `cd parakeet-stt-daemon && ty check .`
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/ tests/`
+- For offline-risk commits (`SA3`, opt-in promotion of `SA7`):
+  - `cd parakeet-stt-daemon && uv run python check_model.py --bench-offline --device cuda --max-avg-wer <locked> --max-p95-infer-ms <locked> --max-p95-finalize-ms <locked>`
+
+### Execution Log (2026-02-25)
+
+- [ ] SA1 complete and evidence captured
+- [ ] SA2+SA4 implemented with tests and bench deltas recorded
+- [ ] SA5 stream-then-seal landed with integration tests
+- [ ] SA6 installed + warning removal verified
+- [ ] SA8 prototype behind explicit flag
+- [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
+- [ ] SA7 opt-in VAD landed with default-off safety
+- [ ] SA9+SA10 research follow-ups recorded
+
 ---
 
 ## Status Update (2026-02-25, Offline In-Memory Finalize + Benchmark Priority)
