@@ -9,11 +9,12 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import wave
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from loguru import logger
@@ -166,6 +167,20 @@ def _env_float(name: str, default: float = 0.0) -> float:
         return default
 
 
+def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
+    try:
+        import soundfile as sf
+
+        sf.write(path, samples, sample_rate)
+    except Exception:  # pragma: no cover - fallback for minimal environments
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -211,22 +226,13 @@ class ParakeetTranscriber:
 
     def warmup(self) -> None:
         """Run a trivial forward pass to pay the first-use cost."""
-        tmp_path: Path | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = Path(tmp.name)
             cfg = getattr(self.model, "_cfg", None)
             sample_rate = getattr(cfg, "sample_rate", 16_000)
             silence = np.zeros((sample_rate,), dtype=np.float32)
-            import soundfile as sf
-
-            sf.write(tmp_path, silence, sample_rate)
-            _ = self.transcribe_wav(str(tmp_path))
+            _ = self.transcribe_samples(silence, sample_rate=sample_rate)
         except Exception as exc:  # pragma: no cover - warmup is optional
             logger.debug("Warmup skipped: {}", exc)
-        finally:
-            if tmp_path:
-                tmp_path.unlink(missing_ok=True)
 
     def transcribe_files(self, paths: Sequence[str], *, timestamps: bool = False) -> list[str]:
         if not paths:
@@ -244,6 +250,27 @@ class ParakeetTranscriber:
         if not outputs:
             return ""
         return _extract_text(outputs[0])
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        """Transcribe in-memory audio and fall back to a temp wav on API mismatch."""
+        audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+        try:
+            outputs = self.model.transcribe([audio], batch_size=1, verbose=False)  # type: ignore[operator]
+            if not outputs:
+                return ""
+            return _extract_text(outputs[0])
+        except Exception as exc:
+            logger.warning(
+                "In-memory transcription failed ({}); falling back to temp wav",
+                exc.__class__.__name__,
+            )
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                path = Path(tmp.name)
+            try:
+                _write_audio_file(path, audio, sample_rate)
+                return self.transcribe_wav(str(path))
+            finally:
+                path.unlink(missing_ok=True)
 
 
 class ParakeetStreamingSession:
@@ -376,7 +403,7 @@ class ParakeetStreamingTranscriber:
 
         class _PatchedFrameBatchChunkedRNNT(FrameBatchChunkedRNNT):
             @torch.no_grad()
-            def _get_batch_preds(self, keep_logits: bool = False) -> None:  # type: ignore[override]
+            def _get_batch_preds(self, keep_logits: bool = False) -> None:
                 device = self.asr_model.device
                 for batch in iter(self.data_loader):
                     feat_signal, feat_signal_len = batch
@@ -487,8 +514,8 @@ class ParakeetStreamingTranscriber:
                     )
             self.chunk_helper = _PatchedFrameBatchChunkedRNNT(
                 asr_model=self.model,
-                frame_len=self.chunk_secs,
-                total_buffer=total_buffer_secs,
+                frame_len=cast(Any, self.chunk_secs),
+                total_buffer=cast(Any, total_buffer_secs),
                 batch_size=self.batch_size,
             )
             self._audio_feature_iter_cls = AudioFeatureIterator
@@ -529,15 +556,7 @@ class ParakeetStreamingTranscriber:
         return ParakeetStreamingSession(self, sample_rate)
 
     def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            path = Path(tmp.name)
-        try:
-            import soundfile as sf
-
-            sf.write(path, samples, sample_rate)
-            return self.offline.transcribe_wav(str(path))
-        finally:
-            path.unlink(missing_ok=True)
+        return self.offline.transcribe_samples(samples, sample_rate=sample_rate)
 
 
 __all__ = [

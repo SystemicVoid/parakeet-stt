@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 import time
-import wave
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from functools import partial
 from typing import Literal
 from uuid import UUID
 
@@ -16,11 +14,6 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
-
-try:
-    import soundfile as sf
-except ImportError:  # pragma: no cover - inference extra not installed
-    sf = None  # type: ignore
 
 from .audio import AudioInput
 from .config import ServerSettings
@@ -410,22 +403,6 @@ class DaemonServer:
         reserved_bytes = torch.cuda.memory_reserved(device_index or 0)
         return int(reserved_bytes / (1024 * 1024))
 
-    def _write_wav(self, samples: np.ndarray) -> Path:
-        path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
-        if sf is not None:
-            sf.write(path, samples, self.audio.sample_rate)
-        else:  # pragma: no cover - fallback for dev environments
-            self._write_wav_fallback(path, samples)
-        return path
-
-    def _write_wav_fallback(self, path: Path, samples: np.ndarray) -> None:
-        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self.audio.sample_rate)
-            wf.writeframes(pcm.tobytes())
-
     async def _finalise_transcription(
         self, audio_samples: np.ndarray, ready_chunks: list[np.ndarray], tail: np.ndarray
     ) -> tuple[str, int]:
@@ -444,19 +421,20 @@ class DaemonServer:
             finally:
                 self._active_stream = None
 
-        # Offline fallback: write temp wav and transcribe.
+        # Offline fallback: run in-memory transcription to avoid temp-file I/O.
         trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
-        audio_path = self._write_wav(trimmed)
-        try:
-            loop = asyncio.get_running_loop()
-            infer_started = time.perf_counter()
-            text = await loop.run_in_executor(
-                None, self.transcriber.transcribe_wav, str(audio_path)
-            )
-            infer_ms = int((time.perf_counter() - infer_started) * 1000)
-            return text, infer_ms
-        finally:
-            audio_path.unlink(missing_ok=True)
+        loop = asyncio.get_running_loop()
+        infer_started = time.perf_counter()
+        text = await loop.run_in_executor(
+            None,
+            partial(
+                self.transcriber.transcribe_samples,
+                trimmed,
+                sample_rate=self.audio.sample_rate,
+            ),
+        )
+        infer_ms = int((time.perf_counter() - infer_started) * 1000)
+        return text, infer_ms
 
     def _start_stream_drain_loop(self) -> None:
         if self._stream_drain_task is not None:
