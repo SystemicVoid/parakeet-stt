@@ -132,6 +132,25 @@ ty check .
 uv run parakeet-stt-daemon --check
 ```
 
+Offline benchmark harness (repeatable local regression gate):
+```bash
+cd parakeet-stt-daemon
+uv run python check_model.py \
+  --bench-offline \
+  --device cuda \
+  --bench-output bench_audio/latest-benchmark.json \
+  --max-avg-wer 0.45 \
+  --max-p95-infer-ms 1800 \
+  --max-p95-finalize-ms 2200
+```
+The command prints a per-sample + aggregate summary to stdout and writes JSON with:
+- `benchmark`, `model`, `requested_device`, `effective_device`
+- `bench_dir`, `transcripts_path`, `sample_count`
+- `aggregate.avg_wer`, `aggregate.infer_ms.avg|p50|p95`, `aggregate.finalize_ms.avg|p50|p95`
+- `thresholds.*`, `regression_gate.pass`, `regression_gate.failures`
+- `samples[]` entries including `sample_id`, `audio_path`, `reference`, `hypothesis`, `normalized_reference`, `normalized_hypothesis`, `wer`, `infer_ms`, `finalize_ms`
+When any configured threshold is exceeded, the harness exits non-zero.
+
 Commit and push gates (repo root):
 ```bash
 prek install -t pre-commit -t pre-push

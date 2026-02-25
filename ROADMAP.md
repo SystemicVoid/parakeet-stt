@@ -188,7 +188,7 @@ Acceptance:
 
 1. Complete P-1 daemon hardening gate and lock lifecycle/config invariants with tests.
 2. Complete P0 injection architecture hardening and lock reliability baselines.
-3. Build and lock a repeatable offline benchmark harness (`bench_audio` WER + timing summaries + regression thresholds) before UX phase work.
+3. Build and lock a repeatable offline benchmark harness (`bench_audio` WER + timing summaries + regression thresholds) before UX phase work. (done 2026-02-25)
 4. Ship Phase 1 cues behind a feature flag, default on for sound cues only.
 5. Add Phase 1 tests and update docs.
 6. Ship TUI skeleton with existing state only.
@@ -207,7 +207,7 @@ Status legend: `todo` | `in-progress` | `done` | `blocked`
 5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
 6. `A6` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
 7. `A7` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): default helper launch now streaming-enabled with explicit offline override (`PARAKEET_STREAMING_ENABLED=false`).
-8. `A8` — status: `todo`; owner: `Owner-M1`; branch: `agent/a8-offline-bench-harness`; scope: Committed repeatable offline benchmark harness and thresholds (`parakeet-stt-daemon/check_model.py`, `parakeet-stt-daemon/bench_audio/`, docs + baseline snapshots).
+8. `A8` — status: `done` (2026-02-25); owner: `Owner-M1`; branch: `agent/a8-offline-bench-harness`; scope: Offline benchmark harness implemented in `check_model.py` with committed bench dataset inputs, per-sample + aggregate WER/infer/finalize metrics, JSON report output, and configurable regression thresholds with non-zero exit on failure.
 
 ## Metrics to Track
 

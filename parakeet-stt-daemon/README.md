@@ -4,6 +4,7 @@ Canonical usage and commands live in the top-level `README.md`. Use this file on
 
 - Run the server (matches helper defaults): `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
 - Install deps: `uv sync --dev` (add `--extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match` for GPU inference)
+- Offline benchmark harness: `uv run python check_model.py --bench-offline --bench-output bench_audio/latest-benchmark.json --max-avg-wer 0.45 --max-p95-infer-ms 1800 --max-p95-finalize-ms 2200`
 - Config overrides use `PARAKEET_` env vars (e.g., `PARAKEET_SHARED_SECRET`, `PARAKEET_MIC_DEVICE`); status endpoint is enabled by default, disable with `--no-status`.
 - Dev checks: `uv run ruff check .`, `uv run ruff format --check .`, `ty check .`
 - Commit/push gates are managed from repo root via `prek` (`.pre-commit-config.yaml`).
