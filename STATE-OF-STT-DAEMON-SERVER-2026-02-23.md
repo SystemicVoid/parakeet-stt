@@ -81,7 +81,7 @@ small commits while protecting offline dictation behavior.
 
 | ID | Acceptance Criteria | Verification Loop | Status |
 |---|---|---|---|
-| SA1 | Confirm whether `BatchedFrameASRTDT.__init__` forwards `stateful_decoding` to base class in installed NeMo; record exact source path + line evidence. | Inspect installed NeMo source directly; copy findings into this doc. | IN_PROGRESS |
+| SA1 | Confirm whether `BatchedFrameASRTDT.__init__` forwards `stateful_decoding` to base class in installed NeMo; record exact source path + line evidence. | Inspect installed NeMo source directly; copy findings into this doc. | DONE |
 | SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | TODO |
 | SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
 | SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | TODO |
@@ -104,7 +104,7 @@ small commits while protecting offline dictation behavior.
 
 ### Execution Log (2026-02-25)
 
-- [ ] SA1 complete and evidence captured
+- [x] SA1 complete and evidence captured
 - [ ] SA2+SA4 implemented with tests and bench deltas recorded
 - [ ] SA5 stream-then-seal landed with integration tests
 - [ ] SA6 installed + warning removal verified
@@ -112,6 +112,15 @@ small commits while protecting offline dictation behavior.
 - [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
 - [ ] SA7 opt-in VAD landed with default-off safety
 - [ ] SA9+SA10 research follow-ups recorded
+
+### SA1 Evidence (Installed NeMo 2.5.3)
+
+- Verified module path: `/home/hugo/Documents/Engineering/parakeet-stt/parakeet-stt-daemon/.venv/lib/python3.11/site-packages/nemo/collections/asr/parts/utils/streaming_utils.py`.
+- `BatchedFrameASRTDT.__init__(..., max_steps_per_timestep, stateful_decoding, tdt_search_boundary)` calls:
+  - `super().__init__(asr_model, frame_len=frame_len, total_buffer=total_buffer, batch_size=batch_size)`
+- `BatchedFrameASRRNNT.__init__` signature is:
+  - `(..., max_steps_per_timestep: int = 5, stateful_decoding: bool = False)`
+- Conclusion: `BatchedFrameASRTDT` currently drops the caller-supplied `max_steps_per_timestep` and `stateful_decoding` during `super()` construction in installed NeMo 2.5.3. The daemon-side workaround (`self.chunk_helper.stateful_decoding = ...` and `self.chunk_helper.max_steps_per_timestep = ...`) is still required until upstream fix/upgrade.
 
 ---
 
