@@ -67,7 +67,8 @@ class _FakeParent:
         return "offline text"
 
 
-def test_finalize_disables_padding_for_chunked_iterator() -> None:
+def test_finalize_disables_padding_for_chunked_iterator(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
     parent = _FakeParent()
     session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
     session.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
@@ -80,7 +81,9 @@ def test_finalize_disables_padding_for_chunked_iterator() -> None:
     assert parent.chunk_helper.frame_reader.pad_to_frame_len is False
 
 
-def test_finalize_runs_explicit_drain_pass_for_tdt_helper() -> None:
+def test_finalize_runs_explicit_drain_pass_for_tdt_helper(monkeypatch) -> None:
+    # Keep seal disabled to assert helper drain behavior directly.
+    monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
     parent = _FakeParent()
     parent._helper_tokens_per_chunk = 10
     parent._helper_delay = 3
@@ -98,6 +101,21 @@ def test_finalize_runs_explicit_drain_pass_for_tdt_helper() -> None:
     # Second pass should be drain-only silence from config-derived frame count.
     assert parent.chunk_helper.frame_reader.samples.size == 5120
     assert parent.chunk_helper.frame_reader.pad_to_frame_len is True
+
+
+def test_finalize_uses_offline_seal_by_default() -> None:
+    parent = _FakeParent()
+    parent._helper_tokens_per_chunk = 10
+    parent._helper_delay = 3
+    parent._helper_model_stride_secs = 0.04
+    session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
+    session.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    result = session.finalize()
+
+    assert result == "offline text"
+    assert parent.offline_calls == 1
+    assert parent.chunk_helper.call_count == 0
 
 
 def test_compute_eou_drain_samples_falls_back_to_delay_stride() -> None:

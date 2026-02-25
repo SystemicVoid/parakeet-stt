@@ -331,8 +331,18 @@ class ParakeetStreamingSession:
         tokens_per_chunk = self._parent._helper_tokens_per_chunk
         delay = self._parent._helper_delay
         model_stride_secs = getattr(self._parent, "_helper_model_stride_secs", None)
+        stream_then_seal = os.getenv("PARAKEET_STREAM_THEN_SEAL", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if helper is not None and iter_cls is not None:
             try:
+                if stream_then_seal:
+                    # Keep final transcript quality tied to the proven offline path.
+                    return self._parent._transcribe_offline(combined, self.sample_rate)
+
                 drain_samples = _compute_eou_drain_samples(
                     self._parent.model,
                     sample_rate=self.sample_rate,
