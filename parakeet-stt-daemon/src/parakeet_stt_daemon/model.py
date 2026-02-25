@@ -167,6 +167,40 @@ def _env_float(name: str, default: float = 0.0) -> float:
         return default
 
 
+def _compute_eou_drain_samples(
+    model: ASRModel,
+    *,
+    sample_rate: int,
+    delay: int | None,
+    model_stride_secs: float | None,
+) -> int:
+    """Compute end-of-utterance drain samples from model metadata when possible."""
+    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
+    preprocessor = getattr(cfg, "preprocessor", None)
+    hop_secs = getattr(preprocessor, "window_stride", None)
+    streaming_cfg = getattr(getattr(model, "encoder", None), "streaming_cfg", None)
+    shift_frames = None
+    for key in ("shift_size", "shift_size_frames", "shift_size_in_frames", "cache_drop_size"):
+        value = _get_cfg_value(streaming_cfg, key)
+        if value is not None:
+            shift_frames = value
+            break
+
+    if hop_secs is not None and shift_frames is not None:
+        try:
+            hop = float(hop_secs)
+            shifts = float(shift_frames)
+            if hop > 0 and shifts > 0:
+                # NeMo streaming recipes use ~2x shift frames to flush delayed emissions.
+                return max(0, int(math.ceil(hop * shifts * 2.0 * sample_rate)))
+        except (TypeError, ValueError):
+            pass
+
+    if delay is not None and model_stride_secs is not None and delay > 0 and model_stride_secs > 0:
+        return max(0, int(math.ceil(delay * model_stride_secs * sample_rate)))
+    return 0
+
+
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
     try:
         import soundfile as sf
@@ -299,49 +333,57 @@ class ParakeetStreamingSession:
         model_stride_secs = getattr(self._parent, "_helper_model_stride_secs", None)
         if helper is not None and iter_cls is not None:
             try:
-                delay_pad_samples = 0
-                if (
-                    tokens_per_chunk is not None
-                    and delay is not None
-                    and model_stride_secs is not None
-                    and delay > 0
-                ):
-                    delay_pad_samples = int(delay * model_stride_secs * self.sample_rate)
-                    if delay_pad_samples > 0:
-                        combined = np.pad(combined, (0, delay_pad_samples))
-                if extra_pad_samples > 0:
-                    combined = np.pad(combined, (0, extra_pad_samples))
+                drain_samples = _compute_eou_drain_samples(
+                    self._parent.model,
+                    sample_rate=self.sample_rate,
+                    delay=delay,
+                    model_stride_secs=model_stride_secs,
+                )
+
+                def _run_helper(samples: np.ndarray) -> str:
+                    pad_to_frame_len = tokens_per_chunk is not None and delay is not None
+                    frame_reader = iter_cls(
+                        samples,
+                        helper.frame_len,
+                        helper.raw_preprocessor,
+                        helper.asr_model.device,
+                        pad_to_frame_len=pad_to_frame_len,
+                    )
+                    try:
+                        helper.set_frame_reader(frame_reader, 0)
+                    except TypeError:
+                        helper.set_frame_reader(frame_reader)
+                    if tokens_per_chunk is not None and delay is not None:
+                        result = helper.transcribe(tokens_per_chunk, delay)
+                    else:
+                        result = helper.transcribe()
+                    return _normalize_streaming_text(result)
+
                 if debug:
                     logger.debug(
-                        "Streaming finalize: chunks={}, raw_samples={}, padded_samples={}, "
-                        "delay_pad_samples={}, extra_pad_samples={}, "
+                        "Streaming finalize: chunks={}, raw_samples={}, combined_samples={}, "
+                        "drain_samples={}, extra_pad_samples={}, "
                         "tokens_per_chunk={}, delay={}, helper={}",
                         len(self._chunks),
                         raw_samples,
                         combined.size,
-                        delay_pad_samples,
+                        drain_samples,
                         extra_pad_samples,
                         tokens_per_chunk,
                         delay,
                         type(helper).__name__,
                     )
-                pad_to_frame_len = tokens_per_chunk is not None and delay is not None
-                frame_reader = iter_cls(
-                    combined,
-                    helper.frame_len,
-                    helper.raw_preprocessor,
-                    helper.asr_model.device,
-                    pad_to_frame_len=pad_to_frame_len,
-                )
-                try:
-                    helper.set_frame_reader(frame_reader, 0)
-                except TypeError:
-                    helper.set_frame_reader(frame_reader)
-                if tokens_per_chunk is not None and delay is not None:
-                    result = helper.transcribe(tokens_per_chunk, delay)
-                else:
-                    result = helper.transcribe()
-                return _normalize_streaming_text(result)
+                result_text = _run_helper(combined)
+
+                should_drain = tokens_per_chunk is not None and delay is not None
+                total_drain_samples = 0
+                if should_drain:
+                    total_drain_samples = max(0, drain_samples) + max(0, extra_pad_samples)
+                if total_drain_samples > 0:
+                    drain_audio = np.zeros((total_drain_samples,), dtype=np.float32)
+                    # Drain in a second pass so delayed transducer emissions at EOU can flush.
+                    result_text = _run_helper(drain_audio)
+                return result_text
             except Exception as exc:  # pragma: no cover - fallback path
                 logger.warning("Streaming helper failed during finalization: {}", exc)
         return self._parent._transcribe_offline(combined, self.sample_rate)
