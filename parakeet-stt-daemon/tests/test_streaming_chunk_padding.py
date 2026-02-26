@@ -96,6 +96,11 @@ class _FakeConformerModel:
         )
 
 
+class _FailingConformerModel(_FakeConformerModel):
+    def conformer_stream_step(self, **kwargs: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+        raise TypeError("incompatible streaming path")
+
+
 def test_finalize_disables_padding_for_chunked_iterator(monkeypatch) -> None:
     from parakeet_stt_daemon.model import ParakeetStreamingSession
 
@@ -178,7 +183,8 @@ def test_conformer_partial_feed_updates_partial_text(monkeypatch) -> None:
 
     state.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
 
-    assert model.step_calls == 1
+    # One preflight probe call + one runtime feed call.
+    assert model.step_calls == 2
     assert state.active is True
     assert state.fallback_reason is None
     assert state.last_text == "partial text"
@@ -194,6 +200,18 @@ def test_init_conformer_partial_state_reports_missing_stream_step(monkeypatch) -
 
     assert state is None
     assert reason == "partial_stream_unavailable:conformer_stream_step_missing"
+
+
+def test_init_conformer_partial_state_reports_preflight_failure(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import _init_conformer_partial_state
+
+    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
+
+    model = _FailingConformerModel()
+    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
+
+    assert state is None
+    assert reason == "partial_stream_unavailable:preflight_failed:TypeError"
 
 
 def test_compute_eou_drain_samples_falls_back_to_delay_stride() -> None:

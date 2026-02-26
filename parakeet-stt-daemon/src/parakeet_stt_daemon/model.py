@@ -214,18 +214,36 @@ class _ConformerPartialState:
         cache_last_channel: Any,
         cache_last_time: Any,
         cache_last_channel_len: Any,
+        drop_extra_pre_encoded: int,
     ) -> None:
         self._model = model
         self._sample_rate = int(sample_rate)
         self._preprocessor = preprocessor
         self._conformer_stream_step = conformer_stream_step
+        self._initial_cache_last_channel = cache_last_channel
+        self._initial_cache_last_time = cache_last_time
+        self._initial_cache_last_channel_len = cache_last_channel_len
         self._cache_last_channel = cache_last_channel
         self._cache_last_time = cache_last_time
         self._cache_last_channel_len = cache_last_channel_len
+        self._drop_extra_pre_encoded = int(drop_extra_pre_encoded)
         self._previous_hypotheses: Any = None
         self.last_text = ""
         self.active = True
         self.fallback_reason: str | None = None
+
+    @staticmethod
+    def _clone_cache(value: Any) -> Any:
+        if torch is not None and torch.is_tensor(value):
+            return value.clone()
+        return value
+
+    def reset_runtime_state(self) -> None:
+        self._cache_last_channel = self._clone_cache(self._initial_cache_last_channel)
+        self._cache_last_time = self._clone_cache(self._initial_cache_last_time)
+        self._cache_last_channel_len = self._clone_cache(self._initial_cache_last_channel_len)
+        self._previous_hypotheses = None
+        self.last_text = ""
 
     def _preprocess(self, chunk: np.ndarray) -> tuple[Any, Any]:
         if torch is None:
@@ -247,39 +265,54 @@ class _ConformerPartialState:
         self.active = False
         self.fallback_reason = reason
 
+    def _stream_step(self, chunk: np.ndarray) -> str:
+        processed_signal, processed_signal_length = self._preprocess(chunk)
+        if processed_signal_length is None and torch is not None:
+            processed_signal_length = torch.tensor(
+                [int(processed_signal.shape[-1])],
+                dtype=torch.long,
+                device=processed_signal.device,
+            )
+        result = self._conformer_stream_step(
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            cache_last_channel=self._cache_last_channel,
+            cache_last_time=self._cache_last_time,
+            cache_last_channel_len=self._cache_last_channel_len,
+            keep_all_outputs=True,
+            previous_hypotheses=self._previous_hypotheses,
+            drop_extra_pre_encoded=self._drop_extra_pre_encoded,
+            return_transcription=True,
+        )
+        (
+            _,
+            hypotheses_or_text,
+            self._cache_last_channel,
+            self._cache_last_time,
+            self._cache_last_channel_len,
+            best_hyp,
+            *_,
+        ) = result
+        self._previous_hypotheses = best_hyp
+        return _normalize_streaming_text(hypotheses_or_text)
+
+    def preflight_probe(self) -> str | None:
+        """Validate the experimental partial path once before activating it."""
+        try:
+            probe_samples = max(1, int(self._sample_rate * 0.25))
+            probe = np.zeros((probe_samples,), dtype=np.float32)
+            self.reset_runtime_state()
+            self._stream_step(probe)
+            self.reset_runtime_state()
+            return None
+        except Exception as exc:  # pragma: no cover - runtime/model dependent
+            return f"preflight_failed:{exc.__class__.__name__}"
+
     def feed(self, chunk: np.ndarray) -> None:
         if not self.active or chunk.size == 0:
             return
         try:
-            processed_signal, processed_signal_length = self._preprocess(chunk)
-            if processed_signal_length is None and torch is not None:
-                processed_signal_length = torch.tensor(
-                    [int(processed_signal.shape[-1])],
-                    dtype=torch.long,
-                    device=processed_signal.device,
-                )
-            result = self._conformer_stream_step(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=self._cache_last_channel,
-                cache_last_time=self._cache_last_time,
-                cache_last_channel_len=self._cache_last_channel_len,
-                keep_all_outputs=True,
-                previous_hypotheses=self._previous_hypotheses,
-                drop_extra_pre_encoded=0,
-                return_transcription=True,
-            )
-            (
-                _,
-                hypotheses_or_text,
-                self._cache_last_channel,
-                self._cache_last_time,
-                self._cache_last_channel_len,
-                best_hyp,
-                *_,
-            ) = result
-            self._previous_hypotheses = best_hyp
-            text = _normalize_streaming_text(hypotheses_or_text)
+            text = self._stream_step(chunk)
             if text:
                 self.last_text = text
         except Exception as exc:  # pragma: no cover - runtime/model dependent
@@ -313,18 +346,26 @@ def _init_conformer_partial_state(
     except Exception as exc:  # pragma: no cover - runtime/model dependent
         return None, f"partial_stream_unavailable:{exc.__class__.__name__}"
 
-    return (
-        _ConformerPartialState(
-            model=model,
-            sample_rate=sample_rate,
-            preprocessor=preprocessor,
-            conformer_stream_step=conformer_stream_step,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-        ),
-        None,
+    streaming_cfg = getattr(encoder, "streaming_cfg", None)
+    drop_extra_pre_encoded = _get_cfg_value(streaming_cfg, "drop_extra_pre_encoded")
+    if drop_extra_pre_encoded is None:
+        drop_extra_pre_encoded = 0
+
+    partial_state = _ConformerPartialState(
+        model=model,
+        sample_rate=sample_rate,
+        preprocessor=preprocessor,
+        conformer_stream_step=conformer_stream_step,
+        cache_last_channel=cache_last_channel,
+        cache_last_time=cache_last_time,
+        cache_last_channel_len=cache_last_channel_len,
+        drop_extra_pre_encoded=int(drop_extra_pre_encoded),
     )
+    preflight_reason = partial_state.preflight_probe()
+    if preflight_reason is not None:
+        return None, f"partial_stream_unavailable:{preflight_reason}"
+
+    return partial_state, None
 
 
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:

@@ -14,6 +14,65 @@ Top conclusions:
 
 Net: this is a strong candidate for a daemon hardening sprint before adding higher-level UX features that depend on reliable streaming semantics.
 
+## Status Update (2026-02-26, SA8 Phase-2 Hardening — Partial Stream Preflight)
+
+- Goal for this pass: keep the experimental conformer partial path behind flag, but prevent
+  first-audio runtime self-disable churn (`partial_stream_failed:TypeError`) by failing fast with
+  explicit startup/session telemetry when the NeMo runtime path is incompatible.
+
+### Pre-Change Reproduction (Evidence)
+
+- Manual repro on current runtime lane (`nemo-toolkit==2.6.2`, `cuda-python==13.x`):
+  - `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1 uv run python - <<'PY' ... feed(...) ... PY`
+  - observed behavior before fix:
+    - `partial_stream_active=True` at session start,
+    - first `feed()` call disables path with
+      `partial_stream_failed:TypeError` (`unsupported operand type(s) for -: 'int' and 'NoneType'`).
+- Direct `conformer_stream_step(...)` probe traceback confirms failure originates in NeMo streaming
+  attention internals (`multi_head_attention.update_cache` / `sliding_chunks_matmul_qk`) for this
+  TDT stack.
+
+### Implementation (Pass 2)
+
+- `_init_conformer_partial_state(...)` now performs a one-time preflight probe before activating
+  partial streaming:
+  - builds `_ConformerPartialState`,
+  - runs `preflight_probe()` on a short silence chunk,
+  - if probe fails, returns
+    `partial_stream_unavailable:preflight_failed:<ExceptionClass>` and keeps path inactive.
+- `_ConformerPartialState` refactor for stability and deterministic behavior:
+  - added `_stream_step(...)` shared path for probe + runtime feed,
+  - uses model-config `drop_extra_pre_encoded` (fallback `0`) instead of hardcoded value,
+  - added `reset_runtime_state()` to avoid probe side effects leaking into live chunks,
+  - preserves existing behavior: path remains opt-in and never impacts offline finalize/seal flow.
+
+### Validation (Post-Change)
+
+- Manual smoke (`PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1`):
+  - now reports at session start:
+    - `partial_stream_active=False`
+    - `partial_stream_fallback_reason=partial_stream_unavailable:preflight_failed:TypeError`
+  - no first-feed transition from active→failed; fallback reason is stable and immediate.
+- Regression tests added/updated in `tests/test_streaming_chunk_padding.py`:
+  - preflight probe executes for enabled conformer partial path,
+  - preflight failure returns structured unavailable reason,
+  - existing partial text update path remains covered.
+
+### Full Quality Gate (Required Loop)
+
+- `cd parakeet-stt-daemon && uv run pytest -q tests/` -> `54 passed`
+- `cd parakeet-stt-daemon && uv run ruff check .` -> pass
+- `cd parakeet-stt-daemon && uv run ruff format --check .` -> pass
+- `cd parakeet-stt-daemon && ty check .` -> pass
+- `cd parakeet-stt-daemon && uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
+
+### SA8 Phase-2 Outcome
+
+- Experimental partial path is now operationally hardened for this stack: incompatible runtime
+  behavior is detected up front with deterministic telemetry, rather than failing mid-session on
+  first chunk.
+- Stream-then-seal default and offline safety contract remain unchanged.
+
 ## Status Update (2026-02-25, External Research Synthesis — Streaming WER Gap)
 
 Two independent deep research passes (GPT and Gemini) were run against a detailed technical brief
