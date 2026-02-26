@@ -73,6 +73,47 @@ Net: this is a strong candidate for a daemon hardening sprint before adding high
   first chunk.
 - Stream-then-seal default and offline safety contract remain unchanged.
 
+## Status Update (2026-02-26, Mode Matrix Benchmark — Decision Mapping)
+
+This pass was run to answer the operator decision question directly: which exact runtime mode
+should be used today, using current helper/daemon defaults and measured WER + latency.
+
+### Current Defaults (Ground Truth)
+
+- `scripts/stt-helper.sh` default daemon launch sets `PARAKEET_STREAMING_ENABLED=false` unless explicitly overridden.
+- `ServerSettings` defaults remain:
+  - `streaming_enabled=False`
+  - `chunk_secs=2.4`
+  - `right_context_secs=1.6`
+  - `batch_size=32`
+
+### Benchmark Method
+
+- Dataset: canonical `parakeet-stt-daemon/bench_audio` (8 samples + `transcripts.txt`).
+- Device: CUDA (`effective_device=cuda`).
+- Streaming modes used the current default chunk config (`chunk_secs=2.4`, `right_context_secs=1.6`).
+- Measured per sample and aggregated:
+  - normalized WER,
+  - `infer_ms` (mode core path),
+  - `finalize_ms` (full sample loop timing for each mode harness).
+
+### Results (Current Stack)
+
+| Mode | Effective Config | Avg WER | Infer Avg / P95 (ms) | Finalize Avg / P95 (ms) | Notes |
+|---|---|---:|---:|---:|---|
+| Offline helper default | `PARAKEET_STREAMING_ENABLED=false` | `0.0938` | `55.0 / 61.1` | `55.0 / 61.1` | Matches helper default operator path. |
+| Streaming default (seal) | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, partials off | `0.0938` | `58.1 / 66.0` | `58.2 / 66.2` | Final text parity with offline; slight latency tax vs offline-only. |
+| Streaming helper-only | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=0` | `0.5396` | `271.0 / 323.7` | `271.2 / 323.9` | Large quality + latency regression; experiment-only path. |
+| Streaming seal + partial flag | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1` | `0.0938` (repeat-verified) | `~57.0–57.6` | `~57.0–57.6` | Preflight fallback reason remains `partial_stream_unavailable:preflight_failed:TypeError`; no committed-final quality change expected. |
+
+### Operator Decision (Definitive)
+
+- **Use this for production reliability and best measured tradeoff right now**:
+  - helper default offline path (`PARAKEET_STREAMING_ENABLED=false`) or
+  - streaming with seal (`PARAKEET_STREAMING_ENABLED=true` + `PARAKEET_STREAM_THEN_SEAL=1`) when streaming session semantics are needed.
+- **Do not use helper-only finalize (`PARAKEET_STREAM_THEN_SEAL=0`) for end users** on this stack; measured WER and latency are substantially worse.
+- **Keep experimental partial flag off** for end-user paths until NeMo runtime supports stable conformer step on this TDT lane.
+
 ## Status Update (2026-02-25, External Research Synthesis — Streaming WER Gap)
 
 Two independent deep research passes (GPT and Gemini) were run against a detailed technical brief
