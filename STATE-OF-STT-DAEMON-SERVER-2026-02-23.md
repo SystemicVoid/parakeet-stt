@@ -87,7 +87,7 @@ small commits while protecting offline dictation behavior.
 | SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | DONE |
 | SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | DONE |
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | DONE |
-| SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
+| SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | DONE |
 | SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | DONE |
 | SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | TODO |
 | SA10 | TDT-correct `tokens_per_chunk` candidate formulas documented and experimentally compared (baseline vs burst-aware variants). | Bench sweep script output committed (or archived) with WER/latency deltas. | TODO |
@@ -110,7 +110,7 @@ small commits while protecting offline dictation behavior.
 - [x] SA6 installed + warning removal verified
 - [x] SA8 prototype behind explicit flag
 - [x] SA3 upgrade branch validated and merged (or deferred with reasons)
-- [ ] SA7 opt-in VAD landed with default-off safety
+- [x] SA7 opt-in VAD landed with default-off safety
 - [ ] SA9+SA10 research follow-ups recorded
 
 ### SA1 Evidence (Installed NeMo 2.5.3)
@@ -227,6 +227,31 @@ small commits while protecting offline dictation behavior.
   - `uv run parakeet-stt-daemon --check --no-streaming` passed.
 - Full local quality gate run after dependency update:
   - `uv run pytest -q tests/` -> `50 passed`
+  - `uv run ruff check .` -> pass
+  - `uv run ruff format --check .` -> pass
+  - `ty check .` -> pass
+  - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
+
+### SA7 Progress (Implementation Pass 1)
+
+- Added opt-in Silero VAD tail-trim path (default-off safety preserved):
+  - new setting: `PARAKEET_VAD_ENABLED` (`ServerSettings.vad_enabled`, default `False`).
+  - when enabled, `_trim_tail_silence()` attempts Silero VAD endpoint trim first, then falls back to existing RMS trim on any init/runtime failure.
+- Added runtime dependency for opt-in path:
+  - `silero-vad>=6,<7`.
+- Safety/compatibility behavior:
+  - if Silero model import/init fails, daemon logs warning once and keeps RMS path.
+  - default operator flow remains unchanged because `PARAKEET_VAD_ENABLED` is off by default.
+- Regression coverage:
+  - `tests/test_streaming_truth.py`
+    - default trim path uses RMS,
+    - VAD-enabled path prefers VAD result,
+    - VAD-enabled path falls back to RMS when VAD path returns `None`.
+- A/B smoke checks (`--check --no-streaming`):
+  - `PARAKEET_VAD_ENABLED=false uv run parakeet-stt-daemon --check --no-streaming` -> pass
+  - `PARAKEET_VAD_ENABLED=true uv run parakeet-stt-daemon --check --no-streaming` -> pass
+- Full local quality gate run after SA7 changes:
+  - `uv run pytest -q tests/` -> `53 passed`
   - `uv run ruff check .` -> pass
   - `uv run ruff format --check .` -> pass
   - `ty check .` -> pass

@@ -86,6 +86,9 @@ class DaemonServer:
         self._last_finalize_ms: int | None = None
         self._last_infer_ms: int | None = None
         self._last_send_ms: int | None = None
+        self._vad_model: object | None = None
+        self._vad_import_error: str | None = None
+        self._vad_enabled = bool(settings.vad_enabled)
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
@@ -481,6 +484,51 @@ class DaemonServer:
     ) -> np.ndarray:
         if samples.size == 0:
             return samples
+        if bool(getattr(self, "_vad_enabled", False)):
+            trimmed = self._trim_tail_with_vad(samples, sample_rate)
+            if trimmed is not None:
+                return trimmed
+
+        return self._trim_tail_with_rms(samples, sample_rate, window_ms)
+
+    def _trim_tail_with_vad(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
+        if not bool(getattr(self, "_vad_enabled", False)):
+            return None
+        if getattr(self, "_vad_import_error", None) is not None:
+            return None
+        if getattr(self, "_vad_model", None) is None:
+            try:
+                from silero_vad import load_silero_vad
+
+                self._vad_model = load_silero_vad(onnx=True)
+            except Exception as exc:  # pragma: no cover - optional dependency/runtime
+                self._vad_import_error = f"{exc.__class__.__name__}"
+                logger.warning("Silero VAD unavailable; falling back to RMS trim: {}", exc)
+                return None
+
+        try:
+            import torch
+            from silero_vad import get_speech_timestamps
+
+            audio = samples.astype(np.float32, copy=False)
+            waveform = torch.from_numpy(audio)
+            speech_spans = get_speech_timestamps(
+                waveform,
+                self._vad_model,
+                sampling_rate=sample_rate,
+            )
+            if not speech_spans:
+                return np.zeros((0,), dtype=np.float32)
+            end_sample = int(speech_spans[-1].get("end", 0))
+            end_sample = max(0, min(end_sample, audio.size))
+            return audio[:end_sample]
+        except Exception as exc:  # pragma: no cover - optional dependency/runtime
+            logger.warning("Silero VAD tail trim failed; falling back to RMS trim: {}", exc)
+            return None
+
+    def _trim_tail_with_rms(
+        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50
+    ) -> np.ndarray:
         window = max(1, int(sample_rate * window_ms / 1000))
         # Clamp to mono array
         audio = samples.astype(np.float32, copy=False)

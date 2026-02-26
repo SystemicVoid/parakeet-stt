@@ -18,6 +18,7 @@ dependencies = [
   "loguru>=0.7.2",
   "nemo-toolkit[asr]>=2.6.2,<2.7",
   "cuda-python>=13,<14",
+  "silero-vad>=6,<7",
 ]
 
 [project.optional-dependencies]

@@ -60,6 +60,10 @@ class ServerSettings(BaseSettings):
         le=0.0,
         description="Stop trimming tail silence when RMS exceeds this floor (dB).",
     )
+    vad_enabled: bool = Field(
+        default=False,
+        description="Enable Silero VAD-based tail trimming (opt-in, defaults off).",
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="PARAKEET_",

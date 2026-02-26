@@ -52,12 +52,14 @@ def _build_server(
     *,
     streaming_enabled: bool = True,
     streaming_transcriber: Any = None,
+    vad_enabled: bool = False,
 ) -> DaemonServer:
     server = cast(Any, DaemonServer.__new__(DaemonServer))
     server.settings = ServerSettings(
         device="cpu",
         status_enabled=True,
         streaming_enabled=streaming_enabled,
+        vad_enabled=vad_enabled,
     )
     server.sessions = SessionManager()
     server.audio = FakeAudio()
@@ -75,6 +77,9 @@ def _build_server(
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
+    server._vad_model = None
+    server._vad_import_error = None
+    server._vad_enabled = vad_enabled
     return cast(DaemonServer, server)
 
 
@@ -253,3 +258,53 @@ def test_status_last_timings_populated_after_session() -> None:
     assert status.last_audio_ms == 2500
     assert status.last_infer_ms == 120
     assert status.last_send_ms == 3
+
+
+def test_trim_tail_silence_default_path_uses_rms() -> None:
+    import numpy as np
+
+    server = _build_server(streaming_enabled=False, vad_enabled=False)
+
+    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
+        return "rms"
+
+    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+
+    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
+    assert result == "rms"
+
+
+def test_trim_tail_silence_vad_opt_in_uses_vad_when_available() -> None:
+    import numpy as np
+
+    server = _build_server(streaming_enabled=False, vad_enabled=True)
+
+    def fake_vad(_samples: Any, _sample_rate: int) -> Any:
+        return "vad"
+
+    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
+        return "rms"
+
+    server._trim_tail_with_vad = fake_vad  # type: ignore[method-assign]
+    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+
+    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
+    assert result == "vad"
+
+
+def test_trim_tail_silence_vad_opt_in_falls_back_to_rms() -> None:
+    import numpy as np
+
+    server = _build_server(streaming_enabled=False, vad_enabled=True)
+
+    def fake_vad(_samples: Any, _sample_rate: int) -> Any:
+        return None
+
+    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
+        return "rms"
+
+    server._trim_tail_with_vad = fake_vad  # type: ignore[method-assign]
+    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+
+    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
+    assert result == "rms"
