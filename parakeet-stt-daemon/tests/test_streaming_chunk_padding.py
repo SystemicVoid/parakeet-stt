@@ -6,11 +6,6 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
-from parakeet_stt_daemon.model import (
-    ParakeetStreamingSession,
-    _coerce_rnnt_texts,
-    _compute_eou_drain_samples,
-)
 
 
 class _FakeIterator:
@@ -67,7 +62,43 @@ class _FakeParent:
         return "offline text"
 
 
+class _FakePreprocessor:
+    def __call__(self, input_signal: Any, length: Any) -> tuple[Any, Any]:
+        return input_signal, length
+
+
+class _FakeEncoder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_initial_cache_state(self, *, batch_size: int) -> tuple[Any, Any, Any]:
+        assert batch_size == 1
+        return ("cache_channel", "cache_time", "cache_len")
+
+
+class _FakeConformerModel:
+    def __init__(self) -> None:
+        self.device = "cpu"
+        self.preprocessor = _FakePreprocessor()
+        self.encoder = _FakeEncoder()
+        self.step_calls = 0
+
+    def conformer_stream_step(self, **kwargs: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+        self.step_calls += 1
+        assert kwargs["previous_hypotheses"] is None
+        return (
+            [1],
+            [SimpleNamespace(text="partial text")],
+            "next_cache_channel",
+            "next_cache_time",
+            "next_cache_len",
+            ["hyp"],
+        )
+
+
 def test_finalize_disables_padding_for_chunked_iterator(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingSession
+
     monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
     parent = _FakeParent()
     session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
@@ -82,6 +113,8 @@ def test_finalize_disables_padding_for_chunked_iterator(monkeypatch) -> None:
 
 
 def test_finalize_runs_explicit_drain_pass_for_tdt_helper(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingSession
+
     # Keep seal disabled to assert helper drain behavior directly.
     monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
     parent = _FakeParent()
@@ -104,6 +137,8 @@ def test_finalize_runs_explicit_drain_pass_for_tdt_helper(monkeypatch) -> None:
 
 
 def test_finalize_uses_offline_seal_by_default() -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingSession
+
     parent = _FakeParent()
     parent._helper_tokens_per_chunk = 10
     parent._helper_delay = 3
@@ -118,7 +153,52 @@ def test_finalize_uses_offline_seal_by_default() -> None:
     assert parent.chunk_helper.call_count == 0
 
 
+def test_init_conformer_partial_state_disabled_by_default(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import _init_conformer_partial_state
+
+    monkeypatch.delenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", raising=False)
+
+    model = _FakeConformerModel()
+    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
+
+    assert state is None
+    assert reason is None
+
+
+def test_conformer_partial_feed_updates_partial_text(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import _init_conformer_partial_state
+
+    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
+
+    model = _FakeConformerModel()
+    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
+
+    assert reason is None
+    assert state is not None
+
+    state.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    assert model.step_calls == 1
+    assert state.active is True
+    assert state.fallback_reason is None
+    assert state.last_text == "partial text"
+
+
+def test_init_conformer_partial_state_reports_missing_stream_step(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import _init_conformer_partial_state
+
+    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
+
+    model = SimpleNamespace(device="cpu", preprocessor=_FakePreprocessor(), encoder=_FakeEncoder())
+    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
+
+    assert state is None
+    assert reason == "partial_stream_unavailable:conformer_stream_step_missing"
+
+
 def test_compute_eou_drain_samples_falls_back_to_delay_stride() -> None:
+    from parakeet_stt_daemon.model import _compute_eou_drain_samples
+
     model = SimpleNamespace(
         _cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=0.01)),
         encoder=SimpleNamespace(streaming_cfg=SimpleNamespace()),
@@ -135,18 +215,24 @@ def test_compute_eou_drain_samples_falls_back_to_delay_stride() -> None:
 
 
 def test_coerce_rnnt_texts_handles_hypothesis_list() -> None:
+    from parakeet_stt_daemon.model import _coerce_rnnt_texts
+
     result = _coerce_rnnt_texts([SimpleNamespace(text="hello"), SimpleNamespace(text="world")])
 
     assert result == ["hello", "world"]
 
 
 def test_coerce_rnnt_texts_handles_legacy_tuple() -> None:
+    from parakeet_stt_daemon.model import _coerce_rnnt_texts
+
     result = _coerce_rnnt_texts((["best"], ["alt"]))
 
     assert result == ["best"]
 
 
 def test_coerce_rnnt_texts_handles_nbest_lists() -> None:
+    from parakeet_stt_daemon.model import _coerce_rnnt_texts
+
     result = _coerce_rnnt_texts(
         [
             [SimpleNamespace(text="best"), SimpleNamespace(text="alt")],

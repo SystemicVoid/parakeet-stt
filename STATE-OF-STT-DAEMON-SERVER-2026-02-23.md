@@ -88,7 +88,7 @@ small commits while protecting offline dictation behavior.
 | SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | DONE |
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | DONE |
 | SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | TODO |
-| SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | TODO |
+| SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | DONE |
 | SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | TODO |
 | SA10 | TDT-correct `tokens_per_chunk` candidate formulas documented and experimentally compared (baseline vs burst-aware variants). | Bench sweep script output committed (or archived) with WER/latency deltas. | TODO |
 
@@ -108,7 +108,7 @@ small commits while protecting offline dictation behavior.
 - [x] SA2+SA4 implemented with tests and bench deltas recorded
 - [x] SA5 stream-then-seal landed with integration tests
 - [x] SA6 installed + warning removal verified
-- [ ] SA8 prototype behind explicit flag
+- [x] SA8 prototype behind explicit flag
 - [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
 - [ ] SA7 opt-in VAD landed with default-off safety
 - [ ] SA9+SA10 research follow-ups recorded
@@ -172,6 +172,41 @@ small commits while protecting offline dictation behavior.
   - `uv run parakeet-stt-daemon --check` no longer prints the prior NeMo warning:
     - `No conditional node support for Cuda ... Reason: No cuda-python module`.
 - Scope: dependency/runtime optimization only; no daemon API surface changes.
+
+### SA8 Progress (Implementation Pass 1)
+
+- Added an explicit experimental path for cache-aware conformer partials behind env flag:
+  - `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1`
+- Implementation details:
+  - `ParakeetStreamingTranscriber.start_session()` now optionally initializes cache state via
+    `encoder.get_initial_cache_state(batch_size=1)` and keeps runtime truth fields for partial path status.
+  - `ParakeetStreamingSession.feed()` now invokes a best-effort conformer partial step when the flag is enabled,
+    while preserving existing chunk buffering and finalize behavior.
+  - Failures in the experimental path self-disable and publish a structured fallback reason
+    (`partial_stream_failed:<ExceptionClass>`) without affecting finalize/offline seal behavior.
+- Runtime truth surfacing:
+  - `/status` now includes `partial_stream_active` and `partial_stream_fallback_reason`.
+  - Startup runtime truth log now prints partial-stream truth fields alongside existing helper truth.
+- Regression coverage added:
+  - `tests/test_streaming_chunk_padding.py`
+    - partial state disabled by default,
+    - flag-enabled partial-state init,
+    - partial feed updates text on mocked conformer step,
+    - missing `conformer_stream_step` reports structured fallback reason.
+  - `tests/test_streaming_truth.py`
+    - status truth coverage for active/inactive partial stream and fallback-reason paths.
+- Manual streaming smoke (CUDA, real model, flag enabled):
+  - command: `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1 uv run python - <<'PY' ...`
+  - observed: partial path initializes at session start (`partial_before_feed True None`), then self-disables on
+    first step with `partial_stream_failed:TypeError`; finalize still returns via existing safe path.
+  - interpretation: SA8 prototype wiring and truth instrumentation are in place; step-level API adaptation remains
+    incomplete and is now explicitly visible as fallback telemetry instead of silent behavior.
+- Full local quality gate run after changes:
+  - `uv run pytest -q tests/` -> `50 passed`
+  - `uv run ruff check .` -> pass
+  - `uv run ruff format --check .` -> pass
+  - `ty check .` -> pass
+  - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
 
 ---
 

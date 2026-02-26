@@ -357,6 +357,8 @@ class DaemonServer:
             streaming_enabled=self.settings.streaming_enabled,
             stream_helper_active=self._stream_helper_active(),
             stream_fallback_reason=self._stream_fallback_reason(),
+            partial_stream_active=self._partial_stream_active(),
+            partial_stream_fallback_reason=self._partial_stream_fallback_reason(),
             chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
             active_session_age_ms=active.audio_duration_ms if active else None,
             audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
@@ -381,6 +383,20 @@ class DaemonServer:
         if self.streaming_transcriber is None:
             return "streaming_transcriber_unavailable"
         return self.streaming_transcriber.fallback_reason
+
+    def _partial_stream_active(self) -> bool:
+        if not self.settings.streaming_enabled:
+            return False
+        if self.streaming_transcriber is None:
+            return False
+        return bool(getattr(self.streaming_transcriber, "partial_stream_active", False))
+
+    def _partial_stream_fallback_reason(self) -> str | None:
+        if not self.settings.streaming_enabled:
+            return None
+        if self.streaming_transcriber is None:
+            return "partial_stream_unavailable"
+        return getattr(self.streaming_transcriber, "partial_stream_fallback_reason", None)
 
     def _gpu_mem_mb(self) -> int | None:
         try:
@@ -499,12 +515,15 @@ def create_app(settings: ServerSettings) -> FastAPI:
         _log = logger.warning if streaming_degraded else logger.info
         _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
-            "stream_helper_active={}, stream_fallback_reason={}",
+            "stream_helper_active={}, stream_fallback_reason={}, partial_stream_active={}, "
+            "partial_stream_fallback_reason={}",
             server._requested_device,
             server._effective_device,
             server.settings.streaming_enabled,
             server._stream_helper_active(),
             server._stream_fallback_reason(),
+            server._partial_stream_active(),
+            server._partial_stream_fallback_reason(),
         )
         yield
         logger.info("Stopping audio capture")

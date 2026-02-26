@@ -35,10 +35,14 @@ class FakeStreamingTranscriber:
         helper_active: bool = True,
         fallback_reason: str | None = None,
         helper_class_name: str | None = None,
+        partial_stream_active: bool = False,
+        partial_stream_fallback_reason: str | None = None,
     ) -> None:
         self.helper_active = helper_active
         self.fallback_reason = fallback_reason
         self._helper_class_name = helper_class_name
+        self.partial_stream_active = partial_stream_active
+        self.partial_stream_fallback_reason = partial_stream_fallback_reason
 
     def start_session(self, _sample_rate: int) -> object:
         return object()
@@ -83,6 +87,8 @@ def test_status_streaming_disabled_by_config() -> None:
     assert status.streaming_enabled is False
     assert status.stream_helper_active is False
     assert status.stream_fallback_reason is None
+    assert status.partial_stream_active is False
+    assert status.partial_stream_fallback_reason is None
     assert status.chunk_secs is None
 
 
@@ -99,6 +105,8 @@ def test_status_streaming_enabled_helper_active() -> None:
     assert status.streaming_enabled is True
     assert status.stream_helper_active is True
     assert status.stream_fallback_reason is None
+    assert status.partial_stream_active is False
+    assert status.partial_stream_fallback_reason is None
 
 
 def test_status_streaming_enabled_helper_inactive() -> None:
@@ -114,6 +122,8 @@ def test_status_streaming_enabled_helper_inactive() -> None:
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
     assert status.stream_fallback_reason == "import_failed:ImportError"
+    assert status.partial_stream_active is False
+    assert status.partial_stream_fallback_reason is None
 
 
 def test_status_streaming_enabled_transcriber_none() -> None:
@@ -125,6 +135,39 @@ def test_status_streaming_enabled_transcriber_none() -> None:
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
     assert status.stream_fallback_reason == "streaming_transcriber_unavailable"
+    assert status.partial_stream_active is False
+    assert status.partial_stream_fallback_reason == "partial_stream_unavailable"
+
+
+def test_status_reports_partial_stream_truth() -> None:
+    transcriber = FakeStreamingTranscriber(
+        helper_active=True,
+        partial_stream_active=True,
+        partial_stream_fallback_reason=None,
+    )
+    server = _build_server(streaming_transcriber=transcriber)
+
+    status = server.status()
+
+    assert status.partial_stream_active is True
+    assert status.partial_stream_fallback_reason is None
+
+
+def test_status_reports_partial_stream_fallback_reason() -> None:
+    transcriber = FakeStreamingTranscriber(
+        helper_active=True,
+        partial_stream_active=False,
+        partial_stream_fallback_reason="partial_stream_unavailable:conformer_stream_step_missing",
+    )
+    server = _build_server(streaming_transcriber=transcriber)
+
+    status = server.status()
+
+    assert status.partial_stream_active is False
+    assert (
+        status.partial_stream_fallback_reason
+        == "partial_stream_unavailable:conformer_stream_step_missing"
+    )
 
 
 def test_stream_helper_active_reflects_transcriber_state() -> None:

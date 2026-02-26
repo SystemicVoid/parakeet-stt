@@ -201,6 +201,132 @@ def _compute_eou_drain_samples(
     return 0
 
 
+class _ConformerPartialState:
+    """Best-effort cache-aware partial streaming state for conformer models."""
+
+    def __init__(
+        self,
+        *,
+        model: ASRModel,
+        sample_rate: int,
+        preprocessor: Any,
+        conformer_stream_step: Any,
+        cache_last_channel: Any,
+        cache_last_time: Any,
+        cache_last_channel_len: Any,
+    ) -> None:
+        self._model = model
+        self._sample_rate = int(sample_rate)
+        self._preprocessor = preprocessor
+        self._conformer_stream_step = conformer_stream_step
+        self._cache_last_channel = cache_last_channel
+        self._cache_last_time = cache_last_time
+        self._cache_last_channel_len = cache_last_channel_len
+        self._previous_hypotheses: Any = None
+        self.last_text = ""
+        self.active = True
+        self.fallback_reason: str | None = None
+
+    def _preprocess(self, chunk: np.ndarray) -> tuple[Any, Any]:
+        if torch is None:
+            raise RuntimeError("torch unavailable")
+        model_device = getattr(self._model, "device", "cpu")
+        device = torch.device(str(model_device))
+        waveform = torch.from_numpy(chunk.astype(np.float32, copy=False)).to(device).unsqueeze(0)
+        waveform_len = torch.tensor([chunk.size], dtype=torch.long, device=device)
+        try:
+            return self._preprocessor(input_signal=waveform, length=waveform_len)
+        except TypeError:
+            return self._preprocessor(waveform, waveform_len)
+
+    def _disable(self, reason: str, exc: Exception | None = None) -> None:
+        if exc is not None:
+            logger.warning("Disabling conformer partial stream ({}): {}", reason, exc)
+        else:
+            logger.warning("Disabling conformer partial stream ({})", reason)
+        self.active = False
+        self.fallback_reason = reason
+
+    def feed(self, chunk: np.ndarray) -> None:
+        if not self.active or chunk.size == 0:
+            return
+        try:
+            processed_signal, processed_signal_length = self._preprocess(chunk)
+            if processed_signal_length is None and torch is not None:
+                processed_signal_length = torch.tensor(
+                    [int(processed_signal.shape[-1])],
+                    dtype=torch.long,
+                    device=processed_signal.device,
+                )
+            result = self._conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=self._cache_last_channel,
+                cache_last_time=self._cache_last_time,
+                cache_last_channel_len=self._cache_last_channel_len,
+                keep_all_outputs=True,
+                previous_hypotheses=self._previous_hypotheses,
+                drop_extra_pre_encoded=0,
+                return_transcription=True,
+            )
+            (
+                _,
+                hypotheses_or_text,
+                self._cache_last_channel,
+                self._cache_last_time,
+                self._cache_last_channel_len,
+                best_hyp,
+                *_,
+            ) = result
+            self._previous_hypotheses = best_hyp
+            text = _normalize_streaming_text(hypotheses_or_text)
+            if text:
+                self.last_text = text
+        except Exception as exc:  # pragma: no cover - runtime/model dependent
+            self._disable(f"partial_stream_failed:{exc.__class__.__name__}", exc)
+
+
+def _init_conformer_partial_state(
+    model: ASRModel, *, sample_rate: int
+) -> tuple[_ConformerPartialState | None, str | None]:
+    if not _env_flag("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS"):
+        return None, None
+    if torch is None:
+        return None, "partial_stream_unavailable:torch_missing"
+
+    conformer_stream_step = getattr(model, "conformer_stream_step", None)
+    if not callable(conformer_stream_step):
+        return None, "partial_stream_unavailable:conformer_stream_step_missing"
+
+    preprocessor = getattr(model, "preprocessor", None)
+    if not callable(preprocessor):
+        return None, "partial_stream_unavailable:preprocessor_missing"
+
+    encoder = getattr(model, "encoder", None)
+    get_initial_cache_state = getattr(encoder, "get_initial_cache_state", None)
+    if not callable(get_initial_cache_state):
+        return None, "partial_stream_unavailable:cache_state_missing"
+
+    try:
+        cache_state = cast(tuple[Any, Any, Any], get_initial_cache_state(batch_size=1))
+        cache_last_channel, cache_last_time, cache_last_channel_len = cache_state
+    except Exception as exc:  # pragma: no cover - runtime/model dependent
+        return None, f"partial_stream_unavailable:{exc.__class__.__name__}"
+
+    return (
+        _ConformerPartialState(
+            model=model,
+            sample_rate=sample_rate,
+            preprocessor=preprocessor,
+            conformer_stream_step=conformer_stream_step,
+            cache_last_channel=cache_last_channel,
+            cache_last_time=cache_last_time,
+            cache_last_channel_len=cache_last_channel_len,
+        ),
+        None,
+    )
+
+
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
     try:
         import soundfile as sf
@@ -310,13 +436,25 @@ class ParakeetTranscriber:
 class ParakeetStreamingSession:
     """Accumulate audio chunks for a single streaming session."""
 
-    def __init__(self, parent: ParakeetStreamingTranscriber, sample_rate: int) -> None:
+    def __init__(
+        self,
+        parent: ParakeetStreamingTranscriber,
+        sample_rate: int,
+        partial_state: _ConformerPartialState | None = None,
+    ) -> None:
         self._parent = parent
         self.sample_rate = sample_rate
         self._chunks: list[np.ndarray] = []
+        self._partial_state = partial_state
 
     def feed(self, chunk: np.ndarray) -> None:
-        self._chunks.append(np.array(chunk, dtype=np.float32, copy=True))
+        normalized_chunk = np.array(chunk, dtype=np.float32, copy=True)
+        self._chunks.append(normalized_chunk)
+        if self._partial_state is not None:
+            self._partial_state.feed(normalized_chunk)
+            self._parent._partial_stream_active = self._partial_state.active
+            self._parent._partial_stream_fallback_reason = self._partial_state.fallback_reason
+            self._parent._partial_stream_last_text = self._partial_state.last_text
 
     def finalize(self) -> str:
         if not self._chunks:
@@ -423,6 +561,10 @@ class ParakeetStreamingTranscriber:
         self._helper_tokens_per_chunk: int | None = None
         self._helper_delay: int | None = None
         self._helper_model_stride_secs: float | None = None
+        self._partial_stream_active = False
+        self._partial_stream_fallback_reason: str | None = None
+        self._partial_stream_last_text = ""
+        self._partial_stream_enabled = _env_flag("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS")
 
         self.offline = ParakeetTranscriber(model)
         self._init_helper()
@@ -430,6 +572,14 @@ class ParakeetStreamingTranscriber:
     @property
     def helper_active(self) -> bool:
         return self.chunk_helper is not None
+
+    @property
+    def partial_stream_active(self) -> bool:
+        return self._partial_stream_active
+
+    @property
+    def partial_stream_fallback_reason(self) -> str | None:
+        return self._partial_stream_fallback_reason
 
     def _init_helper(self) -> None:
         try:
@@ -594,6 +744,21 @@ class ParakeetStreamingTranscriber:
             self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
 
     def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
+        partial_state = None
+        self._partial_stream_last_text = ""
+        if self._partial_stream_enabled:
+            partial_state, partial_reason = _init_conformer_partial_state(
+                self.model,
+                sample_rate=sample_rate,
+            )
+            self._partial_stream_active = partial_state is not None
+            self._partial_stream_fallback_reason = partial_reason
+            if partial_reason is not None:
+                logger.warning("Conformer partial stream unavailable: {}", partial_reason)
+        else:
+            self._partial_stream_active = False
+            self._partial_stream_fallback_reason = None
+
         if self.chunk_helper is not None:
             try:
                 self.chunk_helper.reset()
@@ -605,7 +770,7 @@ class ParakeetStreamingTranscriber:
                 self._helper_delay = None
                 self._helper_model_stride_secs = None
                 self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"
-        return ParakeetStreamingSession(self, sample_rate)
+        return ParakeetStreamingSession(self, sample_rate, partial_state=partial_state)
 
     def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
         return self.offline.transcribe_samples(samples, sample_rate=sample_rate)
