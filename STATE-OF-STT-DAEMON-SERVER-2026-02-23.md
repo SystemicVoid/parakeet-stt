@@ -83,7 +83,7 @@ small commits while protecting offline dictation behavior.
 |---|---|---|---|
 | SA1 | Confirm whether `BatchedFrameASRTDT.__init__` forwards `stateful_decoding` to base class in installed NeMo; record exact source path + line evidence. | Inspect installed NeMo source directly; copy findings into this doc. | DONE |
 | SA2 | Streaming finalize performs explicit end-of-utterance drain pass (feature-frame/decoder flush), not only waveform zero-padding; truncation reduced on bench set. | Unit tests for drain behavior + bench A/B run with streaming enabled. | DONE |
-| SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | TODO |
+| SA3 | NeMo upgraded to 2.6.2 with no offline regression beyond thresholds; streaming helpers still initialize. | Run `check_model.py --bench-offline` before/after with fixed thresholds; run daemon smoke + tests. | DONE |
 | SA4 | Tail/drain frame count derived from model config (`hop_length`, streaming shift/caches), no hardcoded seconds constant for correctness path. | Unit test asserting computed pad/drain samples from mocked model cfg values. | DONE |
 | SA5 | Stream-Then-Seal enabled: partials come from streaming path, final committed transcript uses offline `model.transcribe()` seal pass. | Session integration tests + bench check that final text equals offline path for same audio. | DONE |
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | DONE |
@@ -109,7 +109,7 @@ small commits while protecting offline dictation behavior.
 - [x] SA5 stream-then-seal landed with integration tests
 - [x] SA6 installed + warning removal verified
 - [x] SA8 prototype behind explicit flag
-- [ ] SA3 upgrade branch validated and merged (or deferred with reasons)
+- [x] SA3 upgrade branch validated and merged (or deferred with reasons)
 - [ ] SA7 opt-in VAD landed with default-off safety
 - [ ] SA9+SA10 research follow-ups recorded
 
@@ -202,6 +202,30 @@ small commits while protecting offline dictation behavior.
   - interpretation: SA8 prototype wiring and truth instrumentation are in place; step-level API adaptation remains
     incomplete and is now explicitly visible as fallback telemetry instead of silent behavior.
 - Full local quality gate run after changes:
+  - `uv run pytest -q tests/` -> `50 passed`
+  - `uv run ruff check .` -> pass
+  - `uv run ruff format --check .` -> pass
+  - `ty check .` -> pass
+  - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
+
+### SA3 Progress (Implementation Pass 1)
+
+- Dependency lane updated to NeMo 2.6.2:
+  - `nemo-toolkit[asr]>=2.6.2,<2.7` in runtime deps and `inference` extra.
+- During first upgrade pass, offline benchmark regressed to WER `1.0000` due a CUDA graph decode runtime mismatch when paired with `cuda-python<13`:
+  - exception observed in direct probe: `ValueError: not enough values to unpack (expected 6, got 5)` from NeMo TDT CUDA-graph path.
+- Compatibility fix for NeMo 2.6.2 lane:
+  - moved runtime dep to `cuda-python>=13,<14`.
+  - direct offline probe on `sample_01.wav` returns expected hypothesis text again.
+- Offline benchmark gating (CUDA, `check_model.py --bench-offline`) with locked thresholds:
+  - thresholds: `max_avg_wer=0.12`, `max_p95_infer_ms=300`, `max_p95_finalize_ms=300`.
+  - post-upgrade result: `avg_wer=0.0938`, `infer_p95=184.43ms`, `finalize_p95=184.77ms` -> gate **PASS**.
+- Streaming helper smoke validation after upgrade:
+  - `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --check`
+  - helper status: `ACTIVE (class=BatchedFrameASRTDT)`.
+- Offline startup smoke:
+  - `uv run parakeet-stt-daemon --check --no-streaming` passed.
+- Full local quality gate run after dependency update:
   - `uv run pytest -q tests/` -> `50 passed`
   - `uv run ruff check .` -> pass
   - `uv run ruff format --check .` -> pass

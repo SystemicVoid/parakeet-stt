@@ -16,14 +16,14 @@ dependencies = [
   "numpy>=1.24,<2",
   "sounddevice>=0.4.7",
   "loguru>=0.7.2",
-  "nemo-toolkit[asr]>=2.5.3",
-  "cuda-python>=12.3,<13",
+  "nemo-toolkit[asr]>=2.6.2,<2.7",
+  "cuda-python>=13,<14",
 ]
 
 [project.optional-dependencies]
 inference = [
   "torch>=2.5.1",
-  "nemo-toolkit[asr]>=2.5.3",
+  "nemo-toolkit[asr]>=2.6.2,<2.7",
 ]
 
 [project.scripts]
