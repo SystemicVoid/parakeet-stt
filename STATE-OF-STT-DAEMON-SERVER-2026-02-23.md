@@ -917,3 +917,48 @@ line-level hotspots referenced by top-ranked findings:
 - Transcription temp-file path: `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py:266`
 - Streaming helper import/fallback path: `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:180`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py:205`
 - Helper default forcing offline mode: `scripts/stt-helper.sh:580`
+
+## Handoff For Next Agent (Post SA3/SA7/SA8/SA9/SA10)
+
+Current head includes these lane commits:
+
+1. `40b1081` — `feat(streaming): prototype conformer partial path behind flag`
+2. `bff850b` — `build(runtime): upgrade NeMo to 2.6.2 with cuda-python 13`
+3. `dc3ba80` — `feat(vad): add opt-in silero tail trimming with rms fallback`
+4. `2fa585a` — `docs(state): record SA9 decision and SA10 token sweep results`
+
+All SA checklist items are now marked `DONE`, with two explicit deferred/follow-up outcomes:
+
+- SA8 follow-up: conformer partial stream path is wired and telemetry-complete but currently self-disables at runtime on first step (`partial_stream_failed:TypeError`); default finalize path remains safe.
+- SA9 follow-up: `2.7.x` upgrade is deferred until stable upstream `2.7.x` release is available and validated against transducer CUDA-graph decode behavior.
+
+### Remaining Work Queue (Practical)
+
+1. **SA8 Phase 2 hardening**
+   - Make `conformer_stream_step()` partial path produce stable partials (no first-step self-disable).
+   - Keep behind `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS` until proven.
+   - Add targeted runtime test/probe evidence in this doc before changing status semantics.
+
+2. **SA10 deeper formula research (optional)**
+   - Only if pursuing helper-only quality: investigate non-naive TDT-aware token budgeting (beyond scalar multipliers).
+   - Keep stream-then-seal default untouched.
+
+3. **SA9 revisit trigger**
+   - Re-open only when upstream publishes stable `2.7.x` with relevant ASR/transducer fix notes.
+   - Re-run the same offline gate envelope + streaming helper smoke matrix used in SA3.
+
+### Methodology Contract (Must Keep)
+
+- Small, atomic commits by fix area.
+- Before/after evidence recorded in this state document during each lane.
+- For each relevant code/dependency change, run full gates in `parakeet-stt-daemon`:
+  - `uv run pytest -q tests/`
+  - `uv run ruff check .`
+  - `uv run ruff format --check .`
+  - `ty check .`
+  - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/`
+- For offline-risk changes, run offline benchmark gate:
+  - `uv run python check_model.py --bench-offline --device cuda --max-avg-wer 0.12 --max-p95-infer-ms 300 --max-p95-finalize-ms 300`
+- Preserve offline safety contract:
+  - no default offline behavior regressions,
+  - any experimental streaming/VAD path remains opt-in until benchmark-validated.
