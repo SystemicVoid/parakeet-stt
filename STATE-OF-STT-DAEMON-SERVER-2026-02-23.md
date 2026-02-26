@@ -89,8 +89,8 @@ small commits while protecting offline dictation behavior.
 | SA6 | `cuda-python` installed/configured; NeMo startup warning removed; no inference API changes. | `parakeet-stt-daemon --check` warning-free for cuda-graphs note; benchmark latency snapshot. | DONE |
 | SA7 | Silero VAD integration available behind opt-in flag; default behavior unchanged; both path metrics captured when enabled. | A/B tests with env flag on/off + regression tests for default path parity. | DONE |
 | SA8 | Prototype `conformer_stream_step()` cache-aware partial streaming path without touching offline finalize path. | New targeted tests + manual streaming smoke with helper truth fields. | DONE |
-| SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | TODO |
-| SA10 | TDT-correct `tokens_per_chunk` candidate formulas documented and experimentally compared (baseline vs burst-aware variants). | Bench sweep script output committed (or archived) with WER/latency deltas. | TODO |
+| SA9 | Evidence-based decision doc for 2.7.x (latency/memory/leak fixes) after 2.6.2 stabilization. | Release-note/source audit + controlled benchmark comparison report. | DONE |
+| SA10 | TDT-correct `tokens_per_chunk` candidate formulas documented and experimentally compared (baseline vs burst-aware variants). | Bench sweep script output committed (or archived) with WER/latency deltas. | DONE |
 
 ### Global Regression Gates (apply per commit where relevant)
 
@@ -111,7 +111,7 @@ small commits while protecting offline dictation behavior.
 - [x] SA8 prototype behind explicit flag
 - [x] SA3 upgrade branch validated and merged (or deferred with reasons)
 - [x] SA7 opt-in VAD landed with default-off safety
-- [ ] SA9+SA10 research follow-ups recorded
+- [x] SA9+SA10 research follow-ups recorded
 
 ### SA1 Evidence (Installed NeMo 2.5.3)
 
@@ -256,6 +256,37 @@ small commits while protecting offline dictation behavior.
   - `uv run ruff format --check .` -> pass
   - `ty check .` -> pass
   - `uv run --with pyright pyright src/parakeet_stt_daemon/ tests/` -> pass
+
+### SA10 Progress (Investigation Pass 1)
+
+- Ran controlled helper-only streaming sweep in `PARAKEET_STREAM_THEN_SEAL=0` mode over the canonical 8-sample bench set.
+- Baseline model/streaming config:
+  - `chunk_secs=2.4`, `right_context_secs=1.6`, helper `BatchedFrameASRTDT`, base `tokens_per_chunk=30`.
+- Candidate formulas evaluated:
+  - baseline: `tokens_per_chunk = base`
+  - burst-aware 1: `ceil(base × 1.5)`
+  - burst-aware 2: `ceil(base × 2.0)`
+  - burst-aware 3: `base + max_steps_per_timestep`
+- Average WER results:
+  - baseline (`30`): `0.5022`
+  - `ceil(base × 1.5)` (`45`): `0.5137`
+  - `ceil(base × 2.0)` (`60`): `0.6481`
+  - `base + max_steps_per_timestep` (`35`): `0.5752`
+- Conclusion:
+  - naive burst multipliers did **not** improve WER on this bench; baseline RNNT-derived `tokens_per_chunk` remained best among tested candidates.
+  - SA10 outcome is recorded as a negative-result gate: keep current formula for now and defer deeper TDT-specific derivation work.
+
+### SA9 Progress (Evaluation Pass 1)
+
+- Release/source audit completed:
+  - NeMo releases currently expose `2.6.x` stable line (`2.6.0`, `2.6.1`, `2.6.2`); no published `2.7.x` release tag available in upstream release feed at this time.
+  - NeMo changelog confirms ASR/streaming additions in `2.6.0` and security-only `2.6.2` patch.
+- Operational evidence from this lane:
+  - `2.6.2` required compatibility correction to `cuda-python>=13,<14` in our runtime to avoid CUDA-graph decode failures.
+  - upstream issue traffic still reports CUDA-graph decode instability in some `2.6.x` environments.
+- Decision:
+  - defer `2.7.x` upgrade work until a stable `2.7.x` release is published and validated against transducer CUDA-graph decode in upstream notes/issues.
+  - remain on validated `2.6.2` + `cuda-python>=13,<14` for now.
 
 ---
 
