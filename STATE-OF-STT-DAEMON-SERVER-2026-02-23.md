@@ -73,46 +73,62 @@ Net: this is a strong candidate for a daemon hardening sprint before adding high
   first chunk.
 - Stream-then-seal default and offline safety contract remain unchanged.
 
-## Status Update (2026-02-26, Mode Matrix Benchmark — Decision Mapping)
+## Status Update (2026-02-26, Benchmark Matrix — Current Helper/Mode Truth)
 
-This pass was run to answer the operator decision question directly: which exact runtime mode
-should be used today, using current helper/daemon defaults and measured WER + latency.
+This pass was run to produce an explicit decision matrix across current defaults, stream/seal modes,
+and experimental partial flag behavior, with WER + latency deltas captured against offline baseline.
 
-### Current Defaults (Ground Truth)
+### Runtime Defaults Mapped (Ground Truth)
 
-- `scripts/stt-helper.sh` default daemon launch sets `PARAKEET_STREAMING_ENABLED=false` unless explicitly overridden.
-- `ServerSettings` defaults remain:
+- Operator default remains offline because `scripts/stt-helper.sh` launches daemon with `--no-streaming`.
+- Current daemon defaults (`ServerSettings`):
   - `streaming_enabled=False`
   - `chunk_secs=2.4`
   - `right_context_secs=1.6`
+  - `left_context_secs=10.0`
   - `batch_size=32`
+- On this model/runtime lane (`nemo-toolkit==2.6.2`, `cuda-python==13.x`), streaming helper resolves to:
+  - `BatchedFrameASRTDT`
+  - `tokens_per_chunk=30`
+  - `delay=40`
+  - helper-enforced `batch_size=1` (runtime info log)
 
-### Benchmark Method
+### Method + Artifacts
 
-- Dataset: canonical `parakeet-stt-daemon/bench_audio` (8 samples + `transcripts.txt`).
+- Dataset: `parakeet-stt-daemon/bench_audio` (8 canonical samples).
 - Device: CUDA (`effective_device=cuda`).
-- Streaming modes used the current default chunk config (`chunk_secs=2.4`, `right_context_secs=1.6`).
-- Measured per sample and aggregated:
-  - normalized WER,
-  - `infer_ms` (mode core path),
-  - `finalize_ms` (full sample loop timing for each mode harness).
+- Bench artifact (full per-sample matrix):
+  - `parakeet-stt-daemon/bench_audio/streaming_benchmark_matrix_2026-02-26.json`
+- Due one anomalous mixed-process pass, modes were re-run in isolated fresh processes (one mode per run)
+  and those isolated numbers below are treated as decision ground truth.
 
-### Results (Current Stack)
+### Matrix (Isolated Runs, Decision Ground Truth)
 
-| Mode | Effective Config | Avg WER | Infer Avg / P95 (ms) | Finalize Avg / P95 (ms) | Notes |
-|---|---|---:|---:|---:|---|
-| Offline helper default | `PARAKEET_STREAMING_ENABLED=false` | `0.0938` | `55.0 / 61.1` | `55.0 / 61.1` | Matches helper default operator path. |
-| Streaming default (seal) | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, partials off | `0.0938` | `58.1 / 66.0` | `58.2 / 66.2` | Final text parity with offline; slight latency tax vs offline-only. |
-| Streaming helper-only | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=0` | `0.5396` | `271.0 / 323.7` | `271.2 / 323.9` | Large quality + latency regression; experiment-only path. |
-| Streaming seal + partial flag | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1` | `0.0938` (repeat-verified) | `~57.0–57.6` | `~57.0–57.6` | Preflight fallback reason remains `partial_stream_unavailable:preflight_failed:TypeError`; no committed-final quality change expected. |
+Baseline for deltas: offline mode (`avg_wer=0.0938`, `finalize_p95_ms=185.35`).
 
-### Operator Decision (Definitive)
+| Mode | Effective Config | Avg WER | Finalize Avg / P95 (ms) | ΔWER vs Offline | ΔP95 vs Offline (ms) | Observed Runtime Truth |
+|---|---|---:|---:|---:|---:|---|
+| Offline default | `PARAKEET_STREAMING_ENABLED=false` | `0.0938` | `76.59 / 185.35` | `+0.0000` | `+0.00` | Operator-safe default path |
+| Stream + seal | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, partials off | `0.0813` | `71.29 / 135.11` | `-0.0125` | `-50.25` | Helper active (`BatchedFrameASRTDT`) |
+| Stream helper-only | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=0`, partials off | `0.5807` | `274.38 / 360.50` | `+0.4869` | `+175.15` | Helper-only finalize regresses heavily |
+| Stream + seal + partial flag | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=1`, `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1` | `0.0938` | `59.58 / 72.00` | `+0.0000` | `-113.35` | Partial path disabled at start with `partial_stream_unavailable:preflight_failed:TypeError` |
+| Stream helper-only + partial flag | `PARAKEET_STREAMING_ENABLED=true`, `PARAKEET_STREAM_THEN_SEAL=0`, `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS=1` | `0.4539` | `256.09 / 303.37` | `+0.3602` | `+118.02` | Partial preflight fallback remains deterministic |
 
-- **Use this for production reliability and best measured tradeoff right now**:
-  - helper default offline path (`PARAKEET_STREAMING_ENABLED=false`) or
-  - streaming with seal (`PARAKEET_STREAMING_ENABLED=true` + `PARAKEET_STREAM_THEN_SEAL=1`) when streaming session semantics are needed.
-- **Do not use helper-only finalize (`PARAKEET_STREAM_THEN_SEAL=0`) for end users** on this stack; measured WER and latency are substantially worse.
-- **Keep experimental partial flag off** for end-user paths until NeMo runtime supports stable conformer step on this TDT lane.
+### Comparison to Prior SA5 Snapshot
+
+- Prior SA5 snapshot recorded parity at `offline WER == streaming WER == 0.094`.
+- Current isolated matrix remains consistent with that parity contract for committed-final mode:
+  - offline now `0.0938`,
+  - stream+seal now `0.0813` (same-quality lane, slightly better on this run).
+- The helper-only path remains far worse than SA5 committed-final behavior and should not be promoted.
+
+### Decision-Oriented Recommendations
+
+1. Keep default operator path unchanged (`--no-streaming`) for maximum safety and existing UX expectations.
+2. If streaming sessions are required, use `PARAKEET_STREAM_THEN_SEAL=1`; this remains the only measured mode with offline-grade final quality.
+3. Treat `PARAKEET_STREAM_THEN_SEAL=0` strictly as experiment mode; current WER and p95 latency are materially worse.
+4. Keep `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS` default-off; preflight now fails fast and safely, but runtime still reports `preflight_failed:TypeError` on this stack.
+5. Before any default flip proposal, require a fresh isolated matrix rerun plus full quality gates in the same change window.
 
 ## Status Update (2026-02-25, External Research Synthesis — Streaming WER Gap)
 
