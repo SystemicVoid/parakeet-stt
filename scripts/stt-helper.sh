@@ -32,7 +32,13 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
-    local default_daemon_streaming_enabled="${PARAKEET_STREAMING_ENABLED:-false}"
+    local default_daemon_streaming_enabled="false"
+    local default_daemon_stream_then_seal="1"
+    local default_daemon_partials_enabled="0"
+    local default_daemon_chunk_secs="2.4"
+    local default_daemon_right_context_secs="1.6"
+    local default_daemon_left_context_secs="10.0"
+    local default_daemon_batch_size="32"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
     # Local-only default: optimize for this workstation (Zen5 + AVX512), not portable builds.
     local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
@@ -75,6 +81,10 @@ stt() {
 
     local cmd="${1:-start}"
     shift || true
+    if [ "$cmd" = "stream" ]; then
+        cmd="start"
+        set -- streaming "$@"
+    fi
 
     _start_option_exists() {
         local target="$1"
@@ -408,10 +418,12 @@ PY
         cat <<EOF
 Usage:
   stt start [options]
+  stt stream [options]
   stt <command> [args]
 
 Commands:
   start [options]        Start daemon + client (default command).
+  stream [options]       Start daemon/client in stream+seal mode.
   stop                   Stop daemon/client and remove pid/port files.
   restart [options]      Restart with the same options as start.
   status                 Show daemon/client/tmux status.
@@ -427,7 +439,11 @@ EOF
     _print_help_start() {
         cat <<EOF
 Usage:
-  stt start [options]
+  stt start [streaming|offline] [options]
+
+Modes:
+  (default) offline      Launch daemon with streaming disabled.
+  streaming|stream       Launch daemon with stream+seal enabled.
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
@@ -442,7 +458,6 @@ EOF
 Other environment overrides:
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
-  PARAKEET_STREAMING_ENABLED=$default_daemon_streaming_enabled
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
@@ -504,6 +519,9 @@ CLIENTCMD
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume
             local -a ptt_args
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
+                shift
+            fi
             _load_start_vars_from_defaults
 
             local parse_status=0
@@ -521,7 +539,24 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume
+            local launch_profile="offline"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ]; then
+                launch_profile="stream-seal"
+                shift
+            elif [ "${1:-}" = "offline" ]; then
+                launch_profile="offline"
+                shift
+            fi
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
+            local daemon_stream_then_seal="$default_daemon_stream_then_seal"
+            local daemon_partials_enabled="$default_daemon_partials_enabled"
+            local daemon_chunk_secs="$default_daemon_chunk_secs"
+            local daemon_right_context_secs="$default_daemon_right_context_secs"
+            local daemon_left_context_secs="$default_daemon_left_context_secs"
+            local daemon_batch_size="$default_daemon_batch_size"
+            if [ "$launch_profile" = "stream-seal" ]; then
+                daemon_streaming_enabled="true"
+            fi
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
@@ -550,7 +585,11 @@ CLIENTCMD
             echo "   - Completion sound: $completion_sound"
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
+            echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
+            echo "   - Daemon stream-then-seal: $daemon_stream_then_seal"
+            echo "   - Daemon experimental partials: $daemon_partials_enabled"
+            echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
             echo "   - PTT RUSTFLAGS: $ptt_rustflags"
@@ -581,7 +620,15 @@ CLIENTCMD
                 _log_daemon "launch via stt helper (streaming=${daemon_streaming_enabled})"
                 (
                     cd "$DAEMON_DIR" || exit 1
-                    PARAKEET_STREAMING_ENABLED="$daemon_streaming_enabled" PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
+                    PARAKEET_STREAMING_ENABLED="$daemon_streaming_enabled" \
+                    PARAKEET_STREAM_THEN_SEAL="$daemon_stream_then_seal" \
+                    PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS="$daemon_partials_enabled" \
+                    PARAKEET_CHUNK_SECS="$daemon_chunk_secs" \
+                    PARAKEET_RIGHT_CONTEXT_SECS="$daemon_right_context_secs" \
+                    PARAKEET_LEFT_CONTEXT_SECS="$daemon_left_context_secs" \
+                    PARAKEET_BATCH_SIZE="$daemon_batch_size" \
+                    PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
+                    nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
                     echo $! > "$DAEMON_PID_FILE"
                 )
             fi
@@ -655,8 +702,17 @@ CLIENTCMD
             echo "     Use 'stt show' to view panes; Ctrl+b d to detach."
             ;;
         restart)
+            local restart_mode=""
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
+                restart_mode="$1"
+                shift
+            fi
             stt stop
-            stt start "$@"
+            if [ -n "$restart_mode" ]; then
+                stt start "$restart_mode" "$@"
+            else
+                stt start "$@"
+            fi
             ;;
         stop)
             echo ">>> Stopping Parakeet..."
