@@ -77,7 +77,7 @@ def _get_cfg_value(cfg: Any, key: str) -> Any:
         return cfg.get(key)
     try:
         return cfg[key]
-    except Exception:
+    except (AttributeError, IndexError, KeyError, TypeError):
         return getattr(cfg, key, None)
 
 
@@ -94,23 +94,34 @@ def _set_cfg_value(cfg: Any, key: str, value: Any) -> bool:
         if hasattr(cfg, key):
             setattr(cfg, key, value)
             return True
-    except Exception:
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return False
     return False
 
 
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
+    sf: Any | None
     try:
-        import soundfile as sf
+        import soundfile as sf_mod
+    except ImportError:
+        sf = None  # pragma: no cover - fallback for minimal environments
+    else:
+        sf = sf_mod
 
-        sf.write(path, samples, sample_rate)
-    except Exception:  # pragma: no cover - fallback for minimal environments
-        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm.tobytes())
+    if sf is not None:
+        try:
+            sf.write(path, samples, sample_rate)
+            return
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass  # pragma: no cover - fallback for minimal environments
+
+    # Minimal fallback path for environments without soundfile or where writes fail.
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
 
 
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
@@ -145,7 +156,7 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
     if callable(change_attention):
         try:
             change_attention(self_attention_model="rel_pos_local_attn", att_context_size=[256, 256])
-        except Exception as exc:  # pragma: no cover - best-effort
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:  # pragma: no cover
             logger.warning("Failed to adjust attention window: {}", exc)
 
     object.__setattr__(model, "_parakeet_effective_device", resolved_device)
@@ -163,7 +174,7 @@ class ParakeetTranscriber:
             sample_rate = getattr(cfg, "sample_rate", 16_000)
             silence = np.zeros((sample_rate,), dtype=np.float32)
             _ = self.transcribe_samples(silence, sample_rate=sample_rate)
-        except Exception as exc:  # pragma: no cover - warmup is optional
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:  # pragma: no cover
             logger.debug("Warmup skipped: {}", exc)
 
     def transcribe_files(self, paths: Sequence[str], *, timestamps: bool = False) -> list[str]:
@@ -191,7 +202,7 @@ class ParakeetTranscriber:
             if not outputs:
                 return ""
             return _extract_text(outputs[0])
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - compatibility fallback across NeMo variants
             logger.warning(
                 "In-memory transcription failed ({}); falling back to temp wav",
                 exc.__class__.__name__,
@@ -262,12 +273,12 @@ class ParakeetStreamingTranscriber:
 
         try:
             from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT
-        except Exception:  # pragma: no cover - optional helper
+        except ImportError:  # pragma: no cover - optional helper
             BatchedFrameASRTDT = None  # type: ignore[assignment]
 
         try:
             from omegaconf import open_dict
-        except Exception:  # pragma: no cover - optional dependency
+        except ImportError:  # pragma: no cover - optional dependency
             open_dict = None  # type: ignore[assignment]
 
         total_buffer_secs = self.chunk_secs + self.right_context_secs
@@ -312,7 +323,7 @@ class ParakeetStreamingTranscriber:
                                     greedy_cfg, "max_symbols_per_step", int(max_steps_per_timestep)
                                 )
                             change_decoding(decoding_cfg)
-                        except Exception as exc:  # pragma: no cover - best effort
+                        except Exception as exc:  # noqa: BLE001 - NeMo config shape varies by build
                             logger.warning(
                                 "Failed to adjust decoding strategy for TDT streaming: {}", exc
                             )
@@ -344,7 +355,7 @@ class ParakeetStreamingTranscriber:
                     )
                     self.fallback_reason = None
                     return
-                except Exception as exc:  # pragma: no cover - optional helper
+                except Exception as exc:  # noqa: BLE001 - helper init is best-effort
                     logger.warning(
                         "TDT streaming helper init failed; falling back to RNNT helper: {}",
                         exc,
@@ -365,7 +376,7 @@ class ParakeetStreamingTranscriber:
                 self.batch_size,
             )
             self.fallback_reason = None
-        except Exception as exc:  # pragma: no cover - environment dependent
+        except Exception as exc:  # noqa: BLE001 - streaming helper must fail open to offline mode
             logger.warning("Streaming helper init failed; using offline fallback: {}", exc)
             self.chunk_helper = None
             self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
@@ -374,7 +385,7 @@ class ParakeetStreamingTranscriber:
         if self.chunk_helper is not None:
             try:
                 self.chunk_helper.reset()
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:  # noqa: BLE001 - reset failures should not break sessions
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
                 self.chunk_helper = None
                 self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"

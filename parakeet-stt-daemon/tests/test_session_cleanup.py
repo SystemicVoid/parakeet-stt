@@ -8,7 +8,6 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import WebSocketDisconnect
-
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import AbortSession, ClientMessageType, StartSession, StopSession
 from parakeet_stt_daemon.server import DaemonServer

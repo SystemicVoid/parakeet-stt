@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from parakeet_stt_daemon.model import (
     DEFAULT_MODEL_NAME,
     ParakeetStreamingTranscriber,
@@ -341,17 +340,28 @@ def generate_sine(duration_secs: float, freq_hz: float, amplitude: float) -> np.
 
 
 def write_wav(path: Path, samples: np.ndarray) -> None:
+    sf: Any | None
     try:
-        import soundfile as sf
+        import soundfile as sf_mod
+    except ImportError:
+        sf = None  # pragma: no cover - minimal fallback
+    else:
+        sf = sf_mod
 
-        sf.write(path, samples, SAMPLE_RATE)
-    except Exception:  # pragma: no cover - minimal fallback
-        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(pcm.tobytes())
+    if sf is not None:
+        try:
+            sf.write(path, samples, SAMPLE_RATE)
+            return
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass  # pragma: no cover - minimal fallback
+
+    # Minimal fallback path for environments without soundfile or where writes fail.
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.tobytes())
 
 
 def split_chunks(samples: np.ndarray, chunk_size: int) -> list[np.ndarray]:
@@ -367,7 +377,7 @@ def run_streaming_probe(model, samples: np.ndarray) -> str:
             left_context_secs=2.0,
             batch_size=4,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - probe command must report any helper init failure
         return f"streaming helper init failed: {exc}"
 
     helper_available = streamer.chunk_helper is not None
@@ -379,7 +389,7 @@ def run_streaming_probe(model, samples: np.ndarray) -> str:
         result = session.finalize()
         mode = "streaming helper" if helper_available else "offline fallback"
         return f"{mode} succeeded (transcript='{result}')"
-    except Exception as exc:  # pragma: no cover - runtime probe
+    except Exception as exc:  # noqa: BLE001 - probe command must report any runtime helper failure
         return f"streaming helper blew up during run: {exc}"
 
 

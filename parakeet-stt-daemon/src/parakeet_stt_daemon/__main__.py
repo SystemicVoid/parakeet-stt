@@ -155,7 +155,7 @@ def run_checks(settings: ServerSettings) -> None:
         logger.warning("Model warmup skipped/failed: {}", exc)
 
     try:
-        # sounddevice returns DeviceList which pyright doesn't recognize as dict-like
+        # sounddevice returns DeviceList; cast for static typing.
         devices = cast(Sequence[dict[str, Any]], sd.query_devices())
         inputs = [
             (idx, dev["name"])

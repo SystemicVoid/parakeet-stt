@@ -485,7 +485,7 @@ class DaemonServer:
                 from silero_vad import load_silero_vad
 
                 self._vad_model = load_silero_vad(onnx=True)
-            except Exception as exc:  # pragma: no cover - optional dependency/runtime
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
                 self._vad_import_error = f"{exc.__class__.__name__}"
                 logger.warning("Silero VAD unavailable; falling back to RMS trim: {}", exc)
                 return None
@@ -506,7 +506,7 @@ class DaemonServer:
             end_sample = int(speech_spans[-1].get("end", 0))
             end_sample = max(0, min(end_sample, audio.size))
             return audio[:end_sample]
-        except Exception as exc:  # pragma: no cover - optional dependency/runtime
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.warning("Silero VAD tail trim failed; falling back to RMS trim: {}", exc)
             return None
 
