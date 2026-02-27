@@ -6,8 +6,6 @@ start the daemon for protocol testing.
 
 from __future__ import annotations
 
-import math
-import os
 import tempfile
 import wave
 from collections.abc import Iterable, Sequence
@@ -55,33 +53,6 @@ def _extract_text(output: Any) -> str:
     return str(output).strip()
 
 
-def _coerce_rnnt_texts(result: Any) -> list[str]:
-    """Normalize rnnt_decoder_predictions_tensor output across NeMo versions."""
-    if isinstance(result, tuple) and result:
-        result = result[0]
-    if not isinstance(result, list):
-        return [_extract_text(result)]
-    if result and isinstance(result[0], list):
-        texts: list[str] = []
-        for group in result:
-            if not group:
-                texts.append("")
-                continue
-            texts.append(_coerce_rnnt_texts(group)[0])
-        return texts
-    return [_extract_text(item) for item in result]
-
-
-def _normalize_streaming_text(result: Any) -> str:
-    if isinstance(result, tuple) and result:
-        return _normalize_streaming_text(result[0])
-    if isinstance(result, list):
-        if not result:
-            return ""
-        return _extract_text(result[0])
-    return _extract_text(result)
-
-
 def _is_tdt_model(model: ASRModel) -> bool:
     loss = getattr(model, "loss", None)
     loss_impl = getattr(loss, "_loss", None)
@@ -97,30 +68,6 @@ def _is_tdt_model(model: ASRModel) -> bool:
     if target and "tdt" in str(target).lower():
         return True
     return False
-
-
-def _compute_streaming_tokens(
-    model: ASRModel, *, chunk_secs: float, total_buffer_secs: float
-) -> tuple[int, int, float]:
-    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
-    preprocessor = getattr(cfg, "preprocessor", None)
-    window_stride = getattr(preprocessor, "window_stride", None)
-    subsampling = getattr(getattr(model, "encoder", None), "subsampling_factor", None)
-    if window_stride is None or subsampling is None:
-        raise ValueError("missing model stride metadata")
-    model_stride = float(window_stride) * float(subsampling)
-    if model_stride <= 0:
-        raise ValueError("invalid model stride")
-    tokens_per_chunk = max(1, int(math.ceil(chunk_secs / model_stride)))
-    delay = max(
-        0,
-        int(
-            math.ceil(
-                (chunk_secs + (float(total_buffer_secs) - float(chunk_secs)) / 2) / model_stride
-            )
-        ),
-    )
-    return tokens_per_chunk, delay, model_stride
 
 
 def _get_cfg_value(cfg: Any, key: str) -> Any:
@@ -150,222 +97,6 @@ def _set_cfg_value(cfg: Any, key: str, value: Any) -> bool:
     except Exception:
         return False
     return False
-
-
-def _env_flag(name: str) -> bool:
-    raw = os.getenv(name, "")
-    return raw.lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float = 0.0) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _compute_eou_drain_samples(
-    model: ASRModel,
-    *,
-    sample_rate: int,
-    delay: int | None,
-    model_stride_secs: float | None,
-) -> int:
-    """Compute end-of-utterance drain samples from model metadata when possible."""
-    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
-    preprocessor = getattr(cfg, "preprocessor", None)
-    hop_secs = getattr(preprocessor, "window_stride", None)
-    streaming_cfg = getattr(getattr(model, "encoder", None), "streaming_cfg", None)
-    shift_frames = None
-    for key in ("shift_size", "shift_size_frames", "shift_size_in_frames", "cache_drop_size"):
-        value = _get_cfg_value(streaming_cfg, key)
-        if value is not None:
-            shift_frames = value
-            break
-
-    if hop_secs is not None and shift_frames is not None:
-        try:
-            hop = float(hop_secs)
-            shifts = float(shift_frames)
-            if hop > 0 and shifts > 0:
-                # NeMo streaming recipes use ~2x shift frames to flush delayed emissions.
-                return max(0, int(math.ceil(hop * shifts * 2.0 * sample_rate)))
-        except (TypeError, ValueError):
-            pass
-
-    if delay is not None and model_stride_secs is not None and delay > 0 and model_stride_secs > 0:
-        return max(0, int(math.ceil(delay * model_stride_secs * sample_rate)))
-    return 0
-
-
-class _ConformerPartialState:
-    """Best-effort cache-aware partial streaming state for conformer models."""
-
-    def __init__(
-        self,
-        *,
-        model: ASRModel,
-        sample_rate: int,
-        preprocessor: Any,
-        conformer_stream_step: Any,
-        cache_last_channel: Any,
-        cache_last_time: Any,
-        cache_last_channel_len: Any,
-        drop_extra_pre_encoded: int,
-    ) -> None:
-        self._model = model
-        self._sample_rate = int(sample_rate)
-        self._preprocessor = preprocessor
-        self._conformer_stream_step = conformer_stream_step
-        self._initial_cache_last_channel = cache_last_channel
-        self._initial_cache_last_time = cache_last_time
-        self._initial_cache_last_channel_len = cache_last_channel_len
-        self._cache_last_channel = cache_last_channel
-        self._cache_last_time = cache_last_time
-        self._cache_last_channel_len = cache_last_channel_len
-        self._drop_extra_pre_encoded = int(drop_extra_pre_encoded)
-        self._previous_hypotheses: Any = None
-        self.last_text = ""
-        self.active = True
-        self.fallback_reason: str | None = None
-
-    @staticmethod
-    def _clone_cache(value: Any) -> Any:
-        if torch is not None and torch.is_tensor(value):
-            return value.clone()
-        return value
-
-    def reset_runtime_state(self) -> None:
-        self._cache_last_channel = self._clone_cache(self._initial_cache_last_channel)
-        self._cache_last_time = self._clone_cache(self._initial_cache_last_time)
-        self._cache_last_channel_len = self._clone_cache(self._initial_cache_last_channel_len)
-        self._previous_hypotheses = None
-        self.last_text = ""
-
-    def _preprocess(self, chunk: np.ndarray) -> tuple[Any, Any]:
-        if torch is None:
-            raise RuntimeError("torch unavailable")
-        model_device = getattr(self._model, "device", "cpu")
-        device = torch.device(str(model_device))
-        waveform = torch.from_numpy(chunk.astype(np.float32, copy=False)).to(device).unsqueeze(0)
-        waveform_len = torch.tensor([chunk.size], dtype=torch.long, device=device)
-        try:
-            return self._preprocessor(input_signal=waveform, length=waveform_len)
-        except TypeError:
-            return self._preprocessor(waveform, waveform_len)
-
-    def _disable(self, reason: str, exc: Exception | None = None) -> None:
-        if exc is not None:
-            logger.warning("Disabling conformer partial stream ({}): {}", reason, exc)
-        else:
-            logger.warning("Disabling conformer partial stream ({})", reason)
-        self.active = False
-        self.fallback_reason = reason
-
-    def _stream_step(self, chunk: np.ndarray) -> str:
-        processed_signal, processed_signal_length = self._preprocess(chunk)
-        if processed_signal_length is None and torch is not None:
-            processed_signal_length = torch.tensor(
-                [int(processed_signal.shape[-1])],
-                dtype=torch.long,
-                device=processed_signal.device,
-            )
-        result = self._conformer_stream_step(
-            processed_signal=processed_signal,
-            processed_signal_length=processed_signal_length,
-            cache_last_channel=self._cache_last_channel,
-            cache_last_time=self._cache_last_time,
-            cache_last_channel_len=self._cache_last_channel_len,
-            keep_all_outputs=True,
-            previous_hypotheses=self._previous_hypotheses,
-            drop_extra_pre_encoded=self._drop_extra_pre_encoded,
-            return_transcription=True,
-        )
-        (
-            _,
-            hypotheses_or_text,
-            self._cache_last_channel,
-            self._cache_last_time,
-            self._cache_last_channel_len,
-            best_hyp,
-            *_,
-        ) = result
-        self._previous_hypotheses = best_hyp
-        return _normalize_streaming_text(hypotheses_or_text)
-
-    def preflight_probe(self) -> str | None:
-        """Validate the experimental partial path once before activating it."""
-        try:
-            probe_samples = max(1, int(self._sample_rate * 0.25))
-            probe = np.zeros((probe_samples,), dtype=np.float32)
-            self.reset_runtime_state()
-            self._stream_step(probe)
-            self.reset_runtime_state()
-            return None
-        except Exception as exc:  # pragma: no cover - runtime/model dependent
-            return f"preflight_failed:{exc.__class__.__name__}"
-
-    def feed(self, chunk: np.ndarray) -> None:
-        if not self.active or chunk.size == 0:
-            return
-        try:
-            text = self._stream_step(chunk)
-            if text:
-                self.last_text = text
-        except Exception as exc:  # pragma: no cover - runtime/model dependent
-            self._disable(f"partial_stream_failed:{exc.__class__.__name__}", exc)
-
-
-def _init_conformer_partial_state(
-    model: ASRModel, *, sample_rate: int
-) -> tuple[_ConformerPartialState | None, str | None]:
-    if not _env_flag("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS"):
-        return None, None
-    if torch is None:
-        return None, "partial_stream_unavailable:torch_missing"
-
-    conformer_stream_step = getattr(model, "conformer_stream_step", None)
-    if not callable(conformer_stream_step):
-        return None, "partial_stream_unavailable:conformer_stream_step_missing"
-
-    preprocessor = getattr(model, "preprocessor", None)
-    if not callable(preprocessor):
-        return None, "partial_stream_unavailable:preprocessor_missing"
-
-    encoder = getattr(model, "encoder", None)
-    get_initial_cache_state = getattr(encoder, "get_initial_cache_state", None)
-    if not callable(get_initial_cache_state):
-        return None, "partial_stream_unavailable:cache_state_missing"
-
-    try:
-        cache_state = cast(tuple[Any, Any, Any], get_initial_cache_state(batch_size=1))
-        cache_last_channel, cache_last_time, cache_last_channel_len = cache_state
-    except Exception as exc:  # pragma: no cover - runtime/model dependent
-        return None, f"partial_stream_unavailable:{exc.__class__.__name__}"
-
-    streaming_cfg = getattr(encoder, "streaming_cfg", None)
-    drop_extra_pre_encoded = _get_cfg_value(streaming_cfg, "drop_extra_pre_encoded")
-    if drop_extra_pre_encoded is None:
-        drop_extra_pre_encoded = 0
-
-    partial_state = _ConformerPartialState(
-        model=model,
-        sample_rate=sample_rate,
-        preprocessor=preprocessor,
-        conformer_stream_step=conformer_stream_step,
-        cache_last_channel=cache_last_channel,
-        cache_last_time=cache_last_time,
-        cache_last_channel_len=cache_last_channel_len,
-        drop_extra_pre_encoded=int(drop_extra_pre_encoded),
-    )
-    preflight_reason = partial_state.preflight_probe()
-    if preflight_reason is not None:
-        return None, f"partial_stream_unavailable:{preflight_reason}"
-
-    return partial_state, None
 
 
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
@@ -477,104 +208,18 @@ class ParakeetTranscriber:
 class ParakeetStreamingSession:
     """Accumulate audio chunks for a single streaming session."""
 
-    def __init__(
-        self,
-        parent: ParakeetStreamingTranscriber,
-        sample_rate: int,
-        partial_state: _ConformerPartialState | None = None,
-    ) -> None:
+    def __init__(self, parent: ParakeetStreamingTranscriber, sample_rate: int) -> None:
         self._parent = parent
         self.sample_rate = sample_rate
         self._chunks: list[np.ndarray] = []
-        self._partial_state = partial_state
 
     def feed(self, chunk: np.ndarray) -> None:
-        normalized_chunk = np.array(chunk, dtype=np.float32, copy=True)
-        self._chunks.append(normalized_chunk)
-        if self._partial_state is not None:
-            self._partial_state.feed(normalized_chunk)
-            self._parent._partial_stream_active = self._partial_state.active
-            self._parent._partial_stream_fallback_reason = self._partial_state.fallback_reason
-            self._parent._partial_stream_last_text = self._partial_state.last_text
+        self._chunks.append(np.array(chunk, dtype=np.float32, copy=True))
 
     def finalize(self) -> str:
         if not self._chunks:
             return ""
         combined = np.concatenate(self._chunks)
-        raw_samples = combined.size
-        debug = _env_flag("PARAKEET_STREAMING_DEBUG")
-        extra_pad_secs = _env_float("PARAKEET_STREAMING_TAIL_PAD_SECS", 0.0)
-        extra_pad_samples = int(extra_pad_secs * self.sample_rate) if extra_pad_secs > 0 else 0
-        helper = self._parent.chunk_helper
-        iter_cls = self._parent._audio_feature_iter_cls
-        tokens_per_chunk = self._parent._helper_tokens_per_chunk
-        delay = self._parent._helper_delay
-        model_stride_secs = getattr(self._parent, "_helper_model_stride_secs", None)
-        stream_then_seal = os.getenv("PARAKEET_STREAM_THEN_SEAL", "1").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if helper is not None and iter_cls is not None:
-            try:
-                if stream_then_seal:
-                    # Keep final transcript quality tied to the proven offline path.
-                    return self._parent._transcribe_offline(combined, self.sample_rate)
-
-                drain_samples = _compute_eou_drain_samples(
-                    self._parent.model,
-                    sample_rate=self.sample_rate,
-                    delay=delay,
-                    model_stride_secs=model_stride_secs,
-                )
-
-                def _run_helper(samples: np.ndarray) -> str:
-                    pad_to_frame_len = tokens_per_chunk is not None and delay is not None
-                    frame_reader = iter_cls(
-                        samples,
-                        helper.frame_len,
-                        helper.raw_preprocessor,
-                        helper.asr_model.device,
-                        pad_to_frame_len=pad_to_frame_len,
-                    )
-                    try:
-                        helper.set_frame_reader(frame_reader, 0)
-                    except TypeError:
-                        helper.set_frame_reader(frame_reader)
-                    if tokens_per_chunk is not None and delay is not None:
-                        result = helper.transcribe(tokens_per_chunk, delay)
-                    else:
-                        result = helper.transcribe()
-                    return _normalize_streaming_text(result)
-
-                if debug:
-                    logger.debug(
-                        "Streaming finalize: chunks={}, raw_samples={}, combined_samples={}, "
-                        "drain_samples={}, extra_pad_samples={}, "
-                        "tokens_per_chunk={}, delay={}, helper={}",
-                        len(self._chunks),
-                        raw_samples,
-                        combined.size,
-                        drain_samples,
-                        extra_pad_samples,
-                        tokens_per_chunk,
-                        delay,
-                        type(helper).__name__,
-                    )
-                result_text = _run_helper(combined)
-
-                should_drain = tokens_per_chunk is not None and delay is not None
-                total_drain_samples = 0
-                if should_drain:
-                    total_drain_samples = max(0, drain_samples) + max(0, extra_pad_samples)
-                if total_drain_samples > 0:
-                    drain_audio = np.zeros((total_drain_samples,), dtype=np.float32)
-                    # Drain in a second pass so delayed transducer emissions at EOU can flush.
-                    result_text = _run_helper(drain_audio)
-                return result_text
-            except Exception as exc:  # pragma: no cover - fallback path
-                logger.warning("Streaming helper failed during finalization: {}", exc)
         return self._parent._transcribe_offline(combined, self.sample_rate)
 
 
@@ -597,15 +242,7 @@ class ParakeetStreamingTranscriber:
         self.batch_size = int(batch_size)
         self.chunk_helper: Any | None = None
         self.fallback_reason: str | None = None
-        self._audio_feature_iter_cls: type | None = None
         self._helper_class_name: str | None = None
-        self._helper_tokens_per_chunk: int | None = None
-        self._helper_delay: int | None = None
-        self._helper_model_stride_secs: float | None = None
-        self._partial_stream_active = False
-        self._partial_stream_fallback_reason: str | None = None
-        self._partial_stream_last_text = ""
-        self._partial_stream_enabled = _env_flag("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS")
 
         self.offline = ParakeetTranscriber(model)
         self._init_helper()
@@ -614,20 +251,9 @@ class ParakeetStreamingTranscriber:
     def helper_active(self) -> bool:
         return self.chunk_helper is not None
 
-    @property
-    def partial_stream_active(self) -> bool:
-        return self._partial_stream_active
-
-    @property
-    def partial_stream_fallback_reason(self) -> str | None:
-        return self._partial_stream_fallback_reason
-
     def _init_helper(self) -> None:
         try:
-            from nemo.collections.asr.parts.utils.streaming_utils import (
-                AudioFeatureIterator,
-                FrameBatchChunkedRNNT,
-            )
+            from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchChunkedRNNT
         except ImportError as exc:  # pragma: no cover - environment dependent
             logger.warning("NeMo streaming utilities unavailable; using offline fallback: {}", exc)
             self.chunk_helper = None
@@ -643,26 +269,6 @@ class ParakeetStreamingTranscriber:
             from omegaconf import open_dict
         except Exception:  # pragma: no cover - optional dependency
             open_dict = None  # type: ignore[assignment]
-
-        class _PatchedFrameBatchChunkedRNNT(FrameBatchChunkedRNNT):
-            @torch.no_grad()
-            def _get_batch_preds(self, keep_logits: bool = False) -> None:
-                device = self.asr_model.device
-                for batch in iter(self.data_loader):
-                    feat_signal, feat_signal_len = batch
-                    feat_signal, feat_signal_len = (
-                        feat_signal.to(device),
-                        feat_signal_len.to(device),
-                    )
-                    encoded, encoded_len = self.asr_model(
-                        processed_signal=feat_signal, processed_signal_length=feat_signal_len
-                    )
-                    decoded = self.asr_model.decoding.rnnt_decoder_predictions_tensor(
-                        encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
-                    )
-                    self.all_preds.extend(_coerce_rnnt_texts(decoded))
-                    del encoded
-                    del encoded_len
 
         total_buffer_secs = self.chunk_secs + self.right_context_secs
         model_is_tdt = _is_tdt_model(self.model)
@@ -681,11 +287,6 @@ class ParakeetStreamingTranscriber:
                 )
             if model_is_tdt and BatchedFrameASRTDT is not None:
                 try:
-                    tokens_per_chunk, delay, model_stride_secs = _compute_streaming_tokens(
-                        self.model,
-                        chunk_secs=self.chunk_secs,
-                        total_buffer_secs=total_buffer_secs,
-                    )
                     change_decoding = getattr(self.model, "change_decoding_strategy", None)
                     if callable(change_decoding) and decoding_cfg is not None:
                         try:
@@ -732,21 +333,14 @@ class ParakeetStreamingTranscriber:
                     # BatchedFrameASRTDT doesn't pass stateful_decoding/max_steps to the base class.
                     self.chunk_helper.stateful_decoding = False
                     self.chunk_helper.max_steps_per_timestep = int(max_steps_per_timestep)
-                    self._audio_feature_iter_cls = AudioFeatureIterator
                     self._helper_class_name = "BatchedFrameASRTDT"
-                    self._helper_tokens_per_chunk = tokens_per_chunk
-                    self._helper_delay = delay
-                    self._helper_model_stride_secs = model_stride_secs
                     logger.info(
-                        "Streaming helper initialised via {} "
-                        "(frame_len={}, total_buffer={}, batch_size={}, "
-                        "tokens_per_chunk={}, delay={})",
+                        "Streaming helper initialised via {} (frame_len={}, total_buffer={}, "
+                        "batch_size={})",
                         self._helper_class_name,
                         self.chunk_secs,
                         total_buffer_secs,
                         tdt_batch_size,
-                        tokens_per_chunk,
-                        delay,
                     )
                     self.fallback_reason = None
                     return
@@ -755,17 +349,13 @@ class ParakeetStreamingTranscriber:
                         "TDT streaming helper init failed; falling back to RNNT helper: {}",
                         exc,
                     )
-            self.chunk_helper = _PatchedFrameBatchChunkedRNNT(
+            self.chunk_helper = FrameBatchChunkedRNNT(
                 asr_model=self.model,
                 frame_len=cast(Any, self.chunk_secs),
                 total_buffer=cast(Any, total_buffer_secs),
                 batch_size=self.batch_size,
             )
-            self._audio_feature_iter_cls = AudioFeatureIterator
             self._helper_class_name = "FrameBatchChunkedRNNT"
-            self._helper_tokens_per_chunk = None
-            self._helper_delay = None
-            self._helper_model_stride_secs = None
             logger.info(
                 "Streaming helper initialised via {} "
                 "(frame_len={}, total_buffer={}, batch_size={})",
@@ -778,40 +368,17 @@ class ParakeetStreamingTranscriber:
         except Exception as exc:  # pragma: no cover - environment dependent
             logger.warning("Streaming helper init failed; using offline fallback: {}", exc)
             self.chunk_helper = None
-            self._audio_feature_iter_cls = None
-            self._helper_tokens_per_chunk = None
-            self._helper_delay = None
-            self._helper_model_stride_secs = None
             self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
 
     def start_session(self, sample_rate: int) -> ParakeetStreamingSession:
-        partial_state = None
-        self._partial_stream_last_text = ""
-        if self._partial_stream_enabled:
-            partial_state, partial_reason = _init_conformer_partial_state(
-                self.model,
-                sample_rate=sample_rate,
-            )
-            self._partial_stream_active = partial_state is not None
-            self._partial_stream_fallback_reason = partial_reason
-            if partial_reason is not None:
-                logger.warning("Conformer partial stream unavailable: {}", partial_reason)
-        else:
-            self._partial_stream_active = False
-            self._partial_stream_fallback_reason = None
-
         if self.chunk_helper is not None:
             try:
                 self.chunk_helper.reset()
             except Exception as exc:  # pragma: no cover
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
                 self.chunk_helper = None
-                self._audio_feature_iter_cls = None
-                self._helper_tokens_per_chunk = None
-                self._helper_delay = None
-                self._helper_model_stride_secs = None
                 self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"
-        return ParakeetStreamingSession(self, sample_rate, partial_state=partial_state)
+        return ParakeetStreamingSession(self, sample_rate)
 
     def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
         return self.offline.transcribe_samples(samples, sample_rate=sample_rate)

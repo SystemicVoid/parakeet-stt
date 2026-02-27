@@ -33,8 +33,6 @@ stt() {
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_daemon_streaming_enabled="false"
-    local default_daemon_stream_then_seal="1"
-    local default_daemon_partials_enabled="0"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
     local default_daemon_left_context_secs="10.0"
@@ -548,8 +546,6 @@ CLIENTCMD
                 shift
             fi
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local daemon_stream_then_seal="$default_daemon_stream_then_seal"
-            local daemon_partials_enabled="$default_daemon_partials_enabled"
             local daemon_chunk_secs="$default_daemon_chunk_secs"
             local daemon_right_context_secs="$default_daemon_right_context_secs"
             local daemon_left_context_secs="$default_daemon_left_context_secs"
@@ -587,8 +583,6 @@ CLIENTCMD
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
-            echo "   - Daemon stream-then-seal: $daemon_stream_then_seal"
-            echo "   - Daemon experimental partials: $daemon_partials_enabled"
             echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
@@ -621,8 +615,6 @@ CLIENTCMD
                 (
                     cd "$DAEMON_DIR" || exit 1
                     PARAKEET_STREAMING_ENABLED="$daemon_streaming_enabled" \
-                    PARAKEET_STREAM_THEN_SEAL="$daemon_stream_then_seal" \
-                    PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS="$daemon_partials_enabled" \
                     PARAKEET_CHUNK_SECS="$daemon_chunk_secs" \
                     PARAKEET_RIGHT_CONTEXT_SECS="$daemon_right_context_secs" \
                     PARAKEET_LEFT_CONTEXT_SECS="$daemon_left_context_secs" \

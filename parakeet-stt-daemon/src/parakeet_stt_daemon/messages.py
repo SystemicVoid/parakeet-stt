@@ -113,8 +113,6 @@ class StatusMessage(BaseModel):
     streaming_enabled: bool | None = None
     stream_helper_active: bool | None = None
     stream_fallback_reason: str | None = None
-    partial_stream_active: bool | None = None
-    partial_stream_fallback_reason: str | None = None
     chunk_secs: float | None = None
     active_session_age_ms: int | None = None
     audio_stop_ms: int | None = None

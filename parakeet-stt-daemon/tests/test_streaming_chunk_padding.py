@@ -1,153 +1,46 @@
-"""Regression tests for NeMo chunked iterator setup."""
+"""Regression tests for streaming session finalization behavior."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 
 
-class _FakeIterator:
-    def __init__(
-        self,
-        samples: np.ndarray,
-        frame_len: float,
-        raw_preprocessor: object,
-        device: str,
-        *,
-        pad_to_frame_len: bool = True,
-    ) -> None:
-        self.samples = samples
-        self.frame_len = frame_len
-        self.raw_preprocessor = raw_preprocessor
-        self.device = device
-        self.pad_to_frame_len = pad_to_frame_len
-
-
-class _FakeChunkHelper:
-    def __init__(self) -> None:
-        self.frame_len = 2.0
-        self.raw_preprocessor = object()
-        self.asr_model = SimpleNamespace(device="cpu")
-        self.frame_reader: _FakeIterator | None = None
-        self.call_count = 0
-        self.calls: list[tuple[int, int]] = []
-
-    def set_frame_reader(self, frame_reader: _FakeIterator) -> None:
-        self.frame_reader = frame_reader
-
-    def transcribe(self, *args: int) -> str:
-        self.call_count += 1
-        if len(args) == 2:
-            self.calls.append((args[0], args[1]))
-        return "tail text" if self.call_count == 1 else "drained text"
-
-
 class _FakeParent:
     def __init__(self) -> None:
-        self.chunk_helper = _FakeChunkHelper()
-        self._audio_feature_iter_cls = _FakeIterator
-        self._helper_tokens_per_chunk: int | None = None
-        self._helper_delay: int | None = None
-        self._helper_model_stride_secs: float | None = None
-        self.model = SimpleNamespace(
-            _cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=0.01)),
-            encoder=SimpleNamespace(streaming_cfg=SimpleNamespace(shift_size=16)),
-        )
         self.offline_calls = 0
+        self.last_samples: np.ndarray | None = None
+        self.last_sample_rate: int | None = None
 
-    def _transcribe_offline(self, _samples: np.ndarray, _sample_rate: int) -> str:
+    def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:
         self.offline_calls += 1
+        self.last_samples = samples
+        self.last_sample_rate = sample_rate
         return "offline text"
 
 
-class _FakePreprocessor:
-    def __call__(self, input_signal: Any, length: Any) -> tuple[Any, Any]:
-        return input_signal, length
-
-
-class _FakeEncoder:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def get_initial_cache_state(self, *, batch_size: int) -> tuple[Any, Any, Any]:
-        assert batch_size == 1
-        return ("cache_channel", "cache_time", "cache_len")
-
-
-class _FakeConformerModel:
-    def __init__(self) -> None:
-        self.device = "cpu"
-        self.preprocessor = _FakePreprocessor()
-        self.encoder = _FakeEncoder()
-        self.step_calls = 0
-
-    def conformer_stream_step(self, **kwargs: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
-        self.step_calls += 1
-        assert kwargs["previous_hypotheses"] is None
-        return (
-            [1],
-            [SimpleNamespace(text="partial text")],
-            "next_cache_channel",
-            "next_cache_time",
-            "next_cache_len",
-            ["hyp"],
-        )
-
-
-class _FailingConformerModel(_FakeConformerModel):
-    def conformer_stream_step(self, **kwargs: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
-        raise TypeError("incompatible streaming path")
-
-
-def test_finalize_disables_padding_for_chunked_iterator(monkeypatch) -> None:
+def test_finalize_returns_empty_when_no_audio() -> None:
     from parakeet_stt_daemon.model import ParakeetStreamingSession
 
-    monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
     parent = _FakeParent()
     session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
-    session.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
 
     result = session.finalize()
 
-    assert result == "tail text"
+    assert result == ""
     assert parent.offline_calls == 0
-    assert parent.chunk_helper.frame_reader is not None
-    assert parent.chunk_helper.frame_reader.pad_to_frame_len is False
 
 
-def test_finalize_runs_explicit_drain_pass_for_tdt_helper(monkeypatch) -> None:
+def test_finalize_uses_offline_seal_even_with_retired_streaming_envs(monkeypatch) -> None:
     from parakeet_stt_daemon.model import ParakeetStreamingSession
 
-    # Keep seal disabled to assert helper drain behavior directly.
     monkeypatch.setenv("PARAKEET_STREAM_THEN_SEAL", "0")
-    parent = _FakeParent()
-    parent._helper_tokens_per_chunk = 10
-    parent._helper_delay = 3
-    parent._helper_model_stride_secs = 0.04
-    session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
-    session.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
-
-    result = session.finalize()
-
-    assert result == "drained text"
-    assert parent.offline_calls == 0
-    assert parent.chunk_helper.call_count == 2
-    assert parent.chunk_helper.calls == [(10, 3), (10, 3)]
-    assert parent.chunk_helper.frame_reader is not None
-    # Second pass should be drain-only silence from config-derived frame count.
-    assert parent.chunk_helper.frame_reader.samples.size == 5120
-    assert parent.chunk_helper.frame_reader.pad_to_frame_len is True
-
-
-def test_finalize_uses_offline_seal_by_default() -> None:
-    from parakeet_stt_daemon.model import ParakeetStreamingSession
+    monkeypatch.setenv("PARAKEET_STREAMING_TAIL_PAD_SECS", "0.6")
+    monkeypatch.setenv("PARAKEET_STREAMING_DEBUG", "1")
+    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
 
     parent = _FakeParent()
-    parent._helper_tokens_per_chunk = 10
-    parent._helper_delay = 3
-    parent._helper_model_stride_secs = 0.04
     session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
     session.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
 
@@ -155,107 +48,25 @@ def test_finalize_uses_offline_seal_by_default() -> None:
 
     assert result == "offline text"
     assert parent.offline_calls == 1
-    assert parent.chunk_helper.call_count == 0
+    assert parent.last_samples is not None
+    np.testing.assert_allclose(parent.last_samples, np.array([0.1, 0.2, 0.3], dtype=np.float32))
+    assert parent.last_sample_rate == 16_000
 
 
-def test_init_conformer_partial_state_disabled_by_default(monkeypatch) -> None:
-    from parakeet_stt_daemon.model import _init_conformer_partial_state
+def test_finalize_concatenates_stream_chunks_before_offline_seal() -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingSession
 
-    monkeypatch.delenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", raising=False)
+    parent = _FakeParent()
+    session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
+    session.feed(np.array([0.1, 0.2], dtype=np.float32))
+    session.feed(np.array([0.3, 0.4], dtype=np.float32))
 
-    model = _FakeConformerModel()
-    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
+    result = session.finalize()
 
-    assert state is None
-    assert reason is None
-
-
-def test_conformer_partial_feed_updates_partial_text(monkeypatch) -> None:
-    from parakeet_stt_daemon.model import _init_conformer_partial_state
-
-    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
-
-    model = _FakeConformerModel()
-    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
-
-    assert reason is None
-    assert state is not None
-
-    state.feed(np.array([0.1, 0.2, 0.3], dtype=np.float32))
-
-    # One preflight probe call + one runtime feed call.
-    assert model.step_calls == 2
-    assert state.active is True
-    assert state.fallback_reason is None
-    assert state.last_text == "partial text"
-
-
-def test_init_conformer_partial_state_reports_missing_stream_step(monkeypatch) -> None:
-    from parakeet_stt_daemon.model import _init_conformer_partial_state
-
-    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
-
-    model = SimpleNamespace(device="cpu", preprocessor=_FakePreprocessor(), encoder=_FakeEncoder())
-    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
-
-    assert state is None
-    assert reason == "partial_stream_unavailable:conformer_stream_step_missing"
-
-
-def test_init_conformer_partial_state_reports_preflight_failure(monkeypatch) -> None:
-    from parakeet_stt_daemon.model import _init_conformer_partial_state
-
-    monkeypatch.setenv("PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS", "1")
-
-    model = _FailingConformerModel()
-    state, reason = _init_conformer_partial_state(cast(Any, model), sample_rate=16_000)
-
-    assert state is None
-    assert reason == "partial_stream_unavailable:preflight_failed:TypeError"
-
-
-def test_compute_eou_drain_samples_falls_back_to_delay_stride() -> None:
-    from parakeet_stt_daemon.model import _compute_eou_drain_samples
-
-    model = SimpleNamespace(
-        _cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=0.01)),
-        encoder=SimpleNamespace(streaming_cfg=SimpleNamespace()),
+    assert result == "offline text"
+    assert parent.offline_calls == 1
+    assert parent.last_samples is not None
+    np.testing.assert_allclose(
+        parent.last_samples, np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
     )
-
-    samples = _compute_eou_drain_samples(
-        cast(Any, model),
-        sample_rate=16_000,
-        delay=4,
-        model_stride_secs=0.04,
-    )
-
-    assert samples == 2560
-
-
-def test_coerce_rnnt_texts_handles_hypothesis_list() -> None:
-    from parakeet_stt_daemon.model import _coerce_rnnt_texts
-
-    result = _coerce_rnnt_texts([SimpleNamespace(text="hello"), SimpleNamespace(text="world")])
-
-    assert result == ["hello", "world"]
-
-
-def test_coerce_rnnt_texts_handles_legacy_tuple() -> None:
-    from parakeet_stt_daemon.model import _coerce_rnnt_texts
-
-    result = _coerce_rnnt_texts((["best"], ["alt"]))
-
-    assert result == ["best"]
-
-
-def test_coerce_rnnt_texts_handles_nbest_lists() -> None:
-    from parakeet_stt_daemon.model import _coerce_rnnt_texts
-
-    result = _coerce_rnnt_texts(
-        [
-            [SimpleNamespace(text="best"), SimpleNamespace(text="alt")],
-            [SimpleNamespace(text="next")],
-        ]
-    )
-
-    assert result == ["best", "next"]
+    assert parent.last_sample_rate == 16_000
