@@ -24,8 +24,45 @@ from parakeet_stt_daemon.model import (
 SAMPLE_RATE = 16_000
 BENCH_AUDIO_DIR = Path(__file__).resolve().parent / "bench_audio"
 DEFAULT_BENCH_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_results.json"
+DEFAULT_BASELINE_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_baseline.json"
 _TRANSCRIPT_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\.\s*(?P<text>.+?)\s*$")
 _TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
+_ALLOWED_DOMAINS = {"command", "dictation"}
+
+PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "smoke": {
+        "bench_runs": 1,
+        "warmup_samples": 1,
+        "max_weighted_wer": 0.28,
+        "min_command_exact_match": 0.60,
+        "min_critical_token_recall": 0.90,
+        "max_warm_p95_finalize_ms": 240.0,
+    },
+    "daily": {
+        "bench_runs": 2,
+        "warmup_samples": 1,
+        "max_weighted_wer": 0.20,
+        "min_command_exact_match": 0.70,
+        "min_critical_token_recall": 0.94,
+        "max_warm_p95_finalize_ms": 180.0,
+        "max_weighted_wer_delta": 0.03,
+        "max_command_exact_match_drop": 0.05,
+        "max_critical_token_recall_drop": 0.03,
+        "max_warm_p95_finalize_ms_delta": 40.0,
+    },
+    "weekly": {
+        "bench_runs": 3,
+        "warmup_samples": 1,
+        "max_weighted_wer": 0.18,
+        "min_command_exact_match": 0.75,
+        "min_critical_token_recall": 0.95,
+        "max_warm_p95_finalize_ms": 160.0,
+        "max_weighted_wer_delta": 0.02,
+        "max_command_exact_match_drop": 0.04,
+        "max_critical_token_recall_drop": 0.02,
+        "max_warm_p95_finalize_ms_delta": 30.0,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +70,9 @@ class BenchmarkCase:
     sample_id: str
     audio_path: Path
     reference: str
+    tier: str = "default"
+    domain: str = "dictation"
+    critical_tokens: tuple[str, ...] = ()
 
 
 def _strip_wrapping_quotes(text: str) -> str:
@@ -41,6 +81,17 @@ def _strip_wrapping_quotes(text: str) -> str:
     if len(stripped) >= 2 and stripped[0] in quote_chars and stripped[-1] in quote_chars:
         return stripped[1:-1].strip()
     return stripped
+
+
+def _normalize_critical_tokens(tokens: list[str]) -> tuple[str, ...]:
+    normalized_tokens: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        for normalized in normalize_transcript(token).split():
+            if normalized and normalized not in seen:
+                normalized_tokens.append(normalized)
+                seen.add(normalized)
+    return tuple(normalized_tokens)
 
 
 def parse_benchmark_transcripts(path: Path) -> dict[str, str]:
@@ -66,6 +117,90 @@ def parse_benchmark_transcripts(path: Path) -> dict[str, str]:
     if not parsed:
         raise ValueError(f"No benchmark transcripts found in {path}")
     return parsed
+
+
+def parse_benchmark_manifest(
+    path: Path,
+    *,
+    bench_dir: Path,
+    bench_tier: str | None = None,
+) -> list[BenchmarkCase]:
+    if not path.exists():
+        raise FileNotFoundError(f"Benchmark manifest not found: {path}")
+
+    cases: list[BenchmarkCase] = []
+    seen_sample_ids: set[str] = set()
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"Invalid JSON line at {path}:{line_no}") from err
+        if not isinstance(payload, dict):
+            raise ValueError(f"Manifest row must be a JSON object at {path}:{line_no}")
+
+        sample_id_raw = str(payload.get("sample_id", "")).strip()
+        if not sample_id_raw:
+            raise ValueError(f"Manifest row missing sample_id at {path}:{line_no}")
+        sample_id = sample_id_raw
+        if sample_id in seen_sample_ids:
+            raise ValueError(f"Duplicate manifest sample_id {sample_id} in {path}:{line_no}")
+
+        reference = str(payload.get("reference", "")).strip()
+        if not reference:
+            raise ValueError(f"Manifest row missing reference for {sample_id} at {path}:{line_no}")
+
+        audio_path_raw = str(payload.get("audio_path", "")).strip()
+        if not audio_path_raw:
+            raise ValueError(f"Manifest row missing audio_path for {sample_id} at {path}:{line_no}")
+        audio_path = Path(audio_path_raw)
+        if not audio_path.is_absolute():
+            audio_path = (bench_dir / audio_path).resolve()
+        if not audio_path.exists():
+            raise ValueError(f"Manifest audio path not found for {sample_id}: {audio_path}")
+
+        tier = str(payload.get("tier", "default")).strip().casefold()
+        if bench_tier is not None and tier != bench_tier:
+            continue
+
+        domain = str(payload.get("domain", "dictation")).strip().casefold()
+        if domain not in _ALLOWED_DOMAINS:
+            raise ValueError(
+                f"Manifest row domain must be one of {sorted(_ALLOWED_DOMAINS)} "
+                f"for {sample_id} at {path}:{line_no}"
+            )
+
+        critical_tokens_raw = payload.get("critical_tokens", [])
+        if critical_tokens_raw is None:
+            critical_tokens_raw = []
+        if not isinstance(critical_tokens_raw, list) or not all(
+            isinstance(token, str) for token in critical_tokens_raw
+        ):
+            raise ValueError(
+                f"Manifest row critical_tokens must be a list[str] for {sample_id} "
+                f"at {path}:{line_no}"
+            )
+        critical_tokens = _normalize_critical_tokens(critical_tokens_raw)
+
+        seen_sample_ids.add(sample_id)
+        cases.append(
+            BenchmarkCase(
+                sample_id=sample_id,
+                audio_path=audio_path,
+                reference=reference,
+                tier=tier,
+                domain=domain,
+                critical_tokens=critical_tokens,
+            )
+        )
+
+    if not cases:
+        if bench_tier is not None:
+            raise ValueError(f"No manifest benchmark cases found for tier '{bench_tier}' in {path}")
+        raise ValueError(f"No manifest benchmark cases found in {path}")
+    return cases
 
 
 def collect_benchmark_cases(bench_dir: Path, transcripts: dict[str, str]) -> list[BenchmarkCase]:
@@ -152,6 +287,65 @@ def summarize_timings_ms(values: list[float]) -> dict[str, float]:
     }
 
 
+def _median(values: list[float]) -> float:
+    return _percentile(values, 50.0)
+
+
+def _metric_from_baseline(baseline: dict[str, float] | None, key: str) -> float | None:
+    if baseline is None:
+        return None
+    return baseline.get(key)
+
+
+def _summarize_domain_wers(rows: list[dict[str, Any]], domain: str) -> tuple[float, int]:
+    domain_wers = [float(row["wer"]) for row in rows if row.get("domain") == domain]
+    if not domain_wers:
+        return 0.0, 0
+    return sum(domain_wers) / len(domain_wers), len(domain_wers)
+
+
+def compute_command_exact_match_rate(rows: list[dict[str, Any]]) -> float:
+    command_rows = [row for row in rows if row.get("domain") == "command"]
+    if not command_rows:
+        return 1.0
+    exact_matches = sum(
+        1
+        for row in command_rows
+        if row.get("normalized_reference") == row.get("normalized_hypothesis")
+    )
+    return exact_matches / len(command_rows)
+
+
+def compute_critical_token_recall(rows: list[dict[str, Any]]) -> float:
+    total_tokens = 0
+    matched_tokens = 0
+    for row in rows:
+        critical_tokens = tuple(row.get("normalized_critical_tokens", ()))
+        if not critical_tokens:
+            continue
+        hypothesis_tokens = set(str(row.get("normalized_hypothesis", "")).split())
+        total_tokens += len(critical_tokens)
+        matched_tokens += sum(1 for token in critical_tokens if token in hypothesis_tokens)
+    if total_tokens == 0:
+        return 1.0
+    return matched_tokens / total_tokens
+
+
+def compute_weighted_wer(rows: list[dict[str, Any]]) -> tuple[float, float, float]:
+    command_wer, command_count = _summarize_domain_wers(rows, domain="command")
+    dictation_wer, dictation_count = _summarize_domain_wers(rows, domain="dictation")
+
+    if command_count == 0 and dictation_count == 0:
+        return 0.0, 0.0, 0.0
+    if command_count == 0:
+        return dictation_wer, dictation_wer, dictation_wer
+    if dictation_count == 0:
+        return command_wer, command_wer, command_wer
+
+    weighted_wer = 0.8 * command_wer + 0.2 * dictation_wer
+    return weighted_wer, command_wer, dictation_wer
+
+
 def evaluate_regression_thresholds(
     *,
     avg_wer: float,
@@ -160,6 +354,19 @@ def evaluate_regression_thresholds(
     max_avg_wer: float | None,
     max_p95_infer_ms: float | None,
     max_p95_finalize_ms: float | None,
+    weighted_wer: float | None = None,
+    command_exact_match_rate: float | None = None,
+    critical_token_recall: float | None = None,
+    warm_finalize_p95_ms: float | None = None,
+    max_weighted_wer: float | None = None,
+    min_command_exact_match: float | None = None,
+    min_critical_token_recall: float | None = None,
+    max_warm_p95_finalize_ms: float | None = None,
+    baseline: dict[str, float] | None = None,
+    max_weighted_wer_delta: float | None = None,
+    max_command_exact_match_drop: float | None = None,
+    max_critical_token_recall_drop: float | None = None,
+    max_warm_p95_finalize_ms_delta: float | None = None,
 ) -> list[str]:
     failures: list[str] = []
     if max_avg_wer is not None and avg_wer > max_avg_wer:
@@ -170,6 +377,99 @@ def evaluate_regression_thresholds(
         failures.append(
             f"finalize_p95_ms {finalize_p95_ms:.2f} exceeds threshold {max_p95_finalize_ms:.2f}"
         )
+
+    if (
+        max_weighted_wer is not None
+        and weighted_wer is not None
+        and weighted_wer > max_weighted_wer
+    ):
+        failures.append(f"weighted_wer {weighted_wer:.4f} exceeds threshold {max_weighted_wer:.4f}")
+    if (
+        min_command_exact_match is not None
+        and command_exact_match_rate is not None
+        and command_exact_match_rate < min_command_exact_match
+    ):
+        failures.append(
+            "command_exact_match_rate "
+            f"{command_exact_match_rate:.4f} below threshold {min_command_exact_match:.4f}"
+        )
+    if (
+        min_critical_token_recall is not None
+        and critical_token_recall is not None
+        and critical_token_recall < min_critical_token_recall
+    ):
+        failures.append(
+            f"critical_token_recall {critical_token_recall:.4f} below threshold "
+            f"{min_critical_token_recall:.4f}"
+        )
+    if (
+        max_warm_p95_finalize_ms is not None
+        and warm_finalize_p95_ms is not None
+        and warm_finalize_p95_ms > max_warm_p95_finalize_ms
+    ):
+        failures.append(
+            f"warm_finalize_p95_ms {warm_finalize_p95_ms:.2f} exceeds threshold "
+            f"{max_warm_p95_finalize_ms:.2f}"
+        )
+
+    if max_weighted_wer_delta is not None:
+        baseline_weighted_wer = _metric_from_baseline(baseline, "weighted_wer")
+        if baseline_weighted_wer is None:
+            failures.append("baseline weighted_wer is required for weighted_wer_delta gating")
+        elif (
+            weighted_wer is not None
+            and weighted_wer > baseline_weighted_wer + max_weighted_wer_delta
+        ):
+            failures.append(
+                f"weighted_wer {weighted_wer:.4f} exceeds baseline+delta "
+                f"{baseline_weighted_wer + max_weighted_wer_delta:.4f}"
+            )
+
+    if max_command_exact_match_drop is not None:
+        baseline_command_match = _metric_from_baseline(baseline, "command_exact_match_rate")
+        if baseline_command_match is None:
+            failures.append(
+                "baseline command_exact_match_rate is required for command_exact_match_drop gating"
+            )
+        elif (
+            command_exact_match_rate is not None
+            and command_exact_match_rate < baseline_command_match - max_command_exact_match_drop
+        ):
+            failures.append(
+                f"command_exact_match_rate {command_exact_match_rate:.4f} below baseline-delta "
+                f"{baseline_command_match - max_command_exact_match_drop:.4f}"
+            )
+
+    if max_critical_token_recall_drop is not None:
+        baseline_critical_recall = _metric_from_baseline(baseline, "critical_token_recall")
+        if baseline_critical_recall is None:
+            failures.append(
+                "baseline critical_token_recall is required for critical_token_recall_drop gating"
+            )
+        elif (
+            critical_token_recall is not None
+            and critical_token_recall < baseline_critical_recall - max_critical_token_recall_drop
+        ):
+            failures.append(
+                f"critical_token_recall {critical_token_recall:.4f} below baseline-delta "
+                f"{baseline_critical_recall - max_critical_token_recall_drop:.4f}"
+            )
+
+    if max_warm_p95_finalize_ms_delta is not None:
+        baseline_warm_finalize = _metric_from_baseline(baseline, "warm_finalize_p95_ms")
+        if baseline_warm_finalize is None:
+            failures.append(
+                "baseline warm_finalize_p95_ms is required for warm_p95_finalize_ms_delta gating"
+            )
+        elif (
+            warm_finalize_p95_ms is not None
+            and warm_finalize_p95_ms > baseline_warm_finalize + max_warm_p95_finalize_ms_delta
+        ):
+            failures.append(
+                f"warm_finalize_p95_ms {warm_finalize_p95_ms:.2f} exceeds baseline+delta "
+                f"{baseline_warm_finalize + max_warm_p95_finalize_ms_delta:.2f}"
+            )
+
     return failures
 
 
@@ -209,28 +509,40 @@ def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
     return sample_array.reshape(-1), int(sample_rate)
 
 
-def run_offline_benchmark(args: argparse.Namespace) -> int:
-    bench_dir: Path = args.bench_dir.resolve()
-    transcripts_path: Path = (
-        args.bench_transcripts.resolve()
-        if args.bench_transcripts is not None
+def _resolve_benchmark_cases(
+    *,
+    bench_dir: Path,
+    bench_tier: str | None,
+    bench_manifest: Path | None,
+    bench_transcripts: Path | None,
+) -> tuple[list[BenchmarkCase], Path | None]:
+    if bench_manifest is not None:
+        manifest_path = bench_manifest.resolve()
+        cases = parse_benchmark_manifest(
+            manifest_path,
+            bench_dir=bench_dir,
+            bench_tier=bench_tier,
+        )
+        return cases, manifest_path
+
+    transcripts_path = (
+        bench_transcripts.resolve()
+        if bench_transcripts is not None
         else (bench_dir / "transcripts.txt")
     )
-    output_path: Path = (
-        args.bench_output.resolve()
-        if args.bench_output is not None
-        else DEFAULT_BENCH_OUTPUT.resolve()
-    )
-
     transcripts = parse_benchmark_transcripts(transcripts_path)
     cases = collect_benchmark_cases(bench_dir, transcripts)
+    return cases, None
 
-    model = load_parakeet_model(args.model, device=args.device)
-    transcriber = ParakeetTranscriber(model)
-    effective_device = str(getattr(model, "_parakeet_effective_device", args.device))
 
+def _run_benchmark_once(
+    *,
+    cases: list[BenchmarkCase],
+    transcriber: ParakeetTranscriber,
+    warmup_samples: int,
+    run_index: int,
+) -> dict[str, Any]:
     sample_rows: list[dict[str, Any]] = []
-    wers: list[float] = []
     infer_ms_values: list[float] = []
     finalize_ms_values: list[float] = []
 
@@ -245,85 +557,387 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         normalized_hypothesis = normalize_transcript(hypothesis)
         wer = compute_normalized_wer(case.reference, hypothesis)
 
-        sample_rows.append(
-            {
-                "sample_id": case.sample_id,
-                "audio_path": str(case.audio_path),
-                "sample_rate": sample_rate,
-                "duration_seconds": samples.size / float(sample_rate) if sample_rate > 0 else 0.0,
-                "reference": case.reference,
-                "hypothesis": hypothesis,
-                "normalized_reference": normalized_reference,
-                "normalized_hypothesis": normalized_hypothesis,
-                "wer": wer,
-                "infer_ms": infer_ms,
-                "finalize_ms": finalize_ms,
-            }
-        )
-        wers.append(wer)
+        row = {
+            "run_index": run_index,
+            "sample_id": case.sample_id,
+            "audio_path": str(case.audio_path),
+            "sample_rate": sample_rate,
+            "duration_seconds": samples.size / float(sample_rate) if sample_rate > 0 else 0.0,
+            "tier": case.tier,
+            "domain": case.domain,
+            "critical_tokens": list(case.critical_tokens),
+            "reference": case.reference,
+            "hypothesis": hypothesis,
+            "normalized_reference": normalized_reference,
+            "normalized_hypothesis": normalized_hypothesis,
+            "normalized_critical_tokens": list(case.critical_tokens),
+            "wer": wer,
+            "infer_ms": infer_ms,
+            "finalize_ms": finalize_ms,
+        }
+        sample_rows.append(row)
         infer_ms_values.append(infer_ms)
         finalize_ms_values.append(finalize_ms)
 
-    avg_wer = sum(wers) / len(wers) if wers else 0.0
+    avg_wer = (
+        sum(float(row["wer"]) for row in sample_rows) / len(sample_rows) if sample_rows else 0.0
+    )
     infer_summary = summarize_timings_ms(infer_ms_values)
     finalize_summary = summarize_timings_ms(finalize_ms_values)
+    weighted_wer, command_wer, dictation_wer = compute_weighted_wer(sample_rows)
+    command_exact_match_rate = compute_command_exact_match_rate(sample_rows)
+    critical_token_recall = compute_critical_token_recall(sample_rows)
+
+    warmup_slice = sample_rows[min(max(warmup_samples, 0), len(sample_rows)) :]
+    warm_infer_summary = summarize_timings_ms([float(row["infer_ms"]) for row in warmup_slice])
+    warm_finalize_summary = summarize_timings_ms(
+        [float(row["finalize_ms"]) for row in warmup_slice]
+    )
+    cold_start_ms = float(sample_rows[0]["finalize_ms"]) if sample_rows else 0.0
+
+    command_count = sum(1 for row in sample_rows if row["domain"] == "command")
+    dictation_count = sum(1 for row in sample_rows if row["domain"] == "dictation")
+    aggregate = {
+        "avg_wer": avg_wer,
+        "weighted_wer": weighted_wer,
+        "command_exact_match_rate": command_exact_match_rate,
+        "critical_token_recall": critical_token_recall,
+        "infer_ms": infer_summary,
+        "finalize_ms": finalize_summary,
+        "warm_infer_ms": warm_infer_summary,
+        "warm_finalize_ms": warm_finalize_summary,
+        "cold_start_ms": cold_start_ms,
+        "by_domain": {
+            "command": {"avg_wer": command_wer, "count": command_count},
+            "dictation": {"avg_wer": dictation_wer, "count": dictation_count},
+        },
+    }
+    return {"aggregate": aggregate, "samples": sample_rows}
+
+
+def _medianize_timing_summaries(values: list[dict[str, float]]) -> dict[str, float]:
+    if not values:
+        return {"avg": 0.0, "p50": 0.0, "p95": 0.0}
+    return {
+        "avg": _median([item["avg"] for item in values]),
+        "p50": _median([item["p50"] for item in values]),
+        "p95": _median([item["p95"] for item in values]),
+    }
+
+
+def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not run_results:
+        return {
+            "aggregation_strategy": "median_of_runs",
+            "run_count": 0,
+            "avg_wer": 0.0,
+            "weighted_wer": 0.0,
+            "command_exact_match_rate": 1.0,
+            "critical_token_recall": 1.0,
+            "infer_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+            "finalize_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+            "warm_infer_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+            "warm_finalize_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+            "cold_start_ms": 0.0,
+            "by_domain": {
+                "command": {"avg_wer": 0.0, "count": 0},
+                "dictation": {"avg_wer": 0.0, "count": 0},
+            },
+        }
+
+    run_aggregates = [result["aggregate"] for result in run_results]
+    first_domain = run_aggregates[0]["by_domain"]
+    return {
+        "aggregation_strategy": "median_of_runs",
+        "run_count": len(run_aggregates),
+        "avg_wer": _median([aggregate["avg_wer"] for aggregate in run_aggregates]),
+        "weighted_wer": _median([aggregate["weighted_wer"] for aggregate in run_aggregates]),
+        "command_exact_match_rate": _median(
+            [aggregate["command_exact_match_rate"] for aggregate in run_aggregates]
+        ),
+        "critical_token_recall": _median(
+            [aggregate["critical_token_recall"] for aggregate in run_aggregates]
+        ),
+        "infer_ms": _medianize_timing_summaries(
+            [aggregate["infer_ms"] for aggregate in run_aggregates]
+        ),
+        "finalize_ms": _medianize_timing_summaries(
+            [aggregate["finalize_ms"] for aggregate in run_aggregates]
+        ),
+        "warm_infer_ms": _medianize_timing_summaries(
+            [aggregate["warm_infer_ms"] for aggregate in run_aggregates]
+        ),
+        "warm_finalize_ms": _medianize_timing_summaries(
+            [aggregate["warm_finalize_ms"] for aggregate in run_aggregates]
+        ),
+        "cold_start_ms": _median([aggregate["cold_start_ms"] for aggregate in run_aggregates]),
+        "by_domain": {
+            "command": {
+                "avg_wer": _median(
+                    [aggregate["by_domain"]["command"]["avg_wer"] for aggregate in run_aggregates]
+                ),
+                "count": first_domain["command"]["count"],
+            },
+            "dictation": {
+                "avg_wer": _median(
+                    [aggregate["by_domain"]["dictation"]["avg_wer"] for aggregate in run_aggregates]
+                ),
+                "count": first_domain["dictation"]["count"],
+            },
+        },
+    }
+
+
+def _load_baseline_metrics(path: Path) -> dict[str, float]:
+    if not path.exists():
+        raise FileNotFoundError(f"Baseline file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    aggregate = (
+        payload["aggregate"] if isinstance(payload, dict) and "aggregate" in payload else payload
+    )
+    if not isinstance(aggregate, dict):
+        raise ValueError(f"Invalid baseline payload in {path}")
+
+    metrics: dict[str, float] = {}
+    for key in ("weighted_wer", "command_exact_match_rate", "critical_token_recall"):
+        value = aggregate.get(key)
+        if isinstance(value, (int, float)):
+            metrics[key] = float(value)
+
+    warm_finalize_ms = aggregate.get("warm_finalize_ms")
+    if isinstance(warm_finalize_ms, dict) and isinstance(warm_finalize_ms.get("p95"), (int, float)):
+        metrics["warm_finalize_p95_ms"] = float(warm_finalize_ms["p95"])
+    elif isinstance(aggregate.get("warm_finalize_p95_ms"), (int, float)):
+        metrics["warm_finalize_p95_ms"] = float(aggregate["warm_finalize_p95_ms"])
+
+    return metrics
+
+
+def _compute_baseline_comparison(
+    baseline_metrics: dict[str, float] | None,
+    aggregate: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not baseline_metrics:
+        return None
+
+    current_metrics = {
+        "weighted_wer": float(aggregate["weighted_wer"]),
+        "command_exact_match_rate": float(aggregate["command_exact_match_rate"]),
+        "critical_token_recall": float(aggregate["critical_token_recall"]),
+        "warm_finalize_p95_ms": float(aggregate["warm_finalize_ms"]["p95"]),
+    }
+    comparison: dict[str, Any] = {}
+    for key, baseline_value in baseline_metrics.items():
+        if key not in current_metrics:
+            continue
+        current_value = current_metrics[key]
+        comparison[key] = {
+            "baseline": baseline_value,
+            "current": current_value,
+            "delta": current_value - baseline_value,
+        }
+    return comparison if comparison else None
+
+
+def _write_baseline_output(path: Path, args: argparse.Namespace, aggregate: dict[str, Any]) -> None:
+    payload = {
+        "version": 1,
+        "benchmark": "offline",
+        "model": args.model,
+        "requested_device": args.device,
+        "bench_tier": args.bench_tier,
+        "bench_runs": args.bench_runs,
+        "warmup_samples": args.warmup_samples,
+        "aggregate": aggregate,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _apply_profile_defaults(args: argparse.Namespace) -> None:
+    if args.bench_tier is None:
+        args.bench_runs = 1 if args.bench_runs is None else args.bench_runs
+        args.warmup_samples = 0 if args.warmup_samples is None else args.warmup_samples
+        return
+
+    profile = PROFILE_DEFAULTS[args.bench_tier]
+    if args.bench_runs is None:
+        args.bench_runs = int(profile["bench_runs"])
+    if args.warmup_samples is None:
+        args.warmup_samples = int(profile["warmup_samples"])
+
+    profile_to_arg = {
+        "max_weighted_wer": "max_weighted_wer",
+        "min_command_exact_match": "min_command_exact_match",
+        "min_critical_token_recall": "min_critical_token_recall",
+        "max_warm_p95_finalize_ms": "max_warm_p95_finalize_ms",
+        "max_weighted_wer_delta": "max_weighted_wer_delta",
+        "max_command_exact_match_drop": "max_command_exact_match_drop",
+        "max_critical_token_recall_drop": "max_critical_token_recall_drop",
+        "max_warm_p95_finalize_ms_delta": "max_warm_p95_finalize_ms_delta",
+    }
+    for profile_key, arg_name in profile_to_arg.items():
+        if getattr(args, arg_name) is None and profile_key in profile:
+            setattr(args, arg_name, float(profile[profile_key]))
+
+    if args.calibrate_baseline:
+        args.max_weighted_wer_delta = None
+        args.max_command_exact_match_drop = None
+        args.max_critical_token_recall_drop = None
+        args.max_warm_p95_finalize_ms_delta = None
+
+
+def run_offline_benchmark(args: argparse.Namespace) -> int:
+    _apply_profile_defaults(args)
+    if args.bench_runs is None or args.bench_runs <= 0:
+        raise ValueError("--bench-runs must be at least 1")
+    if args.warmup_samples is None or args.warmup_samples < 0:
+        raise ValueError("--warmup-samples must be >= 0")
+
+    bench_dir: Path = args.bench_dir.resolve()
+    output_path: Path = (
+        args.bench_output.resolve()
+        if args.bench_output is not None
+        else DEFAULT_BENCH_OUTPUT.resolve()
+    )
+
+    transcripts_path = (
+        args.bench_transcripts.resolve()
+        if args.bench_transcripts is not None
+        else (bench_dir / "transcripts.txt")
+    )
+    manifest_path = args.bench_manifest.resolve() if args.bench_manifest is not None else None
+    cases, resolved_manifest_path = _resolve_benchmark_cases(
+        bench_dir=bench_dir,
+        bench_tier=args.bench_tier,
+        bench_manifest=manifest_path,
+        bench_transcripts=transcripts_path,
+    )
+
+    model = load_parakeet_model(args.model, device=args.device)
+    transcriber = ParakeetTranscriber(model)
+    effective_device = str(getattr(model, "_parakeet_effective_device", args.device))
+
+    run_results: list[dict[str, Any]] = []
+    for run_index in range(args.bench_runs):
+        run_results.append(
+            _run_benchmark_once(
+                cases=cases,
+                transcriber=transcriber,
+                warmup_samples=args.warmup_samples,
+                run_index=run_index,
+            )
+        )
+
+    aggregate = _aggregate_run_results(run_results)
+    baseline_metrics = _load_baseline_metrics(args.baseline.resolve()) if args.baseline else None
     failures = evaluate_regression_thresholds(
-        avg_wer=avg_wer,
-        infer_p95_ms=infer_summary["p95"],
-        finalize_p95_ms=finalize_summary["p95"],
+        avg_wer=float(aggregate["avg_wer"]),
+        infer_p95_ms=float(aggregate["infer_ms"]["p95"]),
+        finalize_p95_ms=float(aggregate["finalize_ms"]["p95"]),
         max_avg_wer=args.max_avg_wer,
         max_p95_infer_ms=args.max_p95_infer_ms,
         max_p95_finalize_ms=args.max_p95_finalize_ms,
+        weighted_wer=float(aggregate["weighted_wer"]),
+        command_exact_match_rate=float(aggregate["command_exact_match_rate"]),
+        critical_token_recall=float(aggregate["critical_token_recall"]),
+        warm_finalize_p95_ms=float(aggregate["warm_finalize_ms"]["p95"]),
+        max_weighted_wer=args.max_weighted_wer,
+        min_command_exact_match=args.min_command_exact_match,
+        min_critical_token_recall=args.min_critical_token_recall,
+        max_warm_p95_finalize_ms=args.max_warm_p95_finalize_ms,
+        baseline=baseline_metrics,
+        max_weighted_wer_delta=args.max_weighted_wer_delta,
+        max_command_exact_match_drop=args.max_command_exact_match_drop,
+        max_critical_token_recall_drop=args.max_critical_token_recall_drop,
+        max_warm_p95_finalize_ms_delta=args.max_warm_p95_finalize_ms_delta,
     )
 
+    baseline_comparison = _compute_baseline_comparison(baseline_metrics, aggregate)
+    first_run_samples = run_results[0]["samples"] if run_results else []
     report = {
         "benchmark": "offline",
         "model": args.model,
         "requested_device": args.device,
         "effective_device": effective_device,
         "bench_dir": str(bench_dir),
-        "transcripts_path": str(transcripts_path),
-        "sample_count": len(sample_rows),
-        "aggregate": {
-            "avg_wer": avg_wer,
-            "infer_ms": infer_summary,
-            "finalize_ms": finalize_summary,
-        },
+        "bench_tier": args.bench_tier,
+        "bench_runs": args.bench_runs,
+        "warmup_samples": args.warmup_samples,
+        "manifest_path": str(resolved_manifest_path)
+        if resolved_manifest_path is not None
+        else None,
+        "transcripts_path": None if resolved_manifest_path is not None else str(transcripts_path),
+        "sample_count": len(first_run_samples),
+        "aggregate": aggregate,
         "thresholds": {
             "max_avg_wer": args.max_avg_wer,
             "max_p95_infer_ms": args.max_p95_infer_ms,
             "max_p95_finalize_ms": args.max_p95_finalize_ms,
+            "max_weighted_wer": args.max_weighted_wer,
+            "min_command_exact_match": args.min_command_exact_match,
+            "min_critical_token_recall": args.min_critical_token_recall,
+            "max_warm_p95_finalize_ms": args.max_warm_p95_finalize_ms,
+            "max_weighted_wer_delta": args.max_weighted_wer_delta,
+            "max_command_exact_match_drop": args.max_command_exact_match_drop,
+            "max_critical_token_recall_drop": args.max_critical_token_recall_drop,
+            "max_warm_p95_finalize_ms_delta": args.max_warm_p95_finalize_ms_delta,
+            "baseline_path": str(args.baseline.resolve()) if args.baseline is not None else None,
         },
+        "baseline_comparison": baseline_comparison,
         "regression_gate": {
             "pass": not failures,
             "failures": failures,
         },
-        "samples": sample_rows,
+        "samples": first_run_samples,
+        "runs": run_results,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
-    print(f"Offline benchmark completed for {len(sample_rows)} sample(s)")
-    print(f"Model: {args.model} (requested={args.device}, effective={effective_device})")
-    print(f"Average WER: {avg_wer:.4f}")
+    print(f"Offline benchmark completed for {len(first_run_samples)} sample(s)")
+    print(
+        f"Model: {args.model} (requested={args.device}, effective={effective_device}), "
+        f"runs={args.bench_runs}, aggregation={aggregate['aggregation_strategy']}"
+    )
+    print(f"Average WER: {aggregate['avg_wer']:.4f}")
+    print(f"Weighted WER: {aggregate['weighted_wer']:.4f}")
+    print(f"Command exact-match: {aggregate['command_exact_match_rate']:.4f}")
+    print(f"Critical token recall: {aggregate['critical_token_recall']:.4f}")
     print(
         "Infer ms (avg/p50/p95): "
-        f"{infer_summary['avg']:.2f}/{infer_summary['p50']:.2f}/{infer_summary['p95']:.2f}"
+        f"{aggregate['infer_ms']['avg']:.2f}/{aggregate['infer_ms']['p50']:.2f}/"
+        f"{aggregate['infer_ms']['p95']:.2f}"
     )
     print(
         "Finalize ms (avg/p50/p95): "
-        f"{finalize_summary['avg']:.2f}/{finalize_summary['p50']:.2f}/{finalize_summary['p95']:.2f}"
+        f"{aggregate['finalize_ms']['avg']:.2f}/{aggregate['finalize_ms']['p50']:.2f}/"
+        f"{aggregate['finalize_ms']['p95']:.2f}"
     )
-    for row in sample_rows:
+    print(
+        "Warm finalize ms (avg/p50/p95): "
+        f"{aggregate['warm_finalize_ms']['avg']:.2f}/{aggregate['warm_finalize_ms']['p50']:.2f}/"
+        f"{aggregate['warm_finalize_ms']['p95']:.2f}"
+    )
+    for row in first_run_samples:
         print(
-            f" - {row['sample_id']}: wer={row['wer']:.4f}, "
+            f" - {row['sample_id']}: domain={row['domain']}, wer={row['wer']:.4f}, "
             f"infer_ms={row['infer_ms']:.2f}, finalize_ms={row['finalize_ms']:.2f}"
         )
     print(f"JSON report written to: {output_path}")
+
+    if args.calibrate_baseline:
+        baseline_output = (
+            args.baseline_output.resolve()
+            if args.baseline_output is not None
+            else DEFAULT_BASELINE_OUTPUT
+        )
+        _write_baseline_output(baseline_output, args, aggregate)
+        print(f"Baseline written to: {baseline_output}")
+
     if failures:
         print("Regression gate: FAILED")
         for failure in failures:
@@ -438,14 +1052,27 @@ def parse_args() -> argparse.Namespace:
         "--bench-dir",
         type=Path,
         default=BENCH_AUDIO_DIR,
-        help="Directory containing sample_*.wav benchmark files",
+        help="Directory containing benchmark files",
+    )
+    parser.add_argument(
+        "--bench-manifest",
+        type=Path,
+        default=None,
+        help="Optional JSONL manifest defining benchmark cases",
+    )
+    parser.add_argument(
+        "--bench-tier",
+        choices=sorted(PROFILE_DEFAULTS),
+        default=None,
+        help="Apply tier defaults and (with manifest) select only that tier",
     )
     parser.add_argument(
         "--bench-transcripts",
         type=Path,
         default=None,
         help=(
-            "Override path to benchmark transcripts file (defaults to <bench-dir>/transcripts.txt)"
+            "Override path to benchmark transcripts file (legacy mode; "
+            "defaults to <bench-dir>/transcripts.txt)"
         ),
     )
     parser.add_argument(
@@ -455,6 +1082,38 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Path for benchmark JSON output "
             f"(defaults to {DEFAULT_BENCH_OUTPUT.relative_to(Path(__file__).resolve().parent)})"
+        ),
+    )
+    parser.add_argument(
+        "--bench-runs",
+        type=int,
+        default=None,
+        help="Number of benchmark repeats to run (median aggregate is reported)",
+    )
+    parser.add_argument(
+        "--warmup-samples",
+        type=int,
+        default=None,
+        help="Exclude first N samples per run from warm latency gates",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Path to baseline JSON for relative regression checks",
+    )
+    parser.add_argument(
+        "--calibrate-baseline",
+        action="store_true",
+        help="Write a baseline snapshot from current aggregate metrics",
+    )
+    parser.add_argument(
+        "--baseline-output",
+        type=Path,
+        default=None,
+        help=(
+            "Path to write baseline JSON when --calibrate-baseline is set "
+            f"(defaults to {DEFAULT_BASELINE_OUTPUT.relative_to(Path(__file__).resolve().parent)})"
         ),
     )
     parser.add_argument(
@@ -474,6 +1133,54 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Fail benchmark when finalize p95 (ms) exceeds this threshold",
+    )
+    parser.add_argument(
+        "--max-weighted-wer",
+        type=float,
+        default=None,
+        help="Fail benchmark when weighted WER exceeds this threshold",
+    )
+    parser.add_argument(
+        "--min-command-exact-match",
+        type=float,
+        default=None,
+        help="Fail benchmark when command exact-match ratio falls below this threshold",
+    )
+    parser.add_argument(
+        "--min-critical-token-recall",
+        type=float,
+        default=None,
+        help="Fail benchmark when critical token recall falls below this threshold",
+    )
+    parser.add_argument(
+        "--max-warm-p95-finalize-ms",
+        type=float,
+        default=None,
+        help="Fail benchmark when warm finalize p95 (ms) exceeds this threshold",
+    )
+    parser.add_argument(
+        "--max-weighted-wer-delta",
+        type=float,
+        default=None,
+        help="Relative gate: weighted WER may not exceed baseline + delta",
+    )
+    parser.add_argument(
+        "--max-command-exact-match-drop",
+        type=float,
+        default=None,
+        help="Relative gate: command exact-match may not drop by more than this amount",
+    )
+    parser.add_argument(
+        "--max-critical-token-recall-drop",
+        type=float,
+        default=None,
+        help="Relative gate: critical token recall may not drop by more than this amount",
+    )
+    parser.add_argument(
+        "--max-warm-p95-finalize-ms-delta",
+        type=float,
+        default=None,
+        help="Relative gate: warm finalize p95 may not exceed baseline + delta",
     )
     return parser.parse_args()
 
