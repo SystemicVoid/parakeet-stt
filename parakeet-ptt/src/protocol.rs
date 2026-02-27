@@ -97,3 +97,56 @@ pub fn abort_message(session_id: Uuid, reason: &str) -> ClientMessage {
         timestamp: now_rfc3339(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ServerMessage;
+
+    #[test]
+    fn status_deserializes_when_optional_fields_are_missing() {
+        let raw = r#"{"type":"status","state":"idle","sessions_active":0}"#;
+        let msg: ServerMessage =
+            serde_json::from_str(raw).expect("status payload should deserialize");
+
+        match msg {
+            ServerMessage::Status {
+                state,
+                sessions_active,
+                gpu_mem_mb,
+                device,
+                effective_device,
+                streaming_enabled,
+                stream_helper_active,
+                stream_fallback_reason,
+                chunk_secs,
+                active_session_age_ms,
+                audio_stop_ms,
+                finalize_ms,
+                infer_ms,
+                send_ms,
+                last_audio_ms,
+                last_infer_ms,
+                last_send_ms,
+            } => {
+                assert_eq!(state, "idle");
+                assert_eq!(sessions_active, 0);
+                assert_eq!(gpu_mem_mb, None);
+                assert_eq!(device, None);
+                assert_eq!(effective_device, None);
+                assert_eq!(streaming_enabled, None);
+                assert_eq!(stream_helper_active, None);
+                assert_eq!(stream_fallback_reason, None);
+                assert_eq!(chunk_secs, None);
+                assert_eq!(active_session_age_ms, None);
+                assert_eq!(audio_stop_ms, None);
+                assert_eq!(finalize_ms, None);
+                assert_eq!(infer_ms, None);
+                assert_eq!(send_ms, None);
+                assert_eq!(last_audio_ms, None);
+                assert_eq!(last_infer_ms, None);
+                assert_eq!(last_send_ms, None);
+            }
+            other => panic!("expected status message, got {other:?}"),
+        }
+    }
+}
