@@ -1,3 +1,6 @@
 # Ignore editor/OS scratch files in archive docs.
 *.swp
 .DS_Store
+
+# Keep ad-hoc deep research notes local unless explicitly added.
+*deep-research-report.md
