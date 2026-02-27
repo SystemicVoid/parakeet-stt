@@ -144,13 +144,25 @@ uv run python check_model.py \
   --max-p95-infer-ms 1800 \
   --max-p95-finalize-ms 2200
 ```
-Personal high-signal workflow (command-heavy, local-only assets):
+Personal high-signal workflow (agent-prompt-heavy, local-only assets):
 ```bash
 cd parakeet-stt-daemon
 
-# 1) Mine local command history into reviewable candidates.
+# 1) Mine Codex CLI user prompts into reviewable candidates for this repo.
+#    Default: scans recent 20 threads from this cwd and uses only role=user messages.
 uv run python scripts/build_personal_eval_candidates.py \
   --output bench_audio/personal/candidates.tsv
+
+# Optional: widen history depth.
+# uv run python scripts/build_personal_eval_candidates.py \
+#   --codex-max-threads 80 \
+#   --output bench_audio/personal/candidates.tsv
+
+# Optional: include command-like sources as well.
+# uv run python scripts/build_personal_eval_candidates.py \
+#   --include-codex-exec-commands \
+#   --include-bash-history \
+#   --output bench_audio/personal/candidates.tsv
 
 # 2) Manually review candidates.tsv and set include=yes for approved prompts.
 # 3) Materialize manifest + prompt list.

@@ -91,13 +91,14 @@ scripts/harness-maintenance.sh mark
 ## Personal STT Eval Policy
 
 - Keep eval assets local-first under `parakeet-stt-daemon/bench_audio/personal/` (ignored by git).
-- Build prompts from real command history, then require manual review before recording.
+- Build prompts from real Codex CLI prompt history by default, then require manual review before recording.
 - Daily gate is hybrid when baseline is supplied: absolute floors + relative drift checks.
 
 ```bash
 cd parakeet-stt-daemon
 
-# Build candidate phrases from local history (manual review required).
+# Build candidate phrases from Codex user-message prompt history (manual review required).
+# Default: recent 20 threads, scoped to current cwd.
 uv run python scripts/build_personal_eval_candidates.py \
   --output bench_audio/personal/candidates.tsv
 
