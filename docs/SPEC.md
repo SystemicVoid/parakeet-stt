@@ -43,9 +43,9 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Control flow**
   1. User presses Right Ctrl → `parakeet-ptt` sends `start_session` to daemon.
-  2. Daemon begins session capture and, when streaming engine activation succeeds, performs incremental RNNT decode.
+  2. Daemon begins session capture; streaming engine activation is tracked as runtime truth for diagnostics.
   3. User releases Right Ctrl → `parakeet-ptt` issues `stop_session`.
-  4. Daemon finalizes decoding (streaming finalization if active, otherwise explicit offline fallback), returns final transcription via WebSocket.
+  4. Daemon finalizes with the offline seal path and returns final transcription via WebSocket.
   5. `parakeet-ptt` writes transcript text to the clipboard and executes configured injection behavior (`paste` or `copy-only`), with adaptive shortcut routing available in paste mode.
 
 - **Networking**: localhost WebSocket (JSON frames). No audio leaves the daemon process; control messages only.
@@ -70,7 +70,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Sample rate 16 kHz mono, 16‑bit PCM.
   - Use `sounddevice.InputStream` callback writing into a rolling pre-roll buffer (currently 2.5 s) plus per-session accumulation.
   - Input stream remains open; push-to-talk toggles whether callback frames are attached to the active session.
-  - Streaming defaults: chunk 2.0 s, right context 2.0 s, left context 10 s, batch size 32.
+  - Streaming defaults: chunk 2.4 s, right context 1.6 s, left context 10 s, batch size 32.
   - Offline fallback remains allowed only when explicitly signaled in startup logs and `/status`.
 
 - **Streaming inference**
@@ -78,7 +78,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - On session start: allocate streaming state transactionally; if any downstream setup fails, rollback to idle.
   - Feed chunked frames continuously while the session is active; preserve room for future partials without requiring protocol churn in v1.
   - For `FrameBatchChunkedRNNT` finalization, build `AudioFeatureIterator(..., pad_to_frame_len=False)` to avoid synthetic padded tail frames that can perturb utterance-end decoding.
-  - On session stop: flush remaining frames and finalize using streaming state when active; keep explicit offline finalization as guarded fallback.
+  - On session stop: flush remaining frames and finalize via the offline seal path (final transcript quality anchor).
   - Warm-up pass executed at daemon startup to eliminate first-use latency.
 
 - **API server**

@@ -1043,23 +1043,28 @@ Current head includes these lane commits:
 3. `dc3ba80` — `feat(vad): add opt-in silero tail trimming with rms fallback`
 4. `2fa585a` — `docs(state): record SA9 decision and SA10 token sweep results`
 
-All SA checklist items are now marked `DONE`, with two explicit deferred/follow-up outcomes:
+All SA checklist items are now marked `DONE`.
 
-- SA8 follow-up: conformer partial stream path is wired and telemetry-complete but currently self-disables at runtime on first step (`partial_stream_failed:TypeError`); default finalize path remains safe.
-- SA9 follow-up: `2.7.x` upgrade is deferred until stable upstream `2.7.x` release is available and validated against transducer CUDA-graph decode behavior.
+### Retired Experiments (2026-02-27 cleanup)
+
+These experimental lanes were retired from active runtime surfaces because they did not provide
+reliable operator value:
+
+- `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS` and related `partial_stream_*` status fields.
+- helper-only finalize mode (`PARAKEET_STREAM_THEN_SEAL=0`) and helper-only tail/drain tuning knobs:
+  - `PARAKEET_STREAMING_TAIL_PAD_SECS`
+  - `PARAKEET_STREAMING_DEBUG`
+
+Current runtime contract:
+
+- Streaming sessions remain supported for capture/session flow.
+- Final committed transcript is always sealed via offline `transcribe_samples()` for quality safety.
+- VAD remains opt-in (`PARAKEET_VAD_ENABLED`) with default-off behavior unchanged.
+- SA9 follow-up is unchanged: `2.7.x` upgrade remains deferred until stable upstream release evidence.
 
 ### Remaining Work Queue (Practical)
 
-1. **SA8 Phase 2 hardening**
-   - Make `conformer_stream_step()` partial path produce stable partials (no first-step self-disable).
-   - Keep behind `PARAKEET_EXPERIMENTAL_CONFORMER_PARTIALS` until proven.
-   - Add targeted runtime test/probe evidence in this doc before changing status semantics.
-
-2. **SA10 deeper formula research (optional)**
-   - Only if pursuing helper-only quality: investigate non-naive TDT-aware token budgeting (beyond scalar multipliers).
-   - Keep stream-then-seal default untouched.
-
-3. **SA9 revisit trigger**
+1. **SA9 revisit trigger**
    - Re-open only when upstream publishes stable `2.7.x` with relevant ASR/transducer fix notes.
    - Re-run the same offline gate envelope + streaming helper smoke matrix used in SA3.
 

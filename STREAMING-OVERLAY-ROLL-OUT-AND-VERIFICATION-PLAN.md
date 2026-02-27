@@ -54,16 +54,16 @@ Implement a modern, minimal Rust overlay that displays live session feedback (an
 
 ## Phase 2: Daemon Emission Path (Stream + Seal Preserved)
 ### Implementation Tasks
-- In session processing loop, emit `interim_text` only when partial stream is healthy.
-- If partial stream unavailable/fails preflight, emit `interim_state` transitions instead (e.g. `listening`, `processing`, `partial_unavailable`).
+- In session processing loop, emit `interim_text` only when a validated incremental text source is available.
+- Otherwise emit `interim_state` transitions (e.g. `listening`, `processing`) without draft text.
 - Emit `session_ended` for both normal completion and abort/error paths.
 - Keep existing finalize behavior and `final_result` generation untouched.
 - Add lightweight event counters in structured logs for interim emissions and drop reasons.
 
 ### Robust Verification Loop
 1. Introduce emission behind feature gate/env (default off initially).
-2. Validate happy path with synthetic audio chunks and partials enabled.
-3. Force partial preflight failure and verify graceful status-only fallback.
+2. Validate happy path with synthetic audio chunks and interim-state emissions.
+3. Verify graceful state-only fallback when no incremental text source is active.
 4. Verify stop/abort races do not emit cross-session events (session_id guard).
 5. Confirm only one final result emitted per session.
 

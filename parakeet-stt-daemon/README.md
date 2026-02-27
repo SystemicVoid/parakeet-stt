@@ -2,7 +2,7 @@
 
 Canonical usage and commands live in the top-level `README.md`. Use this file only for daemon-specific notes.
 
-- Run the server (matches helper defaults): `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
+- Run the server (matches helper defaults): `PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
 - Install deps: `uv sync --dev` (add `--extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match` for GPU inference)
 - Offline benchmark harness: `uv run python check_model.py --bench-offline --bench-output bench_audio/latest-benchmark.json --max-avg-wer 0.45 --max-p95-infer-ms 1800 --max-p95-finalize-ms 2200`
 - Config overrides use `PARAKEET_` env vars (e.g., `PARAKEET_SHARED_SECRET`, `PARAKEET_MIC_DEVICE`); status endpoint is enabled by default, disable with `--no-status`.
