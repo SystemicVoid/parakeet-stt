@@ -32,7 +32,7 @@ repos:
         entry: ty check --project parakeet-stt-daemon --error-on-warning
         language: system
         pass_filenames: false
-        files: ^parakeet-stt-daemon/(pyproject\.toml|.*\.pyi?)$
+        always_run: true
         stages: [pre-commit]
 
       - id: rust-fmt
