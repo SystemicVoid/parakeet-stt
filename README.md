@@ -144,12 +144,52 @@ uv run python check_model.py \
   --max-p95-infer-ms 1800 \
   --max-p95-finalize-ms 2200
 ```
-The command prints a per-sample + aggregate summary to stdout and writes JSON with:
+Personal high-signal workflow (command-heavy, local-only assets):
+```bash
+cd parakeet-stt-daemon
+
+# 1) Mine local command history into reviewable candidates.
+uv run python scripts/build_personal_eval_candidates.py \
+  --output bench_audio/personal/candidates.tsv
+
+# 2) Manually review candidates.tsv and set include=yes for approved prompts.
+# 3) Materialize manifest + prompt list.
+uv run python scripts/materialize_personal_manifest.py \
+  --input bench_audio/personal/candidates.tsv \
+  --output bench_audio/personal/manifest.jsonl \
+  --prompts-output bench_audio/personal/prompts.tsv \
+  --tier daily
+
+# 4) Record approved prompts (interactive).
+bash scripts/record_personal_clips.sh \
+  --manifest bench_audio/personal/manifest.jsonl \
+  --output-dir bench_audio/personal/audio
+
+# 5) Calibrate baseline (recommended first run after corpus refresh).
+uv run python check_model.py \
+  --bench-offline \
+  --bench-manifest bench_audio/personal/manifest.jsonl \
+  --bench-tier daily \
+  --calibrate-baseline \
+  --baseline-output bench_audio/personal/baseline.json \
+  --bench-output bench_audio/personal/latest-calibration.json
+
+# 6) Daily hybrid gate (absolute + baseline-relative thresholds).
+uv run python check_model.py \
+  --bench-offline \
+  --bench-manifest bench_audio/personal/manifest.jsonl \
+  --bench-tier daily \
+  --baseline bench_audio/personal/baseline.json \
+  --bench-output bench_audio/personal/latest-daily.json
+```
+The benchmark command prints a per-sample + aggregate summary to stdout and writes JSON with:
 - `benchmark`, `model`, `requested_device`, `effective_device`
-- `bench_dir`, `transcripts_path`, `sample_count`
-- `aggregate.avg_wer`, `aggregate.infer_ms.avg|p50|p95`, `aggregate.finalize_ms.avg|p50|p95`
+- `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_runs`, `sample_count`
+- `aggregate.avg_wer`, `aggregate.weighted_wer`, `aggregate.command_exact_match_rate`, `aggregate.critical_token_recall`
+- `aggregate.infer_ms.*`, `aggregate.finalize_ms.*`, `aggregate.warm_finalize_ms.*`, `aggregate.cold_start_ms`
 - `thresholds.*`, `regression_gate.pass`, `regression_gate.failures`
-- `samples[]` entries including `sample_id`, `audio_path`, `reference`, `hypothesis`, `normalized_reference`, `normalized_hypothesis`, `wer`, `infer_ms`, `finalize_ms`
+- `samples[]` entries including `sample_id`, `tier`, `domain`, `critical_tokens`, `reference`, `hypothesis`, `wer`, `infer_ms`, `finalize_ms`
+- `runs[]` with per-run aggregates and per-sample rows when `--bench-runs > 1`
 When any configured threshold is exceeded, the harness exits non-zero.
 
 Commit and push gates (repo root):
