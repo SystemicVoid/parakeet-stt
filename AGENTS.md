@@ -9,6 +9,12 @@ The role of this file is to describe common mistakes and confusion points that a
 - Maintain lazy imports in `model.py` to avoid GPU dependencies for protocol work. Use structured logging (`loguru`) and environment variables prefixed `PARAKEET_` for overrides.
 - Naming: binaries remain `parakeet-stt-daemon` and `parakeet-ptt`; config flags match protocol and injector surfaces (`shared_secret`, `endpoint`, `hotkey`, `paste_*`).
 
+## Harness Engineering
+- Canonical playbook: `docs/engineering/harness-engineering-playbook.md`.
+- Keep `AGENTS.md` short and map-style; operational depth belongs in canonical docs and scripts.
+- Python static quality is consolidated on Ruff + ty. Prefer adding Ruff rules before adding overlapping one-off tools.
+- Clarification: Ruff `BLE001` is blind exception handling; unreachable duplicate handler checks are `B014` / `B025`.
+
 ## STT Helper Flag Policy
 - Single source of truth: `scripts/stt-helper.sh` `start_option_rows`.
 - Do not hardcode `stt start` flag lists in parser/help/client args/diagnostics; derive behavior from metadata helpers.

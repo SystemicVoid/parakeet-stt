@@ -5,6 +5,14 @@ default_install_hook_types:
 repos:
   - repo: local
     hooks:
+      - id: harness-maintenance-check
+        name: harness maintenance check
+        entry: scripts/harness-maintenance.sh check --threshold 10
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
       - id: python-ruff-format
         name: python ruff format
         entry: uv run --project parakeet-stt-daemon ruff format --config parakeet-stt-daemon/pyproject.toml
@@ -21,7 +29,7 @@ repos:
 
       - id: python-ty-check
         name: python ty check
-        entry: ty check --project parakeet-stt-daemon
+        entry: ty check --project parakeet-stt-daemon --error-on-warning
         language: system
         pass_filenames: false
         files: ^parakeet-stt-daemon/(pyproject\.toml|.*\.pyi?)$

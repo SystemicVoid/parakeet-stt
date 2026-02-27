@@ -128,7 +128,8 @@ Daemon checks:
 cd parakeet-stt-daemon
 uv run ruff check .
 uv run ruff format --check .
-ty check .
+ty check --project . --error-on-warning
+uv run deptry .
 uv run parakeet-stt-daemon --check
 ```
 
@@ -158,9 +159,16 @@ prek run --all-files
 prek run --stage pre-push --all-files
 ```
 Hook stages are split for speed:
-- `pre-commit`: `ruff format`, `ruff check`, `ty check`, `cargo fmt`
+- `pre-commit`: maintenance cadence reminder, `ruff format`, `ruff check`, `ty check`, `cargo fmt`
 - `pre-push`: `pytest`, `cargo clippy`, `cargo test`
 - Hooks are language-scoped, so Python checks run only for `parakeet-stt-daemon/` changes and Rust checks run only for `parakeet-ptt/` changes.
+
+Maintenance audits (warned every 10 commits, non-blocking):
+```bash
+scripts/harness-maintenance.sh check --threshold 10
+scripts/harness-maintenance.sh run
+```
+`run` executes `deptry` and `cargo +nightly udeps`; install `cargo-udeps` first with `cargo install cargo-udeps`.
 
 Manual injector validation:
 ```bash
@@ -169,6 +177,7 @@ stt diag-injector
 
 ## Docs Map
 
+- Harness engineering playbook: `docs/engineering/harness-engineering-playbook.md`
 - Protocol contract: `docs/SPEC.md`
 - Troubleshooting (canonical operator source): `docs/stt-troubleshooting.md`
 - Historical docs archive index (non-canonical): `docs/archive/README.md`
