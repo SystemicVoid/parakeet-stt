@@ -20,6 +20,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Phase 1 (PTT side) added protocol variants and unknown-`type` tolerance in websocket decode paths.
 - 2026-02-28: Phase 1 (daemon side) added message schemas for `interim_state`, `interim_text`, and `session_ended` with strict validation.
 - 2026-02-28: Added daemon message-model tests for required fields, enum validation, and non-negative `seq`.
+- 2026-02-28: Added Rust protocol round-trip test coverage for all currently known server message variants.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -127,7 +128,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] non-negative `seq` validation (per-session monotonic enforcement remains a Phase 2+ runtime invariant).
 - Rust protocol tests:
   - [x] decode new variants.
-  - [ ] round-trip all known variants.
+  - [x] round-trip all known variants.
   - [x] unknown `type` handling path remains non-fatal.
 
 ### Gate To Proceed

@@ -248,4 +248,70 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("missing field"));
     }
+
+    #[test]
+    fn server_message_round_trips_for_all_known_variants() {
+        let session_id = Uuid::new_v4();
+        let messages = vec![
+            ServerMessage::SessionStarted {
+                session_id,
+                ts: "2026-02-28T00:00:00Z".to_string(),
+                mic_device: Some("default".to_string()),
+                lang: Some("en".to_string()),
+            },
+            ServerMessage::FinalResult {
+                session_id,
+                text: "hello".to_string(),
+                latency_ms: 42,
+                audio_ms: 1000,
+                lang: Some("en".to_string()),
+                confidence: Some(0.9),
+            },
+            ServerMessage::Error {
+                session_id: Some(session_id),
+                code: "SESSION_ABORTED".to_string(),
+                message: "aborted".to_string(),
+            },
+            ServerMessage::Status {
+                state: "idle".to_string(),
+                sessions_active: 0,
+                gpu_mem_mb: None,
+                device: Some("cpu".to_string()),
+                effective_device: Some("cpu".to_string()),
+                streaming_enabled: Some(false),
+                stream_helper_active: Some(false),
+                stream_fallback_reason: None,
+                chunk_secs: None,
+                active_session_age_ms: None,
+                audio_stop_ms: None,
+                finalize_ms: None,
+                infer_ms: None,
+                send_ms: None,
+                last_audio_ms: None,
+                last_infer_ms: None,
+                last_send_ms: None,
+            },
+            ServerMessage::InterimState {
+                session_id,
+                seq: 1,
+                state: "listening".to_string(),
+            },
+            ServerMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "hello".to_string(),
+            },
+            ServerMessage::SessionEnded {
+                session_id,
+                reason: Some("final".to_string()),
+            },
+        ];
+
+        for message in messages {
+            let raw = serde_json::to_string(&message).expect("serialize known server message");
+            let round_tripped: ServerMessage =
+                serde_json::from_str(&raw).expect("deserialize known server message");
+            assert_eq!(round_tripped, message);
+        }
+    }
 }
