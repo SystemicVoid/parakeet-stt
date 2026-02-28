@@ -18,6 +18,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added deterministic classification tests for `layer_shell`, `fallback_window`, and `disabled` modes.
 - 2026-02-28: Confirmed no injection semantic change (`final_result` remains sole enqueue trigger).
 - 2026-02-28: Phase 1 (PTT side) added protocol variants and unknown-`type` tolerance in websocket decode paths.
+- 2026-02-28: Phase 1 (daemon side) added message schemas for `interim_state`, `interim_text`, and `session_ended` with strict validation.
+- 2026-02-28: Added daemon message-model tests for required fields, enum validation, and non-negative `seq`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -107,7 +109,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - `error`
   - `status`
 - Update both sides:
-  - [ ] `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`
+  - [x] `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`
   - [x] `parakeet-ptt/src/protocol.rs`
 - [x] Add explicit unknown-message tolerance path in `parakeet-ptt` websocket decode flow.
 
@@ -120,13 +122,13 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ### Essential Tests
 - Daemon message model tests:
-  - `interim_text` required fields and validation.
-  - `interim_state` enum/state validation.
-  - `seq` monotonic constraints and non-negative validation.
+  - [x] `interim_text` required fields and validation.
+  - [x] `interim_state` enum/state validation.
+  - [x] non-negative `seq` validation (per-session monotonic enforcement remains a Phase 2+ runtime invariant).
 - Rust protocol tests:
-  - decode each new variant.
-  - round-trip all known variants.
-  - unknown `type` handling path remains non-fatal.
+  - [x] decode new variants.
+  - [ ] round-trip all known variants.
+  - [x] unknown `type` handling path remains non-fatal.
 
 ### Gate To Proceed
 - Mixed-version protocol matrix passes with no functional regressions.

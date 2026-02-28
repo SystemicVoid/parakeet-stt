@@ -28,6 +28,16 @@ class ServerMessageType(str, Enum):
     FINAL_RESULT = "final_result"
     ERROR = "error"
     STATUS = "status"
+    INTERIM_STATE = "interim_state"
+    INTERIM_TEXT = "interim_text"
+    SESSION_ENDED = "session_ended"
+
+
+class InterimStateValue(str, Enum):
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    INTERIM = "interim"
+    FINALIZING = "finalizing"
 
 
 class StartSession(BaseModel):
@@ -124,7 +134,41 @@ class StatusMessage(BaseModel):
     last_send_ms: int | None = None
 
 
-ServerMessage = SessionStarted | FinalResult | ErrorMessage | StatusMessage
+class InterimStateMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.INTERIM_STATE] = Field(default=ServerMessageType.INTERIM_STATE)
+    session_id: UUID
+    seq: int = Field(ge=0)
+    state: InterimStateValue
+
+
+class InterimTextMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.INTERIM_TEXT] = Field(default=ServerMessageType.INTERIM_TEXT)
+    session_id: UUID
+    seq: int = Field(ge=0)
+    text: str
+
+
+class SessionEndedMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.SESSION_ENDED] = Field(default=ServerMessageType.SESSION_ENDED)
+    session_id: UUID
+    reason: Literal["final", "abort", "error"] | None = None
+
+
+ServerMessage = (
+    SessionStarted
+    | FinalResult
+    | ErrorMessage
+    | StatusMessage
+    | InterimStateMessage
+    | InterimTextMessage
+    | SessionEndedMessage
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +197,7 @@ __all__ = [
     "ClientMessageType",
     "ServerMessage",
     "ServerMessageType",
+    "InterimStateValue",
     "StartSession",
     "StopSession",
     "AbortSession",
@@ -160,6 +205,9 @@ __all__ = [
     "FinalResult",
     "ErrorMessage",
     "StatusMessage",
+    "InterimStateMessage",
+    "InterimTextMessage",
+    "SessionEndedMessage",
     "ParsedMessage",
     "parse_client_message",
 ]
