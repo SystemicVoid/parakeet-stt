@@ -232,6 +232,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
         }
     }
 
+    #[cfg(test)]
     fn metrics(&self) -> &Arc<OverlayRoutingMetrics> {
         &self.metrics
     }
