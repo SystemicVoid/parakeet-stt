@@ -302,7 +302,7 @@ PY
 
     _client_build_in_progress() {
         [ -f "$LOG_CLIENT" ] || return 1
-        grep -Fq "[helper] running cargo run --release" "$LOG_CLIENT" || return 1
+        grep -Fq "[helper] running cargo run --release --bin parakeet-ptt" "$LOG_CLIENT" || return 1
         grep -Eq 'Compiling |Finished `release` profile' "$LOG_CLIENT" || return 1
         grep -Fq 'Running `target/release/parakeet-ptt' "$LOG_CLIENT" && return 1
         return 0
@@ -478,7 +478,7 @@ EOF
                 if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    echo "[helper] running cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
                 fi
 
                 eval "set -- $PTT_ARGS_SHELL"
@@ -487,7 +487,7 @@ EOF
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 else
-                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release --bin parakeet-ptt -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 fi
 CLIENTCMD
     }
@@ -664,7 +664,7 @@ CLIENTCMD
             local runner_mode
             runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
 
             local client_cmd
@@ -830,7 +830,7 @@ CLIENTCMD
             local runner_mode
             runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
 
             local client_cmd='
@@ -839,7 +839,7 @@ CLIENTCMD
                 if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    echo "[helper] running cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
                 fi
 
                 eval "set -- $PTT_ARGS_SHELL"
@@ -848,7 +848,7 @@ CLIENTCMD
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 else
-                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release --bin parakeet-ptt -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 fi
             '
 
@@ -883,7 +883,7 @@ CLIENTCMD
                 if [ "$runner_mode" = "release" ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 elif [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                    echo "   - release binary missing expected start flags; using cargo run --release"
+                    echo "   - release binary missing expected start flags; using cargo run --release --bin parakeet-ptt"
                 fi
 
                 echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
@@ -915,7 +915,7 @@ CLIENTCMD
                             "$runner_bin" --test-injection "${ptt_args[@]}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            RUSTFLAGS="$ptt_rustflags" cargo run --release -- --test-injection "${ptt_args[@]}"
+                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- --test-injection "${ptt_args[@]}"
                     fi
                 }
 
