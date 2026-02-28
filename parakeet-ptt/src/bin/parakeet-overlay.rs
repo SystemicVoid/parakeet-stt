@@ -231,10 +231,8 @@ impl TextRenderer {
                 blend_bitmap(
                     frame,
                     dimensions,
-                    glyph_x,
-                    glyph_y,
-                    metrics.width,
-                    metrics.height,
+                    (glyph_x, glyph_y),
+                    (metrics.width, metrics.height),
                     &bitmap,
                     TEXT_COLOR,
                 );
@@ -1131,13 +1129,13 @@ fn fill_frame(frame: &mut [u8], pixel: [u8; 4]) {
 fn blend_bitmap(
     frame: &mut [u8],
     dimensions: SurfaceDimensions,
-    origin_x: i32,
-    origin_y: i32,
-    width: usize,
-    height: usize,
+    origin: (i32, i32),
+    size: (usize, usize),
     alpha_bitmap: &[u8],
     color: [u8; 4],
 ) {
+    let (origin_x, origin_y) = origin;
+    let (width, height) = size;
     let frame_width = dimensions.width as i32;
     let frame_height = dimensions.height as i32;
     if origin_x >= frame_width || origin_y >= frame_height {
