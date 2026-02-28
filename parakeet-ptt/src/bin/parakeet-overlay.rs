@@ -796,9 +796,10 @@ impl WaylandOverlayBackend {
     }
 
     fn is_fading(&self) -> bool {
-        self.fade
-            .as_ref()
-            .is_some_and(|f| !f.is_complete(self.now_ms()))
+        // Keep ticking while fade state exists so render() can emit the final
+        // terminal frame (alpha 0 for fade-out / alpha 1 for fade-in) and then
+        // clear self.fade.
+        self.fade.is_some()
     }
 }
 
