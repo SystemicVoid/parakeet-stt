@@ -7,6 +7,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _CHECK_MODEL_PATH = Path(__file__).resolve().parents[1] / "check_model.py"
@@ -30,6 +31,7 @@ parse_benchmark_transcripts = _CHECK_MODEL.parse_benchmark_transcripts
 summarize_timings_ms = _CHECK_MODEL.summarize_timings_ms
 resolve_benchmark_cases = _CHECK_MODEL._resolve_benchmark_cases
 apply_profile_defaults = _CHECK_MODEL._apply_profile_defaults
+transcribe_stream_seal = _CHECK_MODEL._transcribe_stream_seal
 
 
 def test_parse_benchmark_transcripts_extracts_numbered_entries(tmp_path: Path) -> None:
@@ -328,3 +330,64 @@ def test_apply_profile_defaults_disables_relative_gates_without_baseline() -> No
     assert args.max_punctuation_f1_drop is None
     assert args.max_terminal_punctuation_accuracy_drop is None
     assert args.max_warm_p95_finalize_ms_delta is None
+
+
+class _DummyStreamSession:
+    def __init__(self, parent: _DummyStreamer) -> None:
+        self._parent = parent
+        self._chunks: list[list[float]] = []
+
+    def feed(self, chunk: list[float]) -> None:
+        self._chunks.append(list(chunk))
+
+    def finalize(self) -> str:
+        total_samples = sum(len(chunk) for chunk in self._chunks)
+        self._parent.finalized_sample_counts.append(total_samples)
+        if self._parent.finalize_outputs:
+            return self._parent.finalize_outputs.pop(0)
+        return "ok"
+
+
+class _DummyStreamer:
+    def __init__(self, *, chunk_secs: float, finalize_outputs: list[str] | None = None) -> None:
+        self.chunk_secs = chunk_secs
+        self.finalize_outputs = list(finalize_outputs or [])
+        self.finalized_sample_counts: list[int] = []
+
+    def start_session(self, sample_rate: int) -> _DummyStreamSession:
+        del sample_rate
+        return _DummyStreamSession(self)
+
+
+def test_transcribe_stream_seal_caps_tail_trimming() -> None:
+    streamer = _DummyStreamer(chunk_secs=1.0)
+    samples = np.zeros((160,), dtype=np.float32)  # sample_rate=100 => ready=100, tail=60
+
+    hypothesis, _ = transcribe_stream_seal(
+        streamer,
+        samples=samples,
+        sample_rate=100,
+        silence_floor_db=-40.0,
+        max_tail_trim_secs=0.2,
+    )
+
+    # Tail trim is capped to 0.2s (20 samples), so at least 40 tail samples are kept.
+    assert hypothesis == "ok"
+    assert streamer.finalized_sample_counts == [140]
+
+
+def test_transcribe_stream_seal_retries_with_full_tail_when_empty() -> None:
+    streamer = _DummyStreamer(chunk_secs=1.0, finalize_outputs=["", "ok"])
+    samples = np.zeros((160,), dtype=np.float32)  # ready=100, tail=60
+
+    hypothesis, _ = transcribe_stream_seal(
+        streamer,
+        samples=samples,
+        sample_rate=100,
+        silence_floor_db=-40.0,
+        max_tail_trim_secs=0.2,
+    )
+
+    # First finalize uses capped tail (140 samples), retry uses full tail (160 samples).
+    assert hypothesis == "ok"
+    assert streamer.finalized_sample_counts == [140, 160]

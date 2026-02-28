@@ -5,7 +5,7 @@ personal_dir := "bench_audio/personal"
 manifest_path := personal_dir + "/manifest.jsonl"
 offline_baseline := personal_dir + "/baseline.json"
 stream_baseline := personal_dir + "/baseline-stream-seal.json"
-stream_runtime_flags := "--bench-runtime stream-seal --stream-chunk-secs 2.4 --stream-right-context-secs 1.6 --stream-left-context-secs 10.0 --stream-batch-size 32"
+stream_runtime_flags := "--bench-runtime stream-seal --stream-chunk-secs 2.4 --stream-right-context-secs 1.6 --stream-left-context-secs 10.0 --stream-batch-size 32 --stream-max-tail-trim-secs 0.35"
 unified_flags := "--bench-offline --bench-manifest bench_audio/personal --bench-append-legacy --bench-tier all"
 
 # Show available commands.

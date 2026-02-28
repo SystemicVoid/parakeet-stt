@@ -36,6 +36,7 @@ DEFAULT_STREAM_RIGHT_CONTEXT_SECS = 1.6
 DEFAULT_STREAM_LEFT_CONTEXT_SECS = 10.0
 DEFAULT_STREAM_BATCH_SIZE = 32
 DEFAULT_STREAM_SILENCE_FLOOR_DB = -40.0
+DEFAULT_STREAM_MAX_TAIL_TRIM_SECS = 0.35
 
 PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "all": {
@@ -742,23 +743,37 @@ def _transcribe_stream_seal(
     *,
     sample_rate: int,
     silence_floor_db: float,
+    max_tail_trim_secs: float,
 ) -> tuple[str, float]:
-    session = streamer.start_session(sample_rate)
     ready_chunks, tail = _split_stream_ready_and_tail(
         samples, sample_rate=sample_rate, chunk_secs=streamer.chunk_secs
     )
-    for chunk in ready_chunks:
-        session.feed(chunk)
+    trimmed_tail = tail
     if tail.size:
-        trimmed_tail = _trim_tail_with_rms(
+        candidate_tail = _trim_tail_with_rms(
             tail,
             sample_rate=sample_rate,
             silence_floor_db=silence_floor_db,
         )
-        if trimmed_tail.size:
-            session.feed(trimmed_tail)
+        max_trim_samples = max(0, int(sample_rate * max_tail_trim_secs))
+        minimum_keep = max(0, tail.size - max_trim_samples)
+        if candidate_tail.size < minimum_keep:
+            candidate_tail = tail[:minimum_keep]
+        trimmed_tail = candidate_tail
+
+    def _finalize_with_tail(active_tail: np.ndarray) -> str:
+        session = streamer.start_session(sample_rate)
+        for chunk in ready_chunks:
+            session.feed(chunk)
+        if active_tail.size:
+            session.feed(active_tail)
+        return session.finalize()
+
     infer_start = time.perf_counter()
-    hypothesis = session.finalize()
+    hypothesis = _finalize_with_tail(trimmed_tail)
+    # Avoid catastrophic empty outputs when tail trimming removed endpoint cues.
+    if not hypothesis.strip() and tail.size and trimmed_tail.size < tail.size:
+        hypothesis = _finalize_with_tail(tail)
     infer_ms = (time.perf_counter() - infer_start) * 1000.0
     return hypothesis, infer_ms
 
@@ -814,6 +829,7 @@ def _run_benchmark_once(
     streaming_transcriber: ParakeetStreamingTranscriber | None,
     bench_runtime: str,
     stream_silence_floor_db: float,
+    stream_max_tail_trim_secs: float,
     warmup_samples: int,
     run_index: int,
 ) -> dict[str, Any]:
@@ -832,6 +848,7 @@ def _run_benchmark_once(
                 samples,
                 sample_rate=sample_rate,
                 silence_floor_db=stream_silence_floor_db,
+                max_tail_trim_secs=stream_max_tail_trim_secs,
             )
         else:
             infer_start = time.perf_counter()
@@ -1164,6 +1181,8 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             raise ValueError("--stream-left-context-secs must be >= 0")
         if args.stream_batch_size <= 0:
             raise ValueError("--stream-batch-size must be > 0")
+        if args.stream_max_tail_trim_secs < 0:
+            raise ValueError("--stream-max-tail-trim-secs must be >= 0")
 
     bench_dir: Path = args.bench_dir.resolve()
     output_path: Path = (
@@ -1208,6 +1227,7 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
                 streaming_transcriber=streaming_transcriber,
                 bench_runtime=args.bench_runtime,
                 stream_silence_floor_db=args.stream_silence_floor_db,
+                stream_max_tail_trim_secs=args.stream_max_tail_trim_secs,
                 warmup_samples=args.warmup_samples,
                 run_index=run_index,
             )
@@ -1253,6 +1273,7 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             "left_context_secs": args.stream_left_context_secs,
             "batch_size": args.stream_batch_size,
             "silence_floor_db": args.stream_silence_floor_db,
+            "max_tail_trim_secs": args.stream_max_tail_trim_secs,
             "helper_active": bool(
                 streaming_transcriber is not None and streaming_transcriber.helper_active
             ),
@@ -1334,6 +1355,7 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             f"right_context={runtime_config['right_context_secs']}, "
             f"left_context={runtime_config['left_context_secs']}, "
             f"batch={runtime_config['batch_size']}, "
+            f"max_tail_trim={runtime_config['max_tail_trim_secs']}, "
             f"helper_active={runtime_config['helper_active']}, "
             f"helper_class={runtime_config['helper_class']}, "
             f"fallback_reason={runtime_config['fallback_reason']}"
@@ -1588,6 +1610,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_STREAM_SILENCE_FLOOR_DB,
         help="Tail-trim silence floor (dB) for stream-seal benchmarking",
+    )
+    parser.add_argument(
+        "--stream-max-tail-trim-secs",
+        type=float,
+        default=DEFAULT_STREAM_MAX_TAIL_TRIM_SECS,
+        help=(
+            "Maximum trailing-tail trim (seconds) during stream-seal simulation; "
+            "caps aggressive tail removal."
+        ),
     )
     parser.add_argument(
         "--baseline",
