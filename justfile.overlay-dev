@@ -1,0 +1,102 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+repo_root := justfile_directory()
+expected_branch := "feature/overlay-phase0-capability-gate"
+expected_root := "/home/hugo/Documents/Engineering/parakeet-overlay-dev"
+status_url := "http://127.0.0.1:8765/status"
+
+# Branch-local overlay E2E helper recipes.
+# Usage:
+#   just --justfile justfile.overlay-dev list
+#   just --justfile justfile.overlay-dev start
+#   just --justfile justfile.overlay-dev status
+#   just --justfile justfile.overlay-dev overlay-kill
+#   just --justfile justfile.overlay-dev logs
+#   just --justfile justfile.overlay-dev stop
+
+[private]
+_guard:
+    @cd "{{repo_root}}"
+    @current_root="$(pwd -P)"; \
+    current_branch="$(git branch --show-current)"; \
+    if [[ "$current_root" != "{{expected_root}}" ]]; then \
+      echo "Refusing to run: expected worktree {{expected_root}}, got $current_root" >&2; \
+      exit 1; \
+    fi; \
+    if [[ "$current_branch" != "{{expected_branch}}" ]]; then \
+      echo "Refusing to run: expected branch {{expected_branch}}, got $current_branch" >&2; \
+      exit 1; \
+    fi
+
+# Show available branch-local recipes.
+list: _guard
+    @just --justfile "{{repo_root}}/justfile.overlay-dev" --list
+
+# Print branch/revision/worktree guard context.
+doctor: _guard
+    @cd "{{repo_root}}"
+    @echo "repo_root=$(pwd -P)"
+    @echo "branch=$(git branch --show-current)"
+    @echo "rev=$(git rev-parse --short HEAD)"
+
+# Start helper in streaming mode with overlay events enabled.
+# This attaches tmux; detach with Ctrl+b then d.
+start: _guard
+    @cd "{{repo_root}}"
+    export PARAKEET_ROOT="{{repo_root}}"
+    export PARAKEET_OVERLAY_EVENTS_ENABLED=true
+    source scripts/stt-helper.sh
+    stt stop || true
+    stt start streaming --completion-sound false
+
+# Stop helper stack.
+stop: _guard
+    @cd "{{repo_root}}"
+    export PARAKEET_ROOT="{{repo_root}}"
+    source scripts/stt-helper.sh
+    stt stop
+
+# Show helper status + daemon overlay flags/counters + overlay process list.
+status: _guard
+    @cd "{{repo_root}}"
+    export PARAKEET_ROOT="{{repo_root}}"
+    source scripts/stt-helper.sh
+    stt status
+    echo
+    echo ">>> daemon status overlay fields"
+    curl -fsS "{{status_url}}" | python3 -m json.tool | rg "streaming_enabled|overlay_events_enabled|overlay_events_emitted|overlay_events_dropped" || true
+    echo
+    echo ">>> overlay processes"
+    pgrep -af '[p]arakeet-overlay' || echo "(none)"
+
+# Tail both helper logs.
+logs: _guard
+    @cd "{{repo_root}}"
+    export PARAKEET_ROOT="{{repo_root}}"
+    source scripts/stt-helper.sh
+    stt logs both
+
+# Filtered overlay-focused log view.
+logs-overlay: _guard
+    @cd "{{repo_root}}"
+    tail -f /tmp/parakeet-ptt.log /tmp/parakeet-daemon.log | rg -i "overlay|interim|session_ended|final_result|spawn|replay|disconnect"
+
+# Simulate overlay crash mid-session; next overlay event should respawn it.
+overlay-kill: _guard
+    @cd "{{repo_root}}"
+    @echo ">>> before"
+    @pgrep -af '[p]arakeet-overlay' || true
+    @pkill -f '[p]arakeet-overlay' || true
+    @sleep 0.4
+    @echo ">>> after"
+    @pgrep -af '[p]arakeet-overlay' || echo "(none; trigger PTT event to respawn)"
+
+# Compact runbook for manual E2E pass.
+runbook: _guard
+    @printf '%s\n' \
+      "1) just --justfile justfile.overlay-dev start" \
+      "2) Detach tmux, then: just --justfile justfile.overlay-dev status" \
+      "3) Do manual hotkey utterance tests" \
+      "4) During utterance: just --justfile justfile.overlay-dev overlay-kill" \
+      "5) Trigger next utterance and confirm respawn + final injection" \
+      "6) just --justfile justfile.overlay-dev stop"
