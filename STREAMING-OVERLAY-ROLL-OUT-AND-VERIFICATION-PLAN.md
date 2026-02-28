@@ -10,6 +10,7 @@ _Last updated: 2026-02-28_
 - [x] Phase 3: PTT routing + hard injection boundary proofs.
 - [ ] Phase 4: Overlay process MVP (separate process).
 - [x] Phase 4 Slice A: separate overlay binary + deterministic state machine + IPC wiring + failure-isolation tests.
+- [x] Phase 4 Slice B: overlay respawn manager + reconnect state replay guarantees.
 - [ ] Phase 5: Config/flags/rollout controls.
 - [ ] Phase 6: E2E reliability and promotion gates.
 
@@ -37,6 +38,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added shared overlay IPC model (`src/overlay_ipc.rs`) and deterministic overlay state machine (`src/overlay_state.rs`) covering `hidden`, `listening`, `interim`, and `finalizing`.
 - 2026-02-28: Wired runtime overlay process spawning from `parakeet-ptt` via NDJSON child-stdio IPC (`src/overlay_process.rs` + `src/main.rs`) with soft-fail fallback to noop sink.
 - 2026-02-28: Added Phase 4 isolation proof that overlay channel disconnect cannot block `final_result` injection enqueue/worker completion (`overlay_disconnect_does_not_block_final_result_injection`).
+- 2026-02-28: Added `OverlayProcessManager` in `parakeet-ptt` to auto-respawn overlay child processes after disconnect with bounded retry backoff and non-fatal failure behavior.
+- 2026-02-28: Added reconnect replay contract to send only the latest valid overlay state after process recovery (no backlog replay), preserving final-result injection boundary isolation.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -51,6 +54,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 3 routing/boundary): `cd parakeet-ptt && cargo test` passed (39 tests), including new overlay-routing boundary tests in `src/main.rs`.
 - 2026-02-28 (Phase 4 slice A): `cd parakeet-ptt && cargo fmt` passed.
 - 2026-02-28 (Phase 4 slice A): `cd parakeet-ptt && cargo test` passed (lib: 5 tests, `src/main.rs`: 40 tests, overlay binary unit target: 0 tests), including new `overlay_disconnect_does_not_block_final_result_injection`.
+- 2026-02-28 (Phase 4 slice B): `cd parakeet-ptt && cargo fmt` passed.
+- 2026-02-28 (Phase 4 slice B): `cd parakeet-ptt && cargo test` passed (lib: 5 tests, `src/main.rs`: 42 tests, overlay binary unit target: 0 tests), including `overlay_process::tests::manager_replays_latest_message_after_disconnect` and `overlay_process::tests::manager_reconnect_sends_only_current_state`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -236,6 +241,9 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 - [x] Backend selection scaffold:
   - [x] primary: layer-shell (scaffold/no-op renderer in MVP slice).
   - [x] fallback: regular best-effort window (scaffold/no-op renderer in MVP slice).
+- [x] Overlay process resilience and reconnect semantics:
+  - [x] auto-respawn manager for child disconnects.
+  - [x] replay only current valid overlay state after reconnect.
 - [x] Behavior requirements:
   - [x] hidden when idle.
   - [x] auto-hide after final/session end timeout.
@@ -250,7 +258,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 1. [x] Validate state machine headlessly.
 2. [x] Validate transitions from fake event streams.
 3. [ ] Validate rendering integration for key states.
-4. [ ] Run overlay crash/restart simulation.
+4. [x] Run overlay crash/restart simulation.
 5. [ ] Validate CPU/memory budget under 10+ minute dictation run.
 
 ### Essential Tests
@@ -260,7 +268,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] auto-hide timer behavior.
 - PTT integration tests:
   - [x] overlay disconnect has zero impact on final injection path.
-  - [ ] overlay reconnect consumes current valid state only.
+  - [x] overlay reconnect consumes current valid state only.
 
 ### Gate To Proceed
 - [ ] Overlay process may fail arbitrarily without affecting capture/transcription/final injection.
