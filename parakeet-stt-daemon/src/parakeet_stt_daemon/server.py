@@ -24,6 +24,7 @@ from .messages import (
     FinalResult,
     InterimStateMessage,
     InterimStateValue,
+    InterimTextMessage,
     ParsedMessage,
     SessionEndedMessage,
     SessionStarted,
@@ -241,6 +242,19 @@ class DaemonServer:
             finalize_ms: int | None = None
             infer_ms: int | None = None
             try:
+                interim_updates = await self._collect_interim_text_updates(ready_chunks)
+                if interim_updates:
+                    await self._emit_interim_state(
+                        websocket,
+                        session.session_id,
+                        state=InterimStateValue.INTERIM,
+                    )
+                    for interim_text in interim_updates:
+                        await self._emit_interim_text(
+                            websocket,
+                            session.session_id,
+                            text=interim_text,
+                        )
                 await self._emit_interim_state(
                     websocket,
                     session.session_id,
@@ -417,6 +431,64 @@ class DaemonServer:
             session_id=session_id,
             seq=self._next_overlay_seq(session_id),
             state=state,
+        )
+        await self._send_overlay_message(websocket, message.model_dump(mode="json"))
+
+    async def _collect_interim_text_updates(self, ready_chunks: list[np.ndarray]) -> list[str]:
+        if not self.settings.overlay_events_enabled:
+            return []
+        if not ready_chunks:
+            return []
+
+        loop = asyncio.get_running_loop()
+        cumulative_chunks: list[np.ndarray] = []
+        updates: list[str] = []
+        last_text = ""
+
+        for chunk in ready_chunks:
+            chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+            if chunk_audio.size == 0:
+                continue
+            cumulative_chunks.append(chunk_audio)
+            combined = np.concatenate(cumulative_chunks)
+            try:
+                candidate = await loop.run_in_executor(
+                    None,
+                    partial(
+                        self.transcriber.transcribe_samples,
+                        combined,
+                        sample_rate=self.audio.sample_rate,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Incremental interim source unavailable for this session: {}",
+                    exc.__class__.__name__,
+                )
+                break
+            normalized = " ".join(candidate.split()).strip()
+            if not normalized or normalized == last_text:
+                continue
+            updates.append(normalized)
+            last_text = normalized
+        return updates
+
+    async def _emit_interim_text(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        text: str,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return
+        message = InterimTextMessage(
+            session_id=session_id,
+            seq=self._next_overlay_seq(session_id),
+            text=normalized,
         )
         await self._send_overlay_message(websocket, message.model_dump(mode="json"))
 

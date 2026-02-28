@@ -22,12 +22,15 @@ from parakeet_stt_daemon.session import SessionManager
 class FakeAudio:
     sample_rate = 16_000
 
+    def __init__(self, *, ready_chunks: list[np.ndarray] | None = None) -> None:
+        self.ready_chunks = ready_chunks or []
+
     def start_session(self) -> None:
         return None
 
     def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         samples = np.ones((1600,), dtype=np.float32)
-        return samples, [], np.zeros((0,), dtype=np.float32)
+        return samples, list(self.ready_chunks), np.zeros((0,), dtype=np.float32)
 
     def abort_session(self) -> None:
         return None
@@ -44,7 +47,34 @@ class FakeWebSocket:
         self.sent_json.append(payload)
 
 
-def _build_server(*, overlay_events_enabled: bool) -> DaemonServer:
+class FakeIncrementalTranscriber:
+    def __init__(
+        self,
+        outputs: list[str] | None = None,
+        *,
+        fail_at_call: int | None = None,
+    ) -> None:
+        self.outputs = outputs or []
+        self.fail_at_call = fail_at_call
+        self.calls = 0
+
+    def transcribe_samples(self, _samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del sample_rate
+        self.calls += 1
+        if self.fail_at_call is not None and self.calls == self.fail_at_call:
+            raise RuntimeError("incremental source failed")
+        if self.calls <= len(self.outputs):
+            return self.outputs[self.calls - 1]
+        return ""
+
+
+def _build_server(
+    *,
+    overlay_events_enabled: bool,
+    ready_chunks: list[np.ndarray] | None = None,
+    incremental_outputs: list[str] | None = None,
+    incremental_fail_at_call: int | None = None,
+) -> DaemonServer:
     server = cast(Any, DaemonServer.__new__(DaemonServer))
     server.settings = ServerSettings(
         device="cpu",
@@ -53,9 +83,12 @@ def _build_server(*, overlay_events_enabled: bool) -> DaemonServer:
         overlay_events_enabled=overlay_events_enabled,
     )
     server.sessions = SessionManager()
-    server.audio = FakeAudio()
+    server.audio = FakeAudio(ready_chunks=ready_chunks)
     server.model = object()
-    server.transcriber = object()
+    server.transcriber = FakeIncrementalTranscriber(
+        incremental_outputs,
+        fail_at_call=incremental_fail_at_call,
+    )
     server._transcribe_lock = asyncio.Lock()
     server.streaming_transcriber = None
     server._active_stream = None
@@ -225,6 +258,98 @@ def test_overlay_send_failures_do_not_block_final_result(monkeypatch) -> None:
         status = server.status()
         assert status.overlay_events_emitted == 0
         assert status.overlay_events_dropped == 4
+
+    asyncio.run(scenario())
+
+
+def test_interim_text_emitted_when_incremental_source_validates(monkeypatch) -> None:
+    async def scenario() -> None:
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+
+        ready_chunks = [
+            np.full((400,), 0.1, dtype=np.float32),
+            np.full((400,), 0.2, dtype=np.float32),
+            np.full((400,), 0.3, dtype=np.float32),
+        ]
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=ready_chunks,
+            incremental_outputs=["hello", "hello", "hello world"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types == [
+            "session_started",
+            "interim_state",
+            "interim_state",
+            "interim_state",
+            "interim_text",
+            "interim_text",
+            "interim_state",
+            "final_result",
+            "session_ended",
+        ]
+        interim_texts = [
+            cast(str, payload["text"])
+            for payload in websocket.sent_json
+            if payload["type"] == "interim_text"
+        ]
+        assert interim_texts == ["hello", "hello world"]
+        assert [
+            cast(int, payload["seq"])
+            for payload in websocket.sent_json
+            if payload["type"] in {"interim_state", "interim_text"}
+        ] == [0, 1, 2, 3, 4, 5]
+
+        status = server.status()
+        assert status.overlay_events_emitted == 7
+        assert status.overlay_events_dropped == 0
+
+    asyncio.run(scenario())
+
+
+def test_incremental_source_failure_does_not_break_final_result(monkeypatch) -> None:
+    async def scenario() -> None:
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+
+        ready_chunks = [np.full((400,), 0.1, dtype=np.float32)]
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=ready_chunks,
+            incremental_outputs=["hello"],
+            incremental_fail_at_call=1,
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types == [
+            "session_started",
+            "interim_state",
+            "interim_state",
+            "interim_state",
+            "final_result",
+            "session_ended",
+        ]
+        assert sent_types.count("final_result") == 1
+
+        status = server.status()
+        assert status.overlay_events_emitted == 4
+        assert status.overlay_events_dropped == 0
 
     asyncio.run(scenario())
 
