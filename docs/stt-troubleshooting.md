@@ -20,6 +20,7 @@ Canonical-source policy:
   - `--paste-key-backend auto` (ladder: uinput → ydotool)
   - `--paste-backend-failure-policy copy-only`
   - daemon launch default: `PARAKEET_STREAMING_ENABLED=false` (set `true` for streaming validation)
+  - overlay launch default: `PARAKEET_OVERLAY_ENABLED=false` (set `true` or pass `--overlay-enabled true` for overlay validation)
   - Wayland focus cache with 30s stale threshold, 500ms transition grace
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
@@ -98,6 +99,7 @@ Client knobs:
 - `--completion-sound true|false` (default: `true`)
 - `--completion-sound-path <path>` (optional)
 - `--completion-sound-volume <0-100>` (default: `100`)
+- `--overlay-enabled true|false` (default: `false`, env: `PARAKEET_OVERLAY_ENABLED`)
 
 Recommended baseline for Ghostty/COSMIC:
 

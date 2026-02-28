@@ -8,13 +8,13 @@ _Last updated: 2026-02-28_
 - [x] Phase 1: Protocol extension + unknown-message compatibility hardening.
 - [x] Phase 2: Daemon emission path behind rollout controls.
 - [x] Phase 3: PTT routing + hard injection boundary proofs.
-- [ ] Phase 4: Overlay process MVP (separate process).
+- [x] Phase 4: Overlay process MVP (separate process).
 - [x] Phase 4 Slice A: separate overlay binary + deterministic state machine + IPC wiring + failure-isolation tests.
 - [x] Phase 4 Slice B: overlay respawn manager + reconnect state replay guarantees.
 - [x] Phase 4 Slice C: layer-shell/fallback render integration path + unsupported-backend noop safety.
 - [x] Phase 4 Slice D: crash/restart simulation through PTT routing path + reconnect/final-injection proof.
 - [x] Phase 4 Slice E: layer-shell text rendering + COSMIC fallback guardrails.
-- [ ] Phase 5: Config/flags/rollout controls.
+- [x] Phase 5: Config/flags/rollout controls.
 - [ ] Phase 6: E2E reliability and promotion gates.
 
 ## Implementation Log
@@ -51,6 +51,10 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Fixed Slice E COSMIC regressions by resolving generic/system font fallbacks for `Sans 16`, keeping layer-shell surfaces mapped with transparent hidden frames (instead of null-buffer detach), and failing fast on renderer errors so PTT respawn semantics recover overlay safely.
 - 2026-02-28: Fixed daemon live interim gap by emitting deduplicated `interim_text` from streaming drain chunks during active sessions (not only stop-time `ready_chunks`), preserving display-only overlay routing and `final_result` injection boundaries.
 - 2026-02-28: Fixed overlay long-utterance visibility by tail-clamping wrapped lines in `parakeet-overlay` so the newest interim words remain visible after `max_lines` is reached (instead of freezing on earliest lines).
+- 2026-02-28: Completed Phase 4 closeout failure-isolation hardening with repeated overlay spawn/disconnect fault injection tests proving `final_result` enqueue/injection remains unaffected, including explicit missing-overlay-binary non-fatal coverage.
+- 2026-02-28: Added repeatable `justfile.overlay-dev soak-perf` sustained-run sampler for `parakeet-ptt` + `parakeet-overlay` CPU/RSS collection (10+ minute window, deterministic artifact path).
+- 2026-02-28: Completed Phase 5 rollout controls by adding `--overlay-enabled <true|false>` with `PARAKEET_OVERLAY_ENABLED` precedence (`CLI > env > default=false`), invalid-env soft-fail disable semantics, and empty-mode-env normalization.
+- 2026-02-28: Updated helper/runbook operator surfaces (`scripts/stt-helper.sh`, `justfile.overlay-dev`, `docs/stt-troubleshooting.md`) so overlay remains explicit opt-in while preserving non-fatal fallback behavior.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -77,6 +81,9 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 4 slice E hotfix): scripted `parakeet-overlay --backend layer-shell --auto-hide-ms 400` NDJSON two-session replay validated no post-hide backend flush failure and confirmed runtime font fallback no longer disables text rendering (`using_requested_generic_family:sans-serif`).
 - 2026-02-28 (Phase 2/4 live interim fix): `cd parakeet-stt-daemon && uv run pytest tests/test_session_cleanup.py tests/test_streaming_truth.py tests/test_overlay_event_stream.py tests/test_messages.py` passed (40 tests), including new `test_live_interim_chunk_emission_dedupes_repeated_text`.
 - 2026-02-28 (Phase 4 slice E long-utterance tail clamp): `cd parakeet-ptt && cargo fmt && cargo test` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 45 tests), including new `text_layout_keeps_recent_tail_lines_when_clamped` and `text_layout_truncates_single_long_word_to_width`.
+- 2026-02-28 (Phase 4 closeout + Phase 5 controls): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 56 tests), including new repeated overlay-failure isolation and explicit missing-binary non-fatal tests.
+- 2026-02-28 (helper contract): `bash -n scripts/stt-helper.sh` and `source scripts/stt-helper.sh && stt help start` passed with `--overlay-enabled` surfaced from `start_option_rows`.
+- 2026-02-28 (Phase 4 sustained runtime soak): `just --justfile justfile.overlay-dev soak-perf 600 1` generated artifact `/tmp/parakeet-overlay-soak-20260228-221536.tsv` with 591 samples each for `parakeet-ptt` and `parakeet-overlay`; summarized CPU/RSS were `parakeet-ptt` avg/p95/max CPU `0.12/0.20/0.60%`, RSS `14.8/14.8/14.8 MiB`; `parakeet-overlay` avg/p95/max CPU `0.00/0.00/0.10%`, RSS `31.9/31.9/31.9 MiB`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -272,8 +279,8 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] no injection, no clipboard, no keyboard ownership.
 - [x] Add configuration fields (opacity/font/anchor/margins/max width/lines) with conservative defaults in overlay CLI process.
 - [ ] Remaining for full Phase 4 completion:
-  - [ ] crash/restart simulation with reconnect semantics validated end-to-end.
-  - [ ] CPU/memory budget validation under sustained dictation run.
+  - [x] crash/restart simulation with reconnect semantics validated end-to-end.
+  - [x] CPU/memory budget validation under sustained 10-minute runtime soak.
   - [ ] richer text shaping/typography beyond phase-colored state surfaces.
 
 ### Verification Loop
@@ -281,7 +288,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 2. [x] Validate transitions from fake event streams.
 3. [x] Validate rendering integration for key states (render-intent mapping, backend selection safety, and state-phase color routing unit coverage).
 4. [x] Run overlay crash/restart simulation.
-5. [ ] Validate CPU/memory budget under 10+ minute dictation run.
+5. [x] Validate CPU/memory budget under 10+ minute dictation run.
 
 ### Essential Tests
 - Overlay state-machine tests:
@@ -293,30 +300,30 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] overlay reconnect consumes current valid state only.
 
 ### Gate To Proceed
-- [ ] Overlay process may fail arbitrarily without affecting capture/transcription/final injection.
+- [x] Overlay process may fail arbitrarily without affecting capture/transcription/final injection.
 
 ## Phase 5: Config, Feature Flags, and Rollout Controls
 ### Implementation Tasks
-- Add `PARAKEET_OVERLAY_ENABLED` and CLI equivalent.
-- Add mode control (`auto`, `layer-shell`, `fallback`, `off`) if needed.
-- Keep overlay disabled by default initially.
-- Ensure startup logs include effective overlay mode and fallback reason.
+- [x] Add `PARAKEET_OVERLAY_ENABLED` and CLI equivalent.
+- [x] Add mode control (`auto`, `layer-shell`, `fallback`, `off`) if needed.
+- [x] Keep overlay disabled by default initially.
+- [x] Ensure startup logs include effective overlay mode and fallback reason.
 
 ### Verification Loop
-1. Verify defaults preserve baseline behavior bit-for-bit.
-2. Validate env/CLI precedence.
-3. Validate invalid config handling.
-4. Validate soft-fail when overlay binary missing.
+1. [x] Verify defaults preserve baseline behavior bit-for-bit.
+2. [x] Validate env/CLI precedence.
+3. [x] Validate invalid config handling.
+4. [x] Validate soft-fail when overlay binary missing.
 
 ### Essential Tests
 - Rust config precedence tests in `parakeet-ptt/src/config.rs`.
 - Startup mode tests:
-  - enabled+available.
-  - enabled+missing binary.
-  - disabled.
+  - [x] enabled+available.
+  - [x] enabled+missing binary.
+  - [x] disabled.
 
 ### Gate To Proceed
-- Overlay remains opt-in and cannot break baseline runtime when disabled.
+- [x] Overlay remains opt-in and cannot break baseline runtime when disabled.
 
 ## Phase 6: End-To-End Reliability And Promotion Gates
 ### Implementation Tasks

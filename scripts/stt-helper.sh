@@ -32,6 +32,7 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
+    local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
     local default_daemon_streaming_enabled="false"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
@@ -52,6 +53,7 @@ stt() {
         "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Stable controls|<v>|true|always|true"
         "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Stable controls|<path>|<system default>|nonempty|"
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
+        "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
     )
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
@@ -459,6 +461,7 @@ Other environment overrides:
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
+  PARAKEET_OVERLAY_ENABLED=<true|false>
   PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled>
 EOF
     }
@@ -543,7 +546,7 @@ CLIENTCMD
         __start-args)
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled
             local -a ptt_args
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
                 shift
@@ -564,7 +567,7 @@ CLIENTCMD
         start)
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled
             local launch_profile="offline"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ]; then
                 launch_profile="stream-seal"
@@ -609,6 +612,7 @@ CLIENTCMD
             echo "   - Completion sound: $completion_sound"
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
+            echo "   - Overlay enabled: $overlay_enabled"
             echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
             echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
