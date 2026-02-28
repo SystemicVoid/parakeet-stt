@@ -123,6 +123,9 @@ class StatusMessage(BaseModel):
     streaming_enabled: bool | None = None
     stream_helper_active: bool | None = None
     stream_fallback_reason: str | None = None
+    overlay_events_enabled: bool | None = None
+    overlay_events_emitted: int | None = None
+    overlay_events_dropped: int | None = None
     chunk_secs: float | None = None
     active_session_age_ms: int | None = None
     audio_stop_ms: int | None = None

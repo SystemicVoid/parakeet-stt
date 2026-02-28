@@ -24,6 +24,9 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Completed mixed-version compatibility matrix checks across `main` and `feature/overlay-phase0-capability-gate`.
 - 2026-02-28: Verified old-client + new-daemon safety gate by confirming Phase 1 daemon changes are schema/test only (no runtime emission path changes).
 - 2026-02-28: Ran stream-seal eval compare in overlay worktree with personal corpus; results stayed within baseline acceptance thresholds.
+- 2026-02-28: Phase 2 started in daemon: state-first overlay emission path added behind `PARAKEET_OVERLAY_EVENTS_ENABLED` (default off).
+- 2026-02-28: Added structured overlay counters (`overlay_events_emitted`, `overlay_events_dropped`) and surfaced them through status/runtime logs.
+- 2026-02-28: Added overlay event stream invariants test suite covering ordering, per-session seq reset, abort terminal event, and non-fatal overlay send failures.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -31,6 +34,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-stt-daemon && uv run pytest tests/test_streaming_truth.py tests/test_session_cleanup.py` passed on `main` baseline (28 tests).
 - 2026-02-28 (eval regression): `just eval compare` passed with personal corpus in overlay worktree.
 - 2026-02-28 (eval regression): offline vs stream-seal deltas were WER `+0.000569`, strict command exact match `-0.010000`, critical token recall `+0.001297`, and warm finalize P95 `+1.769628 ms`.
+- 2026-02-28 (Phase 2 state-first): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_overlay_event_stream.py tests/test_streaming_truth.py tests/test_session_cleanup.py tests/test_cli_precedence.py` passed (42 tests).
+- 2026-02-28 (Phase 2 eval regression): `just eval compare` passed; stream-seal vs offline deltas were WER `-0.002778`, strict command exact match `+0.020000`, critical token recall `+0.006485`, and warm finalize P95 `+0.697694 ms`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -42,11 +47,11 @@ Implement a modern Rust overlay that displays session feedback (and interim text
 - Protocol changes must remain backward-compatible during rollout.
 
 ## Canonical Local Truth (As Of This Revision)
-- Daemon server message types currently include only `session_started`, `final_result`, `error`, and `status`.
-- Daemon stop flow emits final output at session end; no realtime overlay event emission path exists yet.
+- Daemon server message schema includes `interim_state`, `interim_text`, and `session_ended` in addition to baseline variants.
+- Daemon now emits state-first overlay events (`interim_state`, `session_ended`) only when `PARAKEET_OVERLAY_EVENTS_ENABLED=true`; default runtime behavior remains unchanged.
 - Daemon Pydantic message models currently use strict `extra="forbid"` behavior.
 - Rust client injection boundary is already clean: only `ServerMessage::FinalResult` enqueues injection work.
-- Rust protocol decode currently uses tagged enum deserialization; unknown message types are decode errors unless explicitly handled.
+- Rust protocol decode now tolerates unknown server `type` values and ignores them safely.
 
 ## Final Strategy Decisions
 
@@ -146,19 +151,19 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 2: Daemon Emission Path (State-First, Then Text)
 ### Implementation Tasks
-- Introduce emission behind feature flag/environment control, default off.
-- Emit `interim_state` transitions first (`listening`, `processing`, etc.).
-- Emit `interim_text` only when validated incremental source is available.
-- Emit `session_ended` on normal completion and abort/error paths.
-- Keep `final_result` generation path unchanged.
-- Add structured counters for emitted and dropped overlay events.
+- [x] Introduce emission behind feature flag/environment control, default off (`PARAKEET_OVERLAY_EVENTS_ENABLED`).
+- [x] Emit `interim_state` transitions first (`listening`, `processing`, `finalizing`).
+- [ ] Emit `interim_text` only when validated incremental source is available.
+- [x] Emit `session_ended` on normal completion and abort/error paths.
+- [x] Keep `final_result` generation path unchanged.
+- [x] Add structured counters for emitted and dropped overlay events.
 
 ### Verification Loop
-1. Validate state-only emission path.
-2. Validate optional interim-text path.
-3. Validate no cross-session event leakage.
-4. Validate stop/abort race behavior.
-5. Validate exactly one `final_result` per session.
+1. [x] Validate state-only emission path.
+2. [ ] Validate optional interim-text path.
+3. [x] Validate no cross-session event leakage.
+4. [x] Validate stop/abort race behavior.
+5. [x] Validate exactly one `final_result` per session.
 
 ### Essential Tests
 - Extend `parakeet-stt-daemon/tests/test_streaming_truth.py`:
@@ -172,7 +177,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - abort paths emit terminal event and clean state.
 
 ### Gate To Proceed
-- Emission path passes all invariant tests without changing final-result behavior.
+- [ ] Emission path passes all invariant tests without changing final-result behavior (remaining item: optional `interim_text` source path).
 
 ## Phase 3: PTT Routing + Injection Hard Boundary
 ### Implementation Tasks
