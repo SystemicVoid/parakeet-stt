@@ -175,7 +175,7 @@ fn rounded_rect_coverage(px: f32, py: f32, rect: Rect, radius: f32) -> f32 {
         (rect.x + rect.w - r, rect.y + rect.h - r), // bottom-right
     ];
     for &(cx, cy) in &corners {
-        let in_corner_x = (px < rect.x + r && cx == corners[0].0 || cx == corners[2].0)
+        let in_corner_x = (px < rect.x + r && (cx == corners[0].0 || cx == corners[2].0))
             || (px > rect.x + rect.w - r && (cx == corners[1].0 || cx == corners[3].0));
         let in_corner_y = (py < rect.y + r && (cy == corners[0].1 || cy == corners[1].1))
             || (py > rect.y + rect.h - r && (cy == corners[2].1 || cy == corners[3].1));
@@ -2281,6 +2281,12 @@ mod tests {
         assert!(
             (0.0..=1.0).contains(&corner_cov),
             "corner coverage should be 0..1, got {corner_cov}"
+        );
+        // Along the top edge but outside corner arcs: full coverage.
+        let top_edge_cov = rounded_rect_coverage(95.5, 10.5, rect, 12.0);
+        assert!(
+            (top_edge_cov - 1.0).abs() < f32::EPSILON,
+            "top edge coverage should stay full outside corners, got {top_edge_cov}"
         );
     }
 
