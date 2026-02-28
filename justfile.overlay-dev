@@ -42,39 +42,19 @@ doctor: _guard
 # Start helper in streaming mode with overlay events enabled.
 # This attaches tmux; detach with Ctrl+b then d.
 start: _guard
-    @cd "{{repo_root}}"
-    export PARAKEET_ROOT="{{repo_root}}"
-    export PARAKEET_OVERLAY_EVENTS_ENABLED=true
-    source scripts/stt-helper.sh
-    stt stop || true
-    stt start streaming --completion-sound false
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false'
 
 # Stop helper stack.
 stop: _guard
-    @cd "{{repo_root}}"
-    export PARAKEET_ROOT="{{repo_root}}"
-    source scripts/stt-helper.sh
-    stt stop
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt stop'
 
 # Show helper status + daemon overlay flags/counters + overlay process list.
 status: _guard
-    @cd "{{repo_root}}"
-    export PARAKEET_ROOT="{{repo_root}}"
-    source scripts/stt-helper.sh
-    stt status
-    echo
-    echo ">>> daemon status overlay fields"
-    curl -fsS "{{status_url}}" | python3 -m json.tool | rg "streaming_enabled|overlay_events_enabled|overlay_events_emitted|overlay_events_dropped" || true
-    echo
-    echo ">>> overlay processes"
-    pgrep -af '[p]arakeet-overlay' || echo "(none)"
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt status && echo && echo ">>> daemon status overlay fields" && if payload="$(curl -fsS "{{status_url}}" 2>/dev/null)"; then printf "%s" "$payload" | python3 -m json.tool | rg "streaming_enabled|overlay_events_enabled|overlay_events_emitted|overlay_events_dropped" || true; else echo "(daemon status unavailable)"; fi && echo && echo ">>> overlay processes" && pattern="(^|/)parakeet-overlay($| )" && matches="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$matches" ]]; then printf "%s\n" "$matches"; else echo "(none)"; fi'
 
 # Tail both helper logs.
 logs: _guard
-    @cd "{{repo_root}}"
-    export PARAKEET_ROOT="{{repo_root}}"
-    source scripts/stt-helper.sh
-    stt logs both
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'
 
 # Filtered overlay-focused log view.
 logs-overlay: _guard
@@ -83,13 +63,7 @@ logs-overlay: _guard
 
 # Simulate overlay crash mid-session; next overlay event should respawn it.
 overlay-kill: _guard
-    @cd "{{repo_root}}"
-    @echo ">>> before"
-    @pgrep -af '[p]arakeet-overlay' || true
-    @pkill -f '[p]arakeet-overlay' || true
-    @sleep 0.4
-    @echo ">>> after"
-    @pgrep -af '[p]arakeet-overlay' || echo "(none; trigger PTT event to respawn)"
+    @bash -lc 'cd "{{repo_root}}" && pattern="(^|/)parakeet-overlay($| )" && echo ">>> before" && before="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$before" ]]; then printf "%s\n" "$before"; else echo "(none)"; fi && (pkill -f "$pattern" || true) && sleep 0.4 && echo ">>> after" && after="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$after" ]]; then printf "%s\n" "$after"; else echo "(none; trigger PTT event to respawn)"; fi'
 
 # Compact runbook for manual E2E pass.
 runbook: _guard
