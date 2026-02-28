@@ -146,58 +146,25 @@ uv run python check_model.py \
 ```
 Personal high-signal workflow (agent-prompt-heavy, local-only assets):
 ```bash
-cd parakeet-stt-daemon
+just eval-candidates
+# Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes.
+just eval-materialize
+just eval-record
+just eval-calibrate-offline
+just eval-daily-offline
 
-# 1) Mine Codex CLI user prompts into reviewable candidates for this repo.
-#    Default: scans recent 20 threads from this cwd and uses only role=user messages.
-uv run python scripts/build_personal_eval_candidates.py \
-  --output bench_audio/personal/candidates.tsv
+# Optional daemon-like stream+seal path, with separate baseline:
+just eval-calibrate-stream
+just eval-daily-stream
 
-# Optional: widen history depth.
-# uv run python scripts/build_personal_eval_candidates.py \
-#   --codex-max-threads 80 \
-#   --output bench_audio/personal/candidates.tsv
-
-# Optional: include command-like sources as well.
-# uv run python scripts/build_personal_eval_candidates.py \
-#   --include-codex-exec-commands \
-#   --include-bash-history \
-#   --output bench_audio/personal/candidates.tsv
-
-# 2) Manually review candidates.tsv and set include=yes for approved prompts.
-# 3) Materialize manifest + prompt list.
-uv run python scripts/materialize_personal_manifest.py \
-  --input bench_audio/personal/candidates.tsv \
-  --output bench_audio/personal/manifest.jsonl \
-  --prompts-output bench_audio/personal/prompts.tsv \
-  --tier daily
-
-# 4) Record approved prompts (interactive).
-bash scripts/record_personal_clips.sh \
-  --manifest bench_audio/personal/manifest.jsonl \
-  --output-dir bench_audio/personal/audio
-
-# 5) Calibrate baseline (recommended first run after corpus refresh).
-uv run python check_model.py \
-  --bench-offline \
-  --bench-manifest bench_audio/personal/manifest.jsonl \
-  --bench-tier daily \
-  --calibrate-baseline \
-  --baseline-output bench_audio/personal/baseline.json \
-  --bench-output bench_audio/personal/latest-calibration.json
-
-# 6) Daily hybrid gate (absolute + baseline-relative thresholds).
-uv run python check_model.py \
-  --bench-offline \
-  --bench-manifest bench_audio/personal/manifest.jsonl \
-  --bench-tier daily \
-  --baseline bench_audio/personal/baseline.json \
-  --bench-output bench_audio/personal/latest-daily.json
+# Compare offline vs stream+seal metrics side-by-side:
+just eval-compare
 ```
 The benchmark command prints a per-sample + aggregate summary to stdout and writes JSON with:
-- `benchmark`, `model`, `requested_device`, `effective_device`
+- `benchmark`, `bench_runtime`, `model`, `requested_device`, `effective_device`
 - `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_runs`, `sample_count`
 - `aggregate.avg_wer`, `aggregate.weighted_wer`, `aggregate.command_exact_match_rate`, `aggregate.critical_token_recall`
+- `aggregate.punctuation.{precision,recall,f1,terminal_accuracy}`, `aggregate.punctuation_f1`, `aggregate.terminal_punctuation_accuracy`
 - `aggregate.infer_ms.*`, `aggregate.finalize_ms.*`, `aggregate.warm_finalize_ms.*`, `aggregate.cold_start_ms`
 - `thresholds.*`, `regression_gate.pass`, `regression_gate.failures`
 - `samples[]` entries including `sample_id`, `tier`, `domain`, `critical_tokens`, `reference`, `hypothesis`, `wer`, `infer_ms`, `finalize_ms`

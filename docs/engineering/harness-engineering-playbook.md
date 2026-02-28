@@ -93,36 +93,24 @@ scripts/harness-maintenance.sh mark
 - Keep eval assets local-first under `parakeet-stt-daemon/bench_audio/personal/` (ignored by git).
 - Build prompts from real Codex CLI prompt history by default, then require manual review before recording.
 - Daily gate is hybrid when baseline is supplied: absolute floors + relative drift checks.
+- Track punctuation explicitly (`punctuation_f1`, `terminal_punctuation_accuracy`) in addition to WER/token metrics.
 
 ```bash
-cd parakeet-stt-daemon
+cd <repo-root>
 
-# Build candidate phrases from Codex user-message prompt history (manual review required).
-# Default: recent 20 threads, scoped to current cwd.
-uv run python scripts/build_personal_eval_candidates.py \
-  --output bench_audio/personal/candidates.tsv
+just eval-candidates
+# Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes.
+just eval-materialize
+just eval-record
 
-# Materialize approved prompts into manifest JSONL.
-uv run python scripts/materialize_personal_manifest.py \
-  --input bench_audio/personal/candidates.tsv \
-  --output bench_audio/personal/manifest.jsonl \
-  --prompts-output bench_audio/personal/prompts.tsv \
-  --tier daily
+# Offline path (direct in-memory transcribe).
+just eval-calibrate-offline
+just eval-daily-offline
 
-# Calibrate baseline after corpus refresh.
-uv run python check_model.py \
-  --bench-offline \
-  --bench-manifest bench_audio/personal/manifest.jsonl \
-  --bench-tier daily \
-  --calibrate-baseline \
-  --baseline-output bench_audio/personal/baseline.json \
-  --bench-output bench_audio/personal/latest-calibration.json
+# Stream+seal path (daemon-like finalize path with separate baseline).
+just eval-calibrate-stream
+just eval-daily-stream
 
-# Fast daily hybrid gate (<3 min target on this workstation).
-uv run python check_model.py \
-  --bench-offline \
-  --bench-manifest bench_audio/personal/manifest.jsonl \
-  --bench-tier daily \
-  --baseline bench_audio/personal/baseline.json \
-  --bench-output bench_audio/personal/latest-daily.json
+# Side-by-side summary for offline vs stream+seal:
+just eval-compare
 ```
