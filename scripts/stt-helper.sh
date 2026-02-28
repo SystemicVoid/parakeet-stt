@@ -492,6 +492,33 @@ EOF
 CLIENTCMD
     }
 
+    _ensure_overlay_release_binary() {
+        local ptt_rustflags="$1"
+        local overlay_binary="$CLIENT_DIR/target/release/parakeet-overlay"
+        local build_cmd="cargo build --release --bin parakeet-overlay"
+
+        if ! command -v cargo >/dev/null 2>&1; then
+            if [ ! -x "$overlay_binary" ]; then
+                echo "   - Overlay binary missing and cargo not found; overlay routing will remain best-effort noop."
+                echo "[helper] overlay binary missing at $overlay_binary and cargo unavailable; continuing without overlay process" >> "$LOG_CLIENT"
+            fi
+            return 0
+        fi
+
+        echo "   - Ensuring overlay binary is available (${build_cmd})..."
+        echo "[helper] ensuring overlay binary via ${build_cmd}" >> "$LOG_CLIENT"
+        if (
+            cd "$CLIENT_DIR" || exit 1
+            RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >> "$LOG_CLIENT" 2>&1
+        ); then
+            return 0
+        fi
+
+        echo "   - Overlay build failed; continuing without overlay (non-fatal)."
+        echo "[helper] overlay binary build failed; continuing without overlay process" >> "$LOG_CLIENT"
+        return 0
+    }
+
     case "$cmd" in
         help|--help|-h)
             case "${1:-}" in
@@ -666,6 +693,7 @@ CLIENTCMD
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
+            _ensure_overlay_release_binary "$ptt_rustflags"
 
             local client_cmd
             client_cmd="$(_build_client_cmd)"
@@ -832,6 +860,7 @@ CLIENTCMD
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
+            _ensure_overlay_release_binary "$ptt_rustflags"
 
             local client_cmd='
                 set -e
