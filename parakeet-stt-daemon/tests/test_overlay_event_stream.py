@@ -101,7 +101,10 @@ def _build_server(
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
+    server._live_interim_chunks = []
+    server._live_interim_failed = False
     server._overlay_event_seq_by_session = {}
+    server._overlay_last_interim_text_by_session = {}
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
 
@@ -350,6 +353,53 @@ def test_incremental_source_failure_does_not_break_final_result(monkeypatch) -> 
         status = server.status()
         assert status.overlay_events_emitted == 4
         assert status.overlay_events_dropped == 0
+
+    asyncio.run(scenario())
+
+
+def test_live_interim_chunk_emission_dedupes_repeated_text(monkeypatch) -> None:
+    async def scenario() -> None:
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=["hello", "hello", "hello world"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._emit_live_interim_from_chunk(
+            cast(Any, websocket), session_id, np.full((400,), 0.1, dtype=np.float32)
+        )
+        await server._emit_live_interim_from_chunk(
+            cast(Any, websocket), session_id, np.full((400,), 0.2, dtype=np.float32)
+        )
+        await server._emit_live_interim_from_chunk(
+            cast(Any, websocket), session_id, np.full((400,), 0.3, dtype=np.float32)
+        )
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types == [
+            "session_started",
+            "interim_state",
+            "interim_text",
+            "interim_text",
+        ]
+        interim_texts = [
+            cast(str, payload["text"])
+            for payload in websocket.sent_json
+            if payload["type"] == "interim_text"
+        ]
+        assert interim_texts == ["hello", "hello world"]
+        assert [
+            cast(int, payload["seq"])
+            for payload in websocket.sent_json
+            if payload["type"] in {"interim_state", "interim_text"}
+        ] == [0, 1, 2]
 
     asyncio.run(scenario())
 

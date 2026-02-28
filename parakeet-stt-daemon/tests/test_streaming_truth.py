@@ -73,6 +73,12 @@ def _build_server(
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
+    server._live_interim_chunks = []
+    server._live_interim_failed = False
+    server._overlay_event_seq_by_session = {}
+    server._overlay_last_interim_text_by_session = {}
+    server._overlay_events_emitted = 0
+    server._overlay_events_dropped = 0
     server._vad_model = None
     server._vad_import_error = None
     server._vad_enabled = vad_enabled
