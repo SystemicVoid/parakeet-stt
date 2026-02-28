@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use fontdb::{Database, Family, Query, Source};
+use fontdue::{Font, FontSettings};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
@@ -23,6 +25,12 @@ use parakeet_ptt::overlay_state::{
 
 const FALLBACK_WINDOW_TITLE: &str = "Parakeet Overlay";
 const LAYER_NAMESPACE: &str = "parakeet-overlay";
+const DEFAULT_FONT_FAMILY: &str = "Sans";
+const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
+const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 10.0..=64.0;
+const TEXT_MARGIN_X_PX: u32 = 20;
+const TEXT_MARGIN_Y_PX: u32 = 16;
+const TEXT_COLOR: [u8; 4] = [240, 245, 255, 242];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -116,6 +124,129 @@ impl OverlayUiConfig {
 struct SurfaceDimensions {
     width: u32,
     height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ParsedFontDescriptor {
+    family: String,
+    size_px: f32,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FontResolutionSummary {
+    requested: String,
+    family: String,
+    size_px: f32,
+    fallback_reason: Option<String>,
+}
+
+struct TextRenderer {
+    summary: FontResolutionSummary,
+    font: Option<Font>,
+}
+
+impl TextRenderer {
+    fn new(raw_descriptor: &str) -> Self {
+        let parsed = parse_font_descriptor(raw_descriptor);
+        let mut db = Database::new();
+        db.load_system_fonts();
+        let mut fallback_reasons = Vec::new();
+        if let Some(reason) = parsed.fallback_reason.clone() {
+            fallback_reasons.push(reason);
+        }
+
+        let mut selected_family = parsed.family.clone();
+        let mut font = load_font_from_database(&db, &selected_family);
+        if font.is_none() {
+            fallback_reasons.push(format!("font_unavailable:{selected_family}"));
+            if selected_family != DEFAULT_FONT_FAMILY {
+                selected_family = DEFAULT_FONT_FAMILY.to_string();
+                font = load_font_from_database(&db, DEFAULT_FONT_FAMILY);
+                if font.is_some() {
+                    fallback_reasons.push("using_default_font_family".to_string());
+                }
+            }
+        }
+
+        if font.is_none() {
+            fallback_reasons.push("font_resolution_failed:text_render_disabled".to_string());
+        }
+
+        let fallback_reason = if fallback_reasons.is_empty() {
+            None
+        } else {
+            Some(fallback_reasons.join(";"))
+        };
+        let summary = FontResolutionSummary {
+            requested: raw_descriptor.to_string(),
+            family: selected_family,
+            size_px: parsed.size_px,
+            fallback_reason,
+        };
+
+        info!(
+            requested_font = %summary.requested,
+            resolved_font_family = %summary.family,
+            resolved_font_size_px = summary.size_px,
+            fallback_reason = summary.fallback_reason.as_deref().unwrap_or("none"),
+            "overlay font resolved"
+        );
+
+        Self { summary, font }
+    }
+
+    fn draw_headline(
+        &self,
+        frame: &mut [u8],
+        dimensions: SurfaceDimensions,
+        max_width_px: u32,
+        max_lines: u32,
+        text: &str,
+    ) {
+        let Some(font) = &self.font else {
+            return;
+        };
+
+        let width_limit = max_width_px
+            .clamp(64, dimensions.width)
+            .saturating_sub(TEXT_MARGIN_X_PX.saturating_mul(2));
+        let line_limit = max_lines.clamp(1, 10);
+        let lines = layout_text_lines(text, width_limit, line_limit, |character| {
+            font.metrics(character, self.summary.size_px).advance_width
+        });
+        if lines.is_empty() {
+            return;
+        }
+
+        let line_height = (self.summary.size_px * 1.3).ceil() as i32;
+        let baseline_start = TEXT_MARGIN_Y_PX as i32 + self.summary.size_px.ceil() as i32;
+        let mut baseline = baseline_start;
+        for line in lines {
+            let mut cursor_x = TEXT_MARGIN_X_PX as f32;
+            for character in line.chars() {
+                let (metrics, bitmap) = font.rasterize(character, self.summary.size_px);
+                let glyph_x = cursor_x.floor() as i32 + metrics.xmin;
+                let glyph_y = baseline - metrics.height as i32 - metrics.ymin;
+                blend_bitmap(
+                    frame,
+                    dimensions,
+                    glyph_x,
+                    glyph_y,
+                    metrics.width,
+                    metrics.height,
+                    &bitmap,
+                    TEXT_COLOR,
+                );
+                cursor_x += metrics.advance_width;
+            }
+
+            baseline += line_height;
+            if baseline > dimensions.height as i32 {
+                break;
+            }
+        }
+    }
 }
 
 trait OverlayBackend {
@@ -329,6 +460,7 @@ struct WaylandRuntime {
     shell: ShellSurface,
     shm_buffer: ShmBuffer,
     dimensions: SurfaceDimensions,
+    text_renderer: TextRenderer,
 }
 
 enum ShellSurface {
@@ -378,6 +510,7 @@ impl WaylandRuntime {
         let dimensions = ui.surface_dimensions();
         let mut shm_buffer = ShmBuffer::new(&shm, &queue_handle, dimensions)?;
         shm_buffer.paint(argb_pixel(0, 0, 0, 0))?;
+        let text_renderer = TextRenderer::new(&ui.font);
 
         let shell = match kind {
             BackendKind::LayerShell => {
@@ -445,6 +578,7 @@ impl WaylandRuntime {
             shell,
             shm_buffer,
             dimensions,
+            text_renderer,
         })
     }
 
@@ -462,8 +596,14 @@ impl WaylandRuntime {
         }
 
         if intent.visible {
-            self.shm_buffer
-                .paint(color_for_phase(intent.phase, ui.opacity))?;
+            render_frame(
+                self.shm_buffer.bytes_mut(),
+                self.dimensions,
+                intent,
+                ui,
+                &self.text_renderer,
+            );
+            self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
             self.surface.damage_buffer(
                 0,
@@ -557,6 +697,14 @@ impl ShmBuffer {
         for chunk in self.bytes.chunks_exact_mut(4) {
             chunk.copy_from_slice(&pixel);
         }
+        self.sync_to_file()
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    fn sync_to_file(&mut self) -> Result<()> {
         self.file
             .seek(SeekFrom::Start(0))
             .context("failed to seek overlay shm file")?;
@@ -854,6 +1002,79 @@ fn layer_margins(anchor: CliAnchor, margin_x: u32, margin_y: u32) -> (i32, i32, 
     }
 }
 
+fn parse_font_descriptor(raw: &str) -> ParsedFontDescriptor {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ParsedFontDescriptor {
+            family: DEFAULT_FONT_FAMILY.to_string(),
+            size_px: DEFAULT_FONT_SIZE_PX,
+            fallback_reason: Some("font_descriptor_empty".to_string()),
+        };
+    }
+
+    let mut tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() >= 2 {
+        let maybe_size = tokens.last().and_then(|value| value.parse::<f32>().ok());
+        if let Some(size) = maybe_size {
+            let _ = tokens.pop();
+            let family = tokens.join(" ");
+            if family.trim().is_empty() {
+                return ParsedFontDescriptor {
+                    family: DEFAULT_FONT_FAMILY.to_string(),
+                    size_px: size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()),
+                    fallback_reason: Some("font_family_missing_using_default".to_string()),
+                };
+            }
+            return ParsedFontDescriptor {
+                family,
+                size_px: size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()),
+                fallback_reason: None,
+            };
+        }
+    }
+
+    ParsedFontDescriptor {
+        family: trimmed.to_string(),
+        size_px: DEFAULT_FONT_SIZE_PX,
+        fallback_reason: Some("font_size_missing_using_default".to_string()),
+    }
+}
+
+fn load_font_from_database(db: &Database, family: &str) -> Option<Font> {
+    let query = Query {
+        families: &[Family::Name(family)],
+        ..Query::default()
+    };
+    let face_id = db.query(&query)?;
+    if let Some(font) = db.with_face_data(face_id, |data, face_index| {
+        Font::from_bytes(
+            data,
+            FontSettings {
+                collection_index: face_index,
+                ..FontSettings::default()
+            },
+        )
+        .ok()
+    }) {
+        return font;
+    }
+
+    let face = db.face(face_id)?;
+    let bytes = match &face.source {
+        Source::Binary(bytes) => bytes.as_ref().as_ref().to_vec(),
+        Source::File(path) => std::fs::read(path).ok()?,
+        Source::SharedFile(path, _) => std::fs::read(path).ok()?,
+    };
+    Font::from_bytes(
+        bytes,
+        FontSettings {
+            collection_index: face.index,
+            ..FontSettings::default()
+        },
+    )
+    .ok()
+}
+
 fn color_for_phase(phase: OverlayRenderPhase, opacity: f32) -> [u8; 4] {
     let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
 
@@ -869,6 +1090,183 @@ fn argb_pixel(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [b, g, r, a]
 }
 
+fn render_frame(
+    frame: &mut [u8],
+    dimensions: SurfaceDimensions,
+    intent: &OverlayRenderIntent,
+    ui: &OverlayUiConfig,
+    text_renderer: &TextRenderer,
+) {
+    let pixel = if intent.visible {
+        color_for_phase(intent.phase, ui.opacity)
+    } else {
+        argb_pixel(0, 0, 0, 0)
+    };
+    fill_frame(frame, pixel);
+    if !intent.visible {
+        return;
+    }
+
+    let headline = intent.headline.trim();
+    let detail = intent
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let text = if let Some(detail) = detail {
+        format!("{headline} {detail}")
+    } else {
+        headline.to_string()
+    };
+
+    text_renderer.draw_headline(frame, dimensions, ui.max_width, ui.max_lines, &text);
+}
+
+fn fill_frame(frame: &mut [u8], pixel: [u8; 4]) {
+    for chunk in frame.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&pixel);
+    }
+}
+
+fn blend_bitmap(
+    frame: &mut [u8],
+    dimensions: SurfaceDimensions,
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    alpha_bitmap: &[u8],
+    color: [u8; 4],
+) {
+    let frame_width = dimensions.width as i32;
+    let frame_height = dimensions.height as i32;
+    if origin_x >= frame_width || origin_y >= frame_height {
+        return;
+    }
+
+    for y in 0..height {
+        let draw_y = origin_y + y as i32;
+        if !(0..frame_height).contains(&draw_y) {
+            continue;
+        }
+        for x in 0..width {
+            let draw_x = origin_x + x as i32;
+            if !(0..frame_width).contains(&draw_x) {
+                continue;
+            }
+            let coverage = alpha_bitmap[y * width + x];
+            if coverage == 0 {
+                continue;
+            }
+
+            let source_alpha = ((u16::from(coverage) * u16::from(color[3])) / 255) as u8;
+            if source_alpha == 0 {
+                continue;
+            }
+
+            let idx = ((draw_y as u32 * dimensions.width + draw_x as u32) * 4) as usize;
+            for channel in 0..3 {
+                let dst = frame[idx + channel];
+                let src = color[channel];
+                frame[idx + channel] = (((u16::from(src) * u16::from(source_alpha))
+                    + (u16::from(dst) * u16::from(255 - source_alpha)))
+                    / 255) as u8;
+            }
+            frame[idx + 3] = frame[idx + 3].max(source_alpha);
+        }
+    }
+}
+
+fn layout_text_lines<F>(
+    text: &str,
+    max_width_px: u32,
+    max_lines: u32,
+    mut measure: F,
+) -> Vec<String>
+where
+    F: FnMut(char) -> f32,
+{
+    let max_width = max_width_px.max(48) as f32;
+    let max_lines = max_lines.clamp(1, 10) as usize;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::with_capacity(max_lines);
+    let mut current = String::new();
+    for word in normalized.split(' ') {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if measure_width(&candidate, &mut measure) <= max_width {
+            current = candidate;
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+        }
+
+        let fitted_word = fit_text_to_width(word, max_width, &mut measure);
+        if fitted_word.is_empty() {
+            continue;
+        }
+        if fitted_word != word {
+            lines.push(fitted_word);
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            continue;
+        }
+        current = fitted_word;
+    }
+
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    }
+    lines
+}
+
+fn fit_text_to_width<F>(text: &str, max_width: f32, mut measure: F) -> String
+where
+    F: FnMut(char) -> f32,
+{
+    if measure_width(text, &mut measure) <= max_width {
+        return text.to_string();
+    }
+
+    let suffix = "...";
+    let mut output = String::new();
+    for character in text.chars() {
+        let candidate = format!("{output}{character}");
+        let candidate_with_suffix = format!("{candidate}{suffix}");
+        if measure_width(&candidate_with_suffix, &mut measure) > max_width {
+            break;
+        }
+        output.push(character);
+    }
+
+    if output.is_empty() {
+        String::new()
+    } else {
+        format!("{output}{suffix}")
+    }
+}
+
+fn measure_width<F>(text: &str, measure: &mut F) -> f32
+where
+    F: FnMut(char) -> f32,
+{
+    text.chars()
+        .fold(0.0, |width, character| width + measure(character))
+}
+
 fn truncate_for_title(input: &str) -> String {
     let trimmed = input.trim();
     let mut output = String::new();
@@ -880,6 +1278,17 @@ fn truncate_for_title(input: &str) -> String {
     } else {
         output
     }
+}
+
+fn is_probably_cosmic_session() -> bool {
+    [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+    ]
+    .iter()
+    .filter_map(|key| std::env::var(key).ok())
+    .any(|value| value.to_ascii_lowercase().contains("cosmic"))
 }
 
 #[tokio::main]
@@ -909,6 +1318,13 @@ async fn main() -> Result<()> {
         max_lines = ui.max_lines,
         "overlay process started"
     );
+    if built_backend.kind == BackendKind::FallbackWindow && is_probably_cosmic_session() {
+        warn!(
+            backend = "fallback_window",
+            desktop = "cosmic",
+            "overlay fallback-window is degraded on COSMIC (tiling/focus behavior is compositor-managed); prefer --backend layer-shell"
+        );
+    }
 
     let mut machine = OverlayStateMachine::new(Duration::from_millis(cli.auto_hide_ms.max(1)));
     built_backend.backend.render(machine.visibility());
@@ -975,10 +1391,12 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        color_for_phase, resolve_backend_selection, BackendSelection, BackendSignals,
-        CliBackendMode,
+        color_for_phase, layout_text_lines, parse_font_descriptor, render_frame,
+        resolve_backend_selection, BackendSelection, BackendSignals, CliBackendMode,
+        FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, SurfaceDimensions,
+        TextRenderer,
     };
-    use parakeet_ptt::overlay_state::OverlayRenderPhase;
+    use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
 
     #[test]
     fn auto_prefers_layer_shell_when_available() {
@@ -1046,5 +1464,92 @@ mod tests {
             color_for_phase(OverlayRenderPhase::Hidden, 0.8),
             [0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn font_descriptor_parses_family_and_size() {
+        assert_eq!(
+            parse_font_descriptor("Sans 16"),
+            ParsedFontDescriptor {
+                family: "Sans".to_string(),
+                size_px: 16.0,
+                fallback_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_font_descriptor_falls_back_to_default_size() {
+        let parsed = parse_font_descriptor("InvalidDescriptor");
+        assert_eq!(parsed.family, "InvalidDescriptor".to_string());
+        assert_eq!(parsed.size_px, 16.0);
+        assert_eq!(
+            parsed.fallback_reason.as_deref(),
+            Some("font_size_missing_using_default")
+        );
+    }
+
+    #[test]
+    fn text_layout_clamps_lines_and_applies_width_limit() {
+        let lines = layout_text_lines("alpha beta gamma delta", 40, 2, |_| 10.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "a...");
+        assert_eq!(lines[1], "beta");
+    }
+
+    #[test]
+    fn render_intent_mapping_visible_vs_hidden_alpha() {
+        let ui = OverlayUiConfig {
+            opacity: 0.92,
+            font: "Sans 16".to_string(),
+            anchor: super::CliAnchor::TopCenter,
+            margin_x: 24,
+            margin_y: 24,
+            max_width: 320,
+            max_lines: 3,
+        };
+        let dimensions = SurfaceDimensions {
+            width: 320,
+            height: 100,
+        };
+        let text_renderer = TextRenderer {
+            summary: FontResolutionSummary {
+                requested: "Sans 16".to_string(),
+                family: "Sans".to_string(),
+                size_px: 16.0,
+                fallback_reason: None,
+            },
+            font: None,
+        };
+
+        let mut hidden_frame = vec![255u8; (dimensions.width * dimensions.height * 4) as usize];
+        render_frame(
+            &mut hidden_frame,
+            dimensions,
+            &OverlayRenderIntent {
+                phase: OverlayRenderPhase::Hidden,
+                visible: false,
+                headline: String::new(),
+                detail: None,
+            },
+            &ui,
+            &text_renderer,
+        );
+        assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
+
+        let mut visible_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
+        render_frame(
+            &mut visible_frame,
+            dimensions,
+            &OverlayRenderIntent {
+                phase: OverlayRenderPhase::Listening,
+                visible: true,
+                headline: "listening".to_string(),
+                detail: None,
+            },
+            &ui,
+            &text_renderer,
+        );
+        assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
 }

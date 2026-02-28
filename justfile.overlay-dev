@@ -76,10 +76,10 @@ overlay-kill: _guard
 # Compact runbook for manual E2E pass.
 runbook: _guard
     @printf '%s\n' \
-      "1) just --justfile justfile.overlay-dev start" \
+      "1) just --justfile justfile.overlay-dev start-layer-shell" \
       "2) Detach tmux, then: just --justfile justfile.overlay-dev status" \
       "3) Do manual hotkey utterance tests" \
       "4) During utterance: just --justfile justfile.overlay-dev overlay-kill" \
       "5) Trigger next utterance and confirm respawn + final injection" \
-      "6) If overlay is invisible on layer-shell: just --justfile justfile.overlay-dev start-fallback" \
+      "6) Fallback is diagnostic-only on COSMIC: just --justfile justfile.overlay-dev start-fallback" \
       "7) just --justfile justfile.overlay-dev stop"
