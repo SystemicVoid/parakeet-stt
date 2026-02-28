@@ -2,6 +2,22 @@
 
 _Last updated: 2026-02-28_
 
+## Progress Tracker
+- [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
+- [x] Phase 0: Capability and feasibility gate implemented in `parakeet-ptt`.
+- [ ] Phase 1: Protocol extension + unknown-message compatibility hardening.
+- [ ] Phase 2: Daemon emission path behind rollout controls.
+- [ ] Phase 3: PTT routing + hard injection boundary proofs.
+- [ ] Phase 4: Overlay process MVP (separate process).
+- [ ] Phase 5: Config/flags/rollout controls.
+- [ ] Phase 6: E2E reliability and promotion gates.
+
+## Implementation Log
+- 2026-02-28: Established dedicated overlay worktree/branch from latest `origin/main`.
+- 2026-02-28: Completed Phase 0 classification and startup logging in `parakeet-ptt` with soft-fail behavior.
+- 2026-02-28: Added deterministic classification tests for `layer_shell`, `fallback_window`, and `disabled` modes.
+- 2026-02-28: Confirmed no injection semantic change (`final_result` remains sole enqueue trigger).
+
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
 
@@ -61,20 +77,20 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 0: Capability And Feasibility Gate (New First Phase)
 ### Implementation Tasks
-- Add a startup capability probe for overlay mode selection:
+- [x] Add a startup capability probe for overlay mode selection:
   - `layer_shell` when `zwlr_layer_shell_v1` is available.
   - `fallback_window` when layer-shell is unavailable but regular window rendering works.
   - `disabled` when neither mode initializes.
-- Emit explicit startup log describing effective overlay mode and reason.
-- Ensure overlay probe failures are soft-fail and do not affect existing PTT flow.
+- [x] Emit explicit startup log describing effective overlay mode and reason.
+- [x] Ensure overlay probe failures are soft-fail and do not affect existing PTT flow.
 
 ### Verification Loop
-1. Validate deterministic mode selection on Pop!_OS/COSMIC.
-2. Validate deterministic fallback behavior on unsupported compositor sessions.
-3. Validate that failed probe does not alter start/stop/final injection behavior.
+1. [x] Validate deterministic mode selection on Pop!_OS/COSMIC via protocol-signal classifier tests.
+2. [x] Validate deterministic fallback behavior on unsupported compositor sessions via classifier tests.
+3. [x] Validate that failed probe does not alter start/stop/final injection behavior (`cargo test`, `cargo clippy`, `prek` pre-push suite).
 
 ### Gate To Proceed
-- Overlay mode classification is deterministic and non-fatal under all tested sessions.
+- [x] Overlay mode classification is deterministic and non-fatal under all tested sessions.
 
 ## Phase 1: Protocol Extension And Compatibility Hardening
 ### Implementation Tasks

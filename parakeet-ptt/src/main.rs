@@ -27,7 +27,10 @@ use uuid::Uuid;
 
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
-use crate::config::{ClientConfig, ClipboardOptions, InjectionConfig, DEFAULT_ENDPOINT};
+use crate::config::{
+    probe_overlay_capability, ClientConfig, ClipboardOptions, InjectionConfig, OverlayMode,
+    DEFAULT_ENDPOINT,
+};
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
 use crate::protocol::{start_message, stop_message, ServerMessage};
@@ -690,6 +693,24 @@ async fn run_demo(
 }
 
 async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) -> Result<()> {
+    let overlay_capability = probe_overlay_capability();
+    match overlay_capability.mode {
+        OverlayMode::Disabled => {
+            warn!(
+                overlay_mode = overlay_capability.mode.as_str(),
+                overlay_reason = %overlay_capability.reason,
+                "overlay capability probe completed with disabled mode"
+            );
+        }
+        OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
+            info!(
+                overlay_mode = overlay_capability.mode.as_str(),
+                overlay_reason = %overlay_capability.reason,
+                "overlay capability probe completed"
+            );
+        }
+    }
+
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
