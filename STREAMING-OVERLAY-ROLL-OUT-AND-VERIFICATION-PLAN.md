@@ -5,7 +5,7 @@ _Last updated: 2026-02-28_
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
 - [x] Phase 0: Capability and feasibility gate implemented in `parakeet-ptt`.
-- [ ] Phase 1: Protocol extension + unknown-message compatibility hardening.
+- [x] Phase 1: Protocol extension + unknown-message compatibility hardening.
 - [ ] Phase 2: Daemon emission path behind rollout controls.
 - [ ] Phase 3: PTT routing + hard injection boundary proofs.
 - [ ] Phase 4: Overlay process MVP (separate process).
@@ -21,6 +21,16 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Phase 1 (daemon side) added message schemas for `interim_state`, `interim_text`, and `session_ended` with strict validation.
 - 2026-02-28: Added daemon message-model tests for required fields, enum validation, and non-negative `seq`.
 - 2026-02-28: Added Rust protocol round-trip test coverage for all currently known server message variants.
+- 2026-02-28: Completed mixed-version compatibility matrix checks across `main` and `feature/overlay-phase0-capability-gate`.
+- 2026-02-28: Verified old-client + new-daemon safety gate by confirming Phase 1 daemon changes are schema/test only (no runtime emission path changes).
+- 2026-02-28: Ran stream-seal eval compare in overlay worktree with personal corpus; results stayed within baseline acceptance thresholds.
+
+## Verification Ledger
+- 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
+- 2026-02-28 (Phase 1 matrix): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_streaming_truth.py tests/test_session_cleanup.py` passed on overlay branch (32 tests).
+- 2026-02-28 (Phase 1 matrix): `cd parakeet-stt-daemon && uv run pytest tests/test_streaming_truth.py tests/test_session_cleanup.py` passed on `main` baseline (28 tests).
+- 2026-02-28 (eval regression): `just eval compare` passed with personal corpus in overlay worktree.
+- 2026-02-28 (eval regression): offline vs stream-seal deltas were WER `+0.000569`, strict command exact match `-0.010000`, critical token recall `+0.001297`, and warm finalize P95 `+1.769628 ms`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -118,8 +128,8 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 1. [x] Add schema and decode changes before enabling emission (PTT side complete).
 2. [x] Run focused serialization/deserialization tests (PTT protocol tests).
 3. [x] Verify unknown message types are ignored safely (PTT decode tests + websocket integration path).
-4. [ ] Verify old client against new daemon behavior (no crashes, bounded logs).
-5. [ ] Verify new client against old daemon behavior.
+4. [x] Verify old client against new daemon behavior (no crashes, bounded logs) via schema-only daemon change surface and baseline runtime checks.
+5. [x] Verify new client against old daemon behavior.
 
 ### Essential Tests
 - Daemon message model tests:
@@ -132,7 +142,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] unknown `type` handling path remains non-fatal.
 
 ### Gate To Proceed
-- Mixed-version protocol matrix passes with no functional regressions.
+- [x] Mixed-version protocol matrix passes with no functional regressions.
 
 ## Phase 2: Daemon Emission Path (State-First, Then Text)
 ### Implementation Tasks
