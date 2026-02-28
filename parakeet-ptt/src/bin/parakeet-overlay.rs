@@ -27,11 +27,29 @@ use parakeet_ptt::overlay_state::{
 const FALLBACK_WINDOW_TITLE: &str = "Parakeet Overlay";
 const LAYER_NAMESPACE: &str = "parakeet-overlay";
 const DEFAULT_FONT_FAMILY: &str = "Sans";
-const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
+const DEFAULT_FONT_SIZE_PX: f32 = 18.0;
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 10.0..=64.0;
-const TEXT_MARGIN_X_PX: u32 = 20;
-const TEXT_MARGIN_Y_PX: u32 = 16;
-const TEXT_COLOR: [u8; 4] = [240, 245, 255, 242];
+const LINE_HEIGHT_FACTOR: f32 = 1.45;
+
+// --- Design System ---
+const BG_COLOR: (u8, u8, u8) = (22, 22, 26);
+const BG_ALPHA: u8 = 230; // ~90%
+const BORDER_COLOR: (u8, u8, u8) = (58, 58, 68);
+const BORDER_ALPHA: u8 = 255;
+const BORDER_THICKNESS: f32 = 1.0;
+const CORNER_RADIUS: f32 = 12.0;
+const SHADOW_RADIUS: u32 = 8;
+const SHADOW_ALPHA: u8 = 80; // ~31%
+const TEXT_COLOR_RGB: (u8, u8, u8) = (245, 245, 250);
+const TEXT_SHADOW_COLOR: [u8; 4] = [0, 0, 0, 60];
+const PADDING_H: u32 = 24;
+const PADDING_V: u32 = 16;
+const PADDING_LEFT: u32 = 32;
+const ACCENT_STRIPE_WIDTH: f32 = 3.0;
+const ACCENT_STRIPE_MARGIN: f32 = 6.0;
+const FADE_DURATION_MS: u64 = 250;
+
+const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -94,6 +112,357 @@ enum CliAnchor {
     BottomRight,
 }
 
+// --- Geometry & Rendering Primitives ---
+
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContentArea {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn argb_pixel_premul(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
+    let aa = u16::from(a);
+    [
+        ((u16::from(b) * aa) / 255) as u8,
+        ((u16::from(g) * aa) / 255) as u8,
+        ((u16::from(r) * aa) / 255) as u8,
+        a,
+    ]
+}
+
+fn blend_pixel(frame: &mut [u8], dims: SurfaceDimensions, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= dims.width as i32 || y >= dims.height as i32 {
+        return;
+    }
+    let sa = color[3];
+    if sa == 0 {
+        return;
+    }
+    let idx = ((y as u32 * dims.width + x as u32) * 4) as usize;
+    if idx + 3 >= frame.len() {
+        return;
+    }
+    // Source is premultiplied, destination is premultiplied.
+    let inv = 255 - u16::from(sa);
+    for ch in 0..3 {
+        frame[idx + ch] = (u16::from(color[ch]) + (u16::from(frame[idx + ch]) * inv) / 255) as u8;
+    }
+    frame[idx + 3] = (u16::from(sa) + (u16::from(frame[idx + 3]) * inv) / 255) as u8;
+}
+
+/// Returns coverage 0.0–1.0 for a pixel at (px, py) against a rounded rect.
+fn rounded_rect_coverage(px: f32, py: f32, rect: Rect, radius: f32) -> f32 {
+    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+    // Check if outside bounding box
+    if px < rect.x || px > rect.x + rect.w || py < rect.y || py > rect.y + rect.h {
+        return 0.0;
+    }
+    // Check corner regions
+    let corners = [
+        (rect.x + r, rect.y + r),                   // top-left
+        (rect.x + rect.w - r, rect.y + r),          // top-right
+        (rect.x + r, rect.y + rect.h - r),          // bottom-left
+        (rect.x + rect.w - r, rect.y + rect.h - r), // bottom-right
+    ];
+    for &(cx, cy) in &corners {
+        let in_corner_x = (px < rect.x + r && cx == corners[0].0 || cx == corners[2].0)
+            || (px > rect.x + rect.w - r && (cx == corners[1].0 || cx == corners[3].0));
+        let in_corner_y = (py < rect.y + r && (cy == corners[0].1 || cy == corners[1].1))
+            || (py > rect.y + rect.h - r && (cy == corners[2].1 || cy == corners[3].1));
+        if in_corner_x && in_corner_y {
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > r + 0.5 {
+                return 0.0;
+            }
+            if dist < r - 0.5 {
+                return 1.0;
+            }
+            return (r + 0.5 - dist).clamp(0.0, 1.0);
+        }
+    }
+    1.0
+}
+
+fn fill_rounded_rect(
+    frame: &mut [u8],
+    dims: SurfaceDimensions,
+    rect: Rect,
+    radius: f32,
+    color: [u8; 4],
+) {
+    let base_alpha = u16::from(color[3]);
+    let x0 = (rect.x.floor() as i32).max(0);
+    let y0 = (rect.y.floor() as i32).max(0);
+    let x1 = ((rect.x + rect.w).ceil() as i32).min(dims.width as i32);
+    let y1 = ((rect.y + rect.h).ceil() as i32).min(dims.height as i32);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cov = rounded_rect_coverage(px as f32 + 0.5, py as f32 + 0.5, rect, radius);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = ((base_alpha * (cov * 255.0) as u16) / 255).min(255) as u8;
+            blend_pixel(
+                frame,
+                dims,
+                px,
+                py,
+                argb_pixel_premul(color[2], color[1], color[0], a),
+            );
+        }
+    }
+}
+
+fn stroke_rounded_rect(
+    frame: &mut [u8],
+    dims: SurfaceDimensions,
+    rect: Rect,
+    radius: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    let inner = Rect {
+        x: rect.x + thickness,
+        y: rect.y + thickness,
+        w: rect.w - thickness * 2.0,
+        h: rect.h - thickness * 2.0,
+    };
+    let inner_r = (radius - thickness).max(0.0);
+    let base_alpha = u16::from(color[3]);
+    let x0 = (rect.x.floor() as i32).max(0);
+    let y0 = (rect.y.floor() as i32).max(0);
+    let x1 = ((rect.x + rect.w).ceil() as i32).min(dims.width as i32);
+    let y1 = ((rect.y + rect.h).ceil() as i32).min(dims.height as i32);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let fp = (px as f32 + 0.5, py as f32 + 0.5);
+            let outer_cov = rounded_rect_coverage(fp.0, fp.1, rect, radius);
+            if outer_cov <= 0.0 {
+                continue;
+            }
+            let inner_cov = rounded_rect_coverage(fp.0, fp.1, inner, inner_r);
+            let border_cov = (outer_cov - inner_cov).clamp(0.0, 1.0);
+            if border_cov <= 0.0 {
+                continue;
+            }
+            let a = ((base_alpha * (border_cov * 255.0) as u16) / 255).min(255) as u8;
+            blend_pixel(
+                frame,
+                dims,
+                px,
+                py,
+                argb_pixel_premul(color[2], color[1], color[0], a),
+            );
+        }
+    }
+}
+
+fn draw_shadow(
+    frame: &mut [u8],
+    dims: SurfaceDimensions,
+    content: ContentArea,
+    radius: f32,
+    shadow_radius: u32,
+    shadow_alpha: u8,
+) {
+    let sr = shadow_radius as f32;
+    let content_rect = Rect {
+        x: content.x as f32,
+        y: content.y as f32,
+        w: content.width as f32,
+        h: content.height as f32,
+    };
+    let expand = sr;
+    let shadow_rect = Rect {
+        x: content_rect.x - expand,
+        y: content_rect.y - expand,
+        w: content_rect.w + expand * 2.0,
+        h: content_rect.h + expand * 2.0,
+    };
+    let x0 = (shadow_rect.x.floor() as i32).max(0);
+    let y0 = (shadow_rect.y.floor() as i32).max(0);
+    let x1 = ((shadow_rect.x + shadow_rect.w).ceil() as i32).min(dims.width as i32);
+    let y1 = ((shadow_rect.y + shadow_rect.h).ceil() as i32).min(dims.height as i32);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let fp = (px as f32 + 0.5, py as f32 + 0.5);
+            // If inside the content rect, skip (will be painted by background fill)
+            let inside = rounded_rect_coverage(fp.0, fp.1, content_rect, radius);
+            if inside >= 1.0 {
+                continue;
+            }
+            // Compute distance to the content rect edge
+            let dist = distance_to_rounded_rect(fp.0, fp.1, content_rect, radius);
+            if dist >= sr {
+                continue;
+            }
+            let falloff = 1.0 - dist / sr;
+            let alpha = (f32::from(shadow_alpha) * falloff * falloff).round() as u8;
+            if alpha == 0 {
+                continue;
+            }
+            blend_pixel(frame, dims, px, py, argb_pixel_premul(0, 0, 0, alpha));
+        }
+    }
+}
+
+fn distance_to_rounded_rect(px: f32, py: f32, rect: Rect, radius: f32) -> f32 {
+    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+    // Clamp to the inner rectangle (inset by radius)
+    let inner_x0 = rect.x + r;
+    let inner_x1 = rect.x + rect.w - r;
+    let inner_y0 = rect.y + r;
+    let inner_y1 = rect.y + rect.h - r;
+
+    let cx = px.clamp(inner_x0, inner_x1);
+    let cy = py.clamp(inner_y0, inner_y1);
+
+    let dx = px - cx;
+    let dy = py - cy;
+    let corner_dist = (dx * dx + dy * dy).sqrt();
+
+    // If we're in a corner zone
+    if (px < inner_x0 || px > inner_x1) && (py < inner_y0 || py > inner_y1) {
+        (corner_dist - r).max(0.0)
+    } else {
+        // Straight edge — distance to nearest edge
+        let dist_left = (px - rect.x).abs();
+        let dist_right = (px - (rect.x + rect.w)).abs();
+        let dist_top = (py - rect.y).abs();
+        let dist_bottom = (py - (rect.y + rect.h)).abs();
+        let min_edge = dist_left.min(dist_right).min(dist_top).min(dist_bottom);
+        // If inside, return 0
+        if px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h {
+            0.0
+        } else {
+            min_edge
+        }
+    }
+}
+
+fn draw_accent_stripe(
+    frame: &mut [u8],
+    dims: SurfaceDimensions,
+    content: ContentArea,
+    stripe_width: f32,
+    margin: f32,
+    color: [u8; 4],
+    fade_alpha: f32,
+) {
+    let sw = stripe_width;
+    let half = sw / 2.0;
+    let x_center = content.x as f32 + PADDING_LEFT as f32 - sw - margin;
+    let y_top = content.y as f32 + PADDING_V as f32 + half;
+    let y_bottom = (content.y + content.height) as f32 - PADDING_V as f32 - half;
+    if y_bottom <= y_top {
+        return;
+    }
+
+    let base_alpha = (u16::from(color[3]) as f32 * fade_alpha).round() as u16;
+    let x0 = ((x_center - half).floor() as i32).max(0);
+    let x1 = ((x_center + half).ceil() as i32).min(dims.width as i32);
+    let y0 = ((y_top - half).floor() as i32).max(0);
+    let y1 = ((y_bottom + half).ceil() as i32).min(dims.height as i32);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let fp = (px as f32 + 0.5, py as f32 + 0.5);
+            let dx = (fp.0 - x_center).abs();
+            if dx > half + 0.5 {
+                continue;
+            }
+            // Pill caps
+            let cov = if fp.1 < y_top {
+                let dy = y_top - fp.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > half + 0.5 {
+                    continue;
+                }
+                (half + 0.5 - dist).clamp(0.0, 1.0)
+            } else if fp.1 > y_bottom {
+                let dy = fp.1 - y_bottom;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > half + 0.5 {
+                    continue;
+                }
+                (half + 0.5 - dist).clamp(0.0, 1.0)
+            } else {
+                // Side edges AA
+                (half + 0.5 - dx).clamp(0.0, 1.0)
+            };
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = ((base_alpha * (cov * 255.0) as u16) / 255).min(255) as u8;
+            blend_pixel(
+                frame,
+                dims,
+                px,
+                py,
+                argb_pixel_premul(color[2], color[1], color[0], a),
+            );
+        }
+    }
+}
+
+fn accent_color_for_phase(phase: OverlayRenderPhase) -> Option<[u8; 4]> {
+    match phase {
+        OverlayRenderPhase::Hidden => None,
+        OverlayRenderPhase::Listening => Some([244, 133, 66, 255]), // ARGB stored as [B, G, R, A] via argb_pixel
+        OverlayRenderPhase::Interim => Some([137, 199, 52, 255]),
+        OverlayRenderPhase::Finalizing => Some([64, 179, 255, 255]),
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FadeDirection {
+    In,
+    Out,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FadeState {
+    direction: FadeDirection,
+    started_ms: u64,
+    duration_ms: u64,
+}
+
+impl FadeState {
+    fn progress(&self, now_ms: u64) -> f32 {
+        let elapsed = now_ms.saturating_sub(self.started_ms) as f32;
+        let t = (elapsed / self.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+        match self.direction {
+            FadeDirection::In => ease_out_cubic(t),
+            FadeDirection::Out => 1.0 - ease_out_cubic(t),
+        }
+    }
+
+    fn is_complete(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started_ms) >= self.duration_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     LayerShell,
@@ -114,10 +483,29 @@ struct OverlayUiConfig {
 
 impl OverlayUiConfig {
     fn surface_dimensions(&self) -> SurfaceDimensions {
-        let width = self.max_width.clamp(320, 3840);
+        let content_width = self.max_width.clamp(320, 3840);
         let clamped_lines = self.max_lines.clamp(1, 10);
-        let height = (24 + clamped_lines * 34).clamp(72, 720);
-        SurfaceDimensions { width, height }
+        let line_h = (DEFAULT_FONT_SIZE_PX * LINE_HEIGHT_FACTOR).ceil() as u32;
+        let content_height = (PADDING_V * 2 + clamped_lines * line_h).clamp(72, 720);
+        // Expand for shadow
+        let shadow_pad = SHADOW_RADIUS * 2;
+        SurfaceDimensions {
+            width: content_width + shadow_pad,
+            height: content_height + shadow_pad,
+        }
+    }
+
+    fn content_area(&self) -> ContentArea {
+        let content_width = self.max_width.clamp(320, 3840);
+        let clamped_lines = self.max_lines.clamp(1, 10);
+        let line_h = (DEFAULT_FONT_SIZE_PX * LINE_HEIGHT_FACTOR).ceil() as u32;
+        let content_height = (PADDING_V * 2 + clamped_lines * line_h).clamp(72, 720);
+        ContentArea {
+            x: SHADOW_RADIUS,
+            y: SHADOW_RADIUS,
+            width: content_width,
+            height: content_height,
+        }
     }
 }
 
@@ -187,6 +575,7 @@ const GENERIC_FALLBACK_ORDER: [GenericFamilyKind; 3] = [
 impl TextRenderer {
     fn new(raw_descriptor: &str) -> Self {
         let parsed = parse_font_descriptor(raw_descriptor);
+        let user_specified_font = parsed.fallback_reason.is_none();
         let mut db = Database::new();
         db.load_system_fonts();
         let mut fallback_reasons = Vec::new();
@@ -196,6 +585,19 @@ impl TextRenderer {
 
         let mut selected_family = parsed.family.clone();
         let mut font = load_font_from_database(&db, &selected_family);
+
+        // Try preferred font cascade only when user hasn't overridden --font
+        if font.is_none() && !user_specified_font {
+            for preferred in PREFERRED_FONTS {
+                font = load_font_from_database(&db, preferred);
+                if font.is_some() {
+                    selected_family = (*preferred).to_string();
+                    fallback_reasons.push(format!("using_preferred_font:{preferred}"));
+                    break;
+                }
+            }
+        }
+
         if font.is_none() {
             fallback_reasons.push(format!("font_unavailable:{selected_family}"));
 
@@ -260,51 +662,76 @@ impl TextRenderer {
         Self { summary, font }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_headline(
         &self,
         frame: &mut [u8],
         dimensions: SurfaceDimensions,
+        content: ContentArea,
         max_width_px: u32,
         max_lines: u32,
         text: &str,
+        fade_alpha: f32,
     ) {
         let Some(font) = &self.font else {
             return;
         };
 
-        let width_limit = max_width_px
-            .clamp(64, dimensions.width)
-            .saturating_sub(TEXT_MARGIN_X_PX.saturating_mul(2));
+        let text_area_width = max_width_px
+            .clamp(64, content.width)
+            .saturating_sub(PADDING_LEFT + PADDING_H);
         let line_limit = max_lines.clamp(1, 10);
-        let lines = layout_text_lines(text, width_limit, line_limit, |character| {
+        let lines = layout_text_lines(text, text_area_width, line_limit, |character| {
             font.metrics(character, self.summary.size_px).advance_width
         });
         if lines.is_empty() {
             return;
         }
 
-        let line_height = (self.summary.size_px * 1.3).ceil() as i32;
-        let baseline_start = TEXT_MARGIN_Y_PX as i32 + self.summary.size_px.ceil() as i32;
+        let line_height = (self.summary.size_px * LINE_HEIGHT_FACTOR).ceil() as i32;
+        let baseline_start =
+            content.y as i32 + PADDING_V as i32 + self.summary.size_px.ceil() as i32;
+        let text_x_start = content.x as i32 + PADDING_LEFT as i32;
+        let text_alpha = (fade_alpha * 255.0).round() as u8;
+        let text_color_premul = argb_pixel_premul(
+            TEXT_COLOR_RGB.0,
+            TEXT_COLOR_RGB.1,
+            TEXT_COLOR_RGB.2,
+            text_alpha,
+        );
+        let shadow_alpha = ((TEXT_SHADOW_COLOR[3] as f32) * fade_alpha).round() as u8;
+        let text_shadow_premul = argb_pixel_premul(0, 0, 0, shadow_alpha);
+
         let mut baseline = baseline_start;
         for line in lines {
-            let mut cursor_x = TEXT_MARGIN_X_PX as f32;
+            let mut cursor_x = text_x_start as f32;
             for character in line.chars() {
                 let (metrics, bitmap) = font.rasterize(character, self.summary.size_px);
                 let glyph_x = cursor_x.floor() as i32 + metrics.xmin;
                 let glyph_y = baseline - metrics.height as i32 - metrics.ymin;
+                // Shadow pass (+0, +1)
+                blend_bitmap(
+                    frame,
+                    dimensions,
+                    (glyph_x, glyph_y + 1),
+                    (metrics.width, metrics.height),
+                    &bitmap,
+                    text_shadow_premul,
+                );
+                // Main pass
                 blend_bitmap(
                     frame,
                     dimensions,
                     (glyph_x, glyph_y),
                     (metrics.width, metrics.height),
                     &bitmap,
-                    TEXT_COLOR,
+                    text_color_premul,
                 );
                 cursor_x += metrics.advance_width;
             }
 
             baseline += line_height;
-            if baseline > dimensions.height as i32 {
+            if baseline > (content.y + content.height) as i32 {
                 break;
             }
         }
@@ -313,6 +740,9 @@ impl TextRenderer {
 
 trait OverlayBackend {
     fn render(&mut self, state: &OverlayVisibility) -> Result<()>;
+    fn is_fading(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -331,19 +761,81 @@ struct WaylandOverlayBackend {
     kind: BackendKind,
     ui: OverlayUiConfig,
     runtime: WaylandRuntime,
+    last_visible: bool,
+    fade: Option<FadeState>,
+    started: Instant,
 }
 
 impl WaylandOverlayBackend {
     fn new(kind: BackendKind, ui: OverlayUiConfig, runtime: WaylandRuntime) -> Self {
-        Self { kind, ui, runtime }
+        Self {
+            kind,
+            ui,
+            runtime,
+            last_visible: false,
+            fade: None,
+            started: Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn fade_alpha(&self) -> f32 {
+        match &self.fade {
+            Some(fade) => fade.progress(self.now_ms()),
+            None => {
+                if self.last_visible {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    fn is_fading(&self) -> bool {
+        self.fade
+            .as_ref()
+            .is_some_and(|f| !f.is_complete(self.now_ms()))
     }
 }
 
 impl OverlayBackend for WaylandOverlayBackend {
     fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
+        let intent = state.to_render_intent();
+        let now = self.now_ms();
+
+        // Detect visibility transitions
+        if intent.visible != self.last_visible {
+            self.fade = Some(FadeState {
+                direction: if intent.visible {
+                    FadeDirection::In
+                } else {
+                    FadeDirection::Out
+                },
+                started_ms: now,
+                duration_ms: FADE_DURATION_MS,
+            });
+            self.last_visible = intent.visible;
+        }
+
+        // Clean up completed fades
+        if let Some(fade) = &self.fade {
+            if fade.is_complete(now) {
+                self.fade = None;
+            }
+        }
+
+        let fade_alpha = self.fade_alpha();
         self.runtime
-            .render(&state.to_render_intent(), &self.ui)
+            .render_with_fade(&intent, &self.ui, fade_alpha)
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
+    }
+
+    fn is_fading(&self) -> bool {
+        WaylandOverlayBackend::is_fading(self)
     }
 }
 
@@ -578,7 +1070,14 @@ impl WaylandRuntime {
                     (),
                 );
                 layer_surface.set_anchor(layer_anchor(ui.anchor));
-                let (top, right, bottom, left) = layer_margins(ui.anchor, ui.margin_x, ui.margin_y);
+                // Compensate layer-shell margins for shadow padding so content stays
+                // in the same visual position.
+                let shadow_offset = SHADOW_RADIUS;
+                let (top, right, bottom, left) = layer_margins(
+                    ui.anchor,
+                    ui.margin_x.saturating_sub(shadow_offset),
+                    ui.margin_y.saturating_sub(shadow_offset),
+                );
                 layer_surface.set_margin(top, right, bottom, left);
                 layer_surface.set_exclusive_zone(0);
                 layer_surface
@@ -632,7 +1131,12 @@ impl WaylandRuntime {
         })
     }
 
-    fn render(&mut self, intent: &OverlayRenderIntent, ui: &OverlayUiConfig) -> Result<()> {
+    fn render_with_fade(
+        &mut self,
+        intent: &OverlayRenderIntent,
+        ui: &OverlayUiConfig,
+        fade_alpha: f32,
+    ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
         if self.state.closed {
@@ -646,13 +1150,17 @@ impl WaylandRuntime {
         }
 
         let keep_surface_mapped_when_hidden = matches!(self.shell, ShellSurface::Layer { .. });
-        if intent.visible || keep_surface_mapped_when_hidden {
+        let should_render = intent.visible || fade_alpha > 0.0 || keep_surface_mapped_when_hidden;
+        if should_render {
+            let content = ui.content_area();
             render_frame(
                 self.shm_buffer.bytes_mut(),
                 self.dimensions,
                 intent,
                 ui,
                 &self.text_renderer,
+                fade_alpha,
+                content,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -1161,17 +1669,6 @@ fn load_font_from_face(db: &Database, face_id: fontdb::ID) -> Option<Font> {
     .ok()
 }
 
-fn color_for_phase(phase: OverlayRenderPhase, opacity: f32) -> [u8; 4] {
-    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-
-    match phase {
-        OverlayRenderPhase::Hidden => argb_pixel(0, 0, 0, 0),
-        OverlayRenderPhase::Listening => argb_pixel(38, 113, 199, alpha),
-        OverlayRenderPhase::Interim => argb_pixel(26, 146, 92, alpha),
-        OverlayRenderPhase::Finalizing => argb_pixel(184, 126, 36, alpha),
-    }
-}
-
 fn argb_pixel(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [b, g, r, a]
 }
@@ -1182,17 +1679,69 @@ fn render_frame(
     intent: &OverlayRenderIntent,
     ui: &OverlayUiConfig,
     text_renderer: &TextRenderer,
+    fade_alpha: f32,
+    content: ContentArea,
 ) {
-    let pixel = if intent.visible {
-        color_for_phase(intent.phase, ui.opacity)
-    } else {
-        argb_pixel(0, 0, 0, 0)
-    };
-    fill_frame(frame, pixel);
-    if !intent.visible {
+    // 1. Clear to transparent
+    fill_frame(frame, [0, 0, 0, 0]);
+
+    if fade_alpha <= 0.0 {
         return;
     }
 
+    let content_rect = Rect {
+        x: content.x as f32,
+        y: content.y as f32,
+        w: content.width as f32,
+        h: content.height as f32,
+    };
+
+    // 2. Draw shadow
+    let shadow_a = (SHADOW_ALPHA as f32 * fade_alpha).round() as u8;
+    draw_shadow(
+        frame,
+        dimensions,
+        content,
+        CORNER_RADIUS,
+        SHADOW_RADIUS,
+        shadow_a,
+    );
+
+    // 3. Fill rounded rect (dark background)
+    let bg_a = (BG_ALPHA as f32 * fade_alpha).round() as u8;
+    fill_rounded_rect(
+        frame,
+        dimensions,
+        content_rect,
+        CORNER_RADIUS,
+        argb_pixel(BG_COLOR.0, BG_COLOR.1, BG_COLOR.2, bg_a),
+    );
+
+    // 4. Stroke rounded rect (thin border)
+    let border_a = (BORDER_ALPHA as f32 * fade_alpha).round() as u8;
+    stroke_rounded_rect(
+        frame,
+        dimensions,
+        content_rect,
+        CORNER_RADIUS,
+        BORDER_THICKNESS,
+        argb_pixel(BORDER_COLOR.0, BORDER_COLOR.1, BORDER_COLOR.2, border_a),
+    );
+
+    // 5. Draw accent stripe
+    if let Some(accent) = accent_color_for_phase(intent.phase) {
+        draw_accent_stripe(
+            frame,
+            dimensions,
+            content,
+            ACCENT_STRIPE_WIDTH,
+            ACCENT_STRIPE_MARGIN,
+            accent,
+            fade_alpha,
+        );
+    }
+
+    // 6. Draw text
     let headline = intent.headline.trim();
     let detail = intent
         .detail
@@ -1205,7 +1754,15 @@ fn render_frame(
         headline.to_string()
     };
 
-    text_renderer.draw_headline(frame, dimensions, ui.max_width, ui.max_lines, &text);
+    text_renderer.draw_headline(
+        frame,
+        dimensions,
+        content,
+        ui.max_width,
+        ui.max_lines,
+        &text,
+        fade_alpha,
+    );
 }
 
 fn fill_frame(frame: &mut [u8], pixel: [u8; 4]) {
@@ -1230,6 +1787,7 @@ fn blend_bitmap(
         return;
     }
 
+    // color is already premultiplied: [B*a/255, G*a/255, R*a/255, a]
     for y in 0..height {
         let draw_y = origin_y + y as i32;
         if !(0..frame_height).contains(&draw_y) {
@@ -1245,20 +1803,21 @@ fn blend_bitmap(
                 continue;
             }
 
-            let source_alpha = ((u16::from(coverage) * u16::from(color[3])) / 255) as u8;
-            if source_alpha == 0 {
+            let cov16 = u16::from(coverage);
+            // Scale premultiplied color channels by coverage
+            let sa = ((cov16 * u16::from(color[3])) / 255) as u8;
+            if sa == 0 {
                 continue;
             }
 
             let idx = ((draw_y as u32 * dimensions.width + draw_x as u32) * 4) as usize;
-            for channel in 0..3 {
-                let dst = frame[idx + channel];
-                let src = color[channel];
-                frame[idx + channel] = (((u16::from(src) * u16::from(source_alpha))
-                    + (u16::from(dst) * u16::from(255 - source_alpha)))
-                    / 255) as u8;
+            let inv = 255 - u16::from(sa);
+            for ch in 0..3 {
+                let src_premul = ((cov16 * u16::from(color[ch])) / 255) as u8;
+                frame[idx + ch] =
+                    (u16::from(src_premul) + (u16::from(frame[idx + ch]) * inv) / 255) as u8;
             }
-            frame[idx + 3] = frame[idx + 3].max(source_alpha);
+            frame[idx + 3] = (u16::from(sa) + (u16::from(frame[idx + 3]) * inv) / 255) as u8;
         }
     }
 }
@@ -1472,7 +2031,9 @@ async fn main() -> Result<()> {
             }
             _ = tick.tick() => {
                 let now_ms = started.elapsed().as_millis() as u64;
-                if machine.advance_time(now_ms) {
+                let time_advanced = machine.advance_time(now_ms);
+                let fading = built_backend.backend.is_fading();
+                if time_advanced || fading {
                     built_backend
                         .backend
                         .render(machine.visibility())
@@ -1496,10 +2057,11 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        color_for_phase, layout_text_lines, parse_font_descriptor, parse_generic_family_kind,
-        render_frame, resolve_backend_selection, BackendSelection, BackendSignals, CliBackendMode,
-        FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, SurfaceDimensions,
-        TextRenderer,
+        accent_color_for_phase, ease_out_cubic, layout_text_lines, parse_font_descriptor,
+        parse_generic_family_kind, render_frame, resolve_backend_selection, rounded_rect_coverage,
+        BackendSelection, BackendSignals, CliBackendMode, FadeDirection, FadeState,
+        FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer,
+        SHADOW_RADIUS,
     };
     use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
 
@@ -1564,11 +2126,15 @@ mod tests {
     }
 
     #[test]
-    fn hidden_phase_color_is_transparent() {
-        assert_eq!(
-            color_for_phase(OverlayRenderPhase::Hidden, 0.8),
-            [0, 0, 0, 0]
-        );
+    fn hidden_phase_accent_is_none() {
+        assert!(accent_color_for_phase(OverlayRenderPhase::Hidden).is_none());
+    }
+
+    #[test]
+    fn visible_phase_accents_are_some() {
+        assert!(accent_color_for_phase(OverlayRenderPhase::Listening).is_some());
+        assert!(accent_color_for_phase(OverlayRenderPhase::Interim).is_some());
+        assert!(accent_color_for_phase(OverlayRenderPhase::Finalizing).is_some());
     }
 
     #[test]
@@ -1587,7 +2153,7 @@ mod tests {
     fn malformed_font_descriptor_falls_back_to_default_size() {
         let parsed = parse_font_descriptor("InvalidDescriptor");
         assert_eq!(parsed.family, "InvalidDescriptor".to_string());
-        assert_eq!(parsed.size_px, 16.0);
+        assert_eq!(parsed.size_px, 18.0);
         assert_eq!(
             parsed.fallback_reason.as_deref(),
             Some("font_size_missing_using_default")
@@ -1625,22 +2191,20 @@ mod tests {
     fn render_intent_mapping_visible_vs_hidden_alpha() {
         let ui = OverlayUiConfig {
             opacity: 0.92,
-            font: "Sans 16".to_string(),
+            font: "Sans 18".to_string(),
             anchor: super::CliAnchor::TopCenter,
             margin_x: 24,
             margin_y: 24,
             max_width: 320,
             max_lines: 3,
         };
-        let dimensions = SurfaceDimensions {
-            width: 320,
-            height: 100,
-        };
+        let dimensions = ui.surface_dimensions();
+        let content = ui.content_area();
         let text_renderer = TextRenderer {
             summary: FontResolutionSummary {
-                requested: "Sans 16".to_string(),
+                requested: "Sans 18".to_string(),
                 family: "Sans".to_string(),
-                size_px: 16.0,
+                size_px: 18.0,
                 fallback_reason: None,
             },
             font: None,
@@ -1658,6 +2222,8 @@ mod tests {
             },
             &ui,
             &text_renderer,
+            0.0,
+            content,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -1673,7 +2239,88 @@ mod tests {
             },
             &ui,
             &text_renderer,
+            1.0,
+            content,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn surface_dimensions_include_shadow() {
+        let ui = OverlayUiConfig {
+            opacity: 0.92,
+            font: "Sans 18".to_string(),
+            anchor: super::CliAnchor::TopCenter,
+            margin_x: 24,
+            margin_y: 24,
+            max_width: 320,
+            max_lines: 3,
+        };
+        let dims = ui.surface_dimensions();
+        let content = ui.content_area();
+        assert_eq!(dims.width, content.width + SHADOW_RADIUS * 2);
+        assert_eq!(dims.height, content.height + SHADOW_RADIUS * 2);
+        assert_eq!(content.x, SHADOW_RADIUS);
+        assert_eq!(content.y, SHADOW_RADIUS);
+    }
+
+    #[test]
+    fn fill_rounded_rect_corner_coverage() {
+        let rect = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        // Center of rect: full coverage
+        assert_eq!(rounded_rect_coverage(60.5, 35.5, rect, 12.0), 1.0);
+        // Well outside rect: zero coverage
+        assert_eq!(rounded_rect_coverage(0.5, 0.5, rect, 12.0), 0.0);
+        // Right at the corner: partial coverage (anti-aliased)
+        let corner_cov = rounded_rect_coverage(10.5, 10.5, rect, 12.0);
+        assert!(
+            (0.0..=1.0).contains(&corner_cov),
+            "corner coverage should be 0..1, got {corner_cov}"
+        );
+    }
+
+    #[test]
+    fn fade_progress_interpolation() {
+        let fade_in = FadeState {
+            direction: FadeDirection::In,
+            started_ms: 100,
+            duration_ms: 250,
+        };
+        // At start
+        assert!((fade_in.progress(100) - 0.0).abs() < 0.01);
+        // At end
+        assert!((fade_in.progress(350) - 1.0).abs() < 0.01);
+        // Midway should be between 0 and 1
+        let mid = fade_in.progress(225);
+        assert!(mid > 0.0 && mid < 1.0, "midway progress = {mid}");
+
+        let fade_out = FadeState {
+            direction: FadeDirection::Out,
+            started_ms: 100,
+            duration_ms: 250,
+        };
+        assert!((fade_out.progress(100) - 1.0).abs() < 0.01);
+        assert!((fade_out.progress(350) - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn ease_out_cubic_boundaries() {
+        assert!((ease_out_cubic(0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < f32::EPSILON);
+        // Ease-out should be > linear at midpoint
+        assert!(ease_out_cubic(0.5) > 0.5);
+        // Monotonically increasing
+        let mut prev = 0.0f32;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let v = ease_out_cubic(t);
+            assert!(v >= prev, "not monotonic at t={t}");
+            prev = v;
+        }
     }
 }
