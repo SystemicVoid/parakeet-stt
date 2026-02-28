@@ -135,12 +135,16 @@ def _stop_message(session_id: UUID) -> StopSession:
     )
 
 
+def _disable_server_sleep(monkeypatch) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+
+
 def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         server = _build_server(overlay_events_enabled=False)
         websocket = FakeWebSocket()
@@ -158,10 +162,7 @@ def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> No
 
 def test_overlay_events_enabled_stream_is_ordered_and_final_once(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         server = _build_server(overlay_events_enabled=True)
         websocket = FakeWebSocket()
@@ -205,10 +206,7 @@ def test_overlay_events_enabled_stream_is_ordered_and_final_once(monkeypatch) ->
 
 def test_overlay_sequence_does_not_leak_across_sessions(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         server = _build_server(overlay_events_enabled=True)
         websocket = FakeWebSocket()
@@ -236,10 +234,7 @@ def test_overlay_sequence_does_not_leak_across_sessions(monkeypatch) -> None:
 
 def test_overlay_send_failures_do_not_block_final_result(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         server = _build_server(overlay_events_enabled=True)
         websocket = FakeWebSocket()
@@ -267,10 +262,7 @@ def test_overlay_send_failures_do_not_block_final_result(monkeypatch) -> None:
 
 def test_interim_text_emitted_when_incremental_source_validates(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         ready_chunks = [
             np.full((400,), 0.1, dtype=np.float32),
@@ -321,10 +313,7 @@ def test_interim_text_emitted_when_incremental_source_validates(monkeypatch) -> 
 
 def test_incremental_source_failure_does_not_break_final_result(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         ready_chunks = [np.full((400,), 0.1, dtype=np.float32)]
         server = _build_server(
@@ -359,10 +348,7 @@ def test_incremental_source_failure_does_not_break_final_result(monkeypatch) -> 
 
 def test_live_interim_chunk_emission_dedupes_repeated_text(monkeypatch) -> None:
     async def scenario() -> None:
-        async def no_sleep(_seconds: float) -> None:
-            return None
-
-        monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
+        _disable_server_sleep(monkeypatch)
 
         server = _build_server(
             overlay_events_enabled=True,
@@ -428,5 +414,162 @@ def test_abort_emits_session_ended_and_no_final_result() -> None:
             payload for payload in websocket.sent_json if payload["type"] == "session_ended"
         )
         assert session_ended["reason"] == "abort"
+
+    asyncio.run(scenario())
+
+
+def test_phase6_quick_utterance_contract_preserves_final_once(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=[np.full((400,), 0.1, dtype=np.float32)],
+            incremental_outputs=["quick command"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types.count("final_result") == 1
+        assert sent_types[-1] == "session_ended"
+
+        overlay_seqs = [
+            cast(int, payload["seq"])
+            for payload in websocket.sent_json
+            if payload["type"] in {"interim_state", "interim_text"}
+        ]
+        assert overlay_seqs == sorted(overlay_seqs)
+
+    asyncio.run(scenario())
+
+
+def test_phase6_long_dictation_contract_preserves_monotonic_interim_tail(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        ready_chunks = [
+            np.full((400,), 0.1, dtype=np.float32),
+            np.full((400,), 0.2, dtype=np.float32),
+            np.full((400,), 0.3, dtype=np.float32),
+            np.full((400,), 0.4, dtype=np.float32),
+        ]
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=ready_chunks,
+            incremental_outputs=[
+                "phase",
+                "phase",
+                "phase one",
+                "phase one",
+                "phase one two",
+                "phase one two",
+                "phase one two three",
+                "phase one two three four",
+                "phase one two three four five",
+            ],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        for chunk in ready_chunks:
+            await server._emit_live_interim_from_chunk(cast(Any, websocket), session_id, chunk)
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types.count("final_result") == 1
+        interim_texts = [
+            cast(str, payload["text"])
+            for payload in websocket.sent_json
+            if payload["type"] == "interim_text"
+        ]
+        assert len(interim_texts) >= 4
+        assert interim_texts[-1].startswith("phase one two three four")
+        assert len(set(interim_texts)) == len(interim_texts)
+
+        overlay_seqs = [
+            cast(int, payload["seq"])
+            for payload in websocket.sent_json
+            if payload["type"] in {"interim_state", "interim_text"}
+        ]
+        assert overlay_seqs == sorted(overlay_seqs)
+
+    asyncio.run(scenario())
+
+
+def test_phase6_daemon_reconnect_contract_recovers_with_fresh_session(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        server = _build_server(overlay_events_enabled=True)
+        first_socket = FakeWebSocket()
+        second_socket = FakeWebSocket()
+        first_session = uuid4()
+        second_session = uuid4()
+
+        await server._handle_start(cast(Any, first_socket), _start_message(first_session))
+        cleaned = await server._cleanup_active_session(
+            "websocket disconnected",
+            expected_session_id=first_session,
+            require_session_match=True,
+        )
+        assert cleaned is True
+        assert server.sessions.active is None
+
+        await server._handle_start(cast(Any, second_socket), _start_message(second_session))
+        await server._handle_stop(cast(Any, second_socket), _stop_message(second_session))
+
+        sent_types = [cast(str, payload["type"]) for payload in second_socket.sent_json]
+        assert sent_types.count("final_result") == 1
+        assert sent_types[-1] == "session_ended"
+        assert [
+            cast(int, payload["seq"])
+            for payload in second_socket.sent_json
+            if payload["type"] == "interim_state"
+        ] == [0, 1, 2]
+
+    asyncio.run(scenario())
+
+
+def test_phase6_overlay_crash_mid_session_contract_keeps_final_non_fatal(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=[np.full((400,), 0.1, dtype=np.float32)],
+            incremental_outputs=["first interim", "second interim"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+        failed_overlay_sends = 0
+
+        async def flaky_send_json(payload: dict[str, object]) -> None:
+            nonlocal failed_overlay_sends
+            if payload.get("type") in {"interim_state", "interim_text", "session_ended"}:
+                if failed_overlay_sends < 2:
+                    failed_overlay_sends += 1
+                    raise RuntimeError("overlay process unavailable")
+            websocket.sent_json.append(payload)
+
+        websocket.send_json = flaky_send_json  # type: ignore[method-assign]
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._emit_live_interim_from_chunk(
+            cast(Any, websocket), session_id, np.full((400,), 0.2, dtype=np.float32)
+        )
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types.count("final_result") == 1
+        assert "session_ended" in sent_types
+
+        status = server.status()
+        assert status.overlay_events_dropped is not None
+        assert status.overlay_events_dropped >= 2
 
     asyncio.run(scenario())

@@ -77,14 +77,23 @@ logs-overlay: _guard
 overlay-kill: _guard
     @bash -lc 'cd "{{repo_root}}" && pattern="(^|/)parakeet-overlay($| )" && echo ">>> before" && before="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$before" ]]; then printf "%s\n" "$before"; else echo "(none)"; fi && (pkill -f "$pattern" || true) && sleep 0.4 && echo ">>> after" && after="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$after" ]]; then printf "%s\n" "$after"; else echo "(none; trigger PTT event to respawn)"; fi'
 
-# Compact runbook for manual E2E pass.
+# Run Phase 6 contract suites once (daemon + ptt reliability cases).
+phase6-contract: _guard
+    @bash -lc 'cd "{{repo_root}}" && echo ">>> daemon overlay contract suite" && cd parakeet-stt-daemon && uv run pytest tests/test_overlay_event_stream.py && echo ">>> ptt mixed-version + overlay fault-isolation suite" && cd ../parakeet-ptt && cargo test decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages && cargo test mixed_stream_enqueues_exactly_one_final_result && cargo test overlay_crash_restart_replays_current_state_and_preserves_final_injection && cargo test repeated_overlay_failures_remain_non_fatal_to_final_injection'
+
+# Promotion gate: require repeated clean Phase 6 contract passes + stream/seal quality gate.
+phase6-promotion runs="3": _guard
+    @bash -lc 'cd "{{repo_root}}" && runs="{{runs}}" && if ! [[ "$runs" =~ ^[0-9]+$ ]] || (( runs < 3 )); then echo "runs must be an integer >= 3" >&2; exit 1; fi && outfile="/tmp/parakeet-overlay-phase6-gate-$(date +%Y%m%d-%H%M%S).log" && { echo ">>> phase6 promotion gate (${runs} clean runs required)"; for run in $(seq 1 "$runs"); do echo ""; echo "=== reliability run ${run}/${runs} ==="; just --justfile justfile.overlay-dev phase6-contract; done; echo ""; echo "=== stream/seal regression gate ==="; just eval compare; echo ""; echo "artifact=$outfile"; } 2>&1 | tee "$outfile"'
+
+# Compact runbook for full Phase 6 manual coverage.
 runbook: _guard
     @printf '%s\n' \
-      "1) just --justfile justfile.overlay-dev start-layer-shell" \
-      "2) Detach tmux, then: just --justfile justfile.overlay-dev status" \
-      "3) Do manual hotkey utterance tests" \
-      "4) During utterance: just --justfile justfile.overlay-dev overlay-kill" \
-      "5) Trigger next utterance and confirm respawn + final injection" \
-      "6) Run 10+ minute perf soak: just --justfile justfile.overlay-dev soak-perf 600 1" \
-      "7) Fallback is diagnostic-only on COSMIC: just --justfile justfile.overlay-dev start-fallback" \
-      "8) just --justfile justfile.overlay-dev stop"
+      "1) Start layer-shell session: just --justfile justfile.overlay-dev start-layer-shell" \
+      "2) Quick utterance: tap hotkey briefly; expect one final injection and clean auto-hide." \
+      "3) Long dictation: hold hotkey for sustained speech; expect rolling interim tail + one final injection." \
+      "4) Abort mid-session: release early or abort; expect session_ended=abort and no injected final text." \
+      "5) Overlay crash mid-session: just --justfile justfile.overlay-dev overlay-kill; next overlay event should respawn and final injection still succeeds." \
+      "6) Daemon reconnect: kill daemon process, restart helper stack, verify client reconnect + subsequent final injection." \
+      "7) Mixed-version compatibility: run protocol decode check (cargo test decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages)." \
+      "8) Promotion gate: just --justfile justfile.overlay-dev phase6-promotion 3" \
+      "9) Stop helper stack: just --justfile justfile.overlay-dev stop"

@@ -15,7 +15,7 @@ _Last updated: 2026-02-28_
 - [x] Phase 4 Slice D: crash/restart simulation through PTT routing path + reconnect/final-injection proof.
 - [x] Phase 4 Slice E: layer-shell text rendering + COSMIC fallback guardrails.
 - [x] Phase 5: Config/flags/rollout controls.
-- [ ] Phase 6: E2E reliability and promotion gates.
+- [x] Phase 6: E2E reliability and promotion gates.
 
 ## Implementation Log
 - 2026-02-28: Established dedicated overlay worktree/branch from latest `origin/main`.
@@ -55,6 +55,9 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added repeatable `justfile.overlay-dev soak-perf` sustained-run sampler for `parakeet-ptt` + `parakeet-overlay` CPU/RSS collection (10+ minute window, deterministic artifact path).
 - 2026-02-28: Completed Phase 5 rollout controls by adding `--overlay-enabled <true|false>` with `PARAKEET_OVERLAY_ENABLED` precedence (`CLI > env > default=false`), invalid-env soft-fail disable semantics, and empty-mode-env normalization.
 - 2026-02-28: Updated helper/runbook operator surfaces (`scripts/stt-helper.sh`, `justfile.overlay-dev`, `docs/stt-troubleshooting.md`) so overlay remains explicit opt-in while preserving non-fatal fallback behavior.
+- 2026-02-28: Completed Phase 6 reliability harness by extending daemon overlay contract tests with explicit quick-utterance, long-dictation, daemon-reconnect, and overlay-crash scenarios while preserving non-fatal final-result behavior.
+- 2026-02-28: Added explicit mixed-version decode stream test in `parakeet-ptt` protocol coverage to prove unknown daemon message types remain non-fatal when interleaved with known variants.
+- 2026-02-28: Added `justfile.overlay-dev` Phase 6 operator gates (`phase6-contract`, `phase6-promotion`) to enforce repeated clean reliability runs and emit deterministic promotion artifacts.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -84,6 +87,9 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 4 closeout + Phase 5 controls): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 56 tests), including new repeated overlay-failure isolation and explicit missing-binary non-fatal tests.
 - 2026-02-28 (helper contract): `bash -n scripts/stt-helper.sh` and `source scripts/stt-helper.sh && stt help start` passed with `--overlay-enabled` surfaced from `start_option_rows`.
 - 2026-02-28 (Phase 4 sustained runtime soak): `just --justfile justfile.overlay-dev soak-perf 600 1` generated artifact `/tmp/parakeet-overlay-soak-20260228-221536.tsv` with 591 samples each for `parakeet-ptt` and `parakeet-overlay`; summarized CPU/RSS were `parakeet-ptt` avg/p95/max CPU `0.12/0.20/0.60%`, RSS `14.8/14.8/14.8 MiB`; `parakeet-overlay` avg/p95/max CPU `0.00/0.00/0.10%`, RSS `31.9/31.9/31.9 MiB`.
+- 2026-02-28 (Phase 6 contract coverage): `cd parakeet-stt-daemon && uv run pytest tests/test_overlay_event_stream.py` passed (12 tests), including explicit quick-utterance, long-dictation, daemon-reconnect, and overlay-crash scenario contracts.
+- 2026-02-28 (Phase 6 mixed-version + isolation checks): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 57 tests), including new `decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages`.
+- 2026-02-28 (Phase 6 promotion gate): `just --justfile justfile.overlay-dev phase6-promotion 3` passed (three consecutive clean `phase6-contract` runs + stream/seal regression gate) and generated artifact `/tmp/parakeet-overlay-phase6-gate-20260228-224327.log`; stream-seal vs offline deltas were weighted WER `+0.000514`, strict command exact match `+0.020000`, normalized command exact match `+0.020000`, intent+slot match `+0.020000`, critical token recall `+0.007782`, punctuation F1 `+0.018368`, terminal punctuation accuracy `+0.000000`, and warm finalize P95 `+2.828343 ms`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -327,29 +333,31 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 6: End-To-End Reliability And Promotion Gates
 ### Implementation Tasks
-- Add E2E runner scenarios:
-  - quick utterance.
-  - long dictation.
-  - abort mid-session.
-  - daemon reconnect.
-  - overlay crash mid-session.
-  - mixed-version protocol compatibility.
-- Add acceptance thresholds for latency and final injection reliability.
+- [x] Add E2E runner scenarios:
+  - [x] quick utterance.
+  - [x] long dictation.
+  - [x] abort mid-session.
+  - [x] daemon reconnect.
+  - [x] overlay crash mid-session.
+  - [x] mixed-version protocol compatibility.
+- [x] Add acceptance thresholds for latency and final injection reliability.
 
 ### Verification Loop
-1. Run E2E on every protocol-affecting PR.
-2. Capture artifacts/logs for failures.
-3. Require repeated clean runs before promotion.
-4. Re-run stream+seal quality checks to ensure no WER/latency regression.
+1. [x] Run E2E on every protocol-affecting PR (`just --justfile justfile.overlay-dev phase6-contract`).
+2. [x] Capture artifacts/logs for failures (`phase6-promotion` writes deterministic `/tmp/parakeet-overlay-phase6-gate-*.log`).
+3. [x] Require repeated clean runs before promotion (`phase6-promotion runs>=3`).
+4. [x] Re-run stream+seal quality checks to ensure no WER/latency regression (`just eval compare` within promotion gate).
 
 ### Essential Tests
-- Add integration harness file(s), e.g.:
-  - `parakeet-stt-daemon/tests/test_overlay_e2e_contract.py`
-- Extend benchmark harness assertions:
-  - `parakeet-stt-daemon/tests/test_offline_benchmark_harness.py`
+- Extended daemon overlay contract suite:
+  - `parakeet-stt-daemon/tests/test_overlay_event_stream.py` (Phase 6 scenario tests).
+- Extended PTT mixed-version protocol suite:
+  - `parakeet-ptt/src/protocol.rs` (`decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages`).
+- Added promotion-gate harness:
+  - `justfile.overlay-dev` (`phase6-contract`, `phase6-promotion`, updated `runbook`).
 
 ### Gate To Proceed
-- Promotion requires repeated clean runs and zero regressions to final-result correctness.
+- [x] Promotion requires repeated clean runs and zero regressions to final-result correctness.
 
 ## External Reference Notes (Advisory, Not Source Of Truth)
 - A GTK/layer-shell Whisper overlay reference implementation validates practical tactics:

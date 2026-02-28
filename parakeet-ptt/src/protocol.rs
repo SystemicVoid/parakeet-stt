@@ -241,6 +241,60 @@ mod tests {
     }
 
     #[test]
+    fn decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages() {
+        let session_id = Uuid::new_v4();
+        let messages = [
+            format!(
+                r#"{{"type":"session_started","session_id":"{}","ts":"2026-02-28T00:00:00Z","mic_device":null,"lang":"en"}}"#,
+                session_id
+            ),
+            r#"{"type":"daemon_future_extension","foo":"bar"}"#.to_string(),
+            format!(
+                r#"{{"type":"interim_state","session_id":"{}","seq":0,"state":"listening"}}"#,
+                session_id
+            ),
+            r#"{"type":"daemon_future_extension_v2","extra":true}"#.to_string(),
+            format!(
+                r#"{{"type":"final_result","session_id":"{}","text":"ok","latency_ms":12,"audio_ms":345,"lang":"en","confidence":0.9}}"#,
+                session_id
+            ),
+        ];
+
+        let decoded = messages
+            .iter()
+            .map(|raw| decode_server_message(raw).expect("decode should remain non-fatal"))
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            decoded[0],
+            DecodedServerMessage::Known(ref message)
+                if matches!(&**message, ServerMessage::SessionStarted { .. })
+        ));
+        assert_eq!(
+            decoded[1],
+            DecodedServerMessage::UnknownType {
+                message_type: "daemon_future_extension".to_string()
+            }
+        );
+        assert!(matches!(
+            decoded[2],
+            DecodedServerMessage::Known(ref message)
+                if matches!(&**message, ServerMessage::InterimState { .. })
+        ));
+        assert_eq!(
+            decoded[3],
+            DecodedServerMessage::UnknownType {
+                message_type: "daemon_future_extension_v2".to_string()
+            }
+        );
+        assert!(matches!(
+            decoded[4],
+            DecodedServerMessage::Known(ref message)
+                if matches!(&**message, ServerMessage::FinalResult { .. })
+        ));
+    }
+
+    #[test]
     fn decode_server_message_preserves_error_for_known_type_shape_mismatch() {
         let raw = r#"{"type":"final_result","session_id":"00000000-0000-0000-0000-000000000000"}"#;
 
