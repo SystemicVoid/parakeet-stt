@@ -65,9 +65,38 @@ struct OverlayProbeSignals {
 }
 
 pub fn probe_overlay_capability() -> OverlayCapability {
+    if let Ok(raw_override) = std::env::var("PARAKEET_OVERLAY_MODE") {
+        if let Some(capability) = parse_overlay_mode_override(raw_override.trim()) {
+            return capability;
+        }
+        return OverlayCapability::disabled(format!(
+            "overlay_mode_override_invalid:{raw_override}"
+        ));
+    }
+
     match probe_wayland_overlay_signals() {
         Ok(signals) => classify_overlay_capability(signals),
         Err(err) => OverlayCapability::disabled(format!("wayland_probe_failed:{err}")),
+    }
+}
+
+fn parse_overlay_mode_override(raw: &str) -> Option<OverlayCapability> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" => None,
+        "layer-shell" | "layer_shell" => Some(OverlayCapability {
+            mode: OverlayMode::LayerShell,
+            reason: "overlay_mode_override:layer_shell".to_string(),
+        }),
+        "fallback-window" | "fallback_window" => Some(OverlayCapability {
+            mode: OverlayMode::FallbackWindow,
+            reason: "overlay_mode_override:fallback_window".to_string(),
+        }),
+        "disabled" | "off" | "none" => Some(OverlayCapability {
+            mode: OverlayMode::Disabled,
+            reason: "overlay_mode_override:disabled".to_string(),
+        }),
+        _ => None,
     }
 }
 
@@ -243,7 +272,9 @@ impl ClientConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_overlay_capability, OverlayMode, OverlayProbeSignals};
+    use super::{
+        classify_overlay_capability, parse_overlay_mode_override, OverlayMode, OverlayProbeSignals,
+    };
 
     #[test]
     fn classify_overlay_prefers_layer_shell_when_available() {
@@ -282,5 +313,19 @@ mod tests {
 
         assert_eq!(capability.mode, OverlayMode::Disabled);
         assert_eq!(capability.reason, "missing_window_protocols:xdg_wm_base");
+    }
+
+    #[test]
+    fn parse_overlay_mode_override_forces_fallback_window() {
+        let capability = parse_overlay_mode_override("fallback-window")
+            .expect("fallback-window override should parse");
+
+        assert_eq!(capability.mode, OverlayMode::FallbackWindow);
+        assert_eq!(capability.reason, "overlay_mode_override:fallback_window");
+    }
+
+    #[test]
+    fn parse_overlay_mode_override_rejects_invalid_values() {
+        assert!(parse_overlay_mode_override("bad-value").is_none());
     }
 }

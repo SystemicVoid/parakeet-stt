@@ -325,8 +325,8 @@ PY
                 pid=$(pgrep -n "[p]arakeet-ptt" || true)
                 if [ -n "$pid" ]; then
                     echo "$pid" > "$CLIENT_PID_FILE"
+                    return 0
                 fi
-                return 0
             fi
 
             if [ $((SECONDS - started_at)) -ge "$max_wait" ]; then
@@ -459,6 +459,7 @@ Other environment overrides:
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
+  PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled>
 EOF
     }
 
@@ -614,6 +615,7 @@ CLIENTCMD
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
             echo "   - PTT RUSTFLAGS: $ptt_rustflags"
+            echo "   - Overlay mode override: ${PARAKEET_OVERLAY_MODE:-auto}"
 
             if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                 echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
@@ -699,7 +701,7 @@ CLIENTCMD
             client_cmd="$(_build_client_cmd)"
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             local primary_pane
@@ -882,7 +884,7 @@ CLIENTCMD
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"

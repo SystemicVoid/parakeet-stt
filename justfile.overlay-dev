@@ -44,6 +44,14 @@ doctor: _guard
 start: _guard
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false'
 
+# Start helper with explicit fallback-window overlay backend.
+start-fallback: _guard
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE=fallback-window && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false'
+
+# Start helper with explicit layer-shell overlay backend.
+start-layer-shell: _guard
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE=layer-shell && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false'
+
 # Stop helper stack.
 stop: _guard
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt stop'
@@ -73,4 +81,5 @@ runbook: _guard
       "3) Do manual hotkey utterance tests" \
       "4) During utterance: just --justfile justfile.overlay-dev overlay-kill" \
       "5) Trigger next utterance and confirm respawn + final injection" \
-      "6) just --justfile justfile.overlay-dev stop"
+      "6) If overlay is invisible on layer-shell: just --justfile justfile.overlay-dev start-fallback" \
+      "7) just --justfile justfile.overlay-dev stop"
