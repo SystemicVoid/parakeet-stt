@@ -1686,7 +1686,8 @@ fn render_frame(
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
 
-    if fade_alpha <= 0.0 {
+    let frame_alpha = (fade_alpha * ui.opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if frame_alpha <= 0.0 {
         return;
     }
 
@@ -1698,7 +1699,7 @@ fn render_frame(
     };
 
     // 2. Draw shadow
-    let shadow_a = (SHADOW_ALPHA as f32 * fade_alpha).round() as u8;
+    let shadow_a = (SHADOW_ALPHA as f32 * frame_alpha).round() as u8;
     draw_shadow(
         frame,
         dimensions,
@@ -1709,7 +1710,7 @@ fn render_frame(
     );
 
     // 3. Fill rounded rect (dark background)
-    let bg_a = (BG_ALPHA as f32 * fade_alpha).round() as u8;
+    let bg_a = (BG_ALPHA as f32 * frame_alpha).round() as u8;
     fill_rounded_rect(
         frame,
         dimensions,
@@ -1719,7 +1720,7 @@ fn render_frame(
     );
 
     // 4. Stroke rounded rect (thin border)
-    let border_a = (BORDER_ALPHA as f32 * fade_alpha).round() as u8;
+    let border_a = (BORDER_ALPHA as f32 * frame_alpha).round() as u8;
     stroke_rounded_rect(
         frame,
         dimensions,
@@ -1738,7 +1739,7 @@ fn render_frame(
             ACCENT_STRIPE_WIDTH,
             ACCENT_STRIPE_MARGIN,
             accent,
-            fade_alpha,
+            frame_alpha,
         );
     }
 
@@ -1762,7 +1763,7 @@ fn render_frame(
         ui.max_width,
         ui.max_lines,
         &text,
-        fade_alpha,
+        frame_alpha,
     );
 }
 
@@ -2244,6 +2245,82 @@ mod tests {
             content,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn render_frame_applies_configured_opacity() {
+        let base_ui = OverlayUiConfig {
+            opacity: 1.0,
+            font: "Sans 18".to_string(),
+            anchor: super::CliAnchor::TopCenter,
+            margin_x: 24,
+            margin_y: 24,
+            max_width: 320,
+            max_lines: 3,
+        };
+        let low_opacity_ui = OverlayUiConfig {
+            opacity: 0.35,
+            ..base_ui.clone()
+        };
+
+        let dimensions = low_opacity_ui.surface_dimensions();
+        let content = low_opacity_ui.content_area();
+        let text_renderer = TextRenderer {
+            summary: FontResolutionSummary {
+                requested: "Sans 18".to_string(),
+                family: "Sans".to_string(),
+                size_px: 18.0,
+                fallback_reason: None,
+            },
+            font: None,
+        };
+        let visible = OverlayRenderIntent {
+            phase: OverlayRenderPhase::Listening,
+            visible: true,
+            headline: "listening".to_string(),
+            detail: None,
+        };
+
+        let mut full_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
+        render_frame(
+            &mut full_alpha_frame,
+            dimensions,
+            &visible,
+            &base_ui,
+            &text_renderer,
+            1.0,
+            content,
+        );
+
+        let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
+        render_frame(
+            &mut low_alpha_frame,
+            dimensions,
+            &visible,
+            &low_opacity_ui,
+            &text_renderer,
+            1.0,
+            content,
+        );
+
+        let max_full = full_alpha_frame
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .max()
+            .unwrap_or(0);
+        let max_low = low_alpha_frame
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_full > 0,
+            "full-opacity frame should contain visible pixels"
+        );
+        assert!(
+            max_low < max_full,
+            "lower configured opacity should reduce composed alpha (full={max_full}, low={max_low})"
+        );
     }
 
     #[test]
