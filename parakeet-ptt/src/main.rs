@@ -1344,6 +1344,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1799,6 +1800,152 @@ mod tests {
                 .expect("recording lock should be available")
                 .clone(),
             vec!["final survives overlay disconnect".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlay_crash_restart_replays_current_state_and_preserves_final_injection() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let spawn_queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = {
+            let spawn_queue = Arc::clone(&spawn_queue);
+            Arc::new(move |_mode| {
+                spawn_queue
+                    .lock()
+                    .expect("spawn queue lock should be available")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
+            })
+        };
+        let manager =
+            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
+
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 1,
+                text: "old-state".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("first interim text should route");
+        let first_seen = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive old state")
+            .expect("first sink channel should stay open");
+        assert_eq!(
+            first_seen,
+            parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 1,
+                text: "old-state".to_string(),
+            }
+        );
+
+        drop(rx_first);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "current-state".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim text after crash should remain non-fatal");
+
+        let second_seen = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed current state")
+            .expect("second sink channel should stay open");
+        assert_eq!(
+            second_seen,
+            parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "current-state".to_string(),
+            }
+        );
+        assert!(timeout(Duration::from_millis(50), rx_second.recv())
+            .await
+            .is_err());
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "final after overlay restart".to_string(),
+                latency_ms: 45,
+                audio_ms: 1000,
+                lang: Some("en".to_string()),
+                confidence: Some(0.98),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should still enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should produce one report")
+            .expect("report channel should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["final after overlay restart".to_string()]
+        );
+        assert_eq!(
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(manager_metrics.replay_sent_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager_metrics.spawn_success_total.load(Ordering::Relaxed),
+            2
         );
     }
 

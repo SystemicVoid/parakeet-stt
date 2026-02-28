@@ -12,6 +12,7 @@ _Last updated: 2026-02-28_
 - [x] Phase 4 Slice A: separate overlay binary + deterministic state machine + IPC wiring + failure-isolation tests.
 - [x] Phase 4 Slice B: overlay respawn manager + reconnect state replay guarantees.
 - [x] Phase 4 Slice C: layer-shell/fallback render integration path + unsupported-backend noop safety.
+- [x] Phase 4 Slice D: crash/restart simulation through PTT routing path + reconnect/final-injection proof.
 - [ ] Phase 5: Config/flags/rollout controls.
 - [ ] Phase 6: E2E reliability and promotion gates.
 
@@ -43,6 +44,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added reconnect replay contract to send only the latest valid overlay state after process recovery (no backlog replay), preserving final-result injection boundary isolation.
 - 2026-02-28: Implemented real overlay renderer initialization in `parakeet-overlay` for both layer-shell (`zwlr_layer_shell_v1`) and fallback window (`xdg_toplevel`) paths with shared-memory surface commits.
 - 2026-02-28: Added deterministic render-intent mapping (`OverlayVisibility -> OverlayRenderIntent`) and backend-selection tests proving unsupported/probe-failure paths degrade to noop safely.
+- 2026-02-28: Added crash/restart simulation in `parakeet-ptt/src/main.rs` proving overlay child disconnect + respawn replays only current interim state while final-result enqueue/injection behavior remains unchanged.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -61,6 +63,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 4 slice B): `cd parakeet-ptt && cargo test` passed (lib: 5 tests, `src/main.rs`: 42 tests, overlay binary unit target: 0 tests), including `overlay_process::tests::manager_replays_latest_message_after_disconnect` and `overlay_process::tests::manager_reconnect_sends_only_current_state`.
 - 2026-02-28 (Phase 4 slice C): `cd parakeet-ptt && cargo fmt` passed.
 - 2026-02-28 (Phase 4 slice C): `cd parakeet-ptt && cargo test` passed (lib: 8 tests, `src/main.rs`: 42 tests, overlay binary unit target: 5 tests), including backend-selection noop safety and render-phase color mapping assertions.
+- 2026-02-28 (Phase 4 slice D): `cd parakeet-ptt && cargo fmt` passed.
+- 2026-02-28 (Phase 4 slice D): `cd parakeet-ptt && cargo test` passed (lib: 8 tests, `src/main.rs`: 43 tests, overlay binary unit target: 5 tests), including `overlay_crash_restart_replays_current_state_and_preserves_final_injection`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -264,7 +268,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 1. [x] Validate state machine headlessly.
 2. [x] Validate transitions from fake event streams.
 3. [x] Validate rendering integration for key states (render-intent mapping, backend selection safety, and state-phase color routing unit coverage).
-4. [ ] Run overlay crash/restart simulation.
+4. [x] Run overlay crash/restart simulation.
 5. [ ] Validate CPU/memory budget under 10+ minute dictation run.
 
 ### Essential Tests
