@@ -24,7 +24,7 @@ pub enum ClientMessage {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     SessionStarted {
@@ -65,6 +65,62 @@ pub enum ServerMessage {
         last_infer_ms: Option<u64>,
         last_send_ms: Option<u64>,
     },
+    InterimState {
+        session_id: Uuid,
+        seq: u64,
+        state: String,
+    },
+    InterimText {
+        session_id: Uuid,
+        seq: u64,
+        text: String,
+    },
+    SessionEnded {
+        session_id: Uuid,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DecodedServerMessage {
+    Known(Box<ServerMessage>),
+    UnknownType { message_type: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageTypeEnvelope {
+    #[serde(rename = "type")]
+    message_type: String,
+}
+
+pub fn decode_server_message(raw: &str) -> Result<DecodedServerMessage, serde_json::Error> {
+    match serde_json::from_str::<ServerMessage>(raw) {
+        Ok(message) => Ok(DecodedServerMessage::Known(Box::new(message))),
+        Err(err) => {
+            let envelope = serde_json::from_str::<MessageTypeEnvelope>(raw);
+            match envelope {
+                Ok(envelope) if !is_known_server_message_type(&envelope.message_type) => {
+                    Ok(DecodedServerMessage::UnknownType {
+                        message_type: envelope.message_type,
+                    })
+                }
+                _ => Err(err),
+            }
+        }
+    }
+}
+
+fn is_known_server_message_type(message_type: &str) -> bool {
+    matches!(
+        message_type,
+        "session_started"
+            | "final_result"
+            | "error"
+            | "status"
+            | "interim_state"
+            | "interim_text"
+            | "session_ended"
+    )
 }
 
 pub fn now_rfc3339() -> String {
@@ -100,7 +156,9 @@ pub fn abort_message(session_id: Uuid, reason: &str) -> ClientMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerMessage;
+    use uuid::Uuid;
+
+    use super::{decode_server_message, DecodedServerMessage, ServerMessage};
 
     #[test]
     fn status_deserializes_when_optional_fields_are_missing() {
@@ -148,5 +206,46 @@ mod tests {
             }
             other => panic!("expected status message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_server_message_nonfatal_for_unknown_type() {
+        let raw = r#"{"type":"daemon_future_extension","foo":"bar"}"#;
+
+        let decoded = decode_server_message(raw).expect("unknown type should be tolerated");
+        assert_eq!(
+            decoded,
+            DecodedServerMessage::UnknownType {
+                message_type: "daemon_future_extension".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decode_server_message_known_variants_decode_normally() {
+        let session_id = Uuid::new_v4();
+        let raw = format!(
+            r#"{{"type":"interim_text","session_id":"{}","seq":4,"text":"hello"}}"#,
+            session_id
+        );
+
+        let decoded = decode_server_message(&raw).expect("known message should decode");
+        assert_eq!(
+            decoded,
+            DecodedServerMessage::Known(Box::new(ServerMessage::InterimText {
+                session_id,
+                seq: 4,
+                text: "hello".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn decode_server_message_preserves_error_for_known_type_shape_mismatch() {
+        let raw = r#"{"type":"final_result","session_id":"00000000-0000-0000-0000-000000000000"}"#;
+
+        let err = decode_server_message(raw).expect_err("known type mismatch should error");
+        let msg = err.to_string();
+        assert!(msg.contains("missing field"));
     }
 }

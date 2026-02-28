@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::config::ClientConfig;
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{decode_server_message, ClientMessage, DecodedServerMessage, ServerMessage};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub type WsWrite = SplitSink<WsStream, Message>;
@@ -39,9 +39,10 @@ impl WsClient {
         while let Some(msg) = self.stream.next().await {
             match msg {
                 Ok(Message::Text(txt)) => {
-                    let parsed: ServerMessage =
-                        serde_json::from_str(&txt).context("failed to decode server message")?;
-                    return Ok(Some(parsed));
+                    match decode_server_message(&txt).context("failed to decode server message")? {
+                        DecodedServerMessage::Known(parsed) => return Ok(Some(*parsed)),
+                        DecodedServerMessage::UnknownType { .. } => continue,
+                    }
                 }
                 Ok(Message::Binary(_)) => {
                     continue;

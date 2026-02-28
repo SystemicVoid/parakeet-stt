@@ -17,6 +17,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Completed Phase 0 classification and startup logging in `parakeet-ptt` with soft-fail behavior.
 - 2026-02-28: Added deterministic classification tests for `layer_shell`, `fallback_window`, and `disabled` modes.
 - 2026-02-28: Confirmed no injection semantic change (`final_result` remains sole enqueue trigger).
+- 2026-02-28: Phase 1 (PTT side) added protocol variants and unknown-`type` tolerance in websocket decode paths.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -94,28 +95,28 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 1: Protocol Extension And Compatibility Hardening
 ### Implementation Tasks
-- Add new server message variants for overlay-safe realtime updates:
+- [x] Add new server message variants for overlay-safe realtime updates (PTT protocol model):
   - `interim_state`
   - `interim_text`
   - `session_ended`
-- Include `session_id` on all new variants.
-- Add monotonic per-session `seq` on interim variants.
+- [x] Include `session_id` on all new variants.
+- [x] Add monotonic per-session `seq` on interim variants.
 - Preserve existing variants unchanged:
   - `session_started`
   - `final_result`
   - `error`
   - `status`
 - Update both sides:
-  - `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`
-  - `parakeet-ptt/src/protocol.rs`
-- Add explicit unknown-message tolerance path in `parakeet-ptt` websocket decode flow.
+  - [ ] `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`
+  - [x] `parakeet-ptt/src/protocol.rs`
+- [x] Add explicit unknown-message tolerance path in `parakeet-ptt` websocket decode flow.
 
 ### Verification Loop
-1. Add schema and decode changes before enabling emission.
-2. Run focused serialization/deserialization tests.
-3. Verify unknown message types are ignored safely.
-4. Verify old client against new daemon behavior (no crashes, bounded logs).
-5. Verify new client against old daemon behavior.
+1. [x] Add schema and decode changes before enabling emission (PTT side complete).
+2. [x] Run focused serialization/deserialization tests (PTT protocol tests).
+3. [x] Verify unknown message types are ignored safely (PTT decode tests + websocket integration path).
+4. [ ] Verify old client against new daemon behavior (no crashes, bounded logs).
+5. [ ] Verify new client against old daemon behavior.
 
 ### Essential Tests
 - Daemon message model tests:

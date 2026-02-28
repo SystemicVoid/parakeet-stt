@@ -33,7 +33,9 @@ use crate::config::{
 };
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
-use crate::protocol::{start_message, stop_message, ServerMessage};
+use crate::protocol::{
+    decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
+};
 use crate::state::PttState;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
@@ -766,8 +768,13 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
                                     Some(Ok(msg)) => {
                                         match msg {
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
-                                                match serde_json::from_str::<ServerMessage>(&txt) {
-                                                    Ok(message) => handle_server_message(message, &mut state, &injector_worker, &audio_feedback).await?,
+                                                match decode_server_message(&txt) {
+                                                    Ok(DecodedServerMessage::Known(message)) => {
+                                                        handle_server_message(*message, &mut state, &injector_worker, &audio_feedback).await?
+                                                    }
+                                                    Ok(DecodedServerMessage::UnknownType { message_type }) => {
+                                                        debug!(%message_type, "ignoring unknown server message type");
+                                                    }
                                                     Err(err) => warn!("failed to decode server message: {}", err),
                                                 }
                                             }
