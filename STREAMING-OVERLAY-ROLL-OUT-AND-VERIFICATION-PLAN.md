@@ -7,7 +7,7 @@ _Last updated: 2026-02-28_
 - [x] Phase 0: Capability and feasibility gate implemented in `parakeet-ptt`.
 - [x] Phase 1: Protocol extension + unknown-message compatibility hardening.
 - [x] Phase 2: Daemon emission path behind rollout controls.
-- [ ] Phase 3: PTT routing + hard injection boundary proofs.
+- [x] Phase 3: PTT routing + hard injection boundary proofs.
 - [ ] Phase 4: Overlay process MVP (separate process).
 - [ ] Phase 5: Config/flags/rollout controls.
 - [ ] Phase 6: E2E reliability and promotion gates.
@@ -29,6 +29,9 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added overlay event stream invariants test suite covering ordering, per-session seq reset, abort terminal event, and non-fatal overlay send failures.
 - 2026-02-28: Completed Phase 2 optional `interim_text` emission from validated incremental runtime chunks, still gated by `PARAKEET_OVERLAY_EVENTS_ENABLED`.
 - 2026-02-28: Added daemon safeguards so incremental-source failures degrade silently and never block `final_result` or `session_ended`.
+- 2026-02-28: Completed Phase 3 in `parakeet-ptt` by routing `interim_state`, `interim_text`, and `session_ended` into a dedicated overlay sink adapter path with per-route counters.
+- 2026-02-28: Added overlay-path stale/out-of-order `seq` dropping and session-mismatch drops without changing state reset behavior or final-result enqueue semantics.
+- 2026-02-28: Added Phase 3 boundary tests proving queue enqueue counters move only on `final_result`, including mixed-stream and adversarial stale-sequence coverage.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -40,6 +43,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 2 eval regression): `just eval compare` passed; stream-seal vs offline deltas were WER `-0.002778`, strict command exact match `+0.020000`, critical token recall `+0.006485`, and warm finalize P95 `+0.697694 ms`.
 - 2026-02-28 (Phase 2 interim-text): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_overlay_event_stream.py tests/test_streaming_truth.py tests/test_session_cleanup.py tests/test_cli_precedence.py` passed (44 tests).
 - 2026-02-28 (Phase 2 interim-text eval regression): `just eval compare` passed; stream-seal vs offline deltas were weighted WER `-0.000765`, strict command exact match `+0.000000`, normalized command exact match `+0.000000`, intent+slot match `+0.000000`, critical token recall `+0.002594`, punctuation F1 `+0.016172`, terminal punctuation accuracy `+0.000000`, and warm finalize P95 `-1.903497 ms`.
+- 2026-02-28 (Phase 3 routing/boundary): `cd parakeet-ptt && cargo test` passed (39 tests), including new overlay-routing boundary tests in `src/main.rs`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -55,7 +59,8 @@ Implement a modern Rust overlay that displays session feedback (and interim text
 - Daemon now emits state-first overlay events (`interim_state`, `interim_text`, `session_ended`) only when `PARAKEET_OVERLAY_EVENTS_ENABLED=true`; default runtime behavior remains unchanged.
 - `interim_text` is optional and emitted only when incremental runtime chunk transcription yields validated, non-empty text deltas.
 - Daemon Pydantic message models currently use strict `extra="forbid"` behavior.
-- Rust client injection boundary is already clean: only `ServerMessage::FinalResult` enqueues injection work.
+- Rust client injection boundary is hardened with routing proofs: only `ServerMessage::FinalResult` enqueues injection work.
+- Rust client routes overlay-only variants (`interim_state`, `interim_text`, `session_ended`) through a dedicated sink adapter with per-session sequence filtering.
 - Rust protocol decode now tolerates unknown server `type` values and ignores them safely.
 
 ## Final Strategy Decisions
@@ -188,29 +193,29 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 3: PTT Routing + Injection Hard Boundary
 ### Implementation Tasks
-- Extend `handle_server_message` in `parakeet-ptt/src/main.rs`:
+- [x] Extend `handle_server_message` in `parakeet-ptt/src/main.rs`:
   - route `interim_state`, `interim_text`, and `session_ended` to overlay sink only.
   - keep enqueue logic only in `FinalResult` arm.
-- Add explicit routing counters/metrics proving interim messages never reach injector queue.
-- Add overlay sink adapter interface for deterministic tests.
-- Add stale/out-of-order `seq` dropping logic in overlay path.
+- [x] Add explicit routing counters/metrics proving interim messages never reach injector queue.
+- [x] Add overlay sink adapter interface for deterministic tests.
+- [x] Add stale/out-of-order `seq` dropping logic in overlay path.
 
 ### Verification Loop
 1. Add exhaustive match coverage.
-2. Run existing queue/injector tests for regressions.
-3. Add adversarial mixed-stream tests.
-4. Validate queue counters change only on final results.
-5. Validate state reset semantics remain unchanged.
+2. [x] Run existing queue/injector tests for regressions.
+3. [x] Add adversarial mixed-stream tests.
+4. [x] Validate queue counters change only on final results.
+5. [x] Validate state reset semantics remain unchanged.
 
 ### Essential Tests
 - Extend `parakeet-ptt/src/main.rs` tests:
-  - interim/state/ended events do not enqueue injection jobs.
-  - final result still enqueues exactly once.
-  - mixed stream enqueues exactly once.
-  - out-of-order interim seq is dropped on overlay path only.
+  - [x] interim/state/ended events do not enqueue injection jobs.
+  - [x] final result still enqueues exactly once.
+  - [x] mixed stream enqueues exactly once.
+  - [x] out-of-order interim seq is dropped on overlay path only.
 
 ### Gate To Proceed
-- Injection boundary remains mathematically unchanged: enqueue count only tracks `final_result`.
+- [x] Injection boundary remains mathematically unchanged: enqueue count only tracks `final_result`.
 
 ## Phase 4: Overlay Process MVP (Separate Process)
 ### Implementation Tasks
