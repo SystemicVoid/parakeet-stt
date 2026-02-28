@@ -146,6 +146,43 @@ struct TextRenderer {
     font: Option<Font>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericFamilyKind {
+    SansSerif,
+    Serif,
+    Monospace,
+    Cursive,
+    Fantasy,
+}
+
+impl GenericFamilyKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SansSerif => "sans-serif",
+            Self::Serif => "serif",
+            Self::Monospace => "monospace",
+            Self::Cursive => "cursive",
+            Self::Fantasy => "fantasy",
+        }
+    }
+
+    fn as_fontdb_family(self) -> Family<'static> {
+        match self {
+            Self::SansSerif => Family::SansSerif,
+            Self::Serif => Family::Serif,
+            Self::Monospace => Family::Monospace,
+            Self::Cursive => Family::Cursive,
+            Self::Fantasy => Family::Fantasy,
+        }
+    }
+}
+
+const GENERIC_FALLBACK_ORDER: [GenericFamilyKind; 3] = [
+    GenericFamilyKind::SansSerif,
+    GenericFamilyKind::Serif,
+    GenericFamilyKind::Monospace,
+];
+
 impl TextRenderer {
     fn new(raw_descriptor: &str) -> Self {
         let parsed = parse_font_descriptor(raw_descriptor);
@@ -160,12 +197,38 @@ impl TextRenderer {
         let mut font = load_font_from_database(&db, &selected_family);
         if font.is_none() {
             fallback_reasons.push(format!("font_unavailable:{selected_family}"));
-            if selected_family != DEFAULT_FONT_FAMILY {
-                selected_family = DEFAULT_FONT_FAMILY.to_string();
-                font = load_font_from_database(&db, DEFAULT_FONT_FAMILY);
+
+            if let Some(requested_generic) = parse_generic_family_kind(&selected_family) {
+                selected_family = requested_generic.label().to_string();
+                font = load_font_from_generic(&db, requested_generic);
                 if font.is_some() {
-                    fallback_reasons.push("using_default_font_family".to_string());
+                    fallback_reasons.push(format!(
+                        "using_requested_generic_family:{}",
+                        requested_generic.label()
+                    ));
                 }
+            }
+        }
+
+        if font.is_none() {
+            for fallback_family in GENERIC_FALLBACK_ORDER {
+                font = load_font_from_generic(&db, fallback_family);
+                if font.is_some() {
+                    selected_family = fallback_family.label().to_string();
+                    fallback_reasons.push(format!(
+                        "using_fallback_generic_family:{}",
+                        fallback_family.label()
+                    ));
+                    break;
+                }
+            }
+        }
+
+        if font.is_none() {
+            font = load_any_font_from_database(&db);
+            if font.is_some() {
+                selected_family = "system-default".to_string();
+                fallback_reasons.push("using_first_available_system_font".to_string());
             }
         }
 
@@ -248,7 +311,7 @@ impl TextRenderer {
 }
 
 trait OverlayBackend {
-    fn render(&mut self, state: &OverlayVisibility);
+    fn render(&mut self, state: &OverlayVisibility) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -257,41 +320,29 @@ struct NoopBackend {
 }
 
 impl OverlayBackend for NoopBackend {
-    fn render(&mut self, state: &OverlayVisibility) {
+    fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
         debug!(reason = %self.reason, ?state, "overlay renderer running in noop mode");
+        Ok(())
     }
 }
 
 struct WaylandOverlayBackend {
     kind: BackendKind,
     ui: OverlayUiConfig,
-    runtime: Option<WaylandRuntime>,
+    runtime: WaylandRuntime,
 }
 
 impl WaylandOverlayBackend {
     fn new(kind: BackendKind, ui: OverlayUiConfig, runtime: WaylandRuntime) -> Self {
-        Self {
-            kind,
-            ui,
-            runtime: Some(runtime),
-        }
+        Self { kind, ui, runtime }
     }
 }
 
 impl OverlayBackend for WaylandOverlayBackend {
-    fn render(&mut self, state: &OverlayVisibility) {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return;
-        };
-
-        if let Err(err) = runtime.render(&state.to_render_intent(), &self.ui) {
-            warn!(
-                backend = ?self.kind,
-                error = %err,
-                "overlay renderer backend failed; switching to noop mode"
-            );
-            self.runtime = None;
-        }
+    fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
+        self.runtime
+            .render(&state.to_render_intent(), &self.ui)
+            .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
     }
 }
 
@@ -593,7 +644,8 @@ impl WaylandRuntime {
                 .context("failed waiting for compositor configure")?;
         }
 
-        if intent.visible {
+        let keep_surface_mapped_when_hidden = matches!(self.shell, ShellSurface::Layer { .. });
+        if intent.visible || keep_surface_mapped_when_hidden {
             render_frame(
                 self.shm_buffer.bytes_mut(),
                 self.dimensions,
@@ -610,10 +662,14 @@ impl WaylandRuntime {
                 self.dimensions.height as i32,
             );
             if let ShellSurface::Fallback { toplevel, .. } = &self.shell {
-                toplevel.set_title(format!(
-                    "{FALLBACK_WINDOW_TITLE}: {}",
-                    truncate_for_title(&intent.headline)
-                ));
+                if intent.visible {
+                    toplevel.set_title(format!(
+                        "{FALLBACK_WINDOW_TITLE}: {}",
+                        truncate_for_title(&intent.headline)
+                    ));
+                } else {
+                    toplevel.set_title(FALLBACK_WINDOW_TITLE.to_string());
+                }
             }
         } else {
             self.surface.attach(None, 0, 0);
@@ -1038,12 +1094,43 @@ fn parse_font_descriptor(raw: &str) -> ParsedFontDescriptor {
     }
 }
 
+fn parse_generic_family_kind(input: &str) -> Option<GenericFamilyKind> {
+    let normalized = input.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "sans" | "sans-serif" | "sans_serif" => Some(GenericFamilyKind::SansSerif),
+        "serif" => Some(GenericFamilyKind::Serif),
+        "mono" | "monospace" | "monospace-ui" => Some(GenericFamilyKind::Monospace),
+        "cursive" => Some(GenericFamilyKind::Cursive),
+        "fantasy" => Some(GenericFamilyKind::Fantasy),
+        _ => None,
+    }
+}
+
 fn load_font_from_database(db: &Database, family: &str) -> Option<Font> {
     let query = Query {
         families: &[Family::Name(family)],
         ..Query::default()
     };
     let face_id = db.query(&query)?;
+    load_font_from_face(db, face_id)
+}
+
+fn load_font_from_generic(db: &Database, family: GenericFamilyKind) -> Option<Font> {
+    let binding = [family.as_fontdb_family()];
+    let query = Query {
+        families: &binding,
+        ..Query::default()
+    };
+    let face_id = db.query(&query)?;
+    load_font_from_face(db, face_id)
+}
+
+fn load_any_font_from_database(db: &Database) -> Option<Font> {
+    let face_id = db.faces().next()?.id;
+    load_font_from_face(db, face_id)
+}
+
+fn load_font_from_face(db: &Database, face_id: fontdb::ID) -> Option<Font> {
     if let Some(font) = db.with_face_data(face_id, |data, face_index| {
         Font::from_bytes(
             data,
@@ -1325,7 +1412,10 @@ async fn main() -> Result<()> {
     }
 
     let mut machine = OverlayStateMachine::new(Duration::from_millis(cli.auto_hide_ms.max(1)));
-    built_backend.backend.render(machine.visibility());
+    built_backend
+        .backend
+        .render(machine.visibility())
+        .context("initial overlay render failed")?;
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -1345,7 +1435,12 @@ async fn main() -> Result<()> {
                         match serde_json::from_str::<OverlayIpcMessage>(&raw) {
                             Ok(message) => {
                                 match machine.apply_event(message, now_ms) {
-                                    ApplyOutcome::Applied => built_backend.backend.render(machine.visibility()),
+                                    ApplyOutcome::Applied => {
+                                        built_backend
+                                            .backend
+                                            .render(machine.visibility())
+                                            .context("overlay render failed while applying event")?;
+                                    }
                                     ApplyOutcome::DroppedStaleSeq => {
                                         debug!("overlay process dropped stale sequence event");
                                     }
@@ -1372,7 +1467,10 @@ async fn main() -> Result<()> {
             _ = tick.tick() => {
                 let now_ms = started.elapsed().as_millis() as u64;
                 if machine.advance_time(now_ms) {
-                    built_backend.backend.render(machine.visibility());
+                    built_backend
+                        .backend
+                        .render(machine.visibility())
+                        .context("overlay render failed while advancing auto-hide timer")?;
                 }
             }
         }
@@ -1383,14 +1481,17 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        color_for_phase, layout_text_lines, parse_font_descriptor, render_frame,
-        resolve_backend_selection, BackendSelection, BackendSignals, CliBackendMode,
+        color_for_phase, layout_text_lines, parse_font_descriptor, parse_generic_family_kind,
+        render_frame, resolve_backend_selection, BackendSelection, BackendSignals, CliBackendMode,
         FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, SurfaceDimensions,
         TextRenderer,
     };
@@ -1485,6 +1586,19 @@ mod tests {
             parsed.fallback_reason.as_deref(),
             Some("font_size_missing_using_default")
         );
+    }
+
+    #[test]
+    fn generic_family_parsing_supports_common_aliases() {
+        assert_eq!(
+            parse_generic_family_kind("Sans"),
+            Some(super::GenericFamilyKind::SansSerif)
+        );
+        assert_eq!(
+            parse_generic_family_kind("monospace"),
+            Some(super::GenericFamilyKind::Monospace)
+        );
+        assert_eq!(parse_generic_family_kind("unknown"), None);
     }
 
     #[test]

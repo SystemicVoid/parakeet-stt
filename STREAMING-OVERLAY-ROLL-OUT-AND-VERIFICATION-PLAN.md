@@ -48,6 +48,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added crash/restart simulation in `parakeet-ptt/src/main.rs` proving overlay child disconnect + respawn replays only current interim state while final-result enqueue/injection behavior remains unchanged.
 - 2026-02-28: Added overlay text rendering path in `parakeet-overlay` (font descriptor parsing, system-font resolution via `fontdb`, glyph rasterization via `fontdue`, and bounded line-layout clamping).
 - 2026-02-28: Added COSMIC fallback guardrail warning when `fallback-window` is selected and updated `justfile.overlay-dev` runbook to prefer `start-layer-shell` with fallback marked diagnostic-only.
+- 2026-02-28: Fixed Slice E COSMIC regressions by resolving generic/system font fallbacks for `Sans 16`, keeping layer-shell surfaces mapped with transparent hidden frames (instead of null-buffer detach), and failing fast on renderer errors so PTT respawn semantics recover overlay safely.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -70,6 +71,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 4 slice D): `cd parakeet-ptt && cargo test` passed (lib: 8 tests, `src/main.rs`: 43 tests, overlay binary unit target: 5 tests), including `overlay_crash_restart_replays_current_state_and_preserves_final_injection`.
 - 2026-02-28 (Phase 4 slice E): `cd parakeet-ptt && cargo fmt` passed.
 - 2026-02-28 (Phase 4 slice E): `cd parakeet-ptt && cargo test` passed (lib: 8 tests, overlay binary unit target: 9 tests, `src/main.rs`: 45 tests), including font parse/layout/render mapping assertions and existing overlay crash/restart boundary proofs.
+- 2026-02-28 (Phase 4 slice E hotfix): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target now 10 tests with generic-family parsing coverage).
+- 2026-02-28 (Phase 4 slice E hotfix): scripted `parakeet-overlay --backend layer-shell --auto-hide-ms 400` NDJSON two-session replay validated no post-hide backend flush failure and confirmed runtime font fallback no longer disables text rendering (`using_requested_generic_family:sans-serif`).
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
