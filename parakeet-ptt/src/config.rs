@@ -10,6 +10,8 @@ use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
 pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
+const OVERLAY_ENABLED_ENV: &str = "PARAKEET_OVERLAY_ENABLED";
+const OVERLAY_MODE_ENV: &str = "PARAKEET_OVERLAY_MODE";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -64,9 +66,87 @@ struct OverlayProbeSignals {
     has_xdg_wm_base: bool,
 }
 
-pub fn probe_overlay_capability() -> OverlayCapability {
-    if let Ok(raw_override) = std::env::var("PARAKEET_OVERLAY_MODE") {
-        if let Some(capability) = parse_overlay_mode_override(raw_override.trim()) {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OverlayEnableGate {
+    Enabled,
+    Disabled { reason: String },
+}
+
+pub fn resolve_overlay_capability(overlay_enabled_override: Option<bool>) -> OverlayCapability {
+    let overlay_enabled_env = std::env::var(OVERLAY_ENABLED_ENV).ok();
+    let overlay_mode_env = std::env::var(OVERLAY_MODE_ENV).ok();
+    match resolve_overlay_enable_gate(overlay_enabled_override, overlay_enabled_env.as_deref()) {
+        OverlayEnableGate::Enabled => probe_overlay_capability_with_inputs(
+            overlay_mode_env.as_deref(),
+            probe_wayland_overlay_signals().map_err(|err| err.to_string()),
+        ),
+        OverlayEnableGate::Disabled { reason } => OverlayCapability::disabled(reason),
+    }
+}
+
+#[cfg(test)]
+fn resolve_overlay_capability_with_inputs(
+    overlay_enabled_override: Option<bool>,
+    overlay_enabled_env: Option<&str>,
+    overlay_mode_env: Option<&str>,
+    probe_signals: std::result::Result<OverlayProbeSignals, String>,
+) -> OverlayCapability {
+    match resolve_overlay_enable_gate(overlay_enabled_override, overlay_enabled_env) {
+        OverlayEnableGate::Enabled => {
+            probe_overlay_capability_with_inputs(overlay_mode_env, probe_signals)
+        }
+        OverlayEnableGate::Disabled { reason } => OverlayCapability::disabled(reason),
+    }
+}
+
+fn resolve_overlay_enable_gate(
+    overlay_enabled_override: Option<bool>,
+    overlay_enabled_env: Option<&str>,
+) -> OverlayEnableGate {
+    if let Some(overlay_enabled) = overlay_enabled_override {
+        if overlay_enabled {
+            return OverlayEnableGate::Enabled;
+        }
+        return OverlayEnableGate::Disabled {
+            reason: "overlay_enabled_override:cli:false".to_string(),
+        };
+    }
+
+    let Some(raw_override) = overlay_enabled_env else {
+        return OverlayEnableGate::Disabled {
+            reason: "overlay_disabled_by_default".to_string(),
+        };
+    };
+
+    match parse_overlay_enabled_override(raw_override) {
+        Some(true) => OverlayEnableGate::Enabled,
+        Some(false) => OverlayEnableGate::Disabled {
+            reason: "overlay_enabled_override:env:false".to_string(),
+        },
+        None => OverlayEnableGate::Disabled {
+            reason: format!("overlay_enabled_invalid:{raw_override}"),
+        },
+    }
+}
+
+fn parse_overlay_enabled_override(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn probe_overlay_capability_with_inputs(
+    overlay_mode_env: Option<&str>,
+    probe_signals: std::result::Result<OverlayProbeSignals, String>,
+) -> OverlayCapability {
+    if let Some(raw_override) = overlay_mode_env
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    {
+        if let Some(capability) = parse_overlay_mode_override(raw_override) {
             return capability;
         }
         return OverlayCapability::disabled(format!(
@@ -74,7 +154,7 @@ pub fn probe_overlay_capability() -> OverlayCapability {
         ));
     }
 
-    match probe_wayland_overlay_signals() {
+    match probe_signals {
         Ok(signals) => classify_overlay_capability(signals),
         Err(err) => OverlayCapability::disabled(format!("wayland_probe_failed:{err}")),
     }
@@ -273,7 +353,9 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_overlay_capability, parse_overlay_mode_override, OverlayMode, OverlayProbeSignals,
+        classify_overlay_capability, parse_overlay_enabled_override, parse_overlay_mode_override,
+        resolve_overlay_capability_with_inputs, resolve_overlay_enable_gate, OverlayEnableGate,
+        OverlayMode, OverlayProbeSignals,
     };
 
     #[test]
@@ -327,5 +409,97 @@ mod tests {
     #[test]
     fn parse_overlay_mode_override_rejects_invalid_values() {
         assert!(parse_overlay_mode_override("bad-value").is_none());
+    }
+
+    #[test]
+    fn parse_overlay_enabled_override_accepts_common_boolean_values() {
+        assert_eq!(parse_overlay_enabled_override("true"), Some(true));
+        assert_eq!(parse_overlay_enabled_override("1"), Some(true));
+        assert_eq!(parse_overlay_enabled_override("off"), Some(false));
+        assert_eq!(parse_overlay_enabled_override("0"), Some(false));
+    }
+
+    #[test]
+    fn resolve_overlay_enable_gate_defaults_to_disabled() {
+        assert_eq!(
+            resolve_overlay_enable_gate(None, None),
+            OverlayEnableGate::Disabled {
+                reason: "overlay_disabled_by_default".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_enable_gate_cli_value_takes_precedence_over_env() {
+        assert_eq!(
+            resolve_overlay_enable_gate(Some(true), Some("false")),
+            OverlayEnableGate::Enabled
+        );
+        assert_eq!(
+            resolve_overlay_enable_gate(Some(false), Some("true")),
+            OverlayEnableGate::Disabled {
+                reason: "overlay_enabled_override:cli:false".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_enable_gate_rejects_invalid_env_value() {
+        assert_eq!(
+            resolve_overlay_enable_gate(None, Some("sometimes")),
+            OverlayEnableGate::Disabled {
+                reason: "overlay_enabled_invalid:sometimes".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_capability_skips_probe_when_overlay_is_not_enabled() {
+        let capability = resolve_overlay_capability_with_inputs(
+            None,
+            None,
+            Some("layer-shell"),
+            Ok(OverlayProbeSignals {
+                has_layer_shell: true,
+                has_wl_compositor: true,
+                has_xdg_wm_base: true,
+            }),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::Disabled);
+        assert_eq!(capability.reason, "overlay_disabled_by_default");
+    }
+
+    #[test]
+    fn resolve_overlay_capability_honors_cli_enabled_over_env_disabled() {
+        let capability = resolve_overlay_capability_with_inputs(
+            Some(true),
+            Some("false"),
+            Some("fallback-window"),
+            Err("probe should not run when mode override is set".to_string()),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::FallbackWindow);
+        assert_eq!(capability.reason, "overlay_mode_override:fallback_window");
+    }
+
+    #[test]
+    fn resolve_overlay_capability_treats_empty_mode_env_as_auto() {
+        let capability = resolve_overlay_capability_with_inputs(
+            Some(true),
+            None,
+            Some(" "),
+            Ok(OverlayProbeSignals {
+                has_layer_shell: false,
+                has_wl_compositor: true,
+                has_xdg_wm_base: true,
+            }),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::FallbackWindow);
+        assert_eq!(
+            capability.reason,
+            "zwlr_layer_shell_v1_unavailable_using_xdg_toplevel_fallback"
+        );
     }
 }

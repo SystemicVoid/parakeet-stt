@@ -501,4 +501,31 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[test]
+    fn missing_overlay_binary_spawn_failures_remain_non_fatal() {
+        let launcher: Arc<OverlayLauncher> = Arc::new(|_mode| {
+            Err(anyhow!(
+                "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
+            ))
+        });
+        let mut manager =
+            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+
+        manager.send(OverlayIpcMessage::InterimText {
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            text: "state survives missing binary".to_string(),
+        });
+
+        assert!(!manager.has_active_sink());
+        assert!(
+            manager
+                .metrics()
+                .spawn_failure_total
+                .load(Ordering::Relaxed)
+                >= 1,
+            "missing binary should be counted as a non-fatal spawn failure"
+        );
+    }
 }

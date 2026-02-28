@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::config::{
-    probe_overlay_capability, ClientConfig, ClipboardOptions, InjectionConfig, OverlayMode,
+    resolve_overlay_capability, ClientConfig, ClipboardOptions, InjectionConfig, OverlayMode,
     DEFAULT_ENDPOINT,
 };
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
@@ -652,6 +652,10 @@ struct Cli {
     /// Volume for completion sound (0-100).
     #[arg(long, default_value_t = 100)]
     completion_sound_volume: u8,
+
+    /// Enable or disable overlay routing (CLI takes precedence over env).
+    #[arg(long, action = clap::ArgAction::Set)]
+    overlay_enabled: Option<bool>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -751,7 +755,7 @@ async fn main() -> Result<()> {
         cli.completion_sound_path,
         cli.completion_sound_volume,
     );
-    run_hotkey_mode(config, audio_feedback).await
+    run_hotkey_mode(config, audio_feedback, cli.overlay_enabled).await
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
@@ -949,8 +953,12 @@ async fn run_demo(
     Ok(())
 }
 
-async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) -> Result<()> {
-    let overlay_capability = probe_overlay_capability();
+async fn run_hotkey_mode(
+    config: ClientConfig,
+    audio_feedback: AudioFeedback,
+    overlay_enabled_override: Option<bool>,
+) -> Result<()> {
+    let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
     match overlay_capability.mode {
         OverlayMode::Disabled => {
             warn!(
@@ -1457,6 +1465,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cli_overlay_enabled_defaults_to_none() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.overlay_enabled, None);
+    }
+
+    #[test]
+    fn cli_overlay_enabled_accepts_boolean_values() {
+        let cli_enabled = super::Cli::parse_from(["parakeet-ptt", "--overlay-enabled", "true"]);
+        assert_eq!(cli_enabled.overlay_enabled, Some(true));
+
+        let cli_disabled = super::Cli::parse_from(["parakeet-ptt", "--overlay-enabled", "false"]);
+        assert_eq!(cli_disabled.overlay_enabled, Some(false));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
         let calls = Arc::new(AtomicU64::new(0));
@@ -1801,6 +1824,115 @@ mod tests {
                 .expect("recording lock should be available")
                 .clone(),
             vec!["final survives overlay disconnect".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_overlay_failures_remain_non_fatal_to_final_injection() {
+        fn disconnected_test_sink() -> OverlayProcessSink {
+            let (overlay_tx, overlay_rx) = mpsc::unbounded_channel();
+            drop(overlay_rx);
+            OverlayProcessSink::from_sender_for_tests(
+                overlay_tx,
+                Arc::new(OverlayProcessMetrics::default()),
+            )
+        }
+
+        let spawn_queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(disconnected_test_sink()),
+            Err(anyhow!(
+                "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
+            )),
+            Ok(disconnected_test_sink()),
+            Err(anyhow!(
+                "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
+            )),
+            Ok(disconnected_test_sink()),
+        ])));
+        let launcher = {
+            let spawn_queue = Arc::clone(&spawn_queue);
+            Arc::new(move |_mode| {
+                spawn_queue
+                    .lock()
+                    .expect("spawn queue lock should be available")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
+            })
+        };
+        let manager =
+            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
+
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        for seq in 1..=4 {
+            handle_server_message(
+                ServerMessage::InterimText {
+                    session_id,
+                    seq,
+                    text: format!("overlay seq {seq}"),
+                },
+                &mut state,
+                &mut overlay_router,
+                &worker,
+                &feedback,
+            )
+            .await
+            .expect("overlay failures should remain non-fatal");
+        }
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "final survives repeated overlay failures".to_string(),
+                latency_ms: 12,
+                audio_ms: 345,
+                lang: Some("en".to_string()),
+                confidence: Some(0.99),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should still enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should report")
+            .expect("report stream should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["final survives repeated overlay failures".to_string()]
+        );
+        assert!(
+            manager_metrics.spawn_failure_total.load(Ordering::Relaxed) >= 1,
+            "at least one spawn failure should be recorded"
+        );
+        assert!(
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed)
+                >= 1,
+            "at least one disconnect should be recorded"
         );
     }
 
