@@ -9,6 +9,8 @@ status_url := "http://127.0.0.1:8765/status"
 # Usage:
 #   just --justfile justfile.overlay-dev list
 #   just --justfile justfile.overlay-dev start
+#   just --justfile justfile.overlay-dev start auto
+#   just --justfile justfile.overlay-dev start fallback-window
 #   just --justfile justfile.overlay-dev status
 #   just --justfile justfile.overlay-dev overlay-kill
 #   just --justfile justfile.overlay-dev logs
@@ -40,17 +42,10 @@ doctor: _guard
     @echo "rev=$(git rev-parse --short HEAD)"
 
 # Start helper in streaming mode with overlay events enabled.
+# Defaults to the simplest path: explicit layer-shell overlay backend.
 # This attaches tmux; detach with Ctrl+b then d.
-start: _guard
-    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true'
-
-# Start helper with explicit fallback-window overlay backend.
-start-fallback: _guard
-    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE=fallback-window && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true'
-
-# Start helper with explicit layer-shell overlay backend.
-start-layer-shell: _guard
-    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE=layer-shell && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true'
+start mode="layer-shell": _guard
+    @bash -lc 'cd "{{repo_root}}" && mode="{{mode}}" && case "$mode" in auto|layer-shell|fallback-window|disabled) ;; *) echo "mode must be one of: auto|layer-shell|fallback-window|disabled" >&2; exit 2 ;; esac && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE="$mode" && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true'
 
 # Stop helper stack.
 stop: _guard
@@ -88,12 +83,12 @@ phase6-promotion runs="3": _guard
 # Compact runbook for full Phase 6 manual coverage.
 runbook: _guard
     @printf '%s\n' \
-      "1) Start layer-shell session: just --justfile justfile.overlay-dev start-layer-shell" \
+      "1) Start layer-shell session: just start" \
       "2) Quick utterance: tap hotkey briefly; expect one final injection and clean auto-hide." \
       "3) Long dictation: hold hotkey for sustained speech; expect rolling interim tail + one final injection." \
       "4) Abort mid-session: release early or abort; expect session_ended=abort and no injected final text." \
-      "5) Overlay crash mid-session: just --justfile justfile.overlay-dev overlay-kill; next overlay event should respawn and final injection still succeeds." \
+      "5) Overlay crash mid-session: just overlay-kill; next overlay event should respawn and final injection still succeeds." \
       "6) Daemon reconnect: kill daemon process, restart helper stack, verify client reconnect + subsequent final injection." \
       "7) Mixed-version compatibility: run protocol decode check (cargo test decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages)." \
-      "8) Promotion gate: just --justfile justfile.overlay-dev phase6-promotion 3" \
-      "9) Stop helper stack: just --justfile justfile.overlay-dev stop"
+      "8) Promotion gate: just phase6-promotion 3" \
+      "9) Stop helper stack: just stop"

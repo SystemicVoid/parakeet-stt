@@ -47,7 +47,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added deterministic render-intent mapping (`OverlayVisibility -> OverlayRenderIntent`) and backend-selection tests proving unsupported/probe-failure paths degrade to noop safely.
 - 2026-02-28: Added crash/restart simulation in `parakeet-ptt/src/main.rs` proving overlay child disconnect + respawn replays only current interim state while final-result enqueue/injection behavior remains unchanged.
 - 2026-02-28: Added overlay text rendering path in `parakeet-overlay` (font descriptor parsing, system-font resolution via `fontdb`, glyph rasterization via `fontdue`, and bounded line-layout clamping).
-- 2026-02-28: Added COSMIC fallback guardrail warning when `fallback-window` is selected and updated `justfile.overlay-dev` runbook to prefer `start-layer-shell` with fallback marked diagnostic-only.
+- 2026-02-28: Added COSMIC fallback guardrail warning when `fallback-window` is selected and updated `justfile.overlay-dev` runbook to prefer the layer-shell path with fallback marked diagnostic-only.
 - 2026-02-28: Fixed Slice E COSMIC regressions by resolving generic/system font fallbacks for `Sans 16`, keeping layer-shell surfaces mapped with transparent hidden frames (instead of null-buffer detach), and failing fast on renderer errors so PTT respawn semantics recover overlay safely.
 - 2026-02-28: Fixed daemon live interim gap by emitting deduplicated `interim_text` from streaming drain chunks during active sessions (not only stop-time `ready_chunks`), preserving display-only overlay routing and `final_result` injection boundaries.
 - 2026-02-28: Fixed overlay long-utterance visibility by tail-clamping wrapped lines in `parakeet-overlay` so the newest interim words remain visible after `max_lines` is reached (instead of freezing on earliest lines).
@@ -58,6 +58,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Completed Phase 6 reliability harness by extending daemon overlay contract tests with explicit quick-utterance, long-dictation, daemon-reconnect, and overlay-crash scenarios while preserving non-fatal final-result behavior.
 - 2026-02-28: Added explicit mixed-version decode stream test in `parakeet-ptt` protocol coverage to prove unknown daemon message types remain non-fatal when interleaved with known variants.
 - 2026-02-28: Added `justfile.overlay-dev` Phase 6 operator gates (`phase6-contract`, `phase6-promotion`) to enforce repeated clean reliability runs and emit deterministic promotion artifacts.
+- 2026-02-28: Simplified `just` operator surface by adding root-level overlay wrappers (`just start`, `just stop`, `just status`, `just phase6-contract`, `just phase6-promotion`) and collapsing redundant overlay start recipes into a single `start mode="<auto|layer-shell|fallback-window|disabled>"` (default `layer-shell`).
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -343,7 +344,7 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 - [x] Add acceptance thresholds for latency and final injection reliability.
 
 ### Verification Loop
-1. [x] Run E2E on every protocol-affecting PR (`just --justfile justfile.overlay-dev phase6-contract`).
+1. [x] Run E2E on every protocol-affecting PR (`just phase6-contract`; legacy equivalent: `just --justfile justfile.overlay-dev phase6-contract`).
 2. [x] Capture artifacts/logs for failures (`phase6-promotion` writes deterministic `/tmp/parakeet-overlay-phase6-gate-*.log`).
 3. [x] Require repeated clean runs before promotion (`phase6-promotion runs>=3`).
 4. [x] Re-run stream+seal quality checks to ensure no WER/latency regression (`just eval compare` within promotion gate).
