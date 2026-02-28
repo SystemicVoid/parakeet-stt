@@ -9,6 +9,7 @@ _Last updated: 2026-02-28_
 - [x] Phase 2: Daemon emission path behind rollout controls.
 - [x] Phase 3: PTT routing + hard injection boundary proofs.
 - [ ] Phase 4: Overlay process MVP (separate process).
+- [x] Phase 4 Slice A: separate overlay binary + deterministic state machine + IPC wiring + failure-isolation tests.
 - [ ] Phase 5: Config/flags/rollout controls.
 - [ ] Phase 6: E2E reliability and promotion gates.
 
@@ -32,6 +33,10 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Completed Phase 3 in `parakeet-ptt` by routing `interim_state`, `interim_text`, and `session_ended` into a dedicated overlay sink adapter path with per-route counters.
 - 2026-02-28: Added overlay-path stale/out-of-order `seq` dropping and session-mismatch drops without changing state reset behavior or final-result enqueue semantics.
 - 2026-02-28: Added Phase 3 boundary tests proving queue enqueue counters move only on `final_result`, including mixed-stream and adversarial stale-sequence coverage.
+- 2026-02-28: Started Phase 4 with a new `parakeet-overlay` process target in `parakeet-ptt` (`src/bin/parakeet-overlay.rs`) and explicit `[[bin]]` entries in `Cargo.toml`.
+- 2026-02-28: Added shared overlay IPC model (`src/overlay_ipc.rs`) and deterministic overlay state machine (`src/overlay_state.rs`) covering `hidden`, `listening`, `interim`, and `finalizing`.
+- 2026-02-28: Wired runtime overlay process spawning from `parakeet-ptt` via NDJSON child-stdio IPC (`src/overlay_process.rs` + `src/main.rs`) with soft-fail fallback to noop sink.
+- 2026-02-28: Added Phase 4 isolation proof that overlay channel disconnect cannot block `final_result` injection enqueue/worker completion (`overlay_disconnect_does_not_block_final_result_injection`).
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -44,6 +49,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 2 interim-text): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_overlay_event_stream.py tests/test_streaming_truth.py tests/test_session_cleanup.py tests/test_cli_precedence.py` passed (44 tests).
 - 2026-02-28 (Phase 2 interim-text eval regression): `just eval compare` passed; stream-seal vs offline deltas were weighted WER `-0.000765`, strict command exact match `+0.000000`, normalized command exact match `+0.000000`, intent+slot match `+0.000000`, critical token recall `+0.002594`, punctuation F1 `+0.016172`, terminal punctuation accuracy `+0.000000`, and warm finalize P95 `-1.903497 ms`.
 - 2026-02-28 (Phase 3 routing/boundary): `cd parakeet-ptt && cargo test` passed (39 tests), including new overlay-routing boundary tests in `src/main.rs`.
+- 2026-02-28 (Phase 4 slice A): `cd parakeet-ptt && cargo fmt` passed.
+- 2026-02-28 (Phase 4 slice A): `cd parakeet-ptt && cargo test` passed (lib: 5 tests, `src/main.rs`: 40 tests, overlay binary unit target: 0 tests), including new `overlay_disconnect_does_not_block_final_result_injection`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -219,37 +226,44 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 
 ## Phase 4: Overlay Process MVP (Separate Process)
 ### Implementation Tasks
-- Add overlay binary target under `parakeet-ptt` workspace.
-- Implement deterministic overlay state machine first:
-  - `hidden`, `listening`, `interim`, `finalizing`.
-- Event intake from PTT via local IPC (newline-delimited JSON over child process stdio or UDS).
-- Backend selection:
-  - primary: layer-shell.
-  - fallback: regular best-effort window.
-- Behavior requirements:
-  - hidden when idle.
-  - auto-hide after final/session end timeout.
-  - no injection, no clipboard, no keyboard ownership.
-- Add configuration fields (opacity/font/anchor/margins/max width/lines) with conservative defaults.
+- [x] Add overlay binary target under `parakeet-ptt` workspace.
+- [x] Implement deterministic overlay state machine first:
+  - [x] `hidden`
+  - [x] `listening`
+  - [x] `interim`
+  - [x] `finalizing`
+- [x] Event intake from PTT via local IPC (newline-delimited JSON over child process stdio).
+- [x] Backend selection scaffold:
+  - [x] primary: layer-shell (scaffold/no-op renderer in MVP slice).
+  - [x] fallback: regular best-effort window (scaffold/no-op renderer in MVP slice).
+- [x] Behavior requirements:
+  - [x] hidden when idle.
+  - [x] auto-hide after final/session end timeout.
+  - [x] no injection, no clipboard, no keyboard ownership.
+- [x] Add configuration fields (opacity/font/anchor/margins/max width/lines) with conservative defaults in overlay CLI process.
+- [ ] Remaining for full Phase 4 completion:
+  - [ ] real rendering integration for layer-shell and fallback window paths.
+  - [ ] crash/restart simulation with reconnect semantics validated end-to-end.
+  - [ ] CPU/memory budget validation under sustained dictation run.
 
 ### Verification Loop
-1. Validate state machine headlessly.
-2. Validate transitions from fake event streams.
-3. Validate rendering integration for key states.
-4. Run overlay crash/restart simulation.
-5. Validate CPU/memory budget under 10+ minute dictation run.
+1. [x] Validate state machine headlessly.
+2. [x] Validate transitions from fake event streams.
+3. [ ] Validate rendering integration for key states.
+4. [ ] Run overlay crash/restart simulation.
+5. [ ] Validate CPU/memory budget under 10+ minute dictation run.
 
 ### Essential Tests
 - Overlay state-machine tests:
-  - transition invariants.
-  - stale sequence drop behavior.
-  - auto-hide timer behavior.
+  - [x] transition invariants.
+  - [x] stale sequence drop behavior.
+  - [x] auto-hide timer behavior.
 - PTT integration tests:
-  - overlay disconnect has zero impact on final injection path.
-  - overlay reconnect consumes current valid state only.
+  - [x] overlay disconnect has zero impact on final injection path.
+  - [ ] overlay reconnect consumes current valid state only.
 
 ### Gate To Proceed
-- Overlay process may fail arbitrarily without affecting capture/transcription/final injection.
+- [ ] Overlay process may fail arbitrarily without affecting capture/transcription/final injection.
 
 ## Phase 5: Config, Feature Flags, and Rollout Controls
 ### Implementation Tasks
