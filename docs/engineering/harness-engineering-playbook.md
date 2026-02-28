@@ -98,19 +98,17 @@ scripts/harness-maintenance.sh mark
 ```bash
 cd <repo-root>
 
-just eval-candidates
+# Run-only flow on existing unified corpus (personal manifest + legacy transcripts/audio append).
+just eval
+just eval offline
+just eval stream
+just eval compare
+just eval calibrate-offline
+just eval calibrate-stream
+
+# Dataset maintenance (explicit, non-default):
+just eval-dataset candidates
 # Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes.
-just eval-materialize
-just eval-record
-
-# Offline path (direct in-memory transcribe).
-just eval-calibrate-offline
-just eval-daily-offline
-
-# Stream+seal path (daemon-like finalize path with separate baseline).
-just eval-calibrate-stream
-just eval-daily-stream
-
-# Side-by-side summary for offline vs stream+seal:
-just eval-compare
+just eval-dataset materialize
+just eval-dataset record
 ```

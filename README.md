@@ -146,23 +146,23 @@ uv run python check_model.py \
 ```
 Personal high-signal workflow (agent-prompt-heavy, local-only assets):
 ```bash
-just eval-candidates
+# Run-only flow on existing unified corpus (personal manifest + appended legacy 8 samples):
+just eval                  # same as: just eval compare
+just eval offline
+just eval stream
+just eval compare
+just eval calibrate-offline
+just eval calibrate-stream
+
+# Dataset maintenance (only when intentionally refreshing prompts/audio):
+just eval-dataset candidates
 # Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes.
-just eval-materialize
-just eval-record
-just eval-calibrate-offline
-just eval-daily-offline
-
-# Optional daemon-like stream+seal path, with separate baseline:
-just eval-calibrate-stream
-just eval-daily-stream
-
-# Compare offline vs stream+seal metrics side-by-side:
-just eval-compare
+just eval-dataset materialize
+just eval-dataset record
 ```
 The benchmark command prints a per-sample + aggregate summary to stdout and writes JSON with:
 - `benchmark`, `bench_runtime`, `model`, `requested_device`, `effective_device`
-- `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_runs`, `sample_count`
+- `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_append_legacy`, `bench_runs`, `sample_count`
 - `aggregate.avg_wer`, `aggregate.weighted_wer`, `aggregate.command_exact_match_rate`, `aggregate.critical_token_recall`
 - `aggregate.punctuation.{precision,recall,f1,terminal_accuracy}`, `aggregate.punctuation_f1`, `aggregate.terminal_punctuation_accuracy`
 - `aggregate.infer_ms.*`, `aggregate.finalize_ms.*`, `aggregate.warm_finalize_ms.*`, `aggregate.cold_start_ms`
