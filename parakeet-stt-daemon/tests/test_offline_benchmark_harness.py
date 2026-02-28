@@ -36,6 +36,20 @@ resolve_benchmark_cases = _CHECK_MODEL._resolve_benchmark_cases
 apply_profile_defaults = _CHECK_MODEL._apply_profile_defaults
 transcribe_stream_seal = _CHECK_MODEL._transcribe_stream_seal
 
+_CMD_073_REFERENCE = (
+    "Push, and give me the command to run the tool for testing. "
+    "I am not sure I want the integration test if not absolutely necessary."
+)
+_CMD_073_SUFFIX = "if not absolutely necessary"
+_CMD_073_TRIMMED_HYPOTHESIS = "Push and give me the command to run the tool for testing."
+_CMD_073_RECOVERED_HYPOTHESIS = (
+    "Push and give me the command to run the tool for testing. "
+    "I'm not sure I want the integration test if not absolutely necessary."
+)
+
+_CMD_087_REFERENCE = "Can you get rid of it, then, if it does nothing?"
+_CMD_087_RECOVERED_HYPOTHESIS = "Can you get rid of it then if it does nothing?"
+
 
 def test_parse_benchmark_transcripts_extracts_numbered_entries(tmp_path: Path) -> None:
     transcript_path = tmp_path / "transcripts.txt"
@@ -432,15 +446,24 @@ class _DummyStreamSession:
     def finalize(self) -> str:
         total_samples = sum(len(chunk) for chunk in self._chunks)
         self._parent.finalized_sample_counts.append(total_samples)
+        if total_samples in self._parent.finalize_outputs_by_sample_count:
+            return self._parent.finalize_outputs_by_sample_count[total_samples]
         if self._parent.finalize_outputs:
             return self._parent.finalize_outputs.pop(0)
         return "ok"
 
 
 class _DummyStreamer:
-    def __init__(self, *, chunk_secs: float, finalize_outputs: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        chunk_secs: float,
+        finalize_outputs: list[str] | None = None,
+        finalize_outputs_by_sample_count: dict[int, str] | None = None,
+    ) -> None:
         self.chunk_secs = chunk_secs
         self.finalize_outputs = list(finalize_outputs or [])
+        self.finalize_outputs_by_sample_count = dict(finalize_outputs_by_sample_count or {})
         self.finalized_sample_counts: list[int] = []
 
     def start_session(self, sample_rate: int) -> _DummyStreamSession:
@@ -480,3 +503,53 @@ def test_transcribe_stream_seal_retries_with_full_tail_when_empty() -> None:
     # First finalize uses capped tail (140 samples), retry uses full tail (160 samples).
     assert hypothesis == "ok"
     assert streamer.finalized_sample_counts == [140, 160]
+
+
+def test_stream_seal_regression_cmd_087_non_empty_for_non_empty_reference() -> None:
+    streamer = _DummyStreamer(
+        chunk_secs=1.0,
+        finalize_outputs_by_sample_count={
+            140: "",
+            160: _CMD_087_RECOVERED_HYPOTHESIS,
+        },
+    )
+    samples = np.zeros((160,), dtype=np.float32)  # ready=100, tail=60, capped trim keeps 40 tail.
+
+    hypothesis, _ = transcribe_stream_seal(
+        streamer,
+        samples=samples,
+        sample_rate=100,
+        silence_floor_db=-40.0,
+        max_tail_trim_secs=0.2,
+    )
+
+    assert normalize_transcript(_CMD_087_REFERENCE)
+    assert hypothesis.strip() != ""
+    assert compute_normalized_wer(_CMD_087_REFERENCE, hypothesis) <= 0.15
+    assert streamer.finalized_sample_counts == [140, 160]
+
+
+def test_stream_seal_regression_cmd_073_retains_suffix_with_tail_trim_cap() -> None:
+    streamer = _DummyStreamer(
+        chunk_secs=1.0,
+        finalize_outputs_by_sample_count={
+            # No cap can trim all 60 tail samples and lose the suffix clause.
+            100: _CMD_073_TRIMMED_HYPOTHESIS,
+            # 0.35s cap (35 samples @100Hz) keeps 25 tail samples and preserves suffix.
+            125: _CMD_073_RECOVERED_HYPOTHESIS,
+        },
+    )
+    samples = np.zeros((160,), dtype=np.float32)  # ready=100, tail=60
+
+    hypothesis, _ = transcribe_stream_seal(
+        streamer,
+        samples=samples,
+        sample_rate=100,
+        silence_floor_db=-40.0,
+        max_tail_trim_secs=0.35,
+    )
+
+    assert compute_normalized_wer(_CMD_073_REFERENCE, _CMD_073_TRIMMED_HYPOTHESIS) > 0.35
+    assert compute_normalized_wer(_CMD_073_REFERENCE, hypothesis) <= 0.10
+    assert _CMD_073_SUFFIX in normalize_transcript(hypothesis)
+    assert streamer.finalized_sample_counts == [125]
