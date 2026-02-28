@@ -27,7 +27,15 @@ DEFAULT_BENCH_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_results.json"
 DEFAULT_BASELINE_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_baseline.json"
 _TRANSCRIPT_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\.\s*(?P<text>.+?)\s*$")
 _TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
+_PUNCT_TOKEN_RE = re.compile(r"[.,?!;:]", flags=re.UNICODE)
+_TERMINAL_PUNCT_RE = re.compile(r"([.?!])\s*$", flags=re.UNICODE)
 _ALLOWED_DOMAINS = {"command", "dictation"}
+
+DEFAULT_STREAM_CHUNK_SECS = 2.4
+DEFAULT_STREAM_RIGHT_CONTEXT_SECS = 1.6
+DEFAULT_STREAM_LEFT_CONTEXT_SECS = 10.0
+DEFAULT_STREAM_BATCH_SIZE = 32
+DEFAULT_STREAM_SILENCE_FLOOR_DB = -40.0
 
 PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "smoke": {
@@ -127,6 +135,11 @@ def parse_benchmark_manifest(
 ) -> list[BenchmarkCase]:
     if not path.exists():
         raise FileNotFoundError(f"Benchmark manifest not found: {path}")
+    if path.is_dir():
+        raise ValueError(
+            "Benchmark manifest path points to a directory; pass a JSONL file like "
+            f"'{path / 'manifest.jsonl'}'"
+        )
 
     cases: list[BenchmarkCase] = []
     seen_sample_ids: set[str] = set()
@@ -346,6 +359,76 @@ def compute_weighted_wer(rows: list[dict[str, Any]]) -> tuple[float, float, floa
     return weighted_wer, command_wer, dictation_wer
 
 
+def _extract_punctuation_tokens(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text)
+    return _PUNCT_TOKEN_RE.findall(normalized)
+
+
+def _extract_terminal_punctuation(text: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    match = _TERMINAL_PUNCT_RE.search(normalized)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _lcs_length(left: list[str], right: list[str]) -> int:
+    if not left or not right:
+        return 0
+    rows = len(left) + 1
+    cols = len(right) + 1
+    table = [[0] * cols for _ in range(rows)]
+    for row_idx, left_token in enumerate(left, start=1):
+        row = table[row_idx]
+        prev_row = table[row_idx - 1]
+        for col_idx, right_token in enumerate(right, start=1):
+            if left_token == right_token:
+                row[col_idx] = prev_row[col_idx - 1] + 1
+                continue
+            row[col_idx] = max(prev_row[col_idx], row[col_idx - 1])
+    return table[-1][-1]
+
+
+def compute_punctuation_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
+    reference_count = 0
+    hypothesis_count = 0
+    true_positive = 0
+    terminal_total = 0
+    terminal_match = 0
+
+    for row in rows:
+        reference_tokens = _extract_punctuation_tokens(str(row.get("reference", "")))
+        hypothesis_tokens = _extract_punctuation_tokens(str(row.get("hypothesis", "")))
+        reference_count += len(reference_tokens)
+        hypothesis_count += len(hypothesis_tokens)
+        true_positive += _lcs_length(reference_tokens, hypothesis_tokens)
+
+        expected_terminal = _extract_terminal_punctuation(str(row.get("reference", "")))
+        if expected_terminal is None:
+            continue
+        terminal_total += 1
+        actual_terminal = _extract_terminal_punctuation(str(row.get("hypothesis", "")))
+        if actual_terminal == expected_terminal:
+            terminal_match += 1
+
+    precision = true_positive / hypothesis_count if hypothesis_count else 1.0
+    recall = true_positive / reference_count if reference_count else 1.0
+    f1 = (2.0 * precision * recall) / (precision + recall) if (precision + recall) > 0.0 else 0.0
+    terminal_accuracy = terminal_match / terminal_total if terminal_total else 1.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "terminal_accuracy": terminal_accuracy,
+        "reference_count": float(reference_count),
+        "hypothesis_count": float(hypothesis_count),
+        "matched_count": float(true_positive),
+        "terminal_total": float(terminal_total),
+        "terminal_matched": float(terminal_match),
+    }
+
+
 def evaluate_regression_thresholds(
     *,
     avg_wer: float,
@@ -367,6 +450,12 @@ def evaluate_regression_thresholds(
     max_command_exact_match_drop: float | None = None,
     max_critical_token_recall_drop: float | None = None,
     max_warm_p95_finalize_ms_delta: float | None = None,
+    punctuation_f1: float | None = None,
+    terminal_punctuation_accuracy: float | None = None,
+    min_punctuation_f1: float | None = None,
+    min_terminal_punctuation_accuracy: float | None = None,
+    max_punctuation_f1_drop: float | None = None,
+    max_terminal_punctuation_accuracy_drop: float | None = None,
 ) -> list[str]:
     failures: list[str] = []
     if max_avg_wer is not None and avg_wer > max_avg_wer:
@@ -410,6 +499,24 @@ def evaluate_regression_thresholds(
         failures.append(
             f"warm_finalize_p95_ms {warm_finalize_p95_ms:.2f} exceeds threshold "
             f"{max_warm_p95_finalize_ms:.2f}"
+        )
+    if (
+        min_punctuation_f1 is not None
+        and punctuation_f1 is not None
+        and punctuation_f1 < min_punctuation_f1
+    ):
+        failures.append(
+            f"punctuation_f1 {punctuation_f1:.4f} below threshold {min_punctuation_f1:.4f}"
+        )
+    if (
+        min_terminal_punctuation_accuracy is not None
+        and terminal_punctuation_accuracy is not None
+        and terminal_punctuation_accuracy < min_terminal_punctuation_accuracy
+    ):
+        failures.append(
+            "terminal_punctuation_accuracy "
+            f"{terminal_punctuation_accuracy:.4f} below threshold "
+            f"{min_terminal_punctuation_accuracy:.4f}"
         )
 
     if max_weighted_wer_delta is not None:
@@ -470,6 +577,39 @@ def evaluate_regression_thresholds(
                 f"{baseline_warm_finalize + max_warm_p95_finalize_ms_delta:.2f}"
             )
 
+    if max_punctuation_f1_drop is not None:
+        baseline_punctuation_f1 = _metric_from_baseline(baseline, "punctuation_f1")
+        if baseline_punctuation_f1 is None:
+            failures.append("baseline punctuation_f1 is required for punctuation_f1_drop gating")
+        elif (
+            punctuation_f1 is not None
+            and punctuation_f1 < baseline_punctuation_f1 - max_punctuation_f1_drop
+        ):
+            failures.append(
+                f"punctuation_f1 {punctuation_f1:.4f} below baseline-delta "
+                f"{baseline_punctuation_f1 - max_punctuation_f1_drop:.4f}"
+            )
+
+    if max_terminal_punctuation_accuracy_drop is not None:
+        baseline_terminal_accuracy = _metric_from_baseline(
+            baseline, "terminal_punctuation_accuracy"
+        )
+        if baseline_terminal_accuracy is None:
+            failures.append(
+                "baseline terminal_punctuation_accuracy is required for "
+                "terminal_punctuation_accuracy_drop gating"
+            )
+        elif (
+            terminal_punctuation_accuracy is not None
+            and terminal_punctuation_accuracy
+            < baseline_terminal_accuracy - max_terminal_punctuation_accuracy_drop
+        ):
+            failures.append(
+                "terminal_punctuation_accuracy "
+                f"{terminal_punctuation_accuracy:.4f} below baseline-delta "
+                f"{baseline_terminal_accuracy - max_terminal_punctuation_accuracy_drop:.4f}"
+            )
+
     return failures
 
 
@@ -509,6 +649,71 @@ def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
     return sample_array.reshape(-1), int(sample_rate)
 
 
+def _trim_tail_with_rms(
+    samples: np.ndarray,
+    *,
+    sample_rate: int,
+    silence_floor_db: float,
+    window_ms: int = 50,
+) -> np.ndarray:
+    if samples.size == 0:
+        return samples
+    window = max(1, int(sample_rate * window_ms / 1000))
+    audio = samples.astype(np.float32, copy=False)
+    idx = audio.size
+    while idx > 0:
+        start = max(0, idx - window)
+        window_slice = audio[start:idx]
+        rms = np.sqrt(np.mean(window_slice**2))
+        db = 20 * np.log10(max(rms, 1e-6))
+        if db > silence_floor_db:
+            break
+        idx = start
+    return audio[:idx]
+
+
+def _split_stream_ready_and_tail(
+    samples: np.ndarray, *, sample_rate: int, chunk_secs: float
+) -> tuple[list[np.ndarray], np.ndarray]:
+    if samples.size == 0:
+        return [], np.zeros((0,), dtype=np.float32)
+    chunk_size = max(1, int(sample_rate * chunk_secs))
+    ready_limit = (samples.size // chunk_size) * chunk_size
+    ready_chunks = [
+        np.asarray(samples[idx : idx + chunk_size], dtype=np.float32)
+        for idx in range(0, ready_limit, chunk_size)
+    ]
+    tail = np.asarray(samples[ready_limit:], dtype=np.float32)
+    return ready_chunks, tail
+
+
+def _transcribe_stream_seal(
+    streamer: ParakeetStreamingTranscriber,
+    samples: np.ndarray,
+    *,
+    sample_rate: int,
+    silence_floor_db: float,
+) -> tuple[str, float]:
+    session = streamer.start_session(sample_rate)
+    ready_chunks, tail = _split_stream_ready_and_tail(
+        samples, sample_rate=sample_rate, chunk_secs=streamer.chunk_secs
+    )
+    for chunk in ready_chunks:
+        session.feed(chunk)
+    if tail.size:
+        trimmed_tail = _trim_tail_with_rms(
+            tail,
+            sample_rate=sample_rate,
+            silence_floor_db=silence_floor_db,
+        )
+        if trimmed_tail.size:
+            session.feed(trimmed_tail)
+    infer_start = time.perf_counter()
+    hypothesis = session.finalize()
+    infer_ms = (time.perf_counter() - infer_start) * 1000.0
+    return hypothesis, infer_ms
+
+
 def _resolve_benchmark_cases(
     *,
     bench_dir: Path,
@@ -518,6 +723,14 @@ def _resolve_benchmark_cases(
 ) -> tuple[list[BenchmarkCase], Path | None]:
     if bench_manifest is not None:
         manifest_path = bench_manifest.resolve()
+        if manifest_path.is_dir():
+            default_manifest = manifest_path / "manifest.jsonl"
+            if not default_manifest.exists():
+                raise FileNotFoundError(
+                    "Benchmark manifest directory provided but manifest.jsonl is missing: "
+                    f"{default_manifest}"
+                )
+            manifest_path = default_manifest
         cases = parse_benchmark_manifest(
             manifest_path,
             bench_dir=bench_dir,
@@ -539,6 +752,9 @@ def _run_benchmark_once(
     *,
     cases: list[BenchmarkCase],
     transcriber: ParakeetTranscriber,
+    streaming_transcriber: ParakeetStreamingTranscriber | None,
+    bench_runtime: str,
+    stream_silence_floor_db: float,
     warmup_samples: int,
     run_index: int,
 ) -> dict[str, Any]:
@@ -549,16 +765,31 @@ def _run_benchmark_once(
     for case in cases:
         finalize_start = time.perf_counter()
         samples, sample_rate = _read_wav_samples(case.audio_path)
-        infer_start = time.perf_counter()
-        hypothesis = transcriber.transcribe_samples(samples, sample_rate=sample_rate)
-        infer_ms = (time.perf_counter() - infer_start) * 1000.0
+        if bench_runtime == "stream-seal":
+            if streaming_transcriber is None:
+                raise ValueError("streaming transcriber is required for stream-seal runtime")
+            hypothesis, infer_ms = _transcribe_stream_seal(
+                streaming_transcriber,
+                samples,
+                sample_rate=sample_rate,
+                silence_floor_db=stream_silence_floor_db,
+            )
+        else:
+            infer_start = time.perf_counter()
+            hypothesis = transcriber.transcribe_samples(samples, sample_rate=sample_rate)
+            infer_ms = (time.perf_counter() - infer_start) * 1000.0
         finalize_ms = (time.perf_counter() - finalize_start) * 1000.0
         normalized_reference = normalize_transcript(case.reference)
         normalized_hypothesis = normalize_transcript(hypothesis)
         wer = compute_normalized_wer(case.reference, hypothesis)
+        reference_punctuation = _extract_punctuation_tokens(case.reference)
+        hypothesis_punctuation = _extract_punctuation_tokens(hypothesis)
+        expected_terminal_punctuation = _extract_terminal_punctuation(case.reference)
+        actual_terminal_punctuation = _extract_terminal_punctuation(hypothesis)
 
         row = {
             "run_index": run_index,
+            "runtime": bench_runtime,
             "sample_id": case.sample_id,
             "audio_path": str(case.audio_path),
             "sample_rate": sample_rate,
@@ -571,6 +802,10 @@ def _run_benchmark_once(
             "normalized_reference": normalized_reference,
             "normalized_hypothesis": normalized_hypothesis,
             "normalized_critical_tokens": list(case.critical_tokens),
+            "reference_punctuation": reference_punctuation,
+            "hypothesis_punctuation": hypothesis_punctuation,
+            "expected_terminal_punctuation": expected_terminal_punctuation,
+            "actual_terminal_punctuation": actual_terminal_punctuation,
             "wer": wer,
             "infer_ms": infer_ms,
             "finalize_ms": finalize_ms,
@@ -587,6 +822,7 @@ def _run_benchmark_once(
     weighted_wer, command_wer, dictation_wer = compute_weighted_wer(sample_rows)
     command_exact_match_rate = compute_command_exact_match_rate(sample_rows)
     critical_token_recall = compute_critical_token_recall(sample_rows)
+    punctuation = compute_punctuation_metrics(sample_rows)
 
     warmup_slice = sample_rows[min(max(warmup_samples, 0), len(sample_rows)) :]
     warm_infer_summary = summarize_timings_ms([float(row["infer_ms"]) for row in warmup_slice])
@@ -602,6 +838,9 @@ def _run_benchmark_once(
         "weighted_wer": weighted_wer,
         "command_exact_match_rate": command_exact_match_rate,
         "critical_token_recall": critical_token_recall,
+        "punctuation": punctuation,
+        "punctuation_f1": float(punctuation["f1"]),
+        "terminal_punctuation_accuracy": float(punctuation["terminal_accuracy"]),
         "infer_ms": infer_summary,
         "finalize_ms": finalize_summary,
         "warm_infer_ms": warm_infer_summary,
@@ -634,6 +873,19 @@ def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
             "weighted_wer": 0.0,
             "command_exact_match_rate": 1.0,
             "critical_token_recall": 1.0,
+            "punctuation": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "terminal_accuracy": 1.0,
+                "reference_count": 0.0,
+                "hypothesis_count": 0.0,
+                "matched_count": 0.0,
+                "terminal_total": 0.0,
+                "terminal_matched": 0.0,
+            },
+            "punctuation_f1": 1.0,
+            "terminal_punctuation_accuracy": 1.0,
             "infer_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
             "finalize_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
             "warm_infer_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
@@ -647,6 +899,7 @@ def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
 
     run_aggregates = [result["aggregate"] for result in run_results]
     first_domain = run_aggregates[0]["by_domain"]
+    punctuation_aggregates = [aggregate["punctuation"] for aggregate in run_aggregates]
     return {
         "aggregation_strategy": "median_of_runs",
         "run_count": len(run_aggregates),
@@ -657,6 +910,23 @@ def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "critical_token_recall": _median(
             [aggregate["critical_token_recall"] for aggregate in run_aggregates]
+        ),
+        "punctuation": {
+            "precision": _median([item["precision"] for item in punctuation_aggregates]),
+            "recall": _median([item["recall"] for item in punctuation_aggregates]),
+            "f1": _median([item["f1"] for item in punctuation_aggregates]),
+            "terminal_accuracy": _median(
+                [item["terminal_accuracy"] for item in punctuation_aggregates]
+            ),
+            "reference_count": punctuation_aggregates[0]["reference_count"],
+            "hypothesis_count": punctuation_aggregates[0]["hypothesis_count"],
+            "matched_count": punctuation_aggregates[0]["matched_count"],
+            "terminal_total": punctuation_aggregates[0]["terminal_total"],
+            "terminal_matched": punctuation_aggregates[0]["terminal_matched"],
+        },
+        "punctuation_f1": _median([aggregate["punctuation_f1"] for aggregate in run_aggregates]),
+        "terminal_punctuation_accuracy": _median(
+            [aggregate["terminal_punctuation_accuracy"] for aggregate in run_aggregates]
         ),
         "infer_ms": _medianize_timing_summaries(
             [aggregate["infer_ms"] for aggregate in run_aggregates]
@@ -699,10 +969,25 @@ def _load_baseline_metrics(path: Path) -> dict[str, float]:
         raise ValueError(f"Invalid baseline payload in {path}")
 
     metrics: dict[str, float] = {}
-    for key in ("weighted_wer", "command_exact_match_rate", "critical_token_recall"):
+    for key in (
+        "weighted_wer",
+        "command_exact_match_rate",
+        "critical_token_recall",
+        "punctuation_f1",
+        "terminal_punctuation_accuracy",
+    ):
         value = aggregate.get(key)
         if isinstance(value, (int, float)):
             metrics[key] = float(value)
+
+    punctuation = aggregate.get("punctuation")
+    if isinstance(punctuation, dict):
+        f1 = punctuation.get("f1")
+        if isinstance(f1, (int, float)):
+            metrics.setdefault("punctuation_f1", float(f1))
+        terminal_accuracy = punctuation.get("terminal_accuracy")
+        if isinstance(terminal_accuracy, (int, float)):
+            metrics.setdefault("terminal_punctuation_accuracy", float(terminal_accuracy))
 
     warm_finalize_ms = aggregate.get("warm_finalize_ms")
     if isinstance(warm_finalize_ms, dict) and isinstance(warm_finalize_ms.get("p95"), (int, float)):
@@ -724,6 +1009,8 @@ def _compute_baseline_comparison(
         "weighted_wer": float(aggregate["weighted_wer"]),
         "command_exact_match_rate": float(aggregate["command_exact_match_rate"]),
         "critical_token_recall": float(aggregate["critical_token_recall"]),
+        "punctuation_f1": float(aggregate["punctuation_f1"]),
+        "terminal_punctuation_accuracy": float(aggregate["terminal_punctuation_accuracy"]),
         "warm_finalize_p95_ms": float(aggregate["warm_finalize_ms"]["p95"]),
     }
     comparison: dict[str, Any] = {}
@@ -743,6 +1030,7 @@ def _write_baseline_output(path: Path, args: argparse.Namespace, aggregate: dict
     payload = {
         "version": 1,
         "benchmark": "offline",
+        "bench_runtime": args.bench_runtime,
         "model": args.model,
         "requested_device": args.device,
         "bench_tier": args.bench_tier,
@@ -770,10 +1058,14 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
         "max_weighted_wer": "max_weighted_wer",
         "min_command_exact_match": "min_command_exact_match",
         "min_critical_token_recall": "min_critical_token_recall",
+        "min_punctuation_f1": "min_punctuation_f1",
+        "min_terminal_punctuation_accuracy": "min_terminal_punctuation_accuracy",
         "max_warm_p95_finalize_ms": "max_warm_p95_finalize_ms",
         "max_weighted_wer_delta": "max_weighted_wer_delta",
         "max_command_exact_match_drop": "max_command_exact_match_drop",
         "max_critical_token_recall_drop": "max_critical_token_recall_drop",
+        "max_punctuation_f1_drop": "max_punctuation_f1_drop",
+        "max_terminal_punctuation_accuracy_drop": "max_terminal_punctuation_accuracy_drop",
         "max_warm_p95_finalize_ms_delta": "max_warm_p95_finalize_ms_delta",
     }
     for profile_key, arg_name in profile_to_arg.items():
@@ -784,6 +1076,8 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
         args.max_weighted_wer_delta = None
         args.max_command_exact_match_drop = None
         args.max_critical_token_recall_drop = None
+        args.max_punctuation_f1_drop = None
+        args.max_terminal_punctuation_accuracy_drop = None
         args.max_warm_p95_finalize_ms_delta = None
 
 
@@ -793,6 +1087,15 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         raise ValueError("--bench-runs must be at least 1")
     if args.warmup_samples is None or args.warmup_samples < 0:
         raise ValueError("--warmup-samples must be >= 0")
+    if args.bench_runtime == "stream-seal":
+        if args.stream_chunk_secs <= 0:
+            raise ValueError("--stream-chunk-secs must be > 0")
+        if args.stream_right_context_secs < 0:
+            raise ValueError("--stream-right-context-secs must be >= 0")
+        if args.stream_left_context_secs < 0:
+            raise ValueError("--stream-left-context-secs must be >= 0")
+        if args.stream_batch_size <= 0:
+            raise ValueError("--stream-batch-size must be > 0")
 
     bench_dir: Path = args.bench_dir.resolve()
     output_path: Path = (
@@ -816,6 +1119,15 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
 
     model = load_parakeet_model(args.model, device=args.device)
     transcriber = ParakeetTranscriber(model)
+    streaming_transcriber: ParakeetStreamingTranscriber | None = None
+    if args.bench_runtime == "stream-seal":
+        streaming_transcriber = ParakeetStreamingTranscriber(
+            model,
+            chunk_secs=args.stream_chunk_secs,
+            right_context_secs=args.stream_right_context_secs,
+            left_context_secs=args.stream_left_context_secs,
+            batch_size=args.stream_batch_size,
+        )
     effective_device = str(getattr(model, "_parakeet_effective_device", args.device))
 
     run_results: list[dict[str, Any]] = []
@@ -824,6 +1136,9 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             _run_benchmark_once(
                 cases=cases,
                 transcriber=transcriber,
+                streaming_transcriber=streaming_transcriber,
+                bench_runtime=args.bench_runtime,
+                stream_silence_floor_db=args.stream_silence_floor_db,
                 warmup_samples=args.warmup_samples,
                 run_index=run_index,
             )
@@ -842,21 +1157,48 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         command_exact_match_rate=float(aggregate["command_exact_match_rate"]),
         critical_token_recall=float(aggregate["critical_token_recall"]),
         warm_finalize_p95_ms=float(aggregate["warm_finalize_ms"]["p95"]),
+        punctuation_f1=float(aggregate["punctuation_f1"]),
+        terminal_punctuation_accuracy=float(aggregate["terminal_punctuation_accuracy"]),
         max_weighted_wer=args.max_weighted_wer,
         min_command_exact_match=args.min_command_exact_match,
         min_critical_token_recall=args.min_critical_token_recall,
+        min_punctuation_f1=args.min_punctuation_f1,
+        min_terminal_punctuation_accuracy=args.min_terminal_punctuation_accuracy,
         max_warm_p95_finalize_ms=args.max_warm_p95_finalize_ms,
         baseline=baseline_metrics,
         max_weighted_wer_delta=args.max_weighted_wer_delta,
         max_command_exact_match_drop=args.max_command_exact_match_drop,
         max_critical_token_recall_drop=args.max_critical_token_recall_drop,
+        max_punctuation_f1_drop=args.max_punctuation_f1_drop,
+        max_terminal_punctuation_accuracy_drop=args.max_terminal_punctuation_accuracy_drop,
         max_warm_p95_finalize_ms_delta=args.max_warm_p95_finalize_ms_delta,
     )
 
     baseline_comparison = _compute_baseline_comparison(baseline_metrics, aggregate)
     first_run_samples = run_results[0]["samples"] if run_results else []
+    runtime_config: dict[str, Any] | None = None
+    if args.bench_runtime == "stream-seal":
+        runtime_config = {
+            "chunk_secs": args.stream_chunk_secs,
+            "right_context_secs": args.stream_right_context_secs,
+            "left_context_secs": args.stream_left_context_secs,
+            "batch_size": args.stream_batch_size,
+            "silence_floor_db": args.stream_silence_floor_db,
+            "helper_active": bool(
+                streaming_transcriber is not None and streaming_transcriber.helper_active
+            ),
+            "helper_class": (
+                getattr(streaming_transcriber, "_helper_class_name", None)
+                if streaming_transcriber is not None
+                else None
+            ),
+            "fallback_reason": (
+                streaming_transcriber.fallback_reason if streaming_transcriber is not None else None
+            ),
+        }
     report = {
         "benchmark": "offline",
+        "bench_runtime": args.bench_runtime,
         "model": args.model,
         "requested_device": args.device,
         "effective_device": effective_device,
@@ -870,6 +1212,7 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         "transcripts_path": None if resolved_manifest_path is not None else str(transcripts_path),
         "sample_count": len(first_run_samples),
         "aggregate": aggregate,
+        "runtime_config": runtime_config,
         "thresholds": {
             "max_avg_wer": args.max_avg_wer,
             "max_p95_infer_ms": args.max_p95_infer_ms,
@@ -877,10 +1220,14 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             "max_weighted_wer": args.max_weighted_wer,
             "min_command_exact_match": args.min_command_exact_match,
             "min_critical_token_recall": args.min_critical_token_recall,
+            "min_punctuation_f1": args.min_punctuation_f1,
+            "min_terminal_punctuation_accuracy": args.min_terminal_punctuation_accuracy,
             "max_warm_p95_finalize_ms": args.max_warm_p95_finalize_ms,
             "max_weighted_wer_delta": args.max_weighted_wer_delta,
             "max_command_exact_match_drop": args.max_command_exact_match_drop,
             "max_critical_token_recall_drop": args.max_critical_token_recall_drop,
+            "max_punctuation_f1_drop": args.max_punctuation_f1_drop,
+            "max_terminal_punctuation_accuracy_drop": args.max_terminal_punctuation_accuracy_drop,
             "max_warm_p95_finalize_ms_delta": args.max_warm_p95_finalize_ms_delta,
             "baseline_path": str(args.baseline.resolve()) if args.baseline is not None else None,
         },
@@ -898,15 +1245,35 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
-    print(f"Offline benchmark completed for {len(first_run_samples)} sample(s)")
+    print(
+        f"Benchmark completed for {len(first_run_samples)} sample(s) (runtime={args.bench_runtime})"
+    )
     print(
         f"Model: {args.model} (requested={args.device}, effective={effective_device}), "
         f"runs={args.bench_runs}, aggregation={aggregate['aggregation_strategy']}"
     )
+    if runtime_config is not None:
+        print(
+            "Stream+seal config: "
+            f"chunk={runtime_config['chunk_secs']}, "
+            f"right_context={runtime_config['right_context_secs']}, "
+            f"left_context={runtime_config['left_context_secs']}, "
+            f"batch={runtime_config['batch_size']}, "
+            f"helper_active={runtime_config['helper_active']}, "
+            f"helper_class={runtime_config['helper_class']}, "
+            f"fallback_reason={runtime_config['fallback_reason']}"
+        )
     print(f"Average WER: {aggregate['avg_wer']:.4f}")
     print(f"Weighted WER: {aggregate['weighted_wer']:.4f}")
     print(f"Command exact-match: {aggregate['command_exact_match_rate']:.4f}")
     print(f"Critical token recall: {aggregate['critical_token_recall']:.4f}")
+    print(
+        "Punctuation (precision/recall/F1/terminal): "
+        f"{aggregate['punctuation']['precision']:.4f}/"
+        f"{aggregate['punctuation']['recall']:.4f}/"
+        f"{aggregate['punctuation_f1']:.4f}/"
+        f"{aggregate['terminal_punctuation_accuracy']:.4f}"
+    )
     print(
         "Infer ms (avg/p50/p95): "
         f"{aggregate['infer_ms']['avg']:.2f}/{aggregate['infer_ms']['p50']:.2f}/"
@@ -1049,6 +1416,16 @@ def parse_args() -> argparse.Namespace:
         help="Run repeatable offline benchmark harness over bench_audio",
     )
     parser.add_argument(
+        "--bench-runtime",
+        choices=["offline", "stream-seal"],
+        default="offline",
+        help=(
+            "Benchmark transcription runtime path: "
+            "'offline' uses direct in-memory transcribe; "
+            "'stream-seal' simulates daemon stream+seal finalize path."
+        ),
+    )
+    parser.add_argument(
         "--bench-dir",
         type=Path,
         default=BENCH_AUDIO_DIR,
@@ -1095,6 +1472,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Exclude first N samples per run from warm latency gates",
+    )
+    parser.add_argument(
+        "--stream-chunk-secs",
+        type=float,
+        default=DEFAULT_STREAM_CHUNK_SECS,
+        help="Chunk size (seconds) used when --bench-runtime=stream-seal",
+    )
+    parser.add_argument(
+        "--stream-right-context-secs",
+        type=float,
+        default=DEFAULT_STREAM_RIGHT_CONTEXT_SECS,
+        help="Right context seconds used when --bench-runtime=stream-seal",
+    )
+    parser.add_argument(
+        "--stream-left-context-secs",
+        type=float,
+        default=DEFAULT_STREAM_LEFT_CONTEXT_SECS,
+        help="Left context seconds used when --bench-runtime=stream-seal",
+    )
+    parser.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=DEFAULT_STREAM_BATCH_SIZE,
+        help="Streaming helper batch size when --bench-runtime=stream-seal",
+    )
+    parser.add_argument(
+        "--stream-silence-floor-db",
+        type=float,
+        default=DEFAULT_STREAM_SILENCE_FLOOR_DB,
+        help="Tail-trim silence floor (dB) for stream-seal benchmarking",
     )
     parser.add_argument(
         "--baseline",
@@ -1153,6 +1560,18 @@ def parse_args() -> argparse.Namespace:
         help="Fail benchmark when critical token recall falls below this threshold",
     )
     parser.add_argument(
+        "--min-punctuation-f1",
+        type=float,
+        default=None,
+        help="Fail benchmark when punctuation F1 falls below this threshold",
+    )
+    parser.add_argument(
+        "--min-terminal-punctuation-accuracy",
+        type=float,
+        default=None,
+        help="Fail benchmark when terminal punctuation accuracy falls below this threshold",
+    )
+    parser.add_argument(
         "--max-warm-p95-finalize-ms",
         type=float,
         default=None,
@@ -1175,6 +1594,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Relative gate: critical token recall may not drop by more than this amount",
+    )
+    parser.add_argument(
+        "--max-punctuation-f1-drop",
+        type=float,
+        default=None,
+        help="Relative gate: punctuation F1 may not drop by more than this amount",
+    )
+    parser.add_argument(
+        "--max-terminal-punctuation-accuracy-drop",
+        type=float,
+        default=None,
+        help="Relative gate: terminal punctuation accuracy may not drop by more than this amount",
     )
     parser.add_argument(
         "--max-warm-p95-finalize-ms-delta",

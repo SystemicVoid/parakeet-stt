@@ -20,6 +20,7 @@ collect_benchmark_cases = _CHECK_MODEL.collect_benchmark_cases
 compute_command_exact_match_rate = _CHECK_MODEL.compute_command_exact_match_rate
 compute_critical_token_recall = _CHECK_MODEL.compute_critical_token_recall
 compute_normalized_wer = _CHECK_MODEL.compute_normalized_wer
+compute_punctuation_metrics = _CHECK_MODEL.compute_punctuation_metrics
 compute_weighted_wer = _CHECK_MODEL.compute_weighted_wer
 evaluate_regression_thresholds = _CHECK_MODEL.evaluate_regression_thresholds
 normalize_transcript = _CHECK_MODEL.normalize_transcript
@@ -128,6 +129,27 @@ def test_command_and_critical_token_metrics() -> None:
     assert compute_critical_token_recall(rows) == pytest.approx(0.75)
 
 
+def test_punctuation_metrics_capture_order_and_terminal_accuracy() -> None:
+    rows = [
+        {
+            "reference": "Hello, world. Is this good?",
+            "hypothesis": "Hello world. Is this good.",
+        },
+        {
+            "reference": "Ship it!",
+            "hypothesis": "Ship it!",
+        },
+    ]
+
+    metrics = compute_punctuation_metrics(rows)
+
+    assert metrics["reference_count"] == pytest.approx(4.0)
+    assert metrics["hypothesis_count"] == pytest.approx(3.0)
+    assert metrics["matched_count"] == pytest.approx(2.0)
+    assert metrics["f1"] == pytest.approx((2.0 * 2.0) / (4.0 + 3.0))
+    assert metrics["terminal_accuracy"] == pytest.approx(0.5)
+
+
 def test_evaluate_regression_thresholds_flags_only_exceedances() -> None:
     failures = evaluate_regression_thresholds(
         avg_wer=0.42,
@@ -191,3 +213,27 @@ def test_evaluate_regression_thresholds_relative_gate_detects_drift() -> None:
 
     assert len(failures) == 4
     assert "weighted_wer" in failures[0]
+
+
+def test_evaluate_regression_thresholds_with_punctuation_gates() -> None:
+    failures = evaluate_regression_thresholds(
+        avg_wer=0.10,
+        infer_p95_ms=100.0,
+        finalize_p95_ms=100.0,
+        max_avg_wer=None,
+        max_p95_infer_ms=None,
+        max_p95_finalize_ms=None,
+        punctuation_f1=0.70,
+        terminal_punctuation_accuracy=0.80,
+        min_punctuation_f1=0.75,
+        min_terminal_punctuation_accuracy=0.90,
+        baseline={
+            "punctuation_f1": 0.85,
+            "terminal_punctuation_accuracy": 0.95,
+        },
+        max_punctuation_f1_drop=0.05,
+        max_terminal_punctuation_accuracy_drop=0.10,
+    )
+
+    assert len(failures) == 4
+    assert "punctuation_f1" in failures[0]
