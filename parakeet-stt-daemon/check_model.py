@@ -38,6 +38,65 @@ DEFAULT_STREAM_BATCH_SIZE = 32
 DEFAULT_STREAM_SILENCE_FLOOR_DB = -40.0
 DEFAULT_STREAM_MAX_TAIL_TRIM_SECS = 0.35
 
+_COMMAND_ARTICLES = frozenset({"a", "an", "the"})
+_COMMAND_FILLER_TOKENS = frozenset(
+    {
+        "and",
+        "can",
+        "could",
+        "for",
+        "i",
+        "like",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "please",
+        "sort",
+        "then",
+        "to",
+        "uh",
+        "um",
+        "we",
+        "with",
+        "you",
+    }
+)
+_COMMAND_INTENT_SYNONYMS = {
+    "begin": "start",
+    "browse": "open",
+    "build": "run",
+    "change": "edit",
+    "create": "make",
+    "delete": "remove",
+    "execute": "run",
+    "find": "search",
+    "launch": "open",
+    "modify": "edit",
+    "new": "make",
+    "open": "open",
+    "remove": "remove",
+    "rename": "move",
+    "run": "run",
+    "search": "search",
+    "start": "start",
+    "update": "edit",
+}
+
+_COMMAND_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "—": "-",
+        "–": "-",
+        "‑": "-",
+        "‐": "-",
+    }
+)
+
 PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "all": {
         "bench_runs": 2,
@@ -300,6 +359,51 @@ def normalize_transcript(text: str) -> str:
     return " ".join(tokens)
 
 
+def _normalize_command_tokens(
+    text: str,
+    *,
+    remove_articles: bool = True,
+    drop_fillers: bool = False,
+) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text).translate(_COMMAND_TRANSLATION)
+    tokens = normalize_transcript(normalized).split()
+    if remove_articles:
+        tokens = [token for token in tokens if token not in _COMMAND_ARTICLES]
+    if drop_fillers:
+        tokens = [token for token in tokens if token not in _COMMAND_FILLER_TOKENS]
+    return tokens
+
+
+def normalize_command_text(text: str) -> str:
+    return " ".join(_normalize_command_tokens(text, remove_articles=True, drop_fillers=True))
+
+
+def parse_command_intent_slots(text: str) -> dict[str, Any]:
+    tokens = _normalize_command_tokens(text, remove_articles=True)
+    if not tokens:
+        return {"intent": "", "slots": [], "signature": ""}
+
+    canonical_tokens = [_COMMAND_INTENT_SYNONYMS.get(token, token) for token in tokens]
+    intent = canonical_tokens[0]
+    for token in canonical_tokens:
+        if token in _COMMAND_INTENT_SYNONYMS.values():
+            intent = token
+            break
+
+    slots: list[str] = []
+    seen_slots: set[str] = set()
+    for token in canonical_tokens:
+        if token == intent or token in _COMMAND_FILLER_TOKENS:
+            continue
+        if token in seen_slots:
+            continue
+        slots.append(token)
+        seen_slots.add(token)
+
+    signature = f"{intent}|{' '.join(slots)}"
+    return {"intent": intent, "slots": slots, "signature": signature}
+
+
 def _levenshtein_distance(reference_tokens: list[str], hypothesis_tokens: list[str]) -> int:
     rows = len(reference_tokens) + 1
     cols = len(hypothesis_tokens) + 1
@@ -368,15 +472,49 @@ def _summarize_domain_wers(rows: list[dict[str, Any]], domain: str) -> tuple[flo
 
 
 def compute_command_exact_match_rate(rows: list[dict[str, Any]]) -> float:
+    return compute_command_match_metrics(rows)["strict_exact_match_rate"]
+
+
+def compute_command_match_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     command_rows = [row for row in rows if row.get("domain") == "command"]
     if not command_rows:
-        return 1.0
-    exact_matches = sum(
+        return {
+            "strict_exact_match_rate": 1.0,
+            "normalized_exact_match_rate": 1.0,
+            "intent_slot_match_rate": 1.0,
+        }
+
+    strict_exact_matches = sum(
         1
         for row in command_rows
         if row.get("normalized_reference") == row.get("normalized_hypothesis")
     )
-    return exact_matches / len(command_rows)
+    normalized_exact_matches = sum(
+        1
+        for row in command_rows
+        if row.get("command_normalized_reference", row.get("normalized_reference"))
+        == row.get("command_normalized_hypothesis", row.get("normalized_hypothesis"))
+    )
+    intent_slot_matches = 0
+    for row in command_rows:
+        reference_signature = row.get("command_reference_signature")
+        hypothesis_signature = row.get("command_hypothesis_signature")
+        if reference_signature is None:
+            reference_signature = parse_command_intent_slots(
+                str(row.get("reference", row.get("normalized_reference", "")))
+            )["signature"]
+        if hypothesis_signature is None:
+            hypothesis_signature = parse_command_intent_slots(
+                str(row.get("hypothesis", row.get("normalized_hypothesis", "")))
+            )["signature"]
+        if reference_signature == hypothesis_signature:
+            intent_slot_matches += 1
+    total = len(command_rows)
+    return {
+        "strict_exact_match_rate": strict_exact_matches / total,
+        "normalized_exact_match_rate": normalized_exact_matches / total,
+        "intent_slot_match_rate": intent_slot_matches / total,
+    }
 
 
 def compute_critical_token_recall(rows: list[dict[str, Any]]) -> float:
@@ -489,15 +627,21 @@ def evaluate_regression_thresholds(
     max_p95_finalize_ms: float | None,
     weighted_wer: float | None = None,
     command_exact_match_rate: float | None = None,
+    command_exact_match_rate_normalized: float | None = None,
+    command_intent_slot_match_rate: float | None = None,
     critical_token_recall: float | None = None,
     warm_finalize_p95_ms: float | None = None,
     max_weighted_wer: float | None = None,
     min_command_exact_match: float | None = None,
+    min_command_normalized_exact_match: float | None = None,
+    min_command_intent_slot_match: float | None = None,
     min_critical_token_recall: float | None = None,
     max_warm_p95_finalize_ms: float | None = None,
     baseline: dict[str, float] | None = None,
     max_weighted_wer_delta: float | None = None,
     max_command_exact_match_drop: float | None = None,
+    max_command_normalized_exact_match_drop: float | None = None,
+    max_command_intent_slot_match_drop: float | None = None,
     max_critical_token_recall_drop: float | None = None,
     max_warm_p95_finalize_ms_delta: float | None = None,
     punctuation_f1: float | None = None,
@@ -540,6 +684,26 @@ def evaluate_regression_thresholds(
         failures.append(
             f"critical_token_recall {critical_token_recall:.4f} below threshold "
             f"{min_critical_token_recall:.4f}"
+        )
+    if (
+        min_command_normalized_exact_match is not None
+        and command_exact_match_rate_normalized is not None
+        and command_exact_match_rate_normalized < min_command_normalized_exact_match
+    ):
+        failures.append(
+            "command_exact_match_rate_normalized "
+            f"{command_exact_match_rate_normalized:.4f} below threshold "
+            f"{min_command_normalized_exact_match:.4f}"
+        )
+    if (
+        min_command_intent_slot_match is not None
+        and command_intent_slot_match_rate is not None
+        and command_intent_slot_match_rate < min_command_intent_slot_match
+    ):
+        failures.append(
+            "command_intent_slot_match_rate "
+            f"{command_intent_slot_match_rate:.4f} below threshold "
+            f"{min_command_intent_slot_match:.4f}"
         )
     if (
         max_warm_p95_finalize_ms is not None
@@ -595,6 +759,46 @@ def evaluate_regression_thresholds(
             failures.append(
                 f"command_exact_match_rate {command_exact_match_rate:.4f} below baseline-delta "
                 f"{baseline_command_match - max_command_exact_match_drop:.4f}"
+            )
+
+    if max_command_normalized_exact_match_drop is not None:
+        baseline_normalized_match = _metric_from_baseline(
+            baseline, "command_exact_match_rate_normalized"
+        )
+        if baseline_normalized_match is None:
+            failures.append(
+                "baseline command_exact_match_rate_normalized is required for "
+                "command_normalized_exact_match_drop gating"
+            )
+        elif (
+            command_exact_match_rate_normalized is not None
+            and command_exact_match_rate_normalized
+            < baseline_normalized_match - max_command_normalized_exact_match_drop
+        ):
+            failures.append(
+                "command_exact_match_rate_normalized "
+                f"{command_exact_match_rate_normalized:.4f} below baseline-delta "
+                f"{baseline_normalized_match - max_command_normalized_exact_match_drop:.4f}"
+            )
+
+    if max_command_intent_slot_match_drop is not None:
+        baseline_intent_slot_match = _metric_from_baseline(
+            baseline, "command_intent_slot_match_rate"
+        )
+        if baseline_intent_slot_match is None:
+            failures.append(
+                "baseline command_intent_slot_match_rate is required for "
+                "command_intent_slot_match_drop gating"
+            )
+        elif (
+            command_intent_slot_match_rate is not None
+            and command_intent_slot_match_rate
+            < baseline_intent_slot_match - max_command_intent_slot_match_drop
+        ):
+            failures.append(
+                "command_intent_slot_match_rate "
+                f"{command_intent_slot_match_rate:.4f} below baseline-delta "
+                f"{baseline_intent_slot_match - max_command_intent_slot_match_drop:.4f}"
             )
 
     if max_critical_token_recall_drop is not None:
@@ -857,6 +1061,37 @@ def _run_benchmark_once(
         finalize_ms = (time.perf_counter() - finalize_start) * 1000.0
         normalized_reference = normalize_transcript(case.reference)
         normalized_hypothesis = normalize_transcript(hypothesis)
+        command_normalized_reference = (
+            normalize_command_text(case.reference) if case.domain == "command" else None
+        )
+        command_normalized_hypothesis = (
+            normalize_command_text(hypothesis) if case.domain == "command" else None
+        )
+        command_reference_parse = (
+            parse_command_intent_slots(case.reference) if case.domain == "command" else None
+        )
+        command_hypothesis_parse = (
+            parse_command_intent_slots(hypothesis) if case.domain == "command" else None
+        )
+        command_reference_signature = (
+            command_reference_parse["signature"] if command_reference_parse is not None else None
+        )
+        command_hypothesis_signature = (
+            command_hypothesis_parse["signature"] if command_hypothesis_parse is not None else None
+        )
+        command_match_strict = (
+            normalized_reference == normalized_hypothesis if case.domain == "command" else None
+        )
+        command_match_normalized = (
+            command_normalized_reference == command_normalized_hypothesis
+            if case.domain == "command"
+            else None
+        )
+        command_match_intent_slot = (
+            command_reference_signature == command_hypothesis_signature
+            if case.domain == "command"
+            else None
+        )
         wer = compute_normalized_wer(case.reference, hypothesis)
         reference_punctuation = _extract_punctuation_tokens(case.reference)
         hypothesis_punctuation = _extract_punctuation_tokens(hypothesis)
@@ -877,6 +1112,15 @@ def _run_benchmark_once(
             "hypothesis": hypothesis,
             "normalized_reference": normalized_reference,
             "normalized_hypothesis": normalized_hypothesis,
+            "command_normalized_reference": command_normalized_reference,
+            "command_normalized_hypothesis": command_normalized_hypothesis,
+            "command_reference_parse": command_reference_parse,
+            "command_hypothesis_parse": command_hypothesis_parse,
+            "command_reference_signature": command_reference_signature,
+            "command_hypothesis_signature": command_hypothesis_signature,
+            "command_match_strict": command_match_strict,
+            "command_match_normalized": command_match_normalized,
+            "command_match_intent_slot": command_match_intent_slot,
             "normalized_critical_tokens": list(case.critical_tokens),
             "reference_punctuation": reference_punctuation,
             "hypothesis_punctuation": hypothesis_punctuation,
@@ -896,7 +1140,10 @@ def _run_benchmark_once(
     infer_summary = summarize_timings_ms(infer_ms_values)
     finalize_summary = summarize_timings_ms(finalize_ms_values)
     weighted_wer, command_wer, dictation_wer = compute_weighted_wer(sample_rows)
-    command_exact_match_rate = compute_command_exact_match_rate(sample_rows)
+    command_match_metrics = compute_command_match_metrics(sample_rows)
+    command_exact_match_rate = command_match_metrics["strict_exact_match_rate"]
+    command_exact_match_rate_normalized = command_match_metrics["normalized_exact_match_rate"]
+    command_intent_slot_match_rate = command_match_metrics["intent_slot_match_rate"]
     critical_token_recall = compute_critical_token_recall(sample_rows)
     punctuation = compute_punctuation_metrics(sample_rows)
 
@@ -913,6 +1160,14 @@ def _run_benchmark_once(
         "avg_wer": avg_wer,
         "weighted_wer": weighted_wer,
         "command_exact_match_rate": command_exact_match_rate,
+        "command_exact_match_rate_strict": command_exact_match_rate,
+        "command_exact_match_rate_normalized": command_exact_match_rate_normalized,
+        "command_intent_slot_match_rate": command_intent_slot_match_rate,
+        "command_match": {
+            "strict_exact_match_rate": command_exact_match_rate,
+            "normalized_exact_match_rate": command_exact_match_rate_normalized,
+            "intent_slot_match_rate": command_intent_slot_match_rate,
+        },
         "critical_token_recall": critical_token_recall,
         "punctuation": punctuation,
         "punctuation_f1": float(punctuation["f1"]),
@@ -948,6 +1203,14 @@ def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
             "avg_wer": 0.0,
             "weighted_wer": 0.0,
             "command_exact_match_rate": 1.0,
+            "command_exact_match_rate_strict": 1.0,
+            "command_exact_match_rate_normalized": 1.0,
+            "command_intent_slot_match_rate": 1.0,
+            "command_match": {
+                "strict_exact_match_rate": 1.0,
+                "normalized_exact_match_rate": 1.0,
+                "intent_slot_match_rate": 1.0,
+            },
             "critical_token_recall": 1.0,
             "punctuation": {
                 "precision": 1.0,
@@ -984,6 +1247,35 @@ def _aggregate_run_results(run_results: list[dict[str, Any]]) -> dict[str, Any]:
         "command_exact_match_rate": _median(
             [aggregate["command_exact_match_rate"] for aggregate in run_aggregates]
         ),
+        "command_exact_match_rate_strict": _median(
+            [aggregate["command_exact_match_rate_strict"] for aggregate in run_aggregates]
+        ),
+        "command_exact_match_rate_normalized": _median(
+            [aggregate["command_exact_match_rate_normalized"] for aggregate in run_aggregates]
+        ),
+        "command_intent_slot_match_rate": _median(
+            [aggregate["command_intent_slot_match_rate"] for aggregate in run_aggregates]
+        ),
+        "command_match": {
+            "strict_exact_match_rate": _median(
+                [
+                    aggregate["command_match"]["strict_exact_match_rate"]
+                    for aggregate in run_aggregates
+                ]
+            ),
+            "normalized_exact_match_rate": _median(
+                [
+                    aggregate["command_match"]["normalized_exact_match_rate"]
+                    for aggregate in run_aggregates
+                ]
+            ),
+            "intent_slot_match_rate": _median(
+                [
+                    aggregate["command_match"]["intent_slot_match_rate"]
+                    for aggregate in run_aggregates
+                ]
+            ),
+        },
         "critical_token_recall": _median(
             [aggregate["critical_token_recall"] for aggregate in run_aggregates]
         ),
@@ -1048,6 +1340,9 @@ def _load_baseline_metrics(path: Path) -> dict[str, float]:
     for key in (
         "weighted_wer",
         "command_exact_match_rate",
+        "command_exact_match_rate_strict",
+        "command_exact_match_rate_normalized",
+        "command_intent_slot_match_rate",
         "critical_token_recall",
         "punctuation_f1",
         "terminal_punctuation_accuracy",
@@ -1084,6 +1379,11 @@ def _compute_baseline_comparison(
     current_metrics = {
         "weighted_wer": float(aggregate["weighted_wer"]),
         "command_exact_match_rate": float(aggregate["command_exact_match_rate"]),
+        "command_exact_match_rate_strict": float(aggregate["command_exact_match_rate_strict"]),
+        "command_exact_match_rate_normalized": float(
+            aggregate["command_exact_match_rate_normalized"]
+        ),
+        "command_intent_slot_match_rate": float(aggregate["command_intent_slot_match_rate"]),
         "critical_token_recall": float(aggregate["critical_token_recall"]),
         "punctuation_f1": float(aggregate["punctuation_f1"]),
         "terminal_punctuation_accuracy": float(aggregate["terminal_punctuation_accuracy"]),
@@ -1134,12 +1434,16 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
     profile_to_arg = {
         "max_weighted_wer": "max_weighted_wer",
         "min_command_exact_match": "min_command_exact_match",
+        "min_command_normalized_exact_match": "min_command_normalized_exact_match",
+        "min_command_intent_slot_match": "min_command_intent_slot_match",
         "min_critical_token_recall": "min_critical_token_recall",
         "min_punctuation_f1": "min_punctuation_f1",
         "min_terminal_punctuation_accuracy": "min_terminal_punctuation_accuracy",
         "max_warm_p95_finalize_ms": "max_warm_p95_finalize_ms",
         "max_weighted_wer_delta": "max_weighted_wer_delta",
         "max_command_exact_match_drop": "max_command_exact_match_drop",
+        "max_command_normalized_exact_match_drop": "max_command_normalized_exact_match_drop",
+        "max_command_intent_slot_match_drop": "max_command_intent_slot_match_drop",
         "max_critical_token_recall_drop": "max_critical_token_recall_drop",
         "max_punctuation_f1_drop": "max_punctuation_f1_drop",
         "max_terminal_punctuation_accuracy_drop": "max_terminal_punctuation_accuracy_drop",
@@ -1152,6 +1456,8 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
     if args.calibrate_baseline:
         args.max_weighted_wer_delta = None
         args.max_command_exact_match_drop = None
+        args.max_command_normalized_exact_match_drop = None
+        args.max_command_intent_slot_match_drop = None
         args.max_critical_token_recall_drop = None
         args.max_punctuation_f1_drop = None
         args.max_terminal_punctuation_accuracy_drop = None
@@ -1160,6 +1466,8 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
         # Keep profile defaults usable before a baseline exists.
         args.max_weighted_wer_delta = None
         args.max_command_exact_match_drop = None
+        args.max_command_normalized_exact_match_drop = None
+        args.max_command_intent_slot_match_drop = None
         args.max_critical_token_recall_drop = None
         args.max_punctuation_f1_drop = None
         args.max_terminal_punctuation_accuracy_drop = None
@@ -1244,12 +1552,16 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         max_p95_finalize_ms=args.max_p95_finalize_ms,
         weighted_wer=float(aggregate["weighted_wer"]),
         command_exact_match_rate=float(aggregate["command_exact_match_rate"]),
+        command_exact_match_rate_normalized=float(aggregate["command_exact_match_rate_normalized"]),
+        command_intent_slot_match_rate=float(aggregate["command_intent_slot_match_rate"]),
         critical_token_recall=float(aggregate["critical_token_recall"]),
         warm_finalize_p95_ms=float(aggregate["warm_finalize_ms"]["p95"]),
         punctuation_f1=float(aggregate["punctuation_f1"]),
         terminal_punctuation_accuracy=float(aggregate["terminal_punctuation_accuracy"]),
         max_weighted_wer=args.max_weighted_wer,
         min_command_exact_match=args.min_command_exact_match,
+        min_command_normalized_exact_match=args.min_command_normalized_exact_match,
+        min_command_intent_slot_match=args.min_command_intent_slot_match,
         min_critical_token_recall=args.min_critical_token_recall,
         min_punctuation_f1=args.min_punctuation_f1,
         min_terminal_punctuation_accuracy=args.min_terminal_punctuation_accuracy,
@@ -1257,6 +1569,8 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         baseline=baseline_metrics,
         max_weighted_wer_delta=args.max_weighted_wer_delta,
         max_command_exact_match_drop=args.max_command_exact_match_drop,
+        max_command_normalized_exact_match_drop=args.max_command_normalized_exact_match_drop,
+        max_command_intent_slot_match_drop=args.max_command_intent_slot_match_drop,
         max_critical_token_recall_drop=args.max_critical_token_recall_drop,
         max_punctuation_f1_drop=args.max_punctuation_f1_drop,
         max_terminal_punctuation_accuracy_drop=args.max_terminal_punctuation_accuracy_drop,
@@ -1313,12 +1627,16 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             "max_p95_finalize_ms": args.max_p95_finalize_ms,
             "max_weighted_wer": args.max_weighted_wer,
             "min_command_exact_match": args.min_command_exact_match,
+            "min_command_normalized_exact_match": args.min_command_normalized_exact_match,
+            "min_command_intent_slot_match": args.min_command_intent_slot_match,
             "min_critical_token_recall": args.min_critical_token_recall,
             "min_punctuation_f1": args.min_punctuation_f1,
             "min_terminal_punctuation_accuracy": args.min_terminal_punctuation_accuracy,
             "max_warm_p95_finalize_ms": args.max_warm_p95_finalize_ms,
             "max_weighted_wer_delta": args.max_weighted_wer_delta,
             "max_command_exact_match_drop": args.max_command_exact_match_drop,
+            "max_command_normalized_exact_match_drop": args.max_command_normalized_exact_match_drop,
+            "max_command_intent_slot_match_drop": args.max_command_intent_slot_match_drop,
             "max_critical_token_recall_drop": args.max_critical_token_recall_drop,
             "max_punctuation_f1_drop": args.max_punctuation_f1_drop,
             "max_terminal_punctuation_accuracy_drop": args.max_terminal_punctuation_accuracy_drop,
@@ -1362,7 +1680,11 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         )
     print(f"Average WER: {aggregate['avg_wer']:.4f}")
     print(f"Weighted WER: {aggregate['weighted_wer']:.4f}")
-    print(f"Command exact-match: {aggregate['command_exact_match_rate']:.4f}")
+    print(f"Command exact-match (strict): {aggregate['command_exact_match_rate_strict']:.4f}")
+    print(
+        f"Command exact-match (normalized): {aggregate['command_exact_match_rate_normalized']:.4f}"
+    )
+    print(f"Command intent+slot match: {aggregate['command_intent_slot_match_rate']:.4f}")
     print(f"Critical token recall: {aggregate['critical_token_recall']:.4f}")
     print(
         "Punctuation (precision/recall/F1/terminal): "
@@ -1671,6 +1993,18 @@ def parse_args() -> argparse.Namespace:
         help="Fail benchmark when command exact-match ratio falls below this threshold",
     )
     parser.add_argument(
+        "--min-command-normalized-exact-match",
+        type=float,
+        default=None,
+        help="Fail benchmark when normalized command exact-match ratio falls below this threshold",
+    )
+    parser.add_argument(
+        "--min-command-intent-slot-match",
+        type=float,
+        default=None,
+        help="Fail benchmark when command intent+slot match ratio falls below this threshold",
+    )
+    parser.add_argument(
         "--min-critical-token-recall",
         type=float,
         default=None,
@@ -1705,6 +2039,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Relative gate: command exact-match may not drop by more than this amount",
+    )
+    parser.add_argument(
+        "--max-command-normalized-exact-match-drop",
+        type=float,
+        default=None,
+        help=(
+            "Relative gate: normalized command exact-match may not drop by more than this amount"
+        ),
+    )
+    parser.add_argument(
+        "--max-command-intent-slot-match-drop",
+        type=float,
+        default=None,
+        help="Relative gate: command intent+slot match may not drop by more than this amount",
     )
     parser.add_argument(
         "--max-critical-token-recall-drop",

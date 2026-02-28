@@ -20,12 +20,15 @@ _SPEC.loader.exec_module(_CHECK_MODEL)
 
 collect_benchmark_cases = _CHECK_MODEL.collect_benchmark_cases
 compute_command_exact_match_rate = _CHECK_MODEL.compute_command_exact_match_rate
+compute_command_match_metrics = _CHECK_MODEL.compute_command_match_metrics
 compute_critical_token_recall = _CHECK_MODEL.compute_critical_token_recall
 compute_normalized_wer = _CHECK_MODEL.compute_normalized_wer
 compute_punctuation_metrics = _CHECK_MODEL.compute_punctuation_metrics
 compute_weighted_wer = _CHECK_MODEL.compute_weighted_wer
 evaluate_regression_thresholds = _CHECK_MODEL.evaluate_regression_thresholds
+normalize_command_text = _CHECK_MODEL.normalize_command_text
 normalize_transcript = _CHECK_MODEL.normalize_transcript
+parse_command_intent_slots = _CHECK_MODEL.parse_command_intent_slots
 parse_benchmark_manifest = _CHECK_MODEL.parse_benchmark_manifest
 parse_benchmark_transcripts = _CHECK_MODEL.parse_benchmark_transcripts
 summarize_timings_ms = _CHECK_MODEL.summarize_timings_ms
@@ -145,6 +148,14 @@ def test_normalize_and_wer_behavior() -> None:
     assert normalize_transcript("Ghostty, Pop!_OS, and Parakeet‑TDT!") == (
         "ghostty pop os and parakeet tdt"
     )
+    assert normalize_command_text("Open the browser — and go to “GitHub”.") == (
+        "open browser go github"
+    )
+    assert parse_command_intent_slots("Could you open the browser and go to GitHub?") == {
+        "intent": "open",
+        "slots": ["browser", "go", "github"],
+        "signature": "open|browser go github",
+    }
     assert compute_normalized_wer("The QUICK brown fox.", "the quick brown fox") == 0.0
     assert compute_normalized_wer("one two three", "one four three") == pytest.approx(1.0 / 3.0)
 
@@ -189,6 +200,50 @@ def test_command_and_critical_token_metrics() -> None:
     assert weighted_wer == pytest.approx(0.8 * 0.3 + 0.2 * 0.1)
     assert compute_command_exact_match_rate(rows) == pytest.approx(0.5)
     assert compute_critical_token_recall(rows) == pytest.approx(0.75)
+
+
+def test_command_match_metrics_expose_strict_normalized_and_intent_scores() -> None:
+    rows = [
+        {
+            "domain": "command",
+            "reference": "Open the browser and go to GitHub",
+            "hypothesis": "open browser and go to github",
+            "normalized_reference": "open the browser and go to github",
+            "normalized_hypothesis": "open browser and go to github",
+            "command_normalized_reference": "open browser go github",
+            "command_normalized_hypothesis": "open browser go github",
+            "command_reference_signature": "open|browser go github",
+            "command_hypothesis_signature": "open|browser go github",
+        },
+        {
+            "domain": "command",
+            "reference": "Could you open browser and go to GitHub",
+            "hypothesis": "open browser go github",
+            "normalized_reference": "could you open browser and go to github",
+            "normalized_hypothesis": "open browser go github",
+            "command_normalized_reference": "open browser go github",
+            "command_normalized_hypothesis": "open browser go github",
+            "command_reference_signature": "open|browser go github",
+            "command_hypothesis_signature": "open|browser go github",
+        },
+        {
+            "domain": "command",
+            "reference": "Open browser and go to GitHub",
+            "hypothesis": "close browser and go to github",
+            "normalized_reference": "open browser and go to github",
+            "normalized_hypothesis": "close browser and go to github",
+            "command_normalized_reference": "open browser go github",
+            "command_normalized_hypothesis": "close browser go github",
+            "command_reference_signature": "open|browser go github",
+            "command_hypothesis_signature": "close|browser go github",
+        },
+    ]
+
+    metrics = compute_command_match_metrics(rows)
+
+    assert metrics["strict_exact_match_rate"] == pytest.approx(0.0)
+    assert metrics["normalized_exact_match_rate"] == pytest.approx(2.0 / 3.0)
+    assert metrics["intent_slot_match_rate"] == pytest.approx(2.0 / 3.0)
 
 
 def test_punctuation_metrics_capture_order_and_terminal_accuracy() -> None:
@@ -308,12 +363,16 @@ def test_apply_profile_defaults_disables_relative_gates_without_baseline() -> No
         warmup_samples=None,
         max_weighted_wer=None,
         min_command_exact_match=None,
+        min_command_normalized_exact_match=None,
+        min_command_intent_slot_match=None,
         min_critical_token_recall=None,
         min_punctuation_f1=None,
         min_terminal_punctuation_accuracy=None,
         max_warm_p95_finalize_ms=None,
         max_weighted_wer_delta=None,
         max_command_exact_match_drop=None,
+        max_command_normalized_exact_match_drop=None,
+        max_command_intent_slot_match_drop=None,
         max_critical_token_recall_drop=None,
         max_punctuation_f1_drop=None,
         max_terminal_punctuation_accuracy_drop=None,
@@ -326,6 +385,8 @@ def test_apply_profile_defaults_disables_relative_gates_without_baseline() -> No
 
     assert args.max_weighted_wer_delta is None
     assert args.max_command_exact_match_drop is None
+    assert args.max_command_normalized_exact_match_drop is None
+    assert args.max_command_intent_slot_match_drop is None
     assert args.max_critical_token_recall_drop is None
     assert args.max_punctuation_f1_drop is None
     assert args.max_terminal_punctuation_accuracy_drop is None
