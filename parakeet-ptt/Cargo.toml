@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Push-to-talk client for the Parakeet speech-to-text daemon"
 
+[[bin]]
+name = "parakeet-ptt"
+path = "src/main.rs"
+
+[[bin]]
+name = "parakeet-overlay"
+path = "src/bin/parakeet-overlay.rs"
+
 [dependencies]
 anyhow = "1.0.95"
 clap = { version = "4.5.21", features = ["derive"] }
