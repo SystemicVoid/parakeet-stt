@@ -38,6 +38,22 @@ DEFAULT_STREAM_BATCH_SIZE = 32
 DEFAULT_STREAM_SILENCE_FLOOR_DB = -40.0
 
 PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "all": {
+        "bench_runs": 2,
+        "warmup_samples": 1,
+        "max_weighted_wer": 0.20,
+        "min_command_exact_match": 0.70,
+        "min_critical_token_recall": 0.94,
+        "min_punctuation_f1": 0.70,
+        "min_terminal_punctuation_accuracy": 0.85,
+        "max_warm_p95_finalize_ms": 180.0,
+        "max_weighted_wer_delta": 0.03,
+        "max_command_exact_match_drop": 0.05,
+        "max_critical_token_recall_drop": 0.03,
+        "max_punctuation_f1_drop": 0.08,
+        "max_terminal_punctuation_accuracy_drop": 0.08,
+        "max_warm_p95_finalize_ms_delta": 40.0,
+    },
     "smoke": {
         "bench_runs": 1,
         "warmup_samples": 1,
@@ -242,6 +258,39 @@ def collect_benchmark_cases(bench_dir: Path, transcripts: dict[str, str]) -> lis
         raise ValueError(f"Transcript entries missing matching audio files: {formatted}")
 
     return cases
+
+
+def _collect_legacy_transcript_cases(
+    *,
+    bench_dir: Path,
+    bench_transcripts: Path | None,
+) -> tuple[list[BenchmarkCase], Path]:
+    transcripts_path = (
+        bench_transcripts.resolve()
+        if bench_transcripts is not None
+        else (bench_dir / "transcripts.txt")
+    )
+    transcripts = parse_benchmark_transcripts(transcripts_path)
+    return collect_benchmark_cases(bench_dir, transcripts), transcripts_path
+
+
+def _merge_benchmark_case_sets(
+    primary_cases: list[BenchmarkCase],
+    extra_cases: list[BenchmarkCase],
+    *,
+    extra_label: str,
+) -> list[BenchmarkCase]:
+    merged = list(primary_cases)
+    seen_sample_ids = {case.sample_id for case in primary_cases}
+    duplicates = sorted(case.sample_id for case in extra_cases if case.sample_id in seen_sample_ids)
+    if duplicates:
+        formatted = ", ".join(duplicates)
+        raise ValueError(
+            "Cannot append "
+            f"{extra_label} benchmark cases because sample_id already exists: {formatted}"
+        )
+    merged.extend(extra_cases)
+    return merged
 
 
 def normalize_transcript(text: str) -> str:
@@ -720,7 +769,9 @@ def _resolve_benchmark_cases(
     bench_tier: str | None,
     bench_manifest: Path | None,
     bench_transcripts: Path | None,
-) -> tuple[list[BenchmarkCase], Path | None]:
+    bench_append_legacy: bool,
+) -> tuple[list[BenchmarkCase], Path | None, Path | None]:
+    effective_manifest_tier = None if bench_tier in {None, "all"} else bench_tier
     if bench_manifest is not None:
         manifest_path = bench_manifest.resolve()
         if manifest_path.is_dir():
@@ -734,18 +785,26 @@ def _resolve_benchmark_cases(
         cases = parse_benchmark_manifest(
             manifest_path,
             bench_dir=bench_dir,
-            bench_tier=bench_tier,
+            bench_tier=effective_manifest_tier,
         )
-        return cases, manifest_path
+        appended_transcripts_path: Path | None = None
+        if bench_append_legacy:
+            legacy_cases, appended_transcripts_path = _collect_legacy_transcript_cases(
+                bench_dir=bench_dir,
+                bench_transcripts=bench_transcripts,
+            )
+            cases = _merge_benchmark_case_sets(
+                cases,
+                legacy_cases,
+                extra_label="legacy transcript",
+            )
+        return cases, manifest_path, appended_transcripts_path
 
-    transcripts_path = (
-        bench_transcripts.resolve()
-        if bench_transcripts is not None
-        else (bench_dir / "transcripts.txt")
+    cases, transcripts_path = _collect_legacy_transcript_cases(
+        bench_dir=bench_dir,
+        bench_transcripts=bench_transcripts,
     )
-    transcripts = parse_benchmark_transcripts(transcripts_path)
-    cases = collect_benchmark_cases(bench_dir, transcripts)
-    return cases, None
+    return cases, None, transcripts_path
 
 
 def _run_benchmark_once(
@@ -1034,6 +1093,7 @@ def _write_baseline_output(path: Path, args: argparse.Namespace, aggregate: dict
         "model": args.model,
         "requested_device": args.device,
         "bench_tier": args.bench_tier,
+        "bench_append_legacy": args.bench_append_legacy,
         "bench_runs": args.bench_runs,
         "warmup_samples": args.warmup_samples,
         "aggregate": aggregate,
@@ -1079,6 +1139,14 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
         args.max_punctuation_f1_drop = None
         args.max_terminal_punctuation_accuracy_drop = None
         args.max_warm_p95_finalize_ms_delta = None
+    elif args.baseline is None:
+        # Keep profile defaults usable before a baseline exists.
+        args.max_weighted_wer_delta = None
+        args.max_command_exact_match_drop = None
+        args.max_critical_token_recall_drop = None
+        args.max_punctuation_f1_drop = None
+        args.max_terminal_punctuation_accuracy_drop = None
+        args.max_warm_p95_finalize_ms_delta = None
 
 
 def run_offline_benchmark(args: argparse.Namespace) -> int:
@@ -1110,11 +1178,12 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         else (bench_dir / "transcripts.txt")
     )
     manifest_path = args.bench_manifest.resolve() if args.bench_manifest is not None else None
-    cases, resolved_manifest_path = _resolve_benchmark_cases(
+    cases, resolved_manifest_path, appended_transcripts_path = _resolve_benchmark_cases(
         bench_dir=bench_dir,
         bench_tier=args.bench_tier,
         bench_manifest=manifest_path,
         bench_transcripts=transcripts_path,
+        bench_append_legacy=args.bench_append_legacy,
     )
 
     model = load_parakeet_model(args.model, device=args.device)
@@ -1204,12 +1273,16 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
         "effective_device": effective_device,
         "bench_dir": str(bench_dir),
         "bench_tier": args.bench_tier,
+        "bench_append_legacy": args.bench_append_legacy,
         "bench_runs": args.bench_runs,
         "warmup_samples": args.warmup_samples,
         "manifest_path": str(resolved_manifest_path)
         if resolved_manifest_path is not None
         else None,
-        "transcripts_path": None if resolved_manifest_path is not None else str(transcripts_path),
+        "transcripts_path": str(transcripts_path) if resolved_manifest_path is None else None,
+        "appended_transcripts_path": (
+            str(appended_transcripts_path) if appended_transcripts_path is not None else None
+        ),
         "sample_count": len(first_run_samples),
         "aggregate": aggregate,
         "runtime_config": runtime_config,
@@ -1248,6 +1321,8 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
     print(
         f"Benchmark completed for {len(first_run_samples)} sample(s) (runtime={args.bench_runtime})"
     )
+    if appended_transcripts_path is not None:
+        print(f"Manifest mode with appended legacy transcripts: {appended_transcripts_path}")
     print(
         f"Model: {args.model} (requested={args.device}, effective={effective_device}), "
         f"runs={args.bench_runs}, aggregation={aggregate['aggregation_strategy']}"
@@ -1441,7 +1516,18 @@ def parse_args() -> argparse.Namespace:
         "--bench-tier",
         choices=sorted(PROFILE_DEFAULTS),
         default=None,
-        help="Apply tier defaults and (with manifest) select only that tier",
+        help=(
+            "Apply profile defaults. With manifest mode, values other than 'all' also filter "
+            "rows by matching manifest tier."
+        ),
+    )
+    parser.add_argument(
+        "--bench-append-legacy",
+        action="store_true",
+        help=(
+            "When --bench-manifest is set, append legacy numbered transcript/audio samples "
+            "from --bench-transcripts (or <bench-dir>/transcripts.txt)."
+        ),
     )
     parser.add_argument(
         "--bench-transcripts",

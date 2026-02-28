@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
@@ -27,6 +28,8 @@ normalize_transcript = _CHECK_MODEL.normalize_transcript
 parse_benchmark_manifest = _CHECK_MODEL.parse_benchmark_manifest
 parse_benchmark_transcripts = _CHECK_MODEL.parse_benchmark_transcripts
 summarize_timings_ms = _CHECK_MODEL.summarize_timings_ms
+resolve_benchmark_cases = _CHECK_MODEL._resolve_benchmark_cases
+apply_profile_defaults = _CHECK_MODEL._apply_profile_defaults
 
 
 def test_parse_benchmark_transcripts_extracts_numbered_entries(tmp_path: Path) -> None:
@@ -77,6 +80,63 @@ def test_parse_benchmark_manifest_filters_tier_and_normalizes_tokens(tmp_path: P
     assert cases[0].sample_id == "daily_01"
     assert cases[0].domain == "command"
     assert cases[0].critical_tokens == ("stt", "paste")
+
+
+def test_resolve_manifest_cases_can_append_legacy_transcripts(tmp_path: Path) -> None:
+    bench_dir = tmp_path
+    (bench_dir / "sample_01.wav").write_bytes(b"")
+    (bench_dir / "transcripts.txt").write_text('1. "legacy prompt"\n', encoding="utf-8")
+
+    manifest_path = bench_dir / "manifest.jsonl"
+    (bench_dir / "personal").mkdir(parents=True, exist_ok=True)
+    (bench_dir / "personal/audio").mkdir(parents=True, exist_ok=True)
+    (bench_dir / "personal/audio/cmd_001.wav").write_bytes(b"")
+    manifest_path.write_text(
+        (
+            '{"sample_id":"cmd_001","audio_path":"personal/audio/cmd_001.wav",'
+            '"reference":"new prompt","tier":"daily","domain":"command"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    cases, resolved_manifest_path, appended_transcripts_path = resolve_benchmark_cases(
+        bench_dir=bench_dir,
+        bench_tier="all",
+        bench_manifest=manifest_path,
+        bench_transcripts=bench_dir / "transcripts.txt",
+        bench_append_legacy=True,
+    )
+
+    assert len(cases) == 2
+    assert {case.sample_id for case in cases} == {"cmd_001", "sample_01"}
+    assert resolved_manifest_path == manifest_path.resolve()
+    assert appended_transcripts_path == (bench_dir / "transcripts.txt").resolve()
+
+
+def test_resolve_manifest_cases_rejects_duplicate_sample_ids_when_appending_legacy(
+    tmp_path: Path,
+) -> None:
+    bench_dir = tmp_path
+    (bench_dir / "sample_01.wav").write_bytes(b"")
+    (bench_dir / "transcripts.txt").write_text('1. "legacy prompt"\n', encoding="utf-8")
+
+    manifest_path = bench_dir / "manifest.jsonl"
+    manifest_path.write_text(
+        (
+            '{"sample_id":"sample_01","audio_path":"sample_01.wav",'
+            '"reference":"new prompt","tier":"daily","domain":"command"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sample_id already exists"):
+        resolve_benchmark_cases(
+            bench_dir=bench_dir,
+            bench_tier="all",
+            bench_manifest=manifest_path,
+            bench_transcripts=bench_dir / "transcripts.txt",
+            bench_append_legacy=True,
+        )
 
 
 def test_normalize_and_wer_behavior() -> None:
@@ -237,3 +297,34 @@ def test_evaluate_regression_thresholds_with_punctuation_gates() -> None:
 
     assert len(failures) == 4
     assert "punctuation_f1" in failures[0]
+
+
+def test_apply_profile_defaults_disables_relative_gates_without_baseline() -> None:
+    args = argparse.Namespace(
+        bench_tier="all",
+        bench_runs=None,
+        warmup_samples=None,
+        max_weighted_wer=None,
+        min_command_exact_match=None,
+        min_critical_token_recall=None,
+        min_punctuation_f1=None,
+        min_terminal_punctuation_accuracy=None,
+        max_warm_p95_finalize_ms=None,
+        max_weighted_wer_delta=None,
+        max_command_exact_match_drop=None,
+        max_critical_token_recall_drop=None,
+        max_punctuation_f1_drop=None,
+        max_terminal_punctuation_accuracy_drop=None,
+        max_warm_p95_finalize_ms_delta=None,
+        calibrate_baseline=False,
+        baseline=None,
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.max_weighted_wer_delta is None
+    assert args.max_command_exact_match_drop is None
+    assert args.max_critical_token_recall_drop is None
+    assert args.max_punctuation_f1_drop is None
+    assert args.max_terminal_punctuation_accuracy_drop is None
+    assert args.max_warm_p95_finalize_ms_delta is None
