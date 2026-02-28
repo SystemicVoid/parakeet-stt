@@ -34,7 +34,7 @@ use crate::config::{
 };
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
-use crate::overlay_process::OverlayProcessSink;
+use crate::overlay_process::OverlayProcessManager;
 use crate::protocol::{
     decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
 };
@@ -159,14 +159,14 @@ impl OverlaySink for NoopOverlaySink {
 
 enum RuntimeOverlaySink {
     Noop(NoopOverlaySink),
-    Process(OverlayProcessSink),
+    Process(OverlayProcessManager),
 }
 
 impl OverlaySink for RuntimeOverlaySink {
     fn on_overlay_event(&mut self, event: OverlayEvent) {
         match self {
             Self::Noop(sink) => sink.on_overlay_event(event),
-            Self::Process(sink) => sink.send(overlay_event_to_ipc(event)),
+            Self::Process(manager) => manager.send(overlay_event_to_ipc(event)),
         }
     }
 }
@@ -201,26 +201,16 @@ fn build_runtime_overlay_sink(mode: OverlayMode) -> RuntimeOverlaySink {
     match mode {
         OverlayMode::Disabled => RuntimeOverlaySink::Noop(NoopOverlaySink),
         OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
-            match OverlayProcessSink::spawn(mode) {
-                Ok(process) => {
-                    let metrics = process.metrics();
-                    info!(
-                        overlay_launch_success_total =
-                            metrics.launch_success_total.load(Ordering::Relaxed),
-                        overlay_launch_failure_total =
-                            metrics.launch_failure_total.load(Ordering::Relaxed),
-                        "overlay process routing enabled"
-                    );
-                    RuntimeOverlaySink::Process(process)
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        "overlay process unavailable; continuing with no-op overlay sink"
-                    );
-                    RuntimeOverlaySink::Noop(NoopOverlaySink)
-                }
-            }
+            let manager = OverlayProcessManager::new(mode);
+            let metrics = manager.metrics();
+            info!(
+                overlay_spawn_attempt_total = metrics.spawn_attempt_total.load(Ordering::Relaxed),
+                overlay_spawn_success_total = metrics.spawn_success_total.load(Ordering::Relaxed),
+                overlay_spawn_failure_total = metrics.spawn_failure_total.load(Ordering::Relaxed),
+                overlay_active_sink = manager.has_active_sink(),
+                "overlay process routing enabled with respawn manager"
+            );
+            RuntimeOverlaySink::Process(manager)
         }
     }
 }
@@ -1360,7 +1350,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use clap::Parser;
     use tokio::sync::mpsc;
     use tokio::task::yield_now;
@@ -1369,11 +1359,13 @@ mod tests {
 
     use crate::audio_feedback::AudioFeedback;
     use crate::config::{
-        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
-        PasteKeyBackend,
+        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
+        PasteBackendFailurePolicy, PasteKeyBackend,
     };
     use crate::injector::TextInjector;
-    use crate::overlay_process::{OverlayProcessMetrics, OverlayProcessSink};
+    use crate::overlay_process::{
+        OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
+    };
     use crate::protocol::ServerMessage;
     use crate::state::PttState;
 
@@ -1725,10 +1717,25 @@ mod tests {
     async fn overlay_disconnect_does_not_block_final_result_injection() {
         let (overlay_tx, overlay_rx) = mpsc::unbounded_channel();
         drop(overlay_rx);
-        let overlay_metrics = Arc::new(OverlayProcessMetrics::default());
-        let sink =
-            OverlayProcessSink::from_sender_for_tests(overlay_tx, Arc::clone(&overlay_metrics));
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(sink));
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            overlay_tx,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let sink_slot = Arc::new(Mutex::new(Some(first_sink)));
+        let launcher = {
+            let sink_slot = Arc::clone(&sink_slot);
+            Arc::new(move |_mode| {
+                sink_slot
+                    .lock()
+                    .expect("sink slot lock should be available")
+                    .take()
+                    .ok_or_else(|| anyhow!("no overlay sink available"))
+            })
+        };
+        let manager =
+            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -1757,7 +1764,9 @@ mod tests {
         .await
         .expect("overlay disconnect should be non-fatal");
         assert_eq!(
-            overlay_metrics.events_dropped_total.load(Ordering::Relaxed),
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed),
             1
         );
 
