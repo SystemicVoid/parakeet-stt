@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
@@ -1278,8 +1279,18 @@ where
         return Vec::new();
     }
 
-    let mut lines = Vec::with_capacity(max_lines);
+    let mut lines = VecDeque::with_capacity(max_lines);
     let mut current = String::new();
+    let mut push_line = |line: String| {
+        if line.is_empty() {
+            return;
+        }
+        if lines.len() >= max_lines {
+            let _ = lines.pop_front();
+        }
+        lines.push_back(line);
+    };
+
     for word in normalized.split(' ') {
         let candidate = if current.is_empty() {
             word.to_string()
@@ -1292,10 +1303,7 @@ where
         }
 
         if !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
-            if lines.len() >= max_lines {
-                return lines;
-            }
+            push_line(std::mem::take(&mut current));
         }
 
         let fitted_word = fit_text_to_width(word, max_width, &mut measure);
@@ -1303,19 +1311,17 @@ where
             continue;
         }
         if fitted_word != word {
-            lines.push(fitted_word);
-            if lines.len() >= max_lines {
-                return lines;
-            }
+            push_line(fitted_word);
             continue;
         }
         current = fitted_word;
     }
 
-    if !current.is_empty() && lines.len() < max_lines {
-        lines.push(current);
+    if !current.is_empty() {
+        push_line(current);
     }
-    lines
+
+    lines.into_iter().collect()
 }
 
 fn fit_text_to_width<F>(text: &str, max_width: f32, mut measure: F) -> String
@@ -1602,11 +1608,17 @@ mod tests {
     }
 
     #[test]
-    fn text_layout_clamps_lines_and_applies_width_limit() {
-        let lines = layout_text_lines("alpha beta gamma delta", 40, 2, |_| 10.0);
+    fn text_layout_keeps_recent_tail_lines_when_clamped() {
+        let lines = layout_text_lines("one two three four five six", 100, 2, |_| 10.0);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "a...");
-        assert_eq!(lines[1], "beta");
+        assert_eq!(lines[0], "three four");
+        assert_eq!(lines[1], "five six");
+    }
+
+    #[test]
+    fn text_layout_truncates_single_long_word_to_width() {
+        let lines = layout_text_lines("alpha", 40, 2, |_| 10.0);
+        assert_eq!(lines, vec!["a...".to_string()]);
     }
 
     #[test]

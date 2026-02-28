@@ -50,6 +50,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added COSMIC fallback guardrail warning when `fallback-window` is selected and updated `justfile.overlay-dev` runbook to prefer `start-layer-shell` with fallback marked diagnostic-only.
 - 2026-02-28: Fixed Slice E COSMIC regressions by resolving generic/system font fallbacks for `Sans 16`, keeping layer-shell surfaces mapped with transparent hidden frames (instead of null-buffer detach), and failing fast on renderer errors so PTT respawn semantics recover overlay safely.
 - 2026-02-28: Fixed daemon live interim gap by emitting deduplicated `interim_text` from streaming drain chunks during active sessions (not only stop-time `ready_chunks`), preserving display-only overlay routing and `final_result` injection boundaries.
+- 2026-02-28: Fixed overlay long-utterance visibility by tail-clamping wrapped lines in `parakeet-overlay` so the newest interim words remain visible after `max_lines` is reached (instead of freezing on earliest lines).
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -75,6 +76,7 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 4 slice E hotfix): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target now 10 tests with generic-family parsing coverage).
 - 2026-02-28 (Phase 4 slice E hotfix): scripted `parakeet-overlay --backend layer-shell --auto-hide-ms 400` NDJSON two-session replay validated no post-hide backend flush failure and confirmed runtime font fallback no longer disables text rendering (`using_requested_generic_family:sans-serif`).
 - 2026-02-28 (Phase 2/4 live interim fix): `cd parakeet-stt-daemon && uv run pytest tests/test_session_cleanup.py tests/test_streaming_truth.py tests/test_overlay_event_stream.py tests/test_messages.py` passed (40 tests), including new `test_live_interim_chunk_emission_dedupes_repeated_text`.
+- 2026-02-28 (Phase 4 slice E long-utterance tail clamp): `cd parakeet-ptt && cargo fmt && cargo test` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 45 tests), including new `text_layout_keeps_recent_tail_lines_when_clamped` and `text_layout_truncates_single_long_word_to_width`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
