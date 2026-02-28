@@ -1041,6 +1041,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -1050,6 +1051,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-wlr",
  "which",
 ]
 

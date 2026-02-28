@@ -23,6 +23,61 @@ pub enum OverlayVisibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRenderPhase {
+    Hidden,
+    Listening,
+    Interim,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayRenderIntent {
+    pub phase: OverlayRenderPhase,
+    pub visible: bool,
+    pub headline: String,
+    pub detail: Option<String>,
+}
+
+impl OverlayVisibility {
+    pub fn to_render_intent(&self) -> OverlayRenderIntent {
+        match self {
+            Self::Hidden => OverlayRenderIntent {
+                phase: OverlayRenderPhase::Hidden,
+                visible: false,
+                headline: String::new(),
+                detail: None,
+            },
+            Self::Listening { .. } => OverlayRenderIntent {
+                phase: OverlayRenderPhase::Listening,
+                visible: true,
+                headline: "Listening...".to_string(),
+                detail: None,
+            },
+            Self::Interim { text, .. } => OverlayRenderIntent {
+                phase: OverlayRenderPhase::Interim,
+                visible: true,
+                headline: if text.trim().is_empty() {
+                    "Listening...".to_string()
+                } else {
+                    text.clone()
+                },
+                detail: None,
+            },
+            Self::Finalizing { reason, .. } => OverlayRenderIntent {
+                phase: OverlayRenderPhase::Finalizing,
+                visible: true,
+                headline: reason
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "Finalizing...".to_string()),
+                detail: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Applied,
     DroppedStaleSeq,
@@ -147,7 +202,10 @@ mod tests {
 
     use crate::overlay_ipc::OverlayIpcMessage;
 
-    use super::{ApplyOutcome, OverlayStateMachine, OverlayVisibility};
+    use super::{
+        ApplyOutcome, OverlayRenderIntent, OverlayRenderPhase, OverlayStateMachine,
+        OverlayVisibility,
+    };
 
     #[test]
     fn state_machine_transitions_listening_interim_finalizing_hidden() {
@@ -330,6 +388,55 @@ mod tests {
             &OverlayVisibility::Interim {
                 session_id: new_session,
                 text: "new".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn hidden_visibility_maps_to_hidden_render_intent() {
+        assert_eq!(
+            OverlayVisibility::Hidden.to_render_intent(),
+            OverlayRenderIntent {
+                phase: OverlayRenderPhase::Hidden,
+                visible: false,
+                headline: String::new(),
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn interim_empty_text_maps_to_listening_headline() {
+        let session_id = Uuid::new_v4();
+        assert_eq!(
+            OverlayVisibility::Interim {
+                session_id,
+                text: "   ".to_string(),
+            }
+            .to_render_intent(),
+            OverlayRenderIntent {
+                phase: OverlayRenderPhase::Interim,
+                visible: true,
+                headline: "Listening...".to_string(),
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn finalizing_without_reason_uses_default_headline() {
+        let session_id = Uuid::new_v4();
+        assert_eq!(
+            OverlayVisibility::Finalizing {
+                session_id,
+                reason: None,
+            }
+            .to_render_intent(),
+            OverlayRenderIntent {
+                phase: OverlayRenderPhase::Finalizing,
+                visible: true,
+                headline: "Finalizing...".to_string(),
+                detail: None,
             }
         );
     }
