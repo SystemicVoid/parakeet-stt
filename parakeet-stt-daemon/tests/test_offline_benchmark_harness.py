@@ -156,6 +156,12 @@ def test_normalize_and_wer_behavior() -> None:
         "slots": ["browser", "go", "github"],
         "signature": "open|browser go github",
     }
+    assert normalize_command_text("Sort imports by module name.") == "sort imports by module name"
+    assert parse_command_intent_slots("Sort imports by module name.") == {
+        "intent": "sort",
+        "slots": ["imports", "by", "module", "name"],
+        "signature": "sort|imports by module name",
+    }
     assert compute_normalized_wer("The QUICK brown fox.", "the quick brown fox") == 0.0
     assert compute_normalized_wer("one two three", "one four three") == pytest.approx(1.0 / 3.0)
 
@@ -244,6 +250,28 @@ def test_command_match_metrics_expose_strict_normalized_and_intent_scores() -> N
     assert metrics["strict_exact_match_rate"] == pytest.approx(0.0)
     assert metrics["normalized_exact_match_rate"] == pytest.approx(2.0 / 3.0)
     assert metrics["intent_slot_match_rate"] == pytest.approx(2.0 / 3.0)
+
+
+def test_command_match_metrics_do_not_drop_sort_keyword() -> None:
+    rows = [
+        {
+            "domain": "command",
+            "reference": "sort imports",
+            "hypothesis": "imports",
+            "normalized_reference": "sort imports",
+            "normalized_hypothesis": "imports",
+            "command_normalized_reference": "sort imports",
+            "command_normalized_hypothesis": "imports",
+            "command_reference_signature": "sort|imports",
+            "command_hypothesis_signature": "imports|",
+        }
+    ]
+
+    metrics = compute_command_match_metrics(rows)
+
+    assert metrics["strict_exact_match_rate"] == 0.0
+    assert metrics["normalized_exact_match_rate"] == 0.0
+    assert metrics["intent_slot_match_rate"] == 0.0
 
 
 def test_punctuation_metrics_capture_order_and_terminal_accuracy() -> None:

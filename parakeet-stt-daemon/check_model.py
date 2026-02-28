@@ -53,7 +53,6 @@ _COMMAND_FILLER_TOKENS = frozenset(
         "on",
         "or",
         "please",
-        "sort",
         "then",
         "to",
         "uh",
