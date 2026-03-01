@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::f32::consts::PI;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
@@ -13,7 +14,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -52,6 +53,11 @@ const EXIT_DURATION_MS: u64 = 250;
 const ACCENT_CROSSFADE_MS: u64 = 150;
 const ENTRANCE_SLIDE_PX: f32 = 7.0;
 const EXIT_SLIDE_PX: f32 = 5.0;
+const BREATHING_CYCLE_MS: u64 = 3000;
+const BREATHING_AMPLITUDE: f32 = 0.05;
+const CHAR_FADEIN_MS: u64 = 100;
+const MIN_PANEL_WIDTH: u32 = 200;
+const WIDTH_ANIM_MS: u64 = 200;
 
 const PHRASE_ROTATE_MS: u64 = 3000;
 const PHRASE_CROSSFADE_MS: u64 = 200;
@@ -123,6 +129,10 @@ struct Cli {
     /// Maximum rendered lines.
     #[arg(long, default_value_t = 4)]
     max_lines: u32,
+
+    /// Preferred wl_output name for the layer surface target.
+    #[arg(long)]
+    output_name: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -466,6 +476,34 @@ fn should_trigger_success_flash(
     previous_phase == OverlayRenderPhase::Finalizing && next_phase == OverlayRenderPhase::Hidden
 }
 
+fn listening_breathing_factor(elapsed_ms: u64) -> f32 {
+    let cycle = BREATHING_CYCLE_MS.max(1) as f32;
+    let phase = 2.0 * PI * ((elapsed_ms as f32) / cycle);
+    1.0 + BREATHING_AMPLITUDE * phase.sin()
+}
+
+fn apply_breathing_alpha(alpha: u8, elapsed_ms: u64) -> u8 {
+    (f32::from(alpha) * listening_breathing_factor(elapsed_ms))
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn should_apply_breathing(phase: OverlayRenderPhase, accent_transition_active: bool) -> bool {
+    phase == OverlayRenderPhase::Listening && !accent_transition_active
+}
+
+fn shared_prefix_len(previous: &str, current: &str) -> usize {
+    previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn interim_char_fade_alpha(now_ms: u64, changed_ms: u64) -> f32 {
+    (now_ms.saturating_sub(changed_ms) as f32 / CHAR_FADEIN_MS.max(1) as f32).clamp(0.0, 1.0)
+}
+
 fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     let inv = 1.0 - t;
@@ -714,6 +752,46 @@ impl FadeState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WidthState {
+    current_width: f32,
+    target_width: f32,
+    started_ms: u64,
+}
+
+impl WidthState {
+    fn new(initial_width: f32, now_ms: u64) -> Self {
+        Self {
+            current_width: initial_width,
+            target_width: initial_width,
+            started_ms: now_ms,
+        }
+    }
+
+    fn start(&mut self, to_width: f32, now_ms: u64) {
+        self.current_width = self.animated_width(now_ms);
+        self.target_width = to_width;
+        self.started_ms = now_ms;
+    }
+
+    fn snap(&mut self, width: f32, now_ms: u64) {
+        self.current_width = width;
+        self.target_width = width;
+        self.started_ms = now_ms;
+    }
+
+    fn animated_width(&self, now_ms: u64) -> f32 {
+        let elapsed = now_ms.saturating_sub(self.started_ms) as f32;
+        let t = (elapsed / WIDTH_ANIM_MS.max(1) as f32).clamp(0.0, 1.0);
+        self.current_width + (self.target_width - self.current_width) * ease_out_cubic(t)
+    }
+
+    fn is_animating(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started_ms) < WIDTH_ANIM_MS
+            && (self.target_width - self.current_width).abs() >= 0.5
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     LayerShell,
@@ -733,11 +811,31 @@ struct OverlayUiConfig {
 }
 
 impl OverlayUiConfig {
-    fn surface_dimensions(&self) -> SurfaceDimensions {
-        let content_width = self.max_width.clamp(320, 3840);
+    fn clamped_content_width(&self) -> u32 {
+        self.max_width.clamp(MIN_PANEL_WIDTH, 3840)
+    }
+
+    fn clamped_content_height(&self) -> u32 {
         let clamped_lines = self.max_lines.clamp(1, 10);
         let line_h = (DEFAULT_FONT_SIZE_PX * LINE_HEIGHT_FACTOR).ceil() as u32;
-        let content_height = (PADDING_V * 2 + clamped_lines * line_h).clamp(72, 720);
+        (PADDING_V * 2 + clamped_lines * line_h).clamp(72, 720)
+    }
+
+    fn surface_width_for_content(content_width: u32) -> u32 {
+        content_width.saturating_add(SHADOW_RADIUS * 2)
+    }
+
+    fn min_surface_width(&self) -> u32 {
+        Self::surface_width_for_content(MIN_PANEL_WIDTH)
+    }
+
+    fn max_surface_width(&self) -> u32 {
+        Self::surface_width_for_content(self.clamped_content_width())
+    }
+
+    fn surface_dimensions(&self) -> SurfaceDimensions {
+        let content_width = self.clamped_content_width();
+        let content_height = self.clamped_content_height();
         // Expand for shadow
         let shadow_pad = SHADOW_RADIUS * 2;
         SurfaceDimensions {
@@ -746,11 +844,13 @@ impl OverlayUiConfig {
         }
     }
 
+    #[cfg(test)]
     fn content_area(&self) -> ContentArea {
-        let content_width = self.max_width.clamp(320, 3840);
-        let clamped_lines = self.max_lines.clamp(1, 10);
-        let line_h = (DEFAULT_FONT_SIZE_PX * LINE_HEIGHT_FACTOR).ceil() as u32;
-        let content_height = (PADDING_V * 2 + clamped_lines * line_h).clamp(72, 720);
+        self.content_area_with_width(self.clamped_content_width())
+    }
+
+    fn content_area_with_width(&self, content_width: u32) -> ContentArea {
+        let content_height = self.clamped_content_height();
         ContentArea {
             x: SHADOW_RADIUS,
             y: SHADOW_RADIUS,
@@ -987,6 +1087,15 @@ impl TextRenderer {
             }
         }
     }
+
+    fn measure_text_width(&self, text: &str) -> f32 {
+        let Some(font) = &self.font else {
+            return 0.0;
+        };
+        text.chars().fold(0.0, |width, character| {
+            width + font.metrics(character, self.summary.size_px).advance_width
+        })
+    }
 }
 
 trait OverlayBackend {
@@ -1019,11 +1128,25 @@ struct WaylandOverlayBackend {
     listening_anim: Option<ListeningAnimState>,
     finalizing_started_ms: Option<u64>,
     success_flash: Option<SuccessFlash>,
+    prev_headline: String,
+    headline_changed_ms: Option<u64>,
+    shared_prefix_len: usize,
+    width_state: WidthState,
+    listening_max_phrase_width: f32,
     started: Instant,
 }
 
 impl WaylandOverlayBackend {
     fn new(kind: BackendKind, ui: OverlayUiConfig, runtime: WaylandRuntime) -> Self {
+        let initial_width = ui.min_surface_width() as f32;
+        let listening_max_phrase_width = LISTENING_PHRASES
+            .iter()
+            .map(|phrase| {
+                runtime
+                    .text_renderer
+                    .measure_text_width(&format!("{phrase}..."))
+            })
+            .fold(0.0, f32::max);
         Self {
             kind,
             ui,
@@ -1035,6 +1158,11 @@ impl WaylandOverlayBackend {
             listening_anim: None,
             finalizing_started_ms: None,
             success_flash: None,
+            prev_headline: String::new(),
+            headline_changed_ms: None,
+            shared_prefix_len: 0,
+            width_state: WidthState::new(initial_width, 0),
+            listening_max_phrase_width,
             started: Instant::now(),
         }
     }
@@ -1055,12 +1183,72 @@ impl WaylandOverlayBackend {
             }
         }
     }
+
+    fn measure_intent_text_width(&self, intent: &OverlayRenderIntent) -> f32 {
+        match intent.phase {
+            OverlayRenderPhase::Listening => self.listening_max_phrase_width,
+            _ => {
+                let headline = intent.headline.trim();
+                let detail = intent
+                    .detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let text = if let Some(detail) = detail {
+                    format!("{headline} {detail}")
+                } else {
+                    headline.to_string()
+                };
+                self.runtime.text_renderer.measure_text_width(&text)
+            }
+        }
+    }
+
+    fn target_surface_width(&self, intent: &OverlayRenderIntent) -> f32 {
+        let text_width = self.measure_intent_text_width(intent);
+        let content_target = (text_width
+            + PADDING_LEFT as f32
+            + PADDING_H as f32
+            + ACCENT_STRIPE_WIDTH
+            + ACCENT_STRIPE_MARGIN)
+            .ceil()
+            .clamp(
+                MIN_PANEL_WIDTH as f32,
+                self.ui.clamped_content_width() as f32,
+            );
+        OverlayUiConfig::surface_width_for_content(content_target as u32) as f32
+    }
+
+    fn update_interim_headline_state(&mut self, intent: &OverlayRenderIntent, now_ms: u64) {
+        if intent.phase != OverlayRenderPhase::Interim {
+            self.headline_changed_ms = None;
+            self.shared_prefix_len = 0;
+            self.prev_headline.clear();
+            return;
+        }
+
+        if self.prev_headline != intent.headline {
+            self.shared_prefix_len = shared_prefix_len(&self.prev_headline, &intent.headline);
+            self.headline_changed_ms = Some(now_ms);
+        }
+    }
+
+    fn interim_fade_state(&mut self, now_ms: u64) -> Option<(usize, f32)> {
+        let changed_ms = self.headline_changed_ms?;
+        let fade = interim_char_fade_alpha(now_ms, changed_ms);
+        if fade >= 1.0 {
+            self.headline_changed_ms = None;
+            return None;
+        }
+        Some((self.shared_prefix_len, fade))
+    }
 }
 
 impl OverlayBackend for WaylandOverlayBackend {
     fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
         let intent = state.to_render_intent();
         let now = self.now_ms();
+        self.update_interim_headline_state(&intent, now);
 
         // Detect visibility transitions
         if intent.visible != self.last_visible {
@@ -1110,6 +1298,10 @@ impl OverlayBackend for WaylandOverlayBackend {
                 }
                 self.finalizing_started_ms = None;
             }
+            if intent.phase == OverlayRenderPhase::Hidden {
+                self.width_state
+                    .snap(self.ui.min_surface_width() as f32, now);
+            }
             self.last_phase = intent.phase;
         }
 
@@ -1132,8 +1324,8 @@ impl OverlayBackend for WaylandOverlayBackend {
             }
         }
 
-        // Resolve accent color: success flash > transition blend > static
-        let accent_color = if let Some(flash) = &self.success_flash {
+        // Resolve accent color: success flash > transition blend > static.
+        let mut accent_color = if let Some(flash) = &self.success_flash {
             Some(flash.color(now))
         } else if let Some(transition) = &self.accent_transition {
             Some(transition.blended_color(now))
@@ -1141,17 +1333,47 @@ impl OverlayBackend for WaylandOverlayBackend {
             accent_color_for_phase(intent.phase)
         };
 
+        if should_apply_breathing(intent.phase, self.accent_transition.is_some()) {
+            if let (Some(color), Some(anim)) = (accent_color.as_mut(), self.listening_anim.as_ref())
+            {
+                let elapsed = now.saturating_sub(anim.listening_entered_ms);
+                color[3] = apply_breathing_alpha(color[3], elapsed);
+            }
+        }
+
         // Tick listening animation
         if let Some(anim) = &mut self.listening_anim {
             anim.tick(now);
         }
+
+        let mut target_width = self.target_surface_width(&intent);
+        if intent.phase == OverlayRenderPhase::Interim {
+            target_width = target_width.max(self.width_state.target_width);
+        }
+        if (target_width - self.width_state.target_width).abs() >= 0.5 {
+            self.width_state.start(target_width, now);
+        }
+        let effective_surface_width = self
+            .width_state
+            .animated_width(now)
+            .clamp(
+                self.ui.min_surface_width() as f32,
+                self.ui.max_surface_width() as f32,
+            )
+            .round() as u32;
+        let interim_fade = if intent.phase == OverlayRenderPhase::Interim {
+            self.interim_fade_state(now)
+        } else {
+            None
+        };
 
         let fade_alpha = self.fade_alpha();
         let y_offset = self
             .fade
             .map(|f| f.slide_offset(now, self.ui.anchor))
             .unwrap_or(0.0);
-        self.runtime
+        let result = self
+            .runtime
             .render_with_fade(
                 &intent,
                 &self.ui,
@@ -1161,8 +1383,12 @@ impl OverlayBackend for WaylandOverlayBackend {
                 self.listening_anim.as_ref(),
                 now,
                 self.finalizing_started_ms,
+                effective_surface_width,
+                interim_fade,
             )
-            .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
+            .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind));
+        self.prev_headline = intent.headline;
+        result
     }
 
     fn is_fading(&self) -> bool {
@@ -1171,6 +1397,8 @@ impl OverlayBackend for WaylandOverlayBackend {
             || self.listening_anim.is_some()
             || self.finalizing_started_ms.is_some()
             || self.success_flash.is_some()
+            || self.headline_changed_ms.is_some()
+            || self.width_state.is_animating(self.now_ms())
     }
 }
 
@@ -1251,58 +1479,64 @@ fn resolve_backend_selection(
     }
 }
 
-fn build_backend(mode: CliBackendMode, ui: OverlayUiConfig) -> BuiltBackend {
+fn build_backend(
+    mode: CliBackendMode,
+    ui: OverlayUiConfig,
+    output_name: Option<&str>,
+) -> BuiltBackend {
     let probe_result = probe_backend_signals().map_err(|err| err.to_string());
     let selection = resolve_backend_selection(mode, probe_result);
 
     match selection {
-        BackendSelection::LayerShell => match WaylandRuntime::new(BackendKind::LayerShell, &ui) {
-            Ok(runtime) => BuiltBackend {
-                kind: BackendKind::LayerShell,
-                reason: "layer_shell".to_string(),
-                backend: Box::new(WaylandOverlayBackend::new(
-                    BackendKind::LayerShell,
-                    ui,
-                    runtime,
-                )),
-            },
-            Err(layer_err) => {
-                if matches!(mode, CliBackendMode::Auto) {
-                    match WaylandRuntime::new(BackendKind::FallbackWindow, &ui) {
-                            Ok(runtime) => BuiltBackend {
-                                kind: BackendKind::FallbackWindow,
-                                reason: format!(
-                                    "layer_shell_init_failed:{layer_err};using_fallback_window"
-                                ),
-                                backend: Box::new(WaylandOverlayBackend::new(
-                                    BackendKind::FallbackWindow,
-                                    ui,
-                                    runtime,
-                                )),
-                            },
-                            Err(fallback_err) => BuiltBackend {
-                                kind: BackendKind::Noop,
-                                reason: format!(
-                                    "layer_shell_init_failed:{layer_err};fallback_init_failed:{fallback_err}"
-                                ),
-                                backend: Box::new(NoopBackend {
-                                    reason: "runtime_backend_init_failed".to_string(),
-                                }),
-                            },
+        BackendSelection::LayerShell => {
+            match WaylandRuntime::new(BackendKind::LayerShell, &ui, output_name) {
+                Ok(runtime) => BuiltBackend {
+                    kind: BackendKind::LayerShell,
+                    reason: "layer_shell".to_string(),
+                    backend: Box::new(WaylandOverlayBackend::new(
+                        BackendKind::LayerShell,
+                        ui,
+                        runtime,
+                    )),
+                },
+                Err(layer_err) => {
+                    if matches!(mode, CliBackendMode::Auto) {
+                        match WaylandRuntime::new(BackendKind::FallbackWindow, &ui, None) {
+                        Ok(runtime) => BuiltBackend {
+                            kind: BackendKind::FallbackWindow,
+                            reason: format!(
+                                "layer_shell_init_failed:{layer_err};using_fallback_window"
+                            ),
+                            backend: Box::new(WaylandOverlayBackend::new(
+                                BackendKind::FallbackWindow,
+                                ui,
+                                runtime,
+                            )),
+                        },
+                        Err(fallback_err) => BuiltBackend {
+                            kind: BackendKind::Noop,
+                            reason: format!(
+                                "layer_shell_init_failed:{layer_err};fallback_init_failed:{fallback_err}"
+                            ),
+                            backend: Box::new(NoopBackend {
+                                reason: "runtime_backend_init_failed".to_string(),
+                            }),
+                        },
+                    }
+                    } else {
+                        BuiltBackend {
+                            kind: BackendKind::Noop,
+                            reason: format!("layer_shell_init_failed:{layer_err}"),
+                            backend: Box::new(NoopBackend {
+                                reason: "runtime_backend_init_failed".to_string(),
+                            }),
                         }
-                } else {
-                    BuiltBackend {
-                        kind: BackendKind::Noop,
-                        reason: format!("layer_shell_init_failed:{layer_err}"),
-                        backend: Box::new(NoopBackend {
-                            reason: "runtime_backend_init_failed".to_string(),
-                        }),
                     }
                 }
             }
-        },
+        }
         BackendSelection::FallbackWindow => {
-            match WaylandRuntime::new(BackendKind::FallbackWindow, &ui) {
+            match WaylandRuntime::new(BackendKind::FallbackWindow, &ui, None) {
                 Ok(runtime) => BuiltBackend {
                     kind: BackendKind::FallbackWindow,
                     reason: "fallback_window".to_string(),
@@ -1329,6 +1563,22 @@ fn build_backend(mode: CliBackendMode, ui: OverlayUiConfig) -> BuiltBackend {
     }
 }
 
+fn output_name_index(outputs: &[RuntimeOutputBinding], requested: &str) -> Option<usize> {
+    output_name_match_index(
+        &outputs
+            .iter()
+            .map(|entry| entry.name.as_deref())
+            .collect::<Vec<_>>(),
+        requested,
+    )
+}
+
+fn output_name_match_index(output_names: &[Option<&str>], requested: &str) -> Option<usize> {
+    output_names
+        .iter()
+        .position(|name| name.is_some_and(|name| name == requested))
+}
+
 struct WaylandRuntime {
     connection: Connection,
     event_queue: EventQueue<WaylandRuntimeState>,
@@ -1342,7 +1592,7 @@ struct WaylandRuntime {
 
 enum ShellSurface {
     Layer {
-        _layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     },
     Fallback {
         _xdg_surface: xdg_surface::XdgSurface,
@@ -1351,7 +1601,7 @@ enum ShellSurface {
 }
 
 impl WaylandRuntime {
-    fn new(kind: BackendKind, ui: &OverlayUiConfig) -> Result<Self> {
+    fn new(kind: BackendKind, ui: &OverlayUiConfig, output_name: Option<&str>) -> Result<Self> {
         if kind == BackendKind::Noop {
             return Err(anyhow!(
                 "cannot initialize Wayland runtime for noop backend"
@@ -1396,9 +1646,13 @@ impl WaylandRuntime {
                     .layer_shell
                     .clone()
                     .ok_or_else(|| anyhow!("zwlr_layer_shell_v1 unavailable"))?;
+                let target_output = output_name.and_then(|requested| {
+                    output_name_index(&state.globals.outputs, requested)
+                        .map(|index| state.globals.outputs[index].output.clone())
+                });
                 let layer_surface = layer_shell.get_layer_surface(
                     &surface,
-                    None,
+                    target_output.as_ref(),
                     zwlr_layer_shell_v1::Layer::Overlay,
                     LAYER_NAMESPACE.to_string(),
                     &queue_handle,
@@ -1418,9 +1672,7 @@ impl WaylandRuntime {
                 layer_surface
                     .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
                 layer_surface.set_size(dimensions.width, dimensions.height);
-                ShellSurface::Layer {
-                    _layer_surface: layer_surface,
-                }
+                ShellSurface::Layer { layer_surface }
             }
             BackendKind::FallbackWindow => {
                 let xdg_wm_base = state
@@ -1477,6 +1729,8 @@ impl WaylandRuntime {
         listening_anim: Option<&ListeningAnimState>,
         now_ms: u64,
         finalizing_started_ms: Option<u64>,
+        effective_surface_width: u32,
+        interim_fade: Option<(usize, f32)>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1493,7 +1747,12 @@ impl WaylandRuntime {
         let keep_surface_mapped_when_hidden = matches!(self.shell, ShellSurface::Layer { .. });
         let should_render = intent.visible || fade_alpha > 0.0 || keep_surface_mapped_when_hidden;
         if should_render {
-            let content = ui.content_area();
+            let effective_content_width =
+                effective_surface_width.saturating_sub(SHADOW_RADIUS.saturating_mul(2));
+            let content = ui.content_area_with_width(effective_content_width);
+            if let ShellSurface::Layer { layer_surface } = &self.shell {
+                layer_surface.set_size(effective_surface_width, self.dimensions.height);
+            }
             render_frame(
                 self.shm_buffer.bytes_mut(),
                 self.dimensions,
@@ -1507,13 +1766,14 @@ impl WaylandRuntime {
                 listening_anim,
                 now_ms,
                 finalizing_started_ms,
+                interim_fade,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
             self.surface.damage_buffer(
                 0,
                 0,
-                self.dimensions.width as i32,
+                effective_surface_width as i32,
                 self.dimensions.height as i32,
             );
             if let ShellSurface::Fallback { toplevel, .. } = &self.shell {
@@ -1637,6 +1897,13 @@ struct RuntimeGlobals {
     shm: Option<wl_shm::WlShm>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    outputs: Vec<RuntimeOutputBinding>,
+}
+
+#[derive(Clone)]
+struct RuntimeOutputBinding {
+    output: wl_output::WlOutput,
+    name: Option<String>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandRuntimeState {
@@ -1691,6 +1958,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandRuntimeState {
                         ),
                     );
                 }
+                "wl_output" => {
+                    let output = registry.bind::<wl_output::WlOutput, _, _>(
+                        name,
+                        version.min(4),
+                        queue_handle,
+                        (),
+                    );
+                    state
+                        .globals
+                        .outputs
+                        .push(RuntimeOutputBinding { output, name: None });
+                }
                 _ => {}
             }
         }
@@ -1718,6 +1997,26 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandRuntimeState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for WaylandRuntimeState {
+    fn event(
+        state: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            for entry in &mut state.globals.outputs {
+                if &entry.output == output {
+                    entry.name = Some(name.clone());
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -2033,6 +2332,7 @@ fn render_frame(
     listening_anim: Option<&ListeningAnimState>,
     now_ms: u64,
     finalizing_started_ms: Option<u64>,
+    interim_fade: Option<(usize, f32)>,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -2123,7 +2423,7 @@ fn render_frame(
                 frame,
                 dimensions,
                 content,
-                ui.max_width,
+                content.width,
                 ui.max_lines,
                 &out_text,
                 frame_alpha * (1.0 - t),
@@ -2132,7 +2432,7 @@ fn render_frame(
                 frame,
                 dimensions,
                 content,
-                ui.max_width,
+                content.width,
                 ui.max_lines,
                 &in_text,
                 frame_alpha * t,
@@ -2143,7 +2443,7 @@ fn render_frame(
                 frame,
                 dimensions,
                 content,
-                ui.max_width,
+                content.width,
                 ui.max_lines,
                 &text,
                 frame_alpha,
@@ -2162,15 +2462,51 @@ fn render_frame(
             headline.to_string()
         };
 
-        text_renderer.draw_headline(
-            frame,
-            dimensions,
-            content,
-            ui.max_width,
-            ui.max_lines,
-            &text,
-            frame_alpha,
-        );
+        if intent.phase == OverlayRenderPhase::Interim {
+            if let Some((prefix_len, new_char_alpha)) = interim_fade {
+                text_renderer.draw_headline(
+                    frame,
+                    dimensions,
+                    content,
+                    content.width,
+                    ui.max_lines,
+                    &text,
+                    frame_alpha * new_char_alpha,
+                );
+                if prefix_len > 0 {
+                    let prefix_text = text.chars().take(prefix_len).collect::<String>();
+                    text_renderer.draw_headline(
+                        frame,
+                        dimensions,
+                        content,
+                        content.width,
+                        ui.max_lines,
+                        &prefix_text,
+                        frame_alpha,
+                    );
+                }
+            } else {
+                text_renderer.draw_headline(
+                    frame,
+                    dimensions,
+                    content,
+                    content.width,
+                    ui.max_lines,
+                    &text,
+                    frame_alpha,
+                );
+            }
+        } else {
+            text_renderer.draw_headline(
+                frame,
+                dimensions,
+                content,
+                content.width,
+                ui.max_lines,
+                &text,
+                frame_alpha,
+            );
+        }
     }
 }
 
@@ -2381,7 +2717,7 @@ async fn main() -> Result<()> {
         max_lines: cli.max_lines,
     };
 
-    let mut built_backend = build_backend(cli.backend, ui.clone());
+    let mut built_backend = build_backend(cli.backend, ui.clone(), cli.output_name.as_deref());
     info!(
         backend = ?built_backend.kind,
         reason = %built_backend.reason,
@@ -2483,10 +2819,12 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_color_for_phase, ease_out_cubic, layout_text_lines, parse_font_descriptor,
+        accent_color_for_phase, apply_breathing_alpha, ease_out_cubic, interim_char_fade_alpha,
+        layout_text_lines, output_name_match_index, parse_font_descriptor,
         parse_generic_family_kind, render_frame, resolve_backend_selection, rounded_rect_coverage,
-        BackendSelection, BackendSignals, CliAnchor, CliBackendMode, FadeDirection, FadeState,
-        FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer,
+        shared_prefix_len, should_apply_breathing, BackendSelection, BackendSignals, CliAnchor,
+        CliBackendMode, FadeDirection, FadeState, FontResolutionSummary, OverlayUiConfig,
+        ParsedFontDescriptor, Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS, CHAR_FADEIN_MS,
         SHADOW_RADIUS,
     };
     use clap::Parser;
@@ -2565,6 +2903,31 @@ mod tests {
     }
 
     #[test]
+    fn breathing_modulates_alpha_at_quarter_cycle() {
+        let baseline = 200;
+        let modulated = apply_breathing_alpha(baseline, BREATHING_CYCLE_MS / 4);
+        assert!(modulated > baseline);
+    }
+
+    #[test]
+    fn breathing_returns_to_baseline_at_full_cycle() {
+        let baseline = 180;
+        let modulated = apply_breathing_alpha(baseline, BREATHING_CYCLE_MS);
+        assert_eq!(modulated, baseline);
+    }
+
+    #[test]
+    fn breathing_only_during_listening() {
+        assert!(should_apply_breathing(OverlayRenderPhase::Listening, false));
+        assert!(!should_apply_breathing(OverlayRenderPhase::Interim, false));
+        assert!(!should_apply_breathing(
+            OverlayRenderPhase::Finalizing,
+            false
+        ));
+        assert!(!should_apply_breathing(OverlayRenderPhase::Listening, true));
+    }
+
+    #[test]
     fn font_descriptor_parses_family_and_size() {
         assert_eq!(
             parse_font_descriptor("Sans 16"),
@@ -2615,6 +2978,22 @@ mod tests {
     }
 
     #[test]
+    fn shared_prefix_detection() {
+        assert_eq!(shared_prefix_len("hello world", "hello rust"), 6);
+        assert_eq!(shared_prefix_len("alpha", "beta"), 0);
+    }
+
+    #[test]
+    fn char_fadein_zero_at_start() {
+        assert_eq!(interim_char_fade_alpha(100, 100), 0.0);
+    }
+
+    #[test]
+    fn char_fadein_full_at_duration() {
+        assert_eq!(interim_char_fade_alpha(100 + CHAR_FADEIN_MS, 100), 1.0);
+    }
+
+    #[test]
     fn render_intent_mapping_visible_vs_hidden_alpha() {
         let ui = OverlayUiConfig {
             opacity: 0.92,
@@ -2656,6 +3035,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -2677,6 +3057,7 @@ mod tests {
             accent_color_for_phase(OverlayRenderPhase::Listening),
             None,
             0,
+            None,
             None,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
@@ -2732,6 +3113,7 @@ mod tests {
             None,
             0,
             None,
+            None,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -2747,6 +3129,7 @@ mod tests {
             accent,
             None,
             0,
+            None,
             None,
         );
 
@@ -2861,6 +3244,24 @@ mod tests {
         let cli = super::Cli::parse_from(["parakeet-overlay"]);
         assert!(matches!(cli.anchor, CliAnchor::BottomCenter));
         assert_eq!(cli.margin_y, 32);
+    }
+
+    #[test]
+    fn cli_parses_output_name_arg() {
+        let cli = super::Cli::parse_from(["parakeet-overlay", "--output-name", "HDMI-A-1"]);
+        assert_eq!(cli.output_name.as_deref(), Some("HDMI-A-1"));
+    }
+
+    #[test]
+    fn output_matching_finds_correct_output() {
+        let outputs = [Some("DP-1"), Some("HDMI-A-1")];
+        assert_eq!(output_name_match_index(&outputs, "HDMI-A-1"), Some(1));
+    }
+
+    #[test]
+    fn output_matching_falls_back_to_none() {
+        let outputs = [Some("DP-1"), None];
+        assert_eq!(output_name_match_index(&outputs, "UNKNOWN"), None);
     }
 
     #[test]
@@ -3064,6 +3465,57 @@ mod tests {
         let pos_after = (just_after - started) as f32 % super::PROGRESS_SWEEP_MS as f32
             / super::PROGRESS_SWEEP_MS as f32;
         assert!(pos_after < 0.01, "pos_after={pos_after}");
+    }
+
+    #[test]
+    fn adaptive_width_clamps_to_min() {
+        let ui = OverlayUiConfig {
+            opacity: 1.0,
+            font: "Sans 18".to_string(),
+            anchor: CliAnchor::BottomCenter,
+            margin_x: 24,
+            margin_y: 32,
+            max_width: 400,
+            max_lines: 3,
+        };
+        let min_width = ui.min_surface_width() as f32;
+        let target = OverlayUiConfig::surface_width_for_content(20) as f32;
+        let clamped = target.clamp(ui.min_surface_width() as f32, ui.max_surface_width() as f32);
+        assert_eq!(clamped, min_width);
+    }
+
+    #[test]
+    fn adaptive_width_clamps_to_max() {
+        let ui = OverlayUiConfig {
+            opacity: 1.0,
+            font: "Sans 18".to_string(),
+            anchor: CliAnchor::BottomCenter,
+            margin_x: 24,
+            margin_y: 32,
+            max_width: 420,
+            max_lines: 3,
+        };
+        let huge = OverlayUiConfig::surface_width_for_content(2_000) as f32;
+        let clamped = huge.clamp(ui.min_surface_width() as f32, ui.max_surface_width() as f32);
+        assert_eq!(clamped, ui.max_surface_width() as f32);
+    }
+
+    #[test]
+    fn width_animation_completes_at_duration() {
+        let mut width_state = WidthState::new(200.0, 0);
+        width_state.start(360.0, 0);
+        assert!((width_state.animated_width(super::WIDTH_ANIM_MS) - 360.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn listening_phase_uses_max_phrase_width() {
+        let expected = super::LISTENING_PHRASES
+            .iter()
+            .map(|phrase| phrase.len())
+            .max()
+            .unwrap_or(0);
+        let current = super::LISTENING_PHRASES[0].len();
+        assert!(expected >= current);
     }
 
     #[test]
