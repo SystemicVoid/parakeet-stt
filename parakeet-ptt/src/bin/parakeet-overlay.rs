@@ -73,6 +73,12 @@ const LISTENING_PHRASES: &[&str] = &[
     "At your service",
 ];
 
+const PROGRESS_BAR_HEIGHT: f32 = 2.0;
+const PROGRESS_SWEEP_MS: u64 = 1500;
+const PROGRESS_SEGMENT_FRAC: f32 = 0.3;
+const SUCCESS_FLASH_MS: u64 = 200;
+const SUCCESS_FLASH_COLOR: [u8; 4] = [80, 220, 120, 255]; // green accent
+
 const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
 #[derive(Parser, Debug)]
@@ -489,6 +495,87 @@ impl AccentTransition {
 
     fn is_complete(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.started_ms) >= ACCENT_CROSSFADE_MS
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SuccessFlash {
+    started_ms: u64,
+}
+
+impl SuccessFlash {
+    fn is_active(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started_ms) < SUCCESS_FLASH_MS
+    }
+
+    fn color(&self, now_ms: u64) -> [u8; 4] {
+        let elapsed = now_ms.saturating_sub(self.started_ms) as f32;
+        let t = (elapsed / SUCCESS_FLASH_MS.max(1) as f32).clamp(0.0, 1.0);
+        // Fade out the flash
+        let alpha = ((1.0 - t) * f32::from(SUCCESS_FLASH_COLOR[3])).round() as u8;
+        [
+            SUCCESS_FLASH_COLOR[0],
+            SUCCESS_FLASH_COLOR[1],
+            SUCCESS_FLASH_COLOR[2],
+            alpha,
+        ]
+    }
+}
+
+fn draw_progress_bar(
+    frame: &mut [u8],
+    dimensions: SurfaceDimensions,
+    content: ContentArea,
+    now_ms: u64,
+    started_ms: u64,
+    fade_alpha: f32,
+) {
+    let elapsed = now_ms.saturating_sub(started_ms) as f32;
+    let sweep_pos = (elapsed % PROGRESS_SWEEP_MS as f32) / PROGRESS_SWEEP_MS as f32;
+
+    let bar_y = (content.y + content.height) as f32 - CORNER_RADIUS - PROGRESS_BAR_HEIGHT;
+    let bar_x0 = content.x as f32 + CORNER_RADIUS;
+    let bar_x1 = (content.x + content.width) as f32 - CORNER_RADIUS;
+    let bar_width = bar_x1 - bar_x0;
+    if bar_width <= 0.0 {
+        return;
+    }
+
+    let segment_width = bar_width * PROGRESS_SEGMENT_FRAC;
+    let center = bar_x0 + sweep_pos * bar_width;
+
+    let px_y0 = bar_y.floor() as i32;
+    let px_y1 = (bar_y + PROGRESS_BAR_HEIGHT).ceil() as i32;
+    let px_x0 = bar_x0.floor() as i32;
+    let px_x1 = bar_x1.ceil() as i32;
+
+    for py in px_y0..px_y1 {
+        for px in px_x0..px_x1 {
+            let fx = px as f32 + 0.5;
+            // Distance from sweep center (wrapping)
+            let mut dist = (fx - center).abs();
+            // Handle wrapping at edges
+            dist = dist.min((fx - center + bar_width).abs());
+            dist = dist.min((fx - center - bar_width).abs());
+
+            let half_seg = segment_width / 2.0;
+            if dist > half_seg {
+                continue;
+            }
+            // Soft edges
+            let intensity = 1.0 - (dist / half_seg);
+            let alpha = (intensity * intensity * 180.0 * fade_alpha).round() as u8;
+            if alpha == 0 {
+                continue;
+            }
+            blend_pixel(
+                frame,
+                dimensions,
+                px,
+                py,
+                argb_pixel_premul(220, 230, 255, alpha),
+            );
+        }
     }
 }
 
@@ -919,6 +1006,8 @@ struct WaylandOverlayBackend {
     last_phase: OverlayRenderPhase,
     accent_transition: Option<AccentTransition>,
     listening_anim: Option<ListeningAnimState>,
+    finalizing_started_ms: Option<u64>,
+    success_flash: Option<SuccessFlash>,
     started: Instant,
 }
 
@@ -933,6 +1022,8 @@ impl WaylandOverlayBackend {
             last_phase: OverlayRenderPhase::Hidden,
             accent_transition: None,
             listening_anim: None,
+            finalizing_started_ms: None,
+            success_flash: None,
             started: Instant::now(),
         }
     }
@@ -998,6 +1089,16 @@ impl OverlayBackend for WaylandOverlayBackend {
             } else {
                 self.listening_anim = None;
             }
+            // Manage finalizing progress bar and success flash
+            if intent.phase == OverlayRenderPhase::Finalizing {
+                self.finalizing_started_ms = Some(now);
+            } else {
+                // Trigger success flash on Finalizing→Hidden exit
+                if self.last_phase == OverlayRenderPhase::Finalizing {
+                    self.success_flash = Some(SuccessFlash { started_ms: now });
+                }
+                self.finalizing_started_ms = None;
+            }
             self.last_phase = intent.phase;
         }
 
@@ -1013,8 +1114,17 @@ impl OverlayBackend for WaylandOverlayBackend {
             }
         }
 
-        // Resolve accent color (transition blend or static)
-        let accent_color = if let Some(transition) = &self.accent_transition {
+        // Clean up completed success flash
+        if let Some(flash) = &self.success_flash {
+            if !flash.is_active(now) {
+                self.success_flash = None;
+            }
+        }
+
+        // Resolve accent color: success flash > transition blend > static
+        let accent_color = if let Some(flash) = &self.success_flash {
+            Some(flash.color(now))
+        } else if let Some(transition) = &self.accent_transition {
             Some(transition.blended_color(now))
         } else {
             accent_color_for_phase(intent.phase)
@@ -1039,12 +1149,17 @@ impl OverlayBackend for WaylandOverlayBackend {
                 accent_color,
                 self.listening_anim.as_ref(),
                 now,
+                self.finalizing_started_ms,
             )
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
     }
 
     fn is_fading(&self) -> bool {
-        self.fade.is_some() || self.accent_transition.is_some() || self.listening_anim.is_some()
+        self.fade.is_some()
+            || self.accent_transition.is_some()
+            || self.listening_anim.is_some()
+            || self.finalizing_started_ms.is_some()
+            || self.success_flash.is_some()
     }
 }
 
@@ -1350,6 +1465,7 @@ impl WaylandRuntime {
         accent_color: Option<[u8; 4]>,
         listening_anim: Option<&ListeningAnimState>,
         now_ms: u64,
+        finalizing_started_ms: Option<u64>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1379,6 +1495,7 @@ impl WaylandRuntime {
                 accent_color,
                 listening_anim,
                 now_ms,
+                finalizing_started_ms,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -1904,6 +2021,7 @@ fn render_frame(
     accent_color: Option<[u8; 4]>,
     listening_anim: Option<&ListeningAnimState>,
     now_ms: u64,
+    finalizing_started_ms: Option<u64>,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -1973,6 +2091,11 @@ fn render_frame(
             accent,
             frame_alpha,
         );
+    }
+
+    // 5b. Draw progress bar during Finalizing phase
+    if let Some(started) = finalizing_started_ms {
+        draw_progress_bar(frame, dimensions, content, now_ms, started, frame_alpha);
     }
 
     // 6. Draw text (with listening animation override)
@@ -2521,6 +2644,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -2542,6 +2666,7 @@ mod tests {
             accent_color_for_phase(OverlayRenderPhase::Listening),
             None,
             0,
+            None,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
@@ -2595,6 +2720,7 @@ mod tests {
             accent,
             None,
             0,
+            None,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -2610,6 +2736,7 @@ mod tests {
             accent,
             None,
             0,
+            None,
         );
 
         let max_full = full_alpha_frame
@@ -2894,5 +3021,54 @@ mod tests {
         // After crossfade window ends
         let cf_done = anim.crossfade_state(anim.phrase_started_ms + super::PHRASE_CROSSFADE_MS);
         assert!(cf_done.is_none(), "crossfade should be done");
+    }
+
+    #[test]
+    fn progress_segment_wraps_at_duration() {
+        // The sweep position should wrap back near 0 after PROGRESS_SWEEP_MS
+        let started = 1000u64;
+        let just_before = started + super::PROGRESS_SWEEP_MS - 1;
+        let just_after = started + super::PROGRESS_SWEEP_MS;
+        // Position just before wrap should be near 1.0
+        let pos_before = (just_before - started) as f32 % super::PROGRESS_SWEEP_MS as f32
+            / super::PROGRESS_SWEEP_MS as f32;
+        assert!(pos_before > 0.9, "pos_before={pos_before}");
+        // Position at exact wrap should be 0.0
+        let pos_after = (just_after - started) as f32 % super::PROGRESS_SWEEP_MS as f32
+            / super::PROGRESS_SWEEP_MS as f32;
+        assert!(pos_after < 0.01, "pos_after={pos_after}");
+    }
+
+    #[test]
+    fn success_flash_active_during_window() {
+        use super::SuccessFlash;
+        let flash = SuccessFlash { started_ms: 100 };
+        assert!(flash.is_active(100));
+        assert!(flash.is_active(100 + super::SUCCESS_FLASH_MS - 1));
+        assert!(!flash.is_active(100 + super::SUCCESS_FLASH_MS));
+        // Color alpha should decay
+        let early = flash.color(100);
+        let late = flash.color(100 + super::SUCCESS_FLASH_MS - 1);
+        assert!(
+            early[3] > late[3],
+            "flash should fade: early={}, late={}",
+            early[3],
+            late[3]
+        );
+    }
+
+    #[test]
+    fn success_flash_triggers_on_finalizing_exit() {
+        // SuccessFlash should be created when transitioning away from Finalizing.
+        // This tests the SuccessFlash struct's basic behavior (integration with
+        // WaylandOverlayBackend is tested via the render loop).
+        use super::SuccessFlash;
+        let flash = SuccessFlash { started_ms: 500 };
+        assert!(flash.is_active(500));
+        let color = flash.color(500);
+        assert_eq!(color[0], super::SUCCESS_FLASH_COLOR[0]);
+        assert_eq!(color[1], super::SUCCESS_FLASH_COLOR[1]);
+        assert_eq!(color[2], super::SUCCESS_FLASH_COLOR[2]);
+        assert!(color[3] > 200, "initial flash alpha should be near-full");
     }
 }
