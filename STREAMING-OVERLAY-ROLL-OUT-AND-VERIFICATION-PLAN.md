@@ -1,6 +1,6 @@
 # Streaming Overlay + Seal-Final Injection: Canonical Plan
 
-_Last updated: 2026-02-28_
+_Last updated: 2026-03-01 (Phase 8 commits 1–5 landed)_
 
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
@@ -16,6 +16,9 @@ _Last updated: 2026-02-28_
 - [x] Phase 4 Slice E: layer-shell text rendering + COSMIC fallback guardrails.
 - [x] Phase 5: Config/flags/rollout controls.
 - [x] Phase 6: E2E reliability and promotion gates.
+- [x] Phase 7: Visual overhaul — dark frosted-glass panel, rounded corners, soft shadow, accent stripe, text shadows, premultiplied alpha, font cascade, 250ms ease-out-cubic fade transitions.
+- [x] Phase 8 (P0–P2): Overlay UX polish — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress bar + success flash.
+- [ ] Phase 8 (deferred): cursor-spawn placement (8.4), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8). See **§ Overlay UX Roadmap**.
 
 ## Implementation Log
 - 2026-02-28: Established dedicated overlay worktree/branch from latest `origin/main`.
@@ -59,6 +62,13 @@ _Last updated: 2026-02-28_
 - 2026-02-28: Added explicit mixed-version decode stream test in `parakeet-ptt` protocol coverage to prove unknown daemon message types remain non-fatal when interleaved with known variants.
 - 2026-02-28: Added `justfile.overlay-dev` Phase 6 operator gates (`phase6-contract`, `phase6-promotion`) to enforce repeated clean reliability runs and emit deterministic promotion artifacts.
 - 2026-02-28: Simplified `just` operator surface by adding root-level overlay wrappers (`just start`, `just stop`, `just status`, `just phase6-contract`, `just phase6-promotion`) and collapsing redundant overlay start recipes into a single `start mode="<auto|layer-shell|fallback-window|disabled>"` (default `layer-shell`).
+- 2026-02-28: Completed Phase 7 visual overhaul in `parakeet-overlay.rs` — replaced flat phase-colored rectangle with dark frosted-glass panel (rounded corners, soft shadow, accent stripe, text shadows, premultiplied alpha compositing, preferred font cascade, 250ms ease-out-cubic fade transitions). All rendering remains pure software pixel manipulation, no new dependencies.
+- 2026-02-28: Documented Phase 8 overlay UX roadmap covering entrance/exit slide animations, animated ellipsis with rotating flavor text, bottom-screen default, cursor-aware multi-monitor placement (3-tier progressive enhancement), finalizing progress hints, interim text character-level fade-in, idle breathing, and adaptive width.
+- 2026-03-01: Phase 8.3 — changed default anchor from `TopCenter` to `BottomCenter` with 32px vertical margin (was 24px). Users look at center-to-bottom of screen; top anchor forced eye-jump.
+- 2026-03-01: Phase 8.1 (spatial) — added entrance slide (7px over 300ms ease-out-cubic) and exit slide (5px over 250ms ease-in-cubic) with anchor-aware direction. Shadow region (8px) absorbs the max 7px offset.
+- 2026-03-01: Phase 8.1 (color) — added 150ms linear RGB cross-fade on accent stripe during visible phase transitions (Listening↔Interim↔Finalizing). Hidden→visible transitions handled by entrance fade.
+- 2026-03-01: Phase 8.2 — added 12 rotating listening phrases (3s rotation cycle, 200ms cross-fade) and staggered ellipsis dot animation (1200ms cycle, 200ms per-dot delay). Starting phrase seeded from wall-clock time.
+- 2026-03-01: Phase 8.5 — added 2px indeterminate progress bar during Finalizing (1500ms sweep, 30% segment width with soft edges) and 200ms green success flash on Finalizing→Hidden transition.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -91,6 +101,8 @@ _Last updated: 2026-02-28_
 - 2026-02-28 (Phase 6 contract coverage): `cd parakeet-stt-daemon && uv run pytest tests/test_overlay_event_stream.py` passed (12 tests), including explicit quick-utterance, long-dictation, daemon-reconnect, and overlay-crash scenario contracts.
 - 2026-02-28 (Phase 6 mixed-version + isolation checks): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (lib: 8 tests, overlay binary unit target: 11 tests, `src/main.rs`: 57 tests), including new `decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages`.
 - 2026-02-28 (Phase 6 promotion gate): `just --justfile justfile.overlay-dev phase6-promotion 3` passed (three consecutive clean `phase6-contract` runs + stream/seal regression gate) and generated artifact `/tmp/parakeet-overlay-phase6-gate-20260228-224327.log`; stream-seal vs offline deltas were weighted WER `+0.000514`, strict command exact match `+0.020000`, normalized command exact match `+0.020000`, intent+slot match `+0.020000`, critical token recall `+0.007782`, punctuation F1 `+0.018368`, terminal punctuation accuracy `+0.000000`, and warm finalize P95 `+2.828343 ms`.
+
+- 2026-03-01 (Phase 8 commits 1–5): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 32 tests), including `default_cli_anchor_is_bottom_center`, `ease_in_cubic_boundaries`, `slide_offset_entrance_ends_at_zero`, `slide_offset_exit_starts_at_zero`, `entrance_duration_longer_than_exit`, `accent_transition_interpolates_at_midpoint`, `accent_transition_completes_at_duration`, `no_accent_transition_from_hidden`, `phrase_advances_after_interval`, `dot_opacities_stagger_correctly`, `dots_reset_after_cycle`, `crossfade_active_during_rotation_window`, `progress_segment_wraps_at_duration`, `success_flash_active_during_window`, `success_flash_triggers_on_finalizing_exit`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -285,10 +297,10 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
   - [x] auto-hide after final/session end timeout.
   - [x] no injection, no clipboard, no keyboard ownership.
 - [x] Add configuration fields (opacity/font/anchor/margins/max width/lines) with conservative defaults in overlay CLI process.
-- [ ] Remaining for full Phase 4 completion:
+- [x] Remaining for full Phase 4 completion:
   - [x] crash/restart simulation with reconnect semantics validated end-to-end.
   - [x] CPU/memory budget validation under sustained 10-minute runtime soak.
-  - [ ] richer text shaping/typography beyond phase-colored state surfaces.
+  - [x] richer text shaping/typography beyond phase-colored state surfaces (completed in Phase 7 visual overhaul).
 
 ### Verification Loop
 1. [x] Validate state machine headlessly.
@@ -390,6 +402,150 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 - Mixed-version compatibility is verified.
 - Feature-flag rollout path is validated and documented in PR notes.
 
+## Phase 7: Visual Overhaul (Completed)
+
+Transformed the overlay from a flat phase-colored rectangle into a polished dark-glass panel. All rendering remains pure software pixel manipulation — no new dependencies.
+
+### What Shipped
+- **Design system**: dark near-black `(22,22,26)` background at ~90% opacity, subtle `(58,58,68)` 1px border, 12px corner radius, 8px soft shadow with quadratic falloff.
+- **Accent stripe**: 3px pill-shaped vertical indicator on the left interior edge, colored per phase (blue=listening, mint=interim, amber=finalizing). Replaces full-background color coding.
+- **Typography**: preferred font cascade `Inter → Cantarell → Noto Sans → generic Sans` (only when user hasn't overridden `--font`); default 18px with 1.45 line height; 1px text shadow for legibility.
+- **Premultiplied alpha**: `argb_pixel_premul()` and premultiplied-over-premultiplied compositing for correct Wayland ARGB8888 rendering (eliminates fringing on shadows and AA edges).
+- **Geometry primitives**: `Rect`, `ContentArea`, `blend_pixel`, `rounded_rect_coverage` (AA at corners), `fill_rounded_rect`, `stroke_rounded_rect`, `distance_to_rounded_rect`.
+- **Shadow**: surface dimensions extended by `2 * shadow_radius`; layer-shell margins compensated so content visual position is unchanged.
+- **Fade transitions**: 250ms ease-out-cubic for visibility transitions. `FadeState` tracks direction/progress; tick handler re-renders while fading.
+- **Tests**: 16 unit tests including `fill_rounded_rect_corner_coverage`, `fade_progress_interpolation`, `ease_out_cubic_boundaries`, `surface_dimensions_include_shadow`.
+
+### Files Modified
+- `parakeet-ptt/src/bin/parakeet-overlay.rs` — all rendering code.
+
+---
+
+## Phase 8: Overlay UX Polish (P0–P2 Complete)
+
+### What Shipped
+- **8.3 — BottomCenter default**: anchor changed from `TopCenter` to `BottomCenter`, vertical margin bumped from 24→32px to clear taskbar/dock areas.
+- **8.1 — Entrance/exit slide**: 7px slide-in over 300ms (ease-out-cubic), 5px slide-out over 250ms (ease-in-cubic). Direction is anchor-aware (bottom anchors slide down, top anchors slide up). Shadow region (8px) absorbs the max 7px offset.
+- **8.1 — Accent cross-fade**: 150ms linear RGB interpolation on accent stripe when transitioning between visible phases. Entrance fade handles Hidden→visible.
+- **8.2 — Animated listening text**: 12 rotating flavor phrases on a 3s cycle with 200ms cross-fade. Staggered 3-dot ellipsis animation (1200ms cycle, 200ms per-dot delay). Starting phrase seeded from wall-clock time.
+- **8.5 — Progress bar + success flash**: 2px indeterminate sweep bar during Finalizing (1500ms cycle, 30% segment, soft edges). 200ms green success flash on Finalizing→Hidden exit overrides accent stripe.
+- **Tests**: 15 new unit tests (32 total in overlay binary), all passing with `cargo clippy --all-targets -- -D warnings`.
+- **Files modified**: `parakeet-ptt/src/bin/parakeet-overlay.rs` only (all 5 commits).
+
+### Design Direction
+The overlay should feel like it belongs on a premium desktop — invisible when idle, delightful when active, and always spatially intuitive. Every interaction should feel like the system is alive and responsive, not just flipping visibility flags.
+
+---
+
+## Overlay UX Roadmap
+
+### 8.1 — Entrance & Exit Micro-Animations
+
+**Problem**: The current 250ms opacity fade is functional but flat. Modern system UIs (macOS notifications, GNOME toast, COSMIC panel hints) combine opacity with spatial motion to create a sense of physical presence.
+
+**Design**:
+- **Entrance**: slide-up 6–8px + opacity fade-in over 300ms with ease-out-cubic. The panel should feel like it's gently rising into view from just below its resting position.
+- **Exit**: slide-down 4–6px + opacity fade-out over 250ms with ease-in-cubic. Slightly faster than entrance — departures should feel snappy, not lingering.
+- **Implementation**: animate a `y_offset` alongside `fade_alpha` in `FadeState`. Apply the offset to `content.y` before rendering. Layer-shell margins or surface position don't need to change — the offset is purely within the allocated surface buffer.
+- **Phase transitions** (listening → interim → finalizing): subtle accent stripe color cross-fade (interpolate RGB over ~150ms) instead of hard cut. No spatial motion for phase changes — only entrance/exit get motion.
+
+### 8.2 — Dynamic Listening Text (Personality)
+
+**Problem**: "Listening..." is static and generic. The overlay sits there unchanged for the entire listening phase, which can last several seconds. It feels dead.
+
+**Design** — two layers of life:
+
+1. **Animated ellipsis**: cycle dots with staggered opacity. Render three dots where each dot fades in sequentially (dot 1 at 0ms, dot 2 at 200ms, dot 3 at 400ms), then the whole set resets at 1200ms. This gives a gentle "breathing" pulse without being distracting. Implemented as a time-based alpha modulation on each dot glyph — no layout changes needed.
+
+2. **Rotating flavor text**: replace static "Listening" with randomly selected warm phrases that rotate every ~3 seconds with a quick cross-fade. Examples (inspired by Claude Code's loading messages, but adapted for voice context):
+   - "Listening closely..."
+   - "All ears..."
+   - "Go ahead, I'm here..."
+   - "Ready when you are..."
+   - "Hearing you out..."
+   - "Speak your mind..."
+   - "Catching every word..."
+   - "Tuned in..."
+   - "Say the word..."
+   - "Standing by..."
+   - "On it..."
+   - "Ears perked..."
+
+   **Implementation**: maintain a `&[&str]` pool in the overlay binary. On entering `Listening` phase, pick a random starting index (seeded from `Instant::now()` to avoid needing `rand`). Advance index every ~3s. Cross-fade between old and new text by rendering outgoing text at decreasing alpha and incoming text at increasing alpha over ~200ms. The `OverlayVisibility::Listening` render intent currently emits a fixed `"Listening..."` headline from `overlay_state.rs` — the flavor rotation should live **in the overlay renderer**, not the state machine, since it's purely cosmetic and shouldn't affect IPC or state transitions.
+
+### 8.3 — Bottom-of-Screen Default Position
+
+**Problem**: the current default anchor is `TopCenter`. Users are typically looking at the center-to-bottom of their screen (text editors, terminals, chat windows). A top-anchored overlay forces the eye to jump to the top of the display, breaking flow.
+
+**Design**:
+- Change `--anchor` default from `TopCenter` to `BottomCenter`.
+- Adjust default `--margin-y` from 24 to 32 (slightly more breathing room from the bottom edge — taskbars, docks, and COSMIC panel live here).
+- This is a one-line default change in the CLI parser. Existing users who pass `--anchor` explicitly are unaffected.
+
+### 8.4 — Cursor-Spawn Placement (Focus Proximity)
+
+**Problem**: on multi-monitor setups, the overlay always appears on the same output regardless of where the user is working. The user has to visually scan across screens to find the overlay.
+
+**Design** — progressive enhancement in two tiers:
+
+1. **Tier 1 — Active-output tracking** (low effort): use the Wayland `wl_output` that the focused surface is on. Layer-shell `get_layer_surface()` accepts an optional `output` parameter. When `parakeet-ptt` knows which output the focused window is on (already partially available from the toplevel cache), pass that output reference to the overlay via IPC. The overlay re-targets its layer surface to that output. This gets the overlay on the right monitor without any pointer tracking.
+
+2. **Tier 2 — Cursor-spawn positioning** (medium effort, target tier): snapshot the pointer position at utterance start via `wl_pointer` and spawn the overlay anchored to the quadrant/region of the output where the cursor was at that moment. The overlay stays put for the duration of the utterance — no continuous tracking, no following, just "appear where I'm looking." Requires a one-shot `wl_pointer` position capture when entering Listening phase. The overlay process already has a Wayland connection.
+
+**Recommended path**: implement Tier 1 first (active output), then Tier 2 (cursor-spawn). Continuous cursor-following (Tier 3 in earlier drafts) is overkill and risks being distracting — removed from the roadmap.
+
+### 8.5 — Finalizing Phase Polish
+
+**Problem**: the "Finalizing..." phase currently shows static text with an amber accent stripe. This is the moment the user is most anxious — they just stopped talking and want to know their text landed.
+
+**Design**:
+- **Progress hint**: show a subtle horizontal progress bar along the bottom edge of the content area (1–2px tall, accent-colored). Even if we don't have real progress data, a smooth indeterminate animation (a short bright segment sweeping left-to-right over ~1.5s) signals that work is happening.
+- **Success flash**: on transition from `Finalizing` to `Hidden` (which means `final_result` was received and injection happened), flash the accent stripe green for ~200ms before starting the fade-out. This gives a satisfying "done" signal without text changes.
+
+### 8.6 — Interim Text Streaming Feel
+
+**Problem**: interim text currently appears as full string replacements — the entire headline swaps on each `interim_text` event. This looks like flickering rather than streaming.
+
+**Design**:
+- **Character-level fade-in**: when new interim text arrives, diff against the previous text. Characters that are unchanged render at full alpha. New characters at the end fade in over ~100ms. This creates a typewriter-like streaming feel.
+- **Implementation**: track `previous_headline: String` in the render path. On each frame, compare current vs previous. For characters beyond the shared prefix, apply a time-based alpha ramp. Reset the timer on each new `interim_text` event.
+
+### 8.7 — Subtle Idle Breathing (Listening Phase)
+
+**Problem**: during the listening phase, the overlay is static apart from the proposed dot animation. A completely still panel can feel frozen.
+
+**Design**:
+- Very subtle accent stripe brightness oscillation: ±5% alpha over a 3-second sine cycle. Just enough to suggest "alive" without being distracting.
+- Only active during `Listening` phase. Pauses during `Interim` (text is the focus) and `Finalizing` (progress bar takes over).
+
+### 8.8 — Adaptive Width
+
+**Problem**: the overlay is always `max_width` wide regardless of text length. Short messages like "Tuned in..." sit in an unnecessarily wide panel.
+
+**Design**:
+- Measure actual text width after layout. Set surface width to `max(text_width + padding, min_width)` clamped to `max_width`.
+- Animate width changes over ~200ms with ease-out to prevent jarring size jumps during interim text streaming.
+- This requires recreating the `wl_shm_pool`/`wl_buffer` on size change, or pre-allocating at `max_width` and only damage/commit the active region. The latter is simpler and wastes minimal memory.
+
+---
+
+### Implementation Priority (Suggested)
+
+| Priority | Item | Status | Effort | Impact |
+|----------|------|--------|--------|--------|
+| **P0** | 8.3 — Bottom-screen default | **Done** | Trivial | High — immediate spatial improvement |
+| **P1** | 8.1 — Entrance/exit slide animations | **Done** | Low | High — transforms perceived quality |
+| **P1** | 8.1 — Accent stripe cross-fade | **Done** | Low | Medium — smooth phase transitions |
+| **P1** | 8.2 — Animated ellipsis + flavor text | **Done** | Low-Medium | High — overlay feels alive |
+| **P2** | 8.5 — Finalizing progress + success flash | **Done** | Low | Medium — reduces anxiety |
+| **P2** | 8.4 Tier 1 — Active-output tracking | Deferred | Medium | High on multi-monitor setups |
+| **P2** | 8.4 Tier 2 — Cursor-spawn positioning | Deferred | Medium | Medium — spawn where user is looking |
+| **P3** | 8.6 — Interim text character fade-in | Deferred | Medium | Medium — polish for streaming feel |
+| **P3** | 8.7 — Idle breathing | Deferred | Trivial | Low — subtle polish |
+| **P3** | 8.8 — Adaptive width | Deferred | Medium | Medium — cleaner look for short text |
+
+---
+
 ## Suggested PR Slicing (Atomic)
 1. Phase 0 capability gate + logging.
 2. Phase 1 protocol and unknown-message tolerance.
@@ -398,3 +554,5 @@ git worktree add ../parakeet-overlay-dev feature/overlay-phase0-capability-gate
 5. Phase 4 overlay binary MVP + state-machine tests.
 6. Phase 5 config/flag wiring + precedence tests.
 7. Phase 6 E2E/reliability harness + rollout defaults.
+8. Phase 7 visual overhaul — design system, rounded corners, shadow, accent stripe, text shadows, premultiplied alpha, fade transitions.
+9. Phase 8 UX polish (landed) — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress bar + success flash. Deferred: cursor-spawn placement (8.4), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8).
