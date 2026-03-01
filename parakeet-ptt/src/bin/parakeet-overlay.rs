@@ -53,6 +53,26 @@ const ACCENT_CROSSFADE_MS: u64 = 150;
 const ENTRANCE_SLIDE_PX: f32 = 7.0;
 const EXIT_SLIDE_PX: f32 = 5.0;
 
+const PHRASE_ROTATE_MS: u64 = 3000;
+const PHRASE_CROSSFADE_MS: u64 = 200;
+const ELLIPSIS_DOT_DELAY_MS: u64 = 200;
+const ELLIPSIS_CYCLE_MS: u64 = 1200;
+
+const LISTENING_PHRASES: &[&str] = &[
+    "Listening",
+    "Go ahead",
+    "Ready when you are",
+    "Speak freely",
+    "I'm all ears",
+    "Say the word",
+    "Standing by",
+    "Fire away",
+    "What's on your mind",
+    "Take your time",
+    "Hearing you",
+    "At your service",
+];
+
 const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
 #[derive(Parser, Debug)]
@@ -472,6 +492,77 @@ impl AccentTransition {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ListeningAnimState {
+    phrase_index: usize,
+    phrase_started_ms: u64,
+    listening_entered_ms: u64,
+}
+
+impl ListeningAnimState {
+    fn new(now_ms: u64) -> Self {
+        // Seed starting index from time to avoid always starting at "Listening"
+        let index = (now_ms as usize) % LISTENING_PHRASES.len();
+        Self {
+            phrase_index: index,
+            phrase_started_ms: now_ms,
+            listening_entered_ms: now_ms,
+        }
+    }
+
+    /// Advance phrase rotation. Returns true if state changed.
+    fn tick(&mut self, now_ms: u64) -> bool {
+        let elapsed = now_ms.saturating_sub(self.phrase_started_ms);
+        if elapsed >= PHRASE_ROTATE_MS {
+            self.phrase_index = (self.phrase_index + 1) % LISTENING_PHRASES.len();
+            self.phrase_started_ms = now_ms;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn current_phrase(&self) -> &'static str {
+        LISTENING_PHRASES[self.phrase_index]
+    }
+
+    /// Returns (outgoing_phrase, blend_factor 0→1) during cross-fade window,
+    /// or None if not cross-fading.
+    fn crossfade_state(&self, now_ms: u64) -> Option<(&'static str, f32)> {
+        let elapsed = now_ms.saturating_sub(self.phrase_started_ms);
+        if elapsed < PHRASE_CROSSFADE_MS {
+            let t = elapsed as f32 / PHRASE_CROSSFADE_MS.max(1) as f32;
+            let prev = if self.phrase_index == 0 {
+                LISTENING_PHRASES.len() - 1
+            } else {
+                self.phrase_index - 1
+            };
+            Some((LISTENING_PHRASES[prev], t))
+        } else {
+            None
+        }
+    }
+
+    /// Per-dot opacity [0.0–1.0] for a 3-dot animated ellipsis.
+    fn dot_opacities(&self, now_ms: u64) -> [f32; 3] {
+        let elapsed = now_ms.saturating_sub(self.listening_entered_ms);
+        let cycle_pos = (elapsed % ELLIPSIS_CYCLE_MS) as f32;
+        let mut opacities = [0.0f32; 3];
+        for (i, opacity) in opacities.iter_mut().enumerate() {
+            let dot_start = (i as u64) * ELLIPSIS_DOT_DELAY_MS;
+            let dot_elapsed = cycle_pos - dot_start as f32;
+            if dot_elapsed < 0.0 {
+                *opacity = 0.0;
+            } else {
+                // Fade in over 200ms, hold, then cycle resets
+                let fade_t = (dot_elapsed / ELLIPSIS_DOT_DELAY_MS as f32).clamp(0.0, 1.0);
+                *opacity = fade_t;
+            }
+        }
+        opacities
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FadeDirection {
     In,
@@ -827,6 +918,7 @@ struct WaylandOverlayBackend {
     fade: Option<FadeState>,
     last_phase: OverlayRenderPhase,
     accent_transition: Option<AccentTransition>,
+    listening_anim: Option<ListeningAnimState>,
     started: Instant,
 }
 
@@ -840,6 +932,7 @@ impl WaylandOverlayBackend {
             fade: None,
             last_phase: OverlayRenderPhase::Hidden,
             accent_transition: None,
+            listening_anim: None,
             started: Instant::now(),
         }
     }
@@ -885,7 +978,7 @@ impl OverlayBackend for WaylandOverlayBackend {
             self.last_visible = intent.visible;
         }
 
-        // Detect phase changes for accent cross-fade
+        // Detect phase changes for accent cross-fade and listening animation
         if intent.phase != self.last_phase {
             // Only cross-fade between visible phases (entrance fade handles Hidden→visible)
             let from = accent_color_for_phase(self.last_phase);
@@ -898,6 +991,12 @@ impl OverlayBackend for WaylandOverlayBackend {
                 });
             } else {
                 self.accent_transition = None;
+            }
+            // Manage listening animation lifecycle
+            if intent.phase == OverlayRenderPhase::Listening {
+                self.listening_anim = Some(ListeningAnimState::new(now));
+            } else {
+                self.listening_anim = None;
             }
             self.last_phase = intent.phase;
         }
@@ -921,18 +1020,31 @@ impl OverlayBackend for WaylandOverlayBackend {
             accent_color_for_phase(intent.phase)
         };
 
+        // Tick listening animation
+        if let Some(anim) = &mut self.listening_anim {
+            anim.tick(now);
+        }
+
         let fade_alpha = self.fade_alpha();
         let y_offset = self
             .fade
             .map(|f| f.slide_offset(now, self.ui.anchor))
             .unwrap_or(0.0);
         self.runtime
-            .render_with_fade(&intent, &self.ui, fade_alpha, y_offset, accent_color)
+            .render_with_fade(
+                &intent,
+                &self.ui,
+                fade_alpha,
+                y_offset,
+                accent_color,
+                self.listening_anim.as_ref(),
+                now,
+            )
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
     }
 
     fn is_fading(&self) -> bool {
-        self.fade.is_some() || self.accent_transition.is_some()
+        self.fade.is_some() || self.accent_transition.is_some() || self.listening_anim.is_some()
     }
 }
 
@@ -1228,6 +1340,7 @@ impl WaylandRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_with_fade(
         &mut self,
         intent: &OverlayRenderIntent,
@@ -1235,6 +1348,8 @@ impl WaylandRuntime {
         fade_alpha: f32,
         y_offset: f32,
         accent_color: Option<[u8; 4]>,
+        listening_anim: Option<&ListeningAnimState>,
+        now_ms: u64,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1262,6 +1377,8 @@ impl WaylandRuntime {
                 content,
                 y_offset,
                 accent_color,
+                listening_anim,
+                now_ms,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -1785,6 +1902,8 @@ fn render_frame(
     content: ContentArea,
     y_offset: f32,
     accent_color: Option<[u8; 4]>,
+    listening_anim: Option<&ListeningAnimState>,
+    now_ms: u64,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -1856,28 +1975,86 @@ fn render_frame(
         );
     }
 
-    // 6. Draw text
-    let headline = intent.headline.trim();
-    let detail = intent
-        .detail
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let text = if let Some(detail) = detail {
-        format!("{headline} {detail}")
-    } else {
-        headline.to_string()
-    };
+    // 6. Draw text (with listening animation override)
+    if let Some(anim) = listening_anim {
+        // Animated phrase + ellipsis dots
+        let phrase = anim.current_phrase();
+        let dot_opacities = anim.dot_opacities(now_ms);
 
-    text_renderer.draw_headline(
-        frame,
-        dimensions,
-        content,
-        ui.max_width,
-        ui.max_lines,
-        &text,
-        frame_alpha,
-    );
+        if let Some((outgoing, t)) = anim.crossfade_state(now_ms) {
+            // During cross-fade: outgoing at (1-t), incoming at t
+            let out_text = format_phrase_with_dots(outgoing, &[1.0; 3]);
+            let in_text = format_phrase_with_dots(phrase, &dot_opacities);
+            text_renderer.draw_headline(
+                frame,
+                dimensions,
+                content,
+                ui.max_width,
+                ui.max_lines,
+                &out_text,
+                frame_alpha * (1.0 - t),
+            );
+            text_renderer.draw_headline(
+                frame,
+                dimensions,
+                content,
+                ui.max_width,
+                ui.max_lines,
+                &in_text,
+                frame_alpha * t,
+            );
+        } else {
+            let text = format_phrase_with_dots(phrase, &dot_opacities);
+            text_renderer.draw_headline(
+                frame,
+                dimensions,
+                content,
+                ui.max_width,
+                ui.max_lines,
+                &text,
+                frame_alpha,
+            );
+        }
+    } else {
+        let headline = intent.headline.trim();
+        let detail = intent
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let text = if let Some(detail) = detail {
+            format!("{headline} {detail}")
+        } else {
+            headline.to_string()
+        };
+
+        text_renderer.draw_headline(
+            frame,
+            dimensions,
+            content,
+            ui.max_width,
+            ui.max_lines,
+            &text,
+            frame_alpha,
+        );
+    }
+}
+
+/// Format a phrase with animated ellipsis dots.
+/// Dots are always rendered (simplifies layout); opacity is controlled
+/// by the caller via per-glyph alpha in the text renderer. For now we
+/// use Unicode half/full-width approach: visible dots at full alpha,
+/// dim dots at reduced alpha. Since draw_headline doesn't support
+/// per-glyph alpha, we approximate with a threshold: dots with opacity
+/// >= 0.5 are shown, others hidden with a space placeholder.
+fn format_phrase_with_dots(phrase: &str, dot_opacities: &[f32; 3]) -> String {
+    let mut s = phrase.to_string();
+    for &opacity in dot_opacities {
+        if opacity >= 0.5 {
+            s.push('.');
+        }
+    }
+    s
 }
 
 fn fill_frame(frame: &mut [u8], pixel: [u8; 4]) {
@@ -2342,6 +2519,8 @@ mod tests {
             content,
             0.0,
             None,
+            None,
+            0,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -2361,6 +2540,8 @@ mod tests {
             content,
             0.0,
             accent_color_for_phase(OverlayRenderPhase::Listening),
+            None,
+            0,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
@@ -2412,6 +2593,8 @@ mod tests {
             content,
             0.0,
             accent,
+            None,
+            0,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -2425,6 +2608,8 @@ mod tests {
             content,
             0.0,
             accent,
+            None,
+            0,
         );
 
         let max_full = full_alpha_frame
@@ -2630,5 +2815,84 @@ mod tests {
         // When going Hidden→Listening, accent_color_for_phase(Hidden) is None,
         // so no AccentTransition should be created (entrance fade handles it).
         assert!(accent_color_for_phase(OverlayRenderPhase::Hidden).is_none());
+    }
+
+    #[test]
+    fn phrase_advances_after_interval() {
+        use super::ListeningAnimState;
+        let mut anim = ListeningAnimState {
+            phrase_index: 0,
+            phrase_started_ms: 0,
+            listening_entered_ms: 0,
+        };
+        let initial = anim.current_phrase();
+        // Before rotation interval: no change
+        assert!(!anim.tick(super::PHRASE_ROTATE_MS - 1));
+        assert_eq!(anim.current_phrase(), initial);
+        // After rotation interval: advances
+        assert!(anim.tick(super::PHRASE_ROTATE_MS));
+        assert_eq!(anim.phrase_index, 1);
+    }
+
+    #[test]
+    fn dot_opacities_stagger_correctly() {
+        use super::ListeningAnimState;
+        let anim = ListeningAnimState {
+            phrase_index: 0,
+            phrase_started_ms: 0,
+            listening_entered_ms: 0,
+        };
+        // At t=0, first dot starts fading, others haven't started
+        let dots = anim.dot_opacities(0);
+        assert!(dots[0] >= 0.0);
+        assert_eq!(dots[1], 0.0);
+        assert_eq!(dots[2], 0.0);
+        // After 2 dot delays, all three should be visible
+        let all_on = anim.dot_opacities(super::ELLIPSIS_DOT_DELAY_MS * 3);
+        assert!(all_on[0] >= 0.5);
+        assert!(all_on[1] >= 0.5);
+        assert!(all_on[2] >= 0.5);
+    }
+
+    #[test]
+    fn dots_reset_after_cycle() {
+        use super::ListeningAnimState;
+        let anim = ListeningAnimState {
+            phrase_index: 0,
+            phrase_started_ms: 0,
+            listening_entered_ms: 0,
+        };
+        // Right at cycle boundary, position wraps to 0
+        let dots = anim.dot_opacities(super::ELLIPSIS_CYCLE_MS);
+        assert!(
+            dots[1] < 0.5,
+            "second dot should reset after cycle, got {}",
+            dots[1]
+        );
+    }
+
+    #[test]
+    fn crossfade_active_during_rotation_window() {
+        use super::ListeningAnimState;
+        let mut anim = ListeningAnimState {
+            phrase_index: 0,
+            phrase_started_ms: 0,
+            listening_entered_ms: 0,
+        };
+        // After rotation, crossfade should be active
+        anim.tick(super::PHRASE_ROTATE_MS);
+        let cf = anim.crossfade_state(anim.phrase_started_ms + super::PHRASE_CROSSFADE_MS / 2);
+        assert!(
+            cf.is_some(),
+            "crossfade should be active right after rotation"
+        );
+        let (_, t) = cf.unwrap();
+        assert!(
+            t > 0.0 && t < 1.0,
+            "blend factor should be mid-range, got {t}"
+        );
+        // After crossfade window ends
+        let cf_done = anim.crossfade_state(anim.phrase_started_ms + super::PHRASE_CROSSFADE_MS);
+        assert!(cf_done.is_none(), "crossfade should be done");
     }
 }
