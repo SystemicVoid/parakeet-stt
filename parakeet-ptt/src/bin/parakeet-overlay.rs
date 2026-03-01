@@ -75,7 +75,7 @@ struct Cli {
     font: String,
 
     /// Screen anchor for overlay placement.
-    #[arg(long, value_enum, default_value_t = CliAnchor::TopCenter)]
+    #[arg(long, value_enum, default_value_t = CliAnchor::BottomCenter)]
     anchor: CliAnchor,
 
     /// Horizontal margin from anchor reference point.
@@ -83,7 +83,7 @@ struct Cli {
     margin_x: u32,
 
     /// Vertical margin from anchor reference point.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value_t = 32)]
     margin_y: u32,
 
     /// Maximum text box width in pixels.
@@ -2061,10 +2061,11 @@ mod tests {
     use super::{
         accent_color_for_phase, ease_out_cubic, layout_text_lines, parse_font_descriptor,
         parse_generic_family_kind, render_frame, resolve_backend_selection, rounded_rect_coverage,
-        BackendSelection, BackendSignals, CliBackendMode, FadeDirection, FadeState,
+        BackendSelection, BackendSignals, CliAnchor, CliBackendMode, FadeDirection, FadeState,
         FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer,
         SHADOW_RADIUS,
     };
+    use clap::Parser;
     use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
 
     #[test]
@@ -2406,5 +2407,13 @@ mod tests {
             assert!(v >= prev, "not monotonic at t={t}");
             prev = v;
         }
+    }
+
+    #[test]
+    fn default_cli_anchor_is_bottom_center() {
+        // Verify Cli struct defaults parse to BottomCenter with 32px vertical margin
+        let cli = super::Cli::parse_from(["parakeet-overlay"]);
+        assert!(matches!(cli.anchor, CliAnchor::BottomCenter));
+        assert_eq!(cli.margin_y, 32);
     }
 }
