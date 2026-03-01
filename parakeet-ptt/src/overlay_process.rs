@@ -11,12 +11,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::OverlayMode;
+use crate::surface_focus::WaylandFocusCache;
 
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 
 const OVERLAY_RESPAWN_BACKOFF_MS: u64 = 750;
 
-type OverlayLauncher = dyn Fn(OverlayMode) -> Result<OverlayProcessSink> + Send + Sync;
+type OverlayLauncher =
+    dyn Fn(OverlayMode, Option<String>) -> Result<OverlayProcessSink> + Send + Sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlaySendError {
@@ -97,7 +99,7 @@ pub struct OverlayProcessSink {
 }
 
 impl OverlayProcessSink {
-    pub fn spawn(mode: OverlayMode) -> Result<Self> {
+    pub fn spawn(mode: OverlayMode, output_name: Option<&str>) -> Result<Self> {
         let backend = match mode {
             OverlayMode::LayerShell => "layer-shell",
             OverlayMode::FallbackWindow => "fallback-window",
@@ -117,6 +119,9 @@ impl OverlayProcessSink {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if let Some(output_name) = output_name {
+            command.arg("--output-name").arg(output_name);
+        }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -218,6 +223,9 @@ pub struct OverlayProcessManager {
     mode: OverlayMode,
     sink: Option<OverlayProcessSink>,
     latest_message: Option<OverlayIpcMessage>,
+    focus_cache: Option<WaylandFocusCache>,
+    pending_output_name: Option<String>,
+    require_output_name_on_spawn: bool,
     launcher: Arc<OverlayLauncher>,
     metrics: Arc<OverlayManagerMetrics>,
     respawn_backoff: Duration,
@@ -225,27 +233,43 @@ pub struct OverlayProcessManager {
 }
 
 impl OverlayProcessManager {
-    pub fn new(mode: OverlayMode) -> Self {
+    pub fn new(mode: OverlayMode, focus_cache: Option<WaylandFocusCache>) -> Self {
+        let require_output_name_on_spawn = focus_cache.is_some();
         Self::new_with_launcher_and_backoff(
             mode,
-            Arc::new(OverlayProcessSink::spawn),
+            focus_cache,
+            require_output_name_on_spawn,
+            Arc::new(|mode, output_name| OverlayProcessSink::spawn(mode, output_name.as_deref())),
             Duration::from_millis(OVERLAY_RESPAWN_BACKOFF_MS),
         )
     }
 
     pub fn send(&mut self, message: OverlayIpcMessage) {
-        self.latest_message = Some(message.clone());
+        let is_output_hint = matches!(&message, OverlayIpcMessage::OutputHint { .. });
+        if let OverlayIpcMessage::OutputHint { output_name } = &message {
+            self.pending_output_name = Some(output_name.clone());
+        } else {
+            self.latest_message = Some(message.clone());
+        }
 
         if self.mode == OverlayMode::Disabled {
             return;
         }
 
-        if self.sink.is_none() {
+        let sink_was_missing = self.sink.is_none();
+        if sink_was_missing {
             self.try_spawn_sink();
         }
 
         match self.try_send_to_active(message.clone()) {
-            Ok(()) => return,
+            Ok(()) => {
+                if sink_was_missing && is_output_hint && self.latest_message.is_some() {
+                    if self.replay_latest_message().is_err() {
+                        self.metrics.note_replay_dropped();
+                    }
+                }
+                return;
+            }
             Err(OverlaySendError::Disconnected) => {
                 self.metrics.note_send_disconnect();
                 self.sink = None;
@@ -278,8 +302,22 @@ impl OverlayProcessManager {
             }
         }
 
+        let output_name = self.pending_output_name.clone().or_else(|| {
+            self.focus_cache
+                .as_ref()
+                .and_then(WaylandFocusCache::current_output_name)
+        });
+        if self.pending_output_name.is_none() {
+            self.pending_output_name = output_name.clone();
+        }
+
+        if self.require_output_name_on_spawn && output_name.is_none() {
+            debug!("deferring overlay process spawn until focused output is available");
+            return;
+        }
+
         self.metrics.note_spawn_attempt();
-        match (self.launcher)(self.mode) {
+        match (self.launcher)(self.mode, output_name) {
             Ok(sink) => {
                 self.metrics.note_spawn_success();
                 self.sink = Some(sink);
@@ -327,6 +365,8 @@ impl OverlayProcessManager {
 
     fn new_with_launcher_and_backoff(
         mode: OverlayMode,
+        focus_cache: Option<WaylandFocusCache>,
+        require_output_name_on_spawn: bool,
         launcher: Arc<OverlayLauncher>,
         respawn_backoff: Duration,
     ) -> Self {
@@ -334,12 +374,17 @@ impl OverlayProcessManager {
             mode,
             sink: None,
             latest_message: None,
+            focus_cache,
+            pending_output_name: None,
+            require_output_name_on_spawn,
             launcher,
             metrics: Arc::new(OverlayManagerMetrics::default()),
             respawn_backoff,
             next_spawn_allowed_at: None,
         };
-        manager.try_spawn_sink();
+        if !manager.require_output_name_on_spawn {
+            manager.try_spawn_sink();
+        }
         manager
     }
 
@@ -349,7 +394,16 @@ impl OverlayProcessManager {
         launcher: Arc<OverlayLauncher>,
         respawn_backoff: Duration,
     ) -> Self {
-        Self::new_with_launcher_and_backoff(mode, launcher, respawn_backoff)
+        Self::new_with_launcher_and_backoff(mode, None, false, launcher, respawn_backoff)
+    }
+
+    #[cfg(test)]
+    pub fn new_for_tests_with_output_targeting(
+        mode: OverlayMode,
+        launcher: Arc<OverlayLauncher>,
+        respawn_backoff: Duration,
+    ) -> Self {
+        Self::new_with_launcher_and_backoff(mode, None, true, launcher, respawn_backoff)
     }
 }
 
@@ -381,7 +435,24 @@ mod tests {
     fn queued_launcher(
         queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
     ) -> Arc<OverlayLauncher> {
-        Arc::new(move |_mode| {
+        Arc::new(move |_mode, _output_name| {
+            queue
+                .lock()
+                .expect("spawn queue lock should be available")
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("no spawn outcome configured")))
+        })
+    }
+
+    fn recording_launcher(
+        seen_output_names: Arc<Mutex<Vec<Option<String>>>>,
+        queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
+    ) -> Arc<OverlayLauncher> {
+        Arc::new(move |_mode, output_name| {
+            seen_output_names
+                .lock()
+                .expect("recorded output names lock should be available")
+                .push(output_name);
             queue
                 .lock()
                 .expect("spawn queue lock should be available")
@@ -502,9 +573,73 @@ mod tests {
             .is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_targeted_manager_waits_for_hint_and_replays_latest_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = OverlayProcessSink::from_sender_for_tests(
+            tx,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let queue = Arc::new(Mutex::new(VecDeque::from([Ok(sink)])));
+        let seen_output_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let launcher = recording_launcher(Arc::clone(&seen_output_names), queue);
+        let mut manager = OverlayProcessManager::new_for_tests_with_output_targeting(
+            OverlayMode::LayerShell,
+            launcher,
+            Duration::ZERO,
+        );
+
+        let session_id = Uuid::new_v4();
+        let latest_state = OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 7,
+            text: "latest-state".to_string(),
+        };
+        manager.send(latest_state.clone());
+        assert!(!manager.has_active_sink());
+        assert_eq!(
+            manager
+                .metrics()
+                .spawn_attempt_total
+                .load(Ordering::Relaxed),
+            0,
+            "spawn should be deferred until an output hint is available"
+        );
+
+        manager.send(OverlayIpcMessage::OutputHint {
+            output_name: "DP-1".to_string(),
+        });
+        assert!(manager.has_active_sink());
+        assert_eq!(
+            seen_output_names
+                .lock()
+                .expect("recorded output names lock should be available")
+                .clone(),
+            vec![Some("DP-1".to_string())]
+        );
+
+        let first_seen = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("output hint should be sent after spawn")
+            .expect("sink should remain open");
+        assert_eq!(
+            first_seen,
+            OverlayIpcMessage::OutputHint {
+                output_name: "DP-1".to_string()
+            }
+        );
+
+        let replayed = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("latest state should be replayed after output-targeted spawn")
+            .expect("sink should remain open");
+        assert_eq!(replayed, latest_state);
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
     #[test]
     fn missing_overlay_binary_spawn_failures_remain_non_fatal() {
-        let launcher: Arc<OverlayLauncher> = Arc::new(|_mode| {
+        let launcher: Arc<OverlayLauncher> = Arc::new(|_mode, _output_name| {
             Err(anyhow!(
                 "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
             ))

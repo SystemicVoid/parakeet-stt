@@ -110,6 +110,7 @@ impl OverlayStateMachine {
 
     pub fn apply_event(&mut self, message: OverlayIpcMessage, now_ms: u64) -> ApplyOutcome {
         match message {
+            OverlayIpcMessage::OutputHint { .. } => ApplyOutcome::Applied,
             OverlayIpcMessage::InterimState {
                 session_id,
                 seq,

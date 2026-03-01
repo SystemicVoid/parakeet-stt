@@ -4,6 +4,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayIpcMessage {
+    OutputHint {
+        output_name: String,
+    },
     InterimState {
         session_id: Uuid,
         seq: u64,
@@ -37,6 +40,20 @@ mod tests {
 
         let encoded = serde_json::to_string(&message).expect("message should serialize");
         assert!(encoded.contains("\"type\":\"interim_text\""));
+
+        let decoded: OverlayIpcMessage =
+            serde_json::from_str(&encoded).expect("message should deserialize");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn output_hint_serialization_roundtrip() {
+        let message = OverlayIpcMessage::OutputHint {
+            output_name: "HDMI-A-1".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&message).expect("message should serialize");
+        assert!(encoded.contains("\"type\":\"output_hint\""));
 
         let decoded: OverlayIpcMessage =
             serde_json::from_str(&encoded).expect("message should deserialize");

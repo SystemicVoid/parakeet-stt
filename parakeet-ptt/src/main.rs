@@ -39,6 +39,7 @@ use crate::protocol::{
     decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
 };
 use crate::state::PttState;
+use crate::surface_focus::WaylandFocusCache;
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
@@ -128,6 +129,9 @@ impl OverlayRoutingMetrics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OverlayEvent {
+    OutputHint {
+        output_name: String,
+    },
     InterimState {
         session_id: Uuid,
         seq: u64,
@@ -173,6 +177,7 @@ impl OverlaySink for RuntimeOverlaySink {
 
 fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
     match event {
+        OverlayEvent::OutputHint { output_name } => OverlayIpcMessage::OutputHint { output_name },
         OverlayEvent::InterimState {
             session_id,
             seq,
@@ -197,11 +202,14 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
     }
 }
 
-fn build_runtime_overlay_sink(mode: OverlayMode) -> RuntimeOverlaySink {
+fn build_runtime_overlay_sink(
+    mode: OverlayMode,
+    focus_cache: Option<WaylandFocusCache>,
+) -> RuntimeOverlaySink {
     match mode {
         OverlayMode::Disabled => RuntimeOverlaySink::Noop(NoopOverlaySink),
         OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
-            let manager = OverlayProcessManager::new(mode);
+            let manager = OverlayProcessManager::new(mode, focus_cache);
             let metrics = manager.metrics();
             info!(
                 overlay_spawn_attempt_total = metrics.spawn_attempt_total.load(Ordering::Relaxed),
@@ -220,15 +228,19 @@ struct OverlayRouter<S: OverlaySink> {
     metrics: Arc<OverlayRoutingMetrics>,
     active_session_id: Option<Uuid>,
     last_seq: Option<u64>,
+    focus_cache: Option<WaylandFocusCache>,
+    last_output_name: Option<String>,
 }
 
 impl<S: OverlaySink> OverlayRouter<S> {
-    fn new(sink: S) -> Self {
+    fn new(sink: S, focus_cache: Option<WaylandFocusCache>) -> Self {
         Self {
             sink,
             metrics: Arc::new(OverlayRoutingMetrics::default()),
             active_session_id: None,
             last_seq: None,
+            focus_cache,
+            last_output_name: None,
         }
     }
 
@@ -241,6 +253,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
         if self.active_session_id != Some(session_id) {
             self.active_session_id = Some(session_id);
             self.last_seq = None;
+            self.last_output_name = None;
         }
     }
 
@@ -256,6 +269,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
             return;
         }
 
+        self.maybe_emit_output_hint();
         self.sink.on_overlay_event(OverlayEvent::InterimState {
             session_id,
             seq,
@@ -276,6 +290,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
             return;
         }
 
+        self.maybe_emit_output_hint();
         self.sink.on_overlay_event(OverlayEvent::InterimText {
             session_id,
             seq,
@@ -301,7 +316,26 @@ impl<S: OverlaySink> OverlayRouter<S> {
         if self.active_session_id == Some(session_id) {
             self.active_session_id = None;
             self.last_seq = None;
+            self.last_output_name = None;
         }
+    }
+
+    fn maybe_emit_output_hint(&mut self) {
+        let Some(focus_cache) = self.focus_cache.as_ref() else {
+            return;
+        };
+
+        let Some(output_name) = focus_cache.current_output_name() else {
+            return;
+        };
+
+        if self.last_output_name.as_deref() == Some(output_name.as_str()) {
+            return;
+        }
+
+        self.last_output_name = Some(output_name.clone());
+        self.sink
+            .on_overlay_event(OverlayEvent::OutputHint { output_name });
     }
 
     fn allow_session(&self, expected_session_id: Option<Uuid>, incoming_session_id: Uuid) -> bool {
@@ -984,9 +1018,12 @@ async fn run_hotkey_mode(
     );
     ensure_input_access()?;
     let injector = build_injector(&config);
+    let focus_cache = Some(WaylandFocusCache::new());
     let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
-    let mut overlay_router =
-        OverlayRouter::new(build_runtime_overlay_sink(overlay_capability.mode));
+    let mut overlay_router = OverlayRouter::new(
+        build_runtime_overlay_sink(overlay_capability.mode, focus_cache.clone()),
+        focus_cache,
+    );
     spawn_event_loop_lag_monitor();
 
     let mut state = PttState::new();
@@ -1492,7 +1529,7 @@ mod tests {
         let mut state = PttState::new();
         let session_id = state.begin_listening().expect("state should start");
         state.stop_listening();
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
         let feedback = AudioFeedback::new(false, None, 100);
         let message = ServerMessage::FinalResult {
             session_id,
@@ -1567,9 +1604,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn interim_overlay_messages_route_without_injection_enqueue() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
-            seen: Arc::clone(&seen_overlay_events),
-        });
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
         let injector_seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
             seen: Arc::clone(&injector_seen),
@@ -1660,9 +1700,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mixed_stream_enqueues_exactly_one_final_result() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
-            seen: Arc::clone(&seen_overlay_events),
-        });
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
             seen: Arc::clone(&seen_injection),
@@ -1749,7 +1792,7 @@ mod tests {
         let sink_slot = Arc::new(Mutex::new(Some(first_sink)));
         let launcher = {
             let sink_slot = Arc::clone(&sink_slot);
-            Arc::new(move |_mode| {
+            Arc::new(move |_mode, _output_name| {
                 sink_slot
                     .lock()
                     .expect("sink slot lock should be available")
@@ -1760,7 +1803,7 @@ mod tests {
         let manager =
             OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -1851,7 +1894,7 @@ mod tests {
         ])));
         let launcher = {
             let spawn_queue = Arc::clone(&spawn_queue);
-            Arc::new(move |_mode| {
+            Arc::new(move |_mode, _output_name| {
                 spawn_queue
                     .lock()
                     .expect("spawn queue lock should be available")
@@ -1862,7 +1905,7 @@ mod tests {
         let manager =
             OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -1955,7 +1998,7 @@ mod tests {
         ])));
         let launcher = {
             let spawn_queue = Arc::clone(&spawn_queue);
-            Arc::new(move |_mode| {
+            Arc::new(move |_mode, _output_name| {
                 spawn_queue
                     .lock()
                     .expect("spawn queue lock should be available")
@@ -1966,7 +2009,7 @@ mod tests {
         let manager =
             OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager));
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -2085,9 +2128,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stale_interim_sequences_are_dropped_on_overlay_path_only() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
-            seen: Arc::clone(&seen_overlay_events),
-        });
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
         let injector = Arc::new(RecordingInjector {
             seen: Arc::new(Mutex::new(Vec::new())),
         });
