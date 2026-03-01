@@ -623,6 +623,10 @@ impl ListeningAnimState {
     /// Returns (outgoing_phrase, blend_factor 0→1) during cross-fade window,
     /// or None if not cross-fading.
     fn crossfade_state(&self, now_ms: u64) -> Option<(&'static str, f32)> {
+        // Avoid cross-fading on initial Listening entry; there is no real outgoing phrase yet.
+        if self.phrase_started_ms == self.listening_entered_ms {
+            return None;
+        }
         let elapsed = now_ms.saturating_sub(self.phrase_started_ms);
         if elapsed < PHRASE_CROSSFADE_MS {
             let t = elapsed as f32 / PHRASE_CROSSFADE_MS.max(1) as f32;
@@ -3028,6 +3032,22 @@ mod tests {
         // After crossfade window ends
         let cf_done = anim.crossfade_state(anim.phrase_started_ms + super::PHRASE_CROSSFADE_MS);
         assert!(cf_done.is_none(), "crossfade should be done");
+    }
+
+    #[test]
+    fn crossfade_inactive_on_listening_entry() {
+        use super::ListeningAnimState;
+        let entered = 1000;
+        let anim = ListeningAnimState::new(entered);
+        assert!(
+            anim.crossfade_state(entered).is_none(),
+            "crossfade should be inactive at listening entry"
+        );
+        assert!(
+            anim.crossfade_state(entered + super::PHRASE_CROSSFADE_MS / 2)
+                .is_none(),
+            "crossfade should stay inactive before first phrase rotation"
+        );
     }
 
     #[test]
