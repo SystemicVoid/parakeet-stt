@@ -49,6 +49,7 @@ const ACCENT_STRIPE_WIDTH: f32 = 3.0;
 const ACCENT_STRIPE_MARGIN: f32 = 6.0;
 const ENTRANCE_DURATION_MS: u64 = 300;
 const EXIT_DURATION_MS: u64 = 250;
+const ACCENT_CROSSFADE_MS: u64 = 150;
 const ENTRANCE_SLIDE_PX: f32 = 7.0;
 const EXIT_SLIDE_PX: f32 = 5.0;
 
@@ -443,6 +444,34 @@ fn ease_in_cubic(t: f32) -> f32 {
     t * t * t
 }
 
+fn lerp_channel(a: u8, b: u8, t: f32) -> u8 {
+    (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AccentTransition {
+    from_color: [u8; 4],
+    to_color: [u8; 4],
+    started_ms: u64,
+}
+
+impl AccentTransition {
+    fn blended_color(&self, now_ms: u64) -> [u8; 4] {
+        let elapsed = now_ms.saturating_sub(self.started_ms) as f32;
+        let t = (elapsed / ACCENT_CROSSFADE_MS.max(1) as f32).clamp(0.0, 1.0);
+        [
+            lerp_channel(self.from_color[0], self.to_color[0], t),
+            lerp_channel(self.from_color[1], self.to_color[1], t),
+            lerp_channel(self.from_color[2], self.to_color[2], t),
+            lerp_channel(self.from_color[3], self.to_color[3], t),
+        ]
+    }
+
+    fn is_complete(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started_ms) >= ACCENT_CROSSFADE_MS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FadeDirection {
     In,
@@ -796,6 +825,8 @@ struct WaylandOverlayBackend {
     runtime: WaylandRuntime,
     last_visible: bool,
     fade: Option<FadeState>,
+    last_phase: OverlayRenderPhase,
+    accent_transition: Option<AccentTransition>,
     started: Instant,
 }
 
@@ -807,6 +838,8 @@ impl WaylandOverlayBackend {
             runtime,
             last_visible: false,
             fade: None,
+            last_phase: OverlayRenderPhase::Hidden,
+            accent_transition: None,
             started: Instant::now(),
         }
     }
@@ -826,13 +859,6 @@ impl WaylandOverlayBackend {
                 }
             }
         }
-    }
-
-    fn is_fading(&self) -> bool {
-        // Keep ticking while fade state exists so render() can emit the final
-        // terminal frame (alpha 0 for fade-out / alpha 1 for fade-in) and then
-        // clear self.fade.
-        self.fade.is_some()
     }
 }
 
@@ -859,12 +885,41 @@ impl OverlayBackend for WaylandOverlayBackend {
             self.last_visible = intent.visible;
         }
 
+        // Detect phase changes for accent cross-fade
+        if intent.phase != self.last_phase {
+            // Only cross-fade between visible phases (entrance fade handles Hidden→visible)
+            let from = accent_color_for_phase(self.last_phase);
+            let to = accent_color_for_phase(intent.phase);
+            if let (Some(from_color), Some(to_color)) = (from, to) {
+                self.accent_transition = Some(AccentTransition {
+                    from_color,
+                    to_color,
+                    started_ms: now,
+                });
+            } else {
+                self.accent_transition = None;
+            }
+            self.last_phase = intent.phase;
+        }
+
         // Clean up completed fades
         if let Some(fade) = &self.fade {
             if fade.is_complete(now) {
                 self.fade = None;
             }
         }
+        if let Some(transition) = &self.accent_transition {
+            if transition.is_complete(now) {
+                self.accent_transition = None;
+            }
+        }
+
+        // Resolve accent color (transition blend or static)
+        let accent_color = if let Some(transition) = &self.accent_transition {
+            Some(transition.blended_color(now))
+        } else {
+            accent_color_for_phase(intent.phase)
+        };
 
         let fade_alpha = self.fade_alpha();
         let y_offset = self
@@ -872,12 +927,12 @@ impl OverlayBackend for WaylandOverlayBackend {
             .map(|f| f.slide_offset(now, self.ui.anchor))
             .unwrap_or(0.0);
         self.runtime
-            .render_with_fade(&intent, &self.ui, fade_alpha, y_offset)
+            .render_with_fade(&intent, &self.ui, fade_alpha, y_offset, accent_color)
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
     }
 
     fn is_fading(&self) -> bool {
-        WaylandOverlayBackend::is_fading(self)
+        self.fade.is_some() || self.accent_transition.is_some()
     }
 }
 
@@ -1179,6 +1234,7 @@ impl WaylandRuntime {
         ui: &OverlayUiConfig,
         fade_alpha: f32,
         y_offset: f32,
+        accent_color: Option<[u8; 4]>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1205,6 +1261,7 @@ impl WaylandRuntime {
                 fade_alpha,
                 content,
                 y_offset,
+                accent_color,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -1727,6 +1784,7 @@ fn render_frame(
     fade_alpha: f32,
     content: ContentArea,
     y_offset: f32,
+    accent_color: Option<[u8; 4]>,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -1786,7 +1844,7 @@ fn render_frame(
     );
 
     // 5. Draw accent stripe
-    if let Some(accent) = accent_color_for_phase(intent.phase) {
+    if let Some(accent) = accent_color {
         draw_accent_stripe(
             frame,
             dimensions,
@@ -2283,6 +2341,7 @@ mod tests {
             0.0,
             content,
             0.0,
+            None,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -2301,6 +2360,7 @@ mod tests {
             1.0,
             content,
             0.0,
+            accent_color_for_phase(OverlayRenderPhase::Listening),
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
@@ -2339,6 +2399,8 @@ mod tests {
             detail: None,
         };
 
+        let accent = accent_color_for_phase(OverlayRenderPhase::Listening);
+
         let mut full_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
         render_frame(
             &mut full_alpha_frame,
@@ -2349,6 +2411,7 @@ mod tests {
             1.0,
             content,
             0.0,
+            accent,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -2361,6 +2424,7 @@ mod tests {
             1.0,
             content,
             0.0,
+            accent,
         );
 
         let max_full = full_alpha_frame
@@ -2529,5 +2593,42 @@ mod tests {
             entrance > exit,
             "entrance={entrance} should exceed exit={exit}"
         );
+    }
+
+    #[test]
+    fn accent_transition_interpolates_at_midpoint() {
+        use super::AccentTransition;
+        let transition = AccentTransition {
+            from_color: [0, 0, 0, 255],
+            to_color: [200, 200, 200, 255],
+            started_ms: 0,
+        };
+        let mid = transition.blended_color(super::ACCENT_CROSSFADE_MS / 2);
+        // Each channel should be roughly halfway (100 ± rounding)
+        assert!(
+            mid[0] > 80 && mid[0] < 120,
+            "R channel midpoint: {}",
+            mid[0]
+        );
+        assert_eq!(mid[3], 255, "alpha should stay 255");
+    }
+
+    #[test]
+    fn accent_transition_completes_at_duration() {
+        use super::AccentTransition;
+        let transition = AccentTransition {
+            from_color: [10, 20, 30, 255],
+            to_color: [200, 100, 50, 255],
+            started_ms: 0,
+        };
+        let final_color = transition.blended_color(super::ACCENT_CROSSFADE_MS);
+        assert_eq!(final_color, [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn no_accent_transition_from_hidden() {
+        // When going Hidden→Listening, accent_color_for_phase(Hidden) is None,
+        // so no AccentTransition should be created (entrance fade handles it).
+        assert!(accent_color_for_phase(OverlayRenderPhase::Hidden).is_none());
     }
 }
