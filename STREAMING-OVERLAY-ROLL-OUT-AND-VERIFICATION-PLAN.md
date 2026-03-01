@@ -1,6 +1,6 @@
 # Streaming Overlay + Seal-Final Injection: Canonical Plan
 
-_Last updated: 2026-03-01 (Phase 8 commits 1–5 landed)_
+_Last updated: 2026-03-01 (Phase 8 follow-through + output-targeting startup race fix landed)_
 
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
@@ -18,7 +18,8 @@ _Last updated: 2026-03-01 (Phase 8 commits 1–5 landed)_
 - [x] Phase 6: E2E reliability and promotion gates.
 - [x] Phase 7: Visual overhaul — dark frosted-glass panel, rounded corners, soft shadow, accent stripe, text shadows, premultiplied alpha, font cascade, 250ms ease-out-cubic fade transitions.
 - [x] Phase 8 (P0–P2): Overlay UX polish — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress bar + success flash.
-- [ ] Phase 8 (deferred): cursor-spawn placement (8.4), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8). See **§ Overlay UX Roadmap**.
+- [x] Phase 8 (P3 follow-through): active-output tracking (8.4 Tier 1), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8).
+- [ ] Phase 8 (remaining deferred): cursor-spawn placement (8.4 Tier 2). See **§ Overlay UX Roadmap**.
 
 ## Implementation Log
 - 2026-02-28: Established dedicated overlay worktree/branch from latest `origin/main`.
@@ -69,6 +70,9 @@ _Last updated: 2026-03-01 (Phase 8 commits 1–5 landed)_
 - 2026-03-01: Phase 8.1 (color) — added 150ms linear RGB cross-fade on accent stripe during visible phase transitions (Listening↔Interim↔Finalizing). Hidden→visible transitions handled by entrance fade.
 - 2026-03-01: Phase 8.2 — added 12 rotating listening phrases (3s rotation cycle, 200ms cross-fade) and staggered ellipsis dot animation (1200ms cycle, 200ms per-dot delay). Starting phrase seeded from wall-clock time.
 - 2026-03-01: Phase 8.5 — added 2px indeterminate progress bar during Finalizing (1500ms sweep, 30% segment width with soft edges) and 200ms green success flash on Finalizing→Hidden transition.
+- 2026-03-01: Phase 8.4 Tier 1 — added active-output tracking from Wayland focus metadata through overlay spawn (`--output-name`) so layer-shell targets the focused monitor.
+- 2026-03-01: Phase 8.6/8.7/8.8 — landed interim character fade-in, subtle listening-phase accent breathing, and adaptive panel width animation for short/long utterances.
+- 2026-03-01: Startup race finding — `OverlayProcessManager` could spawn before focus cache output readiness and lock monitor targeting for process lifetime; decision was to defer output-targeted spawn until output hint/readiness is known and replay latest overlay state after hint-triggered spawn.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -103,6 +107,7 @@ _Last updated: 2026-03-01 (Phase 8 commits 1–5 landed)_
 - 2026-02-28 (Phase 6 promotion gate): `just --justfile justfile.overlay-dev phase6-promotion 3` passed (three consecutive clean `phase6-contract` runs + stream/seal regression gate) and generated artifact `/tmp/parakeet-overlay-phase6-gate-20260228-224327.log`; stream-seal vs offline deltas were weighted WER `+0.000514`, strict command exact match `+0.020000`, normalized command exact match `+0.020000`, intent+slot match `+0.020000`, critical token recall `+0.007782`, punctuation F1 `+0.018368`, terminal punctuation accuracy `+0.000000`, and warm finalize P95 `+2.828343 ms`.
 
 - 2026-03-01 (Phase 8 commits 1–5): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 32 tests), including `default_cli_anchor_is_bottom_center`, `ease_in_cubic_boundaries`, `slide_offset_entrance_ends_at_zero`, `slide_offset_exit_starts_at_zero`, `entrance_duration_longer_than_exit`, `accent_transition_interpolates_at_midpoint`, `accent_transition_completes_at_duration`, `no_accent_transition_from_hidden`, `phrase_advances_after_interval`, `dot_opacities_stagger_correctly`, `dots_reset_after_cycle`, `crossfade_active_during_rotation_window`, `progress_segment_wraps_at_duration`, `success_flash_active_during_window`, `success_flash_triggers_on_finalizing_exit`.
+- 2026-03-01 (Phase 8 follow-through + output-targeting race fix): `cd parakeet-ptt && cargo fmt && cargo test` passed (lib: 9 tests, overlay binary unit target: 47 tests, `src/main.rs`: 59 tests), including `output_targeted_manager_waits_for_hint_and_replays_latest_state`, `focus_snapshot_includes_output_name`, `char_fadein_zero_at_start`, `breathing_modulates_alpha_at_quarter_cycle`, and adaptive-width bounds tests.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -421,7 +426,7 @@ Transformed the overlay from a flat phase-colored rectangle into a polished dark
 
 ---
 
-## Phase 8: Overlay UX Polish (P0–P2 Complete)
+## Phase 8: Overlay UX Polish (P0–P3 Complete, Tier 2 Deferred)
 
 ### What Shipped
 - **8.3 — BottomCenter default**: anchor changed from `TopCenter` to `BottomCenter`, vertical margin bumped from 24→32px to clear taskbar/dock areas.
@@ -429,8 +434,18 @@ Transformed the overlay from a flat phase-colored rectangle into a polished dark
 - **8.1 — Accent cross-fade**: 150ms linear RGB interpolation on accent stripe when transitioning between visible phases. Entrance fade handles Hidden→visible.
 - **8.2 — Animated listening text**: 12 rotating flavor phrases on a 3s cycle with 200ms cross-fade. Staggered 3-dot ellipsis animation (1200ms cycle, 200ms per-dot delay). Starting phrase seeded from wall-clock time.
 - **8.5 — Progress bar + success flash**: 2px indeterminate sweep bar during Finalizing (1500ms cycle, 30% segment, soft edges). 200ms green success flash on Finalizing→Hidden exit overrides accent stripe.
-- **Tests**: 15 new unit tests (32 total in overlay binary), all passing with `cargo clippy --all-targets -- -D warnings`.
-- **Files modified**: `parakeet-ptt/src/bin/parakeet-overlay.rs` only (all 5 commits).
+- **8.4 Tier 1 — Active-output tracking**: wired focused-output names through the Wayland focus cache and process spawn path so layer-shell overlay startup targets the active monitor.
+- **8.6 — Interim character fade-in**: shared-prefix diffing + 100ms alpha ramp for newly appended interim text to reduce full-string flicker.
+- **8.7 — Listening breathing**: subtle ±5% accent alpha oscillation during Listening only (paused during accent transitions and non-listening phases).
+- **8.8 — Adaptive width**: measured-text width targets with ~200ms easing, min/max clamps, and interim growth bias to avoid jarring panel shrink while streaming.
+- **Startup targeting hardening**: fixed output-targeting startup race by deferring output-targeted spawn until output hint/readiness and replaying latest non-hint state after hint-triggered spawn.
+- **Tests**: overlay binary now at 47 unit tests; `src/main.rs` now at 59 tests, including output-targeted spawn deferral/replay coverage.
+- **Files modified**: renderer + routing/focus/process plumbing (`parakeet-ptt/src/bin/parakeet-overlay.rs`, `src/main.rs`, `src/overlay_process.rs`, `src/surface_focus.rs`, `src/overlay_ipc.rs`, `src/overlay_state.rs`).
+
+### Findings and Decisions (2026-03-01)
+- **Finding**: eager overlay spawn could run before focus cache output readiness, leading to untargeted startup and monitor lock-in for the child lifetime.
+- **Decision**: require output readiness for targeted startup, emit output hints before interim events, and replay latest overlay state after hint-driven spawn.
+- **Deferred**: cursor-spawn placement (8.4 Tier 2) remains intentionally deferred until Tier 1 stability is observed under longer multi-monitor soak runs.
 
 ### Design Direction
 The overlay should feel like it belongs on a premium desktop — invisible when idle, delightful when active, and always spatially intuitive. Every interaction should feel like the system is alive and responsive, not just flipping visibility flags.
@@ -538,11 +553,11 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 | **P1** | 8.1 — Accent stripe cross-fade | **Done** | Low | Medium — smooth phase transitions |
 | **P1** | 8.2 — Animated ellipsis + flavor text | **Done** | Low-Medium | High — overlay feels alive |
 | **P2** | 8.5 — Finalizing progress + success flash | **Done** | Low | Medium — reduces anxiety |
-| **P2** | 8.4 Tier 1 — Active-output tracking | Deferred | Medium | High on multi-monitor setups |
+| **P2** | 8.4 Tier 1 — Active-output tracking | **Done** | Medium | High on multi-monitor setups |
 | **P2** | 8.4 Tier 2 — Cursor-spawn positioning | Deferred | Medium | Medium — spawn where user is looking |
-| **P3** | 8.6 — Interim text character fade-in | Deferred | Medium | Medium — polish for streaming feel |
-| **P3** | 8.7 — Idle breathing | Deferred | Trivial | Low — subtle polish |
-| **P3** | 8.8 — Adaptive width | Deferred | Medium | Medium — cleaner look for short text |
+| **P3** | 8.6 — Interim text character fade-in | **Done** | Medium | Medium — polish for streaming feel |
+| **P3** | 8.7 — Idle breathing | **Done** | Trivial | Low — subtle polish |
+| **P3** | 8.8 — Adaptive width | **Done** | Medium | Medium — cleaner look for short text |
 
 ---
 
@@ -555,4 +570,4 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 6. Phase 5 config/flag wiring + precedence tests.
 7. Phase 6 E2E/reliability harness + rollout defaults.
 8. Phase 7 visual overhaul — design system, rounded corners, shadow, accent stripe, text shadows, premultiplied alpha, fade transitions.
-9. Phase 8 UX polish (landed) — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress bar + success flash. Deferred: cursor-spawn placement (8.4), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8).
+9. Phase 8 UX polish (landed) — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress/success flash, active-output tracking, interim fade-in, listening breathing, and adaptive width. Remaining deferment: cursor-spawn placement (8.4 Tier 2).
