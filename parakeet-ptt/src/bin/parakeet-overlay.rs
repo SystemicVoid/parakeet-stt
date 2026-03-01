@@ -459,6 +459,13 @@ fn accent_color_for_phase(phase: OverlayRenderPhase) -> Option<[u8; 4]> {
     }
 }
 
+fn should_trigger_success_flash(
+    previous_phase: OverlayRenderPhase,
+    next_phase: OverlayRenderPhase,
+) -> bool {
+    previous_phase == OverlayRenderPhase::Finalizing && next_phase == OverlayRenderPhase::Hidden
+}
+
 fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     let inv = 1.0 - t;
@@ -1093,8 +1100,8 @@ impl OverlayBackend for WaylandOverlayBackend {
             if intent.phase == OverlayRenderPhase::Finalizing {
                 self.finalizing_started_ms = Some(now);
             } else {
-                // Trigger success flash on Finalizing→Hidden exit
-                if self.last_phase == OverlayRenderPhase::Finalizing {
+                // Trigger success flash only on Finalizing→Hidden exit
+                if should_trigger_success_flash(self.last_phase, intent.phase) {
                     self.success_flash = Some(SuccessFlash { started_ms: now });
                 }
                 self.finalizing_started_ms = None;
@@ -3059,7 +3066,7 @@ mod tests {
 
     #[test]
     fn success_flash_triggers_on_finalizing_exit() {
-        // SuccessFlash should be created when transitioning away from Finalizing.
+        // SuccessFlash should be created when transitioning Finalizing→Hidden.
         // This tests the SuccessFlash struct's basic behavior (integration with
         // WaylandOverlayBackend is tested via the render loop).
         use super::SuccessFlash;
@@ -3070,5 +3077,21 @@ mod tests {
         assert_eq!(color[1], super::SUCCESS_FLASH_COLOR[1]);
         assert_eq!(color[2], super::SUCCESS_FLASH_COLOR[2]);
         assert!(color[3] > 200, "initial flash alpha should be near-full");
+    }
+
+    #[test]
+    fn success_flash_only_triggers_on_finalizing_to_hidden() {
+        assert!(super::should_trigger_success_flash(
+            OverlayRenderPhase::Finalizing,
+            OverlayRenderPhase::Hidden
+        ));
+        assert!(!super::should_trigger_success_flash(
+            OverlayRenderPhase::Finalizing,
+            OverlayRenderPhase::Listening
+        ));
+        assert!(!super::should_trigger_success_flash(
+            OverlayRenderPhase::Interim,
+            OverlayRenderPhase::Hidden
+        ));
     }
 }
