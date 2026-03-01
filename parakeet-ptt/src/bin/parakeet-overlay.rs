@@ -47,7 +47,10 @@ const PADDING_V: u32 = 16;
 const PADDING_LEFT: u32 = 32;
 const ACCENT_STRIPE_WIDTH: f32 = 3.0;
 const ACCENT_STRIPE_MARGIN: f32 = 6.0;
-const FADE_DURATION_MS: u64 = 250;
+const ENTRANCE_DURATION_MS: u64 = 300;
+const EXIT_DURATION_MS: u64 = 250;
+const ENTRANCE_SLIDE_PX: f32 = 7.0;
+const EXIT_SLIDE_PX: f32 = 5.0;
 
 const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
@@ -435,6 +438,11 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - inv * inv * inv
 }
 
+fn ease_in_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FadeDirection {
     In,
@@ -460,6 +468,31 @@ impl FadeState {
 
     fn is_complete(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.started_ms) >= self.duration_ms
+    }
+
+    /// Compute vertical slide offset in pixels.
+    /// Positive = toward screen edge (downward for Bottom*, upward for Top*).
+    fn slide_offset(&self, now_ms: u64, anchor: CliAnchor) -> f32 {
+        let elapsed = now_ms.saturating_sub(self.started_ms) as f32;
+        let t = (elapsed / self.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+        let is_bottom = matches!(
+            anchor,
+            CliAnchor::BottomLeft | CliAnchor::BottomCenter | CliAnchor::BottomRight
+        );
+        // Sign: positive pushes toward screen edge
+        let sign = if is_bottom { 1.0 } else { -1.0 };
+        match self.direction {
+            FadeDirection::In => {
+                // Start offset, ease to 0
+                let remaining = 1.0 - ease_out_cubic(t);
+                sign * ENTRANCE_SLIDE_PX * remaining
+            }
+            FadeDirection::Out => {
+                // Start at 0, ease to offset
+                let progress = ease_in_cubic(t);
+                sign * EXIT_SLIDE_PX * progress
+            }
+        }
     }
 }
 
@@ -810,14 +843,18 @@ impl OverlayBackend for WaylandOverlayBackend {
 
         // Detect visibility transitions
         if intent.visible != self.last_visible {
+            let direction = if intent.visible {
+                FadeDirection::In
+            } else {
+                FadeDirection::Out
+            };
             self.fade = Some(FadeState {
-                direction: if intent.visible {
-                    FadeDirection::In
-                } else {
-                    FadeDirection::Out
-                },
+                direction,
                 started_ms: now,
-                duration_ms: FADE_DURATION_MS,
+                duration_ms: match direction {
+                    FadeDirection::In => ENTRANCE_DURATION_MS,
+                    FadeDirection::Out => EXIT_DURATION_MS,
+                },
             });
             self.last_visible = intent.visible;
         }
@@ -830,8 +867,12 @@ impl OverlayBackend for WaylandOverlayBackend {
         }
 
         let fade_alpha = self.fade_alpha();
+        let y_offset = self
+            .fade
+            .map(|f| f.slide_offset(now, self.ui.anchor))
+            .unwrap_or(0.0);
         self.runtime
-            .render_with_fade(&intent, &self.ui, fade_alpha)
+            .render_with_fade(&intent, &self.ui, fade_alpha, y_offset)
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind))
     }
 
@@ -1137,6 +1178,7 @@ impl WaylandRuntime {
         intent: &OverlayRenderIntent,
         ui: &OverlayUiConfig,
         fade_alpha: f32,
+        y_offset: f32,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1162,6 +1204,7 @@ impl WaylandRuntime {
                 &self.text_renderer,
                 fade_alpha,
                 content,
+                y_offset,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -1674,6 +1717,7 @@ fn argb_pixel(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [b, g, r, a]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut [u8],
     dimensions: SurfaceDimensions,
@@ -1682,6 +1726,7 @@ fn render_frame(
     text_renderer: &TextRenderer,
     fade_alpha: f32,
     content: ContentArea,
+    y_offset: f32,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -1690,6 +1735,16 @@ fn render_frame(
     if frame_alpha <= 0.0 {
         return;
     }
+
+    // Apply slide offset, clamped within shadow region
+    let max_slide = SHADOW_RADIUS as f32;
+    let offset_y = y_offset.clamp(-max_slide, max_slide);
+    let content = ContentArea {
+        y: (content.y as f32 + offset_y)
+            .round()
+            .clamp(0.0, (dimensions.height - content.height) as f32) as u32,
+        ..content
+    };
 
     let content_rect = Rect {
         x: content.x as f32,
@@ -2227,6 +2282,7 @@ mod tests {
             &text_renderer,
             0.0,
             content,
+            0.0,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -2244,6 +2300,7 @@ mod tests {
             &text_renderer,
             1.0,
             content,
+            0.0,
         );
         assert!(visible_frame.chunks_exact(4).any(|pixel| pixel[3] > 0));
     }
@@ -2291,6 +2348,7 @@ mod tests {
             &text_renderer,
             1.0,
             content,
+            0.0,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -2302,6 +2360,7 @@ mod tests {
             &text_renderer,
             1.0,
             content,
+            0.0,
         );
 
         let max_full = full_alpha_frame
@@ -2415,5 +2474,60 @@ mod tests {
         let cli = super::Cli::parse_from(["parakeet-overlay"]);
         assert!(matches!(cli.anchor, CliAnchor::BottomCenter));
         assert_eq!(cli.margin_y, 32);
+    }
+
+    #[test]
+    fn ease_in_cubic_boundaries() {
+        use super::ease_in_cubic;
+        assert!((ease_in_cubic(0.0) - 0.0).abs() < f32::EPSILON);
+        assert!((ease_in_cubic(1.0) - 1.0).abs() < f32::EPSILON);
+        // Ease-in should be < linear at midpoint
+        assert!(ease_in_cubic(0.5) < 0.5);
+        // Monotonically increasing
+        let mut prev = 0.0f32;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let v = ease_in_cubic(t);
+            assert!(v >= prev, "not monotonic at t={t}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn slide_offset_entrance_ends_at_zero() {
+        let fade = FadeState {
+            direction: FadeDirection::In,
+            started_ms: 0,
+            duration_ms: super::ENTRANCE_DURATION_MS,
+        };
+        let offset = fade.slide_offset(super::ENTRANCE_DURATION_MS, CliAnchor::BottomCenter);
+        assert!(
+            offset.abs() < 0.01,
+            "entrance slide should end at zero, got {offset}"
+        );
+    }
+
+    #[test]
+    fn slide_offset_exit_starts_at_zero() {
+        let fade = FadeState {
+            direction: FadeDirection::Out,
+            started_ms: 100,
+            duration_ms: super::EXIT_DURATION_MS,
+        };
+        let offset = fade.slide_offset(100, CliAnchor::BottomCenter);
+        assert!(
+            offset.abs() < 0.01,
+            "exit slide should start at zero, got {offset}"
+        );
+    }
+
+    #[test]
+    fn entrance_duration_longer_than_exit() {
+        let entrance = super::ENTRANCE_DURATION_MS;
+        let exit = super::EXIT_DURATION_MS;
+        assert!(
+            entrance > exit,
+            "entrance={entrance} should exceed exit={exit}"
+        );
     }
 }
