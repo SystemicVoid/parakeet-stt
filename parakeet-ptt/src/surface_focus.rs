@@ -159,8 +159,10 @@ impl WaylandFocusCache {
         match self.observe(1_500, 250) {
             WaylandFocusObservation::Fresh { snapshot, .. } => snapshot.output_name,
             WaylandFocusObservation::LowConfidence {
-                snapshot, reason, ..
-            } if reason == "wayland_transition_no_activated" => snapshot.output_name,
+                snapshot,
+                reason: "wayland_transition_no_activated",
+                ..
+            } => snapshot.output_name,
             WaylandFocusObservation::Unavailable { .. } => None,
             WaylandFocusObservation::LowConfidence { .. } => None,
         }

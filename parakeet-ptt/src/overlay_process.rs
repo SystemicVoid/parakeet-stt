@@ -263,10 +263,12 @@ impl OverlayProcessManager {
 
         match self.try_send_to_active(message.clone()) {
             Ok(()) => {
-                if sink_was_missing && is_output_hint && self.latest_message.is_some() {
-                    if self.replay_latest_message().is_err() {
-                        self.metrics.note_replay_dropped();
-                    }
+                if sink_was_missing
+                    && is_output_hint
+                    && self.latest_message.is_some()
+                    && self.replay_latest_message().is_err()
+                {
+                    self.metrics.note_replay_dropped();
                 }
                 return;
             }
