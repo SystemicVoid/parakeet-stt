@@ -1,6 +1,6 @@
 # Streaming Overlay + Seal-Final Injection: Canonical Plan
 
-_Last updated: 2026-03-01 (Phase 8 follow-through + output-targeting startup race fix landed)_
+_Last updated: 2026-03-02 (live UX findings: monitor targeting, listening text cycling, finalizing animation)_
 
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
@@ -73,6 +73,9 @@ _Last updated: 2026-03-01 (Phase 8 follow-through + output-targeting startup rac
 - 2026-03-01: Phase 8.4 Tier 1 — added active-output tracking from Wayland focus metadata through overlay spawn (`--output-name`) so layer-shell targets the focused monitor.
 - 2026-03-01: Phase 8.6/8.7/8.8 — landed interim character fade-in, subtle listening-phase accent breathing, and adaptive panel width animation for short/long utterances.
 - 2026-03-01: Startup race finding — `OverlayProcessManager` could spawn before focus cache output readiness and lock monitor targeting for process lifetime; decision was to defer output-targeted spawn until output hint/readiness is known and replay latest overlay state after hint-triggered spawn.
+- 2026-03-01: Startup targeting hardening follow-up — added a one-shot output-name watchdog fallback in `OverlayProcessManager`: if focused output remains unavailable past a short timeout, spawn once without `--output-name` and log a warning to avoid permanent overlay invisibility.
+- 2026-03-01: Visual artifact finding (deferred) — after Finalizing→Hidden on adaptive-width utterances, residual frame slices can remain on-screen (ghosted previous widths). Logged from live run screenshot; renderer cleanup fix is deferred.
+- 2026-03-02: Ghosted slices fix — tracking previous committed width and damaging the width union on shrink paths ensures stale pixels are cleared. Added shrink-damage unit tests to overlay binary.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -109,6 +112,8 @@ _Last updated: 2026-03-01 (Phase 8 follow-through + output-targeting startup rac
 - 2026-03-01 (Phase 8 commits 1–5): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 32 tests), including `default_cli_anchor_is_bottom_center`, `ease_in_cubic_boundaries`, `slide_offset_entrance_ends_at_zero`, `slide_offset_exit_starts_at_zero`, `entrance_duration_longer_than_exit`, `accent_transition_interpolates_at_midpoint`, `accent_transition_completes_at_duration`, `no_accent_transition_from_hidden`, `phrase_advances_after_interval`, `dot_opacities_stagger_correctly`, `dots_reset_after_cycle`, `crossfade_active_during_rotation_window`, `progress_segment_wraps_at_duration`, `success_flash_active_during_window`, `success_flash_triggers_on_finalizing_exit`.
 - 2026-03-01 (Phase 8 follow-through + output-targeting race fix): `cd parakeet-ptt && cargo fmt && cargo test` passed (lib: 9 tests, overlay binary unit target: 47 tests, `src/main.rs`: 59 tests), including `output_targeted_manager_waits_for_hint_and_replays_latest_state`, `focus_snapshot_includes_output_name`, `char_fadein_zero_at_start`, `breathing_modulates_alpha_at_quarter_cycle`, and adaptive-width bounds tests.
 - 2026-03-01 (post-review lint gate): `cd parakeet-ptt && cargo clippy --all-targets -- -D warnings` passed after startup race-fix follow-up cleanup.
+- 2026-03-01 (output watchdog fallback): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (`src/main.rs`: 61 tests), including new `overlay_process::tests::output_watchdog_spawns_once_without_output_targeting`.
+- 2026-03-02 (ghosted slices fix): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 51 tests), including new shrink-damage width tests proving stale pixels are cleared on adaptive width shrink. Fix tracks previous committed width and damages the width union on shrink paths.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
@@ -439,14 +444,21 @@ Transformed the overlay from a flat phase-colored rectangle into a polished dark
 - **8.6 — Interim character fade-in**: shared-prefix diffing + 100ms alpha ramp for newly appended interim text to reduce full-string flicker.
 - **8.7 — Listening breathing**: subtle ±5% accent alpha oscillation during Listening only (paused during accent transitions and non-listening phases).
 - **8.8 — Adaptive width**: measured-text width targets with ~200ms easing, min/max clamps, and interim growth bias to avoid jarring panel shrink while streaming.
-- **Startup targeting hardening**: fixed output-targeting startup race by deferring output-targeted spawn until output hint/readiness and replaying latest non-hint state after hint-triggered spawn.
-- **Tests**: overlay binary now at 47 unit tests; `src/main.rs` now at 59 tests, including output-targeted spawn deferral/replay coverage.
+- **Startup targeting hardening**: fixed output-targeting startup race by deferring output-targeted spawn until output hint/readiness, replaying latest non-hint state after hint-triggered spawn, and adding a one-shot watchdog fallback spawn (without `--output-name`) to avoid permanent invisibility when focus output never resolves.
+- **Tests**: overlay binary now at 47 unit tests; `src/main.rs` now at 61 tests, including output-targeted spawn deferral/replay coverage and watchdog fallback coverage.
 - **Files modified**: renderer + routing/focus/process plumbing (`parakeet-ptt/src/bin/parakeet-overlay.rs`, `src/main.rs`, `src/overlay_process.rs`, `src/surface_focus.rs`, `src/overlay_ipc.rs`, `src/overlay_state.rs`).
 
 ### Findings and Decisions (2026-03-01)
 - **Finding**: eager overlay spawn could run before focus cache output readiness, leading to untargeted startup and monitor lock-in for the child lifetime.
 - **Decision**: require output readiness for targeted startup, emit output hints before interim events, and replay latest overlay state after hint-driven spawn.
+- **Decision (hardening)**: if output targeting remains unresolved past watchdog timeout, allow exactly one fallback spawn without `--output-name` and emit a warning, prioritizing visibility over perfect monitor targeting.
+- **Known issue (FIXED 2026-03-02)**: Finalizing→Hidden can leave ghosted width slices from prior adaptive-width frames. Root cause was incomplete damage-region cleanup on shrink — fixed by tracking previous committed width and damaging the width union on shrink paths. See commit `51cf52b`.
 - **Deferred**: cursor-spawn placement (8.4 Tier 2) remains intentionally deferred until Tier 1 stability is observed under longer multi-monitor soak runs.
+
+### Findings and Decisions (2026-03-02)
+- **Finding (monitor targeting)**: live observation shows overlay still appears on wrong monitor most of the time despite Tier 1 output tracking implementation. The focus cache may be returning stale/unavailable output names, or the timing between focus cache readiness and overlay spawn is still misaligned. Root cause investigation needed — not yet clear if this is code behavior or intended design.
+- **Finding (listening text cycling)**: the 12 rotating listening phrases (8.2) are not cycling as implemented. The overlay shows only a single static phrase instead of cycling through the phrases every 3 seconds. This appears to be a renderer or state tick bug rather than a state machine issue. **Key observation**: this bug only occurs on the first time the overlay renders after PTT daemon start. After completing a transcription cycle (overlay appears, text flows, gets hidden), subsequent overlay spawns work correctly and phrases cycle as expected. This suggests an initialization issue in the first render cycle.
+- **Finding (finalizing UX)**: the "Finalizing..." text at session end shows static text instead of an animation. The current implementation displays stock "Finalizing..." text during the finalizing phase, but the original design intent (8.5) was for an indeterminate progress bar + success flash. The progress bar exists but is too thin (2px) and subtle to be noticeable — only a faint hint at the bottom edge. Consider thickening the progress bar and/or replacing the static final text with a brief animation (e.g., pulsing or shrinking) to improve UX at the critical final-to-hidden transition.
 
 ### Design Direction
 The overlay should feel like it belongs on a premium desktop — invisible when idle, delightful when active, and always spatially intuitive. Every interaction should feel like the system is alive and responsive, not just flipping visibility flags.
