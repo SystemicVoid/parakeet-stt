@@ -57,6 +57,7 @@ const EXIT_SLIDE_PX: f32 = 5.0;
 const BREATHING_CYCLE_MS: u64 = 3000;
 const BREATHING_AMPLITUDE: f32 = 0.05;
 const CHAR_FADEIN_MS: u64 = 100;
+const CHAR_STAGGER_MS: u64 = 16;
 const MIN_PANEL_WIDTH: u32 = 200;
 const WIDTH_ANIM_MS: u64 = 200;
 
@@ -636,8 +637,27 @@ fn shared_prefix_len(previous: &str, current: &str) -> usize {
         .count()
 }
 
+fn appended_suffix_start(previous: &str, current: &str) -> Option<usize> {
+    let shared = shared_prefix_len(previous, current);
+    let previous_len = previous.chars().count();
+    let current_len = current.chars().count();
+    if shared == previous_len && current_len > previous_len {
+        Some(shared)
+    } else {
+        None
+    }
+}
+
 fn interim_char_fade_alpha(now_ms: u64, changed_ms: u64) -> f32 {
     (now_ms.saturating_sub(changed_ms) as f32 / CHAR_FADEIN_MS.max(1) as f32).clamp(0.0, 1.0)
+}
+
+fn staggered_char_fade_alpha(elapsed_ms: u64, prefix_len: usize, char_index: usize) -> f32 {
+    if char_index < prefix_len {
+        return 1.0;
+    }
+    let stagger_start_ms = (char_index.saturating_sub(prefix_len) as u64) * CHAR_STAGGER_MS;
+    interim_char_fade_alpha(elapsed_ms, stagger_start_ms)
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -1160,6 +1180,7 @@ impl TextRenderer {
         max_lines: u32,
         text: &str,
         fade_alpha: f32,
+        interim_fade: Option<(usize, u64)>,
     ) {
         let Some(font) = &self.font else {
             return;
@@ -1180,23 +1201,35 @@ impl TextRenderer {
         let baseline_start =
             content.y as i32 + PADDING_V as i32 + self.summary.size_px.ceil() as i32;
         let text_x_start = content.x as i32 + PADDING_LEFT as i32;
-        let text_alpha = (fade_alpha * 255.0).round() as u8;
-        let text_color_premul = argb_pixel_premul(
-            TEXT_COLOR_RGB.0,
-            TEXT_COLOR_RGB.1,
-            TEXT_COLOR_RGB.2,
-            text_alpha,
-        );
-        let shadow_alpha = ((TEXT_SHADOW_COLOR[3] as f32) * fade_alpha).round() as u8;
-        let text_shadow_premul = argb_pixel_premul(0, 0, 0, shadow_alpha);
 
         let mut baseline = baseline_start;
+        let mut char_index = 0usize;
         for line in lines {
             let mut cursor_x = text_x_start as f32;
             for character in line.chars() {
+                let per_char_alpha = if let Some((prefix_len, elapsed_ms)) = interim_fade {
+                    fade_alpha * staggered_char_fade_alpha(elapsed_ms, prefix_len, char_index)
+                } else {
+                    fade_alpha
+                };
+                char_index = char_index.saturating_add(1);
+                if per_char_alpha <= 0.0 {
+                    let metrics = font.metrics(character, self.summary.size_px);
+                    cursor_x += metrics.advance_width;
+                    continue;
+                }
                 let (metrics, bitmap) = font.rasterize(character, self.summary.size_px);
                 let glyph_x = cursor_x.floor() as i32 + metrics.xmin;
                 let glyph_y = baseline - metrics.height as i32 - metrics.ymin;
+                let text_alpha = (per_char_alpha * 255.0).round() as u8;
+                let text_color_premul = argb_pixel_premul(
+                    TEXT_COLOR_RGB.0,
+                    TEXT_COLOR_RGB.1,
+                    TEXT_COLOR_RGB.2,
+                    text_alpha,
+                );
+                let shadow_alpha = ((TEXT_SHADOW_COLOR[3] as f32) * per_char_alpha).round() as u8;
+                let text_shadow_premul = argb_pixel_premul(0, 0, 0, shadow_alpha);
                 // Shadow pass (+0, +1)
                 blend_bitmap(
                     frame,
@@ -1369,19 +1402,32 @@ impl WaylandOverlayBackend {
         }
 
         if self.prev_headline != intent.headline {
-            self.shared_prefix_len = shared_prefix_len(&self.prev_headline, &intent.headline);
-            self.headline_changed_ms = Some(now_ms);
+            if let Some(prefix_start) = appended_suffix_start(&self.prev_headline, &intent.headline)
+            {
+                self.shared_prefix_len = prefix_start;
+                self.headline_changed_ms = Some(now_ms);
+            } else {
+                self.shared_prefix_len = 0;
+                self.headline_changed_ms = None;
+            }
         }
     }
 
-    fn interim_fade_state(&mut self, now_ms: u64) -> Option<(usize, f32)> {
+    fn interim_fade_state(&mut self, now_ms: u64, text: &str) -> Option<(usize, u64)> {
         let changed_ms = self.headline_changed_ms?;
-        let fade = interim_char_fade_alpha(now_ms, changed_ms);
-        if fade >= 1.0 {
+        let elapsed = now_ms.saturating_sub(changed_ms);
+        let suffix_len = text.chars().count().saturating_sub(self.shared_prefix_len);
+        if suffix_len == 0 {
             self.headline_changed_ms = None;
             return None;
         }
-        Some((self.shared_prefix_len, fade))
+        let total_duration = CHAR_FADEIN_MS
+            .saturating_add((suffix_len.saturating_sub(1) as u64).saturating_mul(CHAR_STAGGER_MS));
+        if elapsed >= total_duration {
+            self.headline_changed_ms = None;
+            return None;
+        }
+        Some((self.shared_prefix_len, elapsed))
     }
 }
 
@@ -1524,7 +1570,7 @@ impl OverlayBackend for WaylandOverlayBackend {
             fixed_width.round() as u32
         };
         let interim_fade = if intent.phase == OverlayRenderPhase::Interim {
-            self.interim_fade_state(now)
+            self.interim_fade_state(now, &intent.headline)
         } else {
             None
         };
@@ -1923,7 +1969,7 @@ impl WaylandRuntime {
         now_ms: u64,
         finalizing_started_ms: Option<u64>,
         effective_surface_width: u32,
-        interim_fade: Option<(usize, f32)>,
+        interim_fade: Option<(usize, u64)>,
         vu_state: Option<&AudioVuState>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
@@ -2528,7 +2574,7 @@ fn render_frame(
     listening_anim: Option<&ListeningAnimState>,
     now_ms: u64,
     finalizing_started_ms: Option<u64>,
-    interim_fade: Option<(usize, f32)>,
+    interim_fade: Option<(usize, u64)>,
     vu_state: Option<&AudioVuState>,
 ) {
     // 1. Clear to transparent
@@ -2639,6 +2685,7 @@ fn render_frame(
                 ui.max_lines,
                 &out_text,
                 frame_alpha * (1.0 - t),
+                None,
             );
             text_renderer.draw_headline(
                 frame,
@@ -2648,6 +2695,7 @@ fn render_frame(
                 ui.max_lines,
                 &in_text,
                 frame_alpha * t,
+                None,
             );
         } else {
             let text = format_phrase_with_dots(phrase, &dot_opacities);
@@ -2659,6 +2707,7 @@ fn render_frame(
                 ui.max_lines,
                 &text,
                 frame_alpha,
+                None,
             );
         }
     } else {
@@ -2674,51 +2723,21 @@ fn render_frame(
             headline.to_string()
         };
 
-        if intent.phase == OverlayRenderPhase::Interim {
-            if let Some((prefix_len, new_char_alpha)) = interim_fade {
-                text_renderer.draw_headline(
-                    frame,
-                    dimensions,
-                    content,
-                    content.width,
-                    ui.max_lines,
-                    &text,
-                    frame_alpha * new_char_alpha,
-                );
-                if prefix_len > 0 {
-                    let prefix_text = text.chars().take(prefix_len).collect::<String>();
-                    text_renderer.draw_headline(
-                        frame,
-                        dimensions,
-                        content,
-                        content.width,
-                        ui.max_lines,
-                        &prefix_text,
-                        frame_alpha,
-                    );
-                }
-            } else {
-                text_renderer.draw_headline(
-                    frame,
-                    dimensions,
-                    content,
-                    content.width,
-                    ui.max_lines,
-                    &text,
-                    frame_alpha,
-                );
-            }
+        let per_char_fade = if intent.phase == OverlayRenderPhase::Interim {
+            interim_fade
         } else {
-            text_renderer.draw_headline(
-                frame,
-                dimensions,
-                content,
-                content.width,
-                ui.max_lines,
-                &text,
-                frame_alpha,
-            );
-        }
+            None
+        };
+        text_renderer.draw_headline(
+            frame,
+            dimensions,
+            content,
+            content.width,
+            ui.max_lines,
+            &text,
+            frame_alpha,
+            per_char_fade,
+        );
     }
 }
 
@@ -3039,13 +3058,14 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_color_for_phase, apply_breathing_alpha, damage_width_for_commit, ease_out_cubic,
-        interim_char_fade_alpha, layout_text_lines, output_name_match_index, parse_font_descriptor,
-        parse_generic_family_kind, render_frame, resolve_adaptive_width_with_env_input,
-        resolve_backend_selection, rounded_rect_coverage, shared_prefix_len,
-        should_apply_breathing, BackendSelection, BackendSignals, CliAnchor, CliBackendMode,
-        FadeDirection, FadeState, FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor,
-        Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS, CHAR_FADEIN_MS, SHADOW_RADIUS,
+        accent_color_for_phase, appended_suffix_start, apply_breathing_alpha,
+        damage_width_for_commit, ease_out_cubic, interim_char_fade_alpha, layout_text_lines,
+        output_name_match_index, parse_font_descriptor, parse_generic_family_kind, render_frame,
+        resolve_adaptive_width_with_env_input, resolve_backend_selection, rounded_rect_coverage,
+        shared_prefix_len, should_apply_breathing, staggered_char_fade_alpha, BackendSelection,
+        BackendSignals, CliAnchor, CliBackendMode, FadeDirection, FadeState, FontResolutionSummary,
+        OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS,
+        CHAR_FADEIN_MS, CHAR_STAGGER_MS, SHADOW_RADIUS,
     };
     use clap::Parser;
     use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
@@ -3204,6 +3224,14 @@ mod tests {
     }
 
     #[test]
+    fn appended_suffix_detects_tail_growth_only() {
+        assert_eq!(appended_suffix_start("hello", "hello world"), Some(5));
+        assert_eq!(appended_suffix_start("hello world", "hello"), None);
+        assert_eq!(appended_suffix_start("hello world", "hello rust"), None);
+        assert_eq!(appended_suffix_start("", "hello"), Some(0));
+    }
+
+    #[test]
     fn char_fadein_zero_at_start() {
         assert_eq!(interim_char_fade_alpha(100, 100), 0.0);
     }
@@ -3211,6 +3239,20 @@ mod tests {
     #[test]
     fn char_fadein_full_at_duration() {
         assert_eq!(interim_char_fade_alpha(100 + CHAR_FADEIN_MS, 100), 1.0);
+    }
+
+    #[test]
+    fn staggered_fade_keeps_prefix_visible() {
+        assert_eq!(staggered_char_fade_alpha(0, 5, 4), 1.0);
+    }
+
+    #[test]
+    fn staggered_fade_delays_later_suffix_chars() {
+        let first_suffix = staggered_char_fade_alpha(50, 3, 3);
+        let later_suffix = staggered_char_fade_alpha(50, 3, 5);
+        assert!(first_suffix > later_suffix);
+        let fully_visible = staggered_char_fade_alpha(CHAR_FADEIN_MS + 2 * CHAR_STAGGER_MS, 3, 5);
+        assert_eq!(fully_visible, 1.0);
     }
 
     #[test]
