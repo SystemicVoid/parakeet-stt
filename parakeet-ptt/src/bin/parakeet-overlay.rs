@@ -1636,6 +1636,16 @@ struct WaylandRuntime {
     shm_buffer: ShmBuffer,
     dimensions: SurfaceDimensions,
     text_renderer: TextRenderer,
+    last_committed_surface_width: Option<u32>,
+}
+
+fn damage_width_for_commit(
+    previous_surface_width: Option<u32>,
+    effective_surface_width: u32,
+) -> u32 {
+    previous_surface_width
+        .map(|previous| previous.max(effective_surface_width))
+        .unwrap_or(effective_surface_width)
 }
 
 enum ShellSurface {
@@ -1763,6 +1773,7 @@ impl WaylandRuntime {
             shm_buffer,
             dimensions,
             text_renderer,
+            last_committed_surface_width: None,
         })
     }
 
@@ -1795,6 +1806,9 @@ impl WaylandRuntime {
         let keep_surface_mapped_when_hidden = matches!(self.shell, ShellSurface::Layer { .. });
         let should_render = intent.visible || fade_alpha > 0.0 || keep_surface_mapped_when_hidden;
         if should_render {
+            let damage_width =
+                damage_width_for_commit(self.last_committed_surface_width, effective_surface_width)
+                    .clamp(1, self.dimensions.width);
             let effective_content_width =
                 effective_surface_width.saturating_sub(SHADOW_RADIUS.saturating_mul(2));
             let content = ui.content_area_with_width(effective_content_width);
@@ -1818,12 +1832,8 @@ impl WaylandRuntime {
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
-            self.surface.damage_buffer(
-                0,
-                0,
-                effective_surface_width as i32,
-                self.dimensions.height as i32,
-            );
+            self.surface
+                .damage_buffer(0, 0, damage_width as i32, self.dimensions.height as i32);
             if let ShellSurface::Fallback { toplevel, .. } = &self.shell {
                 if intent.visible {
                     toplevel.set_title(format!(
@@ -1834,11 +1844,13 @@ impl WaylandRuntime {
                     toplevel.set_title(FALLBACK_WINDOW_TITLE.to_string());
                 }
             }
+            self.last_committed_surface_width = Some(effective_surface_width);
         } else {
             self.surface.attach(None, 0, 0);
             if let ShellSurface::Fallback { toplevel, .. } = &self.shell {
                 toplevel.set_title(FALLBACK_WINDOW_TITLE.to_string());
             }
+            self.last_committed_surface_width = None;
         }
 
         self.surface.commit();
@@ -2870,8 +2882,8 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_color_for_phase, apply_breathing_alpha, ease_out_cubic, interim_char_fade_alpha,
-        layout_text_lines, output_name_match_index, parse_font_descriptor,
+        accent_color_for_phase, apply_breathing_alpha, damage_width_for_commit, ease_out_cubic,
+        interim_char_fade_alpha, layout_text_lines, output_name_match_index, parse_font_descriptor,
         parse_generic_family_kind, render_frame, resolve_adaptive_width_with_env_input,
         resolve_backend_selection, rounded_rect_coverage, shared_prefix_len,
         should_apply_breathing, BackendSelection, BackendSignals, CliAnchor, CliBackendMode,
@@ -3595,6 +3607,16 @@ mod tests {
         let mut width_state = WidthState::new(200.0, 0);
         width_state.start(360.0, 0);
         assert!((width_state.animated_width(super::WIDTH_ANIM_MS) - 360.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn damage_width_tracks_previous_width_on_shrink() {
+        assert_eq!(damage_width_for_commit(Some(640), 320), 640);
+    }
+
+    #[test]
+    fn damage_width_uses_current_width_for_first_frame() {
+        assert_eq!(damage_width_for_commit(None, 320), 320);
     }
 
     #[test]
