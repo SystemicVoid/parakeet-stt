@@ -86,6 +86,16 @@ const PROGRESS_SEGMENT_FRAC: f32 = 0.3;
 const SUCCESS_FLASH_MS: u64 = 200;
 const SUCCESS_FLASH_COLOR: [u8; 4] = [80, 220, 120, 255]; // green accent
 
+// --- Audio VU Meter ---
+const VU_BAR_COUNT: usize = 8;
+const VU_BAR_WIDTH: f32 = 2.0;
+const VU_BAR_GAP: f32 = 1.0;
+const VU_DB_FLOOR: f32 = -65.0;
+const VU_DB_CEIL: f32 = -3.0;
+const VU_DECAY_FACTOR: f32 = 0.9;
+const VU_COLOR: (u8, u8, u8) = (0, 210, 200);
+const VU_QUANTIZE_PX: f32 = 2.0;
+
 const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
 #[derive(Parser, Debug)]
@@ -494,6 +504,94 @@ fn draw_accent_stripe(
                 py,
                 argb_pixel_premul(color[2], color[1], color[0], a),
             );
+        }
+    }
+}
+
+struct AudioVuState {
+    levels: [f32; VU_BAR_COUNT],
+    cursor: usize,
+}
+
+impl AudioVuState {
+    fn new() -> Self {
+        Self {
+            levels: [0.0; VU_BAR_COUNT],
+            cursor: 0,
+        }
+    }
+
+    fn push(&mut self, level_db: f32) {
+        let normalized = ((level_db - VU_DB_FLOOR) / (VU_DB_CEIL - VU_DB_FLOOR)).clamp(0.0, 1.0);
+        self.levels[self.cursor] = normalized;
+        self.cursor = (self.cursor + 1) % VU_BAR_COUNT;
+    }
+
+    fn decay(&mut self) {
+        for level in &mut self.levels {
+            *level *= VU_DECAY_FACTOR;
+            if *level < 0.01 {
+                *level = 0.0;
+            }
+        }
+    }
+
+    fn has_signal(&self) -> bool {
+        self.levels.iter().any(|&l| l > 0.0)
+    }
+
+    /// Iterate levels oldest→newest (left→right rendering order).
+    fn bars(&self) -> impl Iterator<Item = f32> + '_ {
+        (0..VU_BAR_COUNT).map(move |i| self.levels[(self.cursor + i) % VU_BAR_COUNT])
+    }
+}
+
+fn draw_vu_bars(
+    frame: &mut [u8],
+    dims: SurfaceDimensions,
+    content: ContentArea,
+    vu: &AudioVuState,
+    frame_alpha: f32,
+) {
+    let total_vu_width = VU_BAR_COUNT as f32 * (VU_BAR_WIDTH + VU_BAR_GAP) - VU_BAR_GAP;
+    let vu_x_start = content.x as f32 + PADDING_LEFT as f32
+        - ACCENT_STRIPE_MARGIN
+        - ACCENT_STRIPE_WIDTH
+        - total_vu_width;
+    let margin_v = PADDING_V as f32 + 2.0;
+    let y_top = content.y as f32 + margin_v;
+    let y_bottom = (content.y + content.height) as f32 - margin_v;
+    let max_height = y_bottom - y_top;
+    if max_height <= 0.0 {
+        return;
+    }
+
+    for (i, level) in vu.bars().enumerate() {
+        if level <= 0.0 {
+            continue;
+        }
+        let bar_x = vu_x_start + i as f32 * (VU_BAR_WIDTH + VU_BAR_GAP);
+        // Quantize height to VU_QUANTIZE_PX steps for pixelated look
+        let raw_height = level * max_height;
+        let bar_height = (raw_height / VU_QUANTIZE_PX).round() * VU_QUANTIZE_PX;
+        if bar_height <= 0.0 {
+            continue;
+        }
+
+        let bar_top = y_bottom - bar_height;
+        let alpha = (level * 0.7 + 0.3).clamp(0.3, 1.0); // dim glow minimum
+        let a = (alpha * frame_alpha * 255.0).round() as u8;
+        let pixel = argb_pixel_premul(VU_COLOR.0, VU_COLOR.1, VU_COLOR.2, a);
+
+        let px0 = bar_x.floor() as i32;
+        let px1 = (bar_x + VU_BAR_WIDTH).ceil() as i32;
+        let py0 = bar_top.floor() as i32;
+        let py1 = y_bottom.ceil() as i32;
+
+        for py in py0..py1 {
+            for px in px0..px1 {
+                blend_pixel(frame, dims, px, py, pixel);
+            }
         }
     }
 }
@@ -1142,6 +1240,8 @@ trait OverlayBackend {
     fn is_fading(&self) -> bool {
         false
     }
+    fn push_audio_level(&mut self, _level_db: f32) {}
+    fn decay_vu(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -1172,6 +1272,7 @@ struct WaylandOverlayBackend {
     shared_prefix_len: usize,
     width_state: WidthState,
     listening_max_phrase_width: f32,
+    vu_state: Option<AudioVuState>,
     started: Instant,
 }
 
@@ -1202,6 +1303,7 @@ impl WaylandOverlayBackend {
             shared_prefix_len: 0,
             width_state: WidthState::new(initial_width, 0),
             listening_max_phrase_width,
+            vu_state: None,
             started: Instant::now(),
         }
     }
@@ -1337,6 +1439,18 @@ impl OverlayBackend for WaylandOverlayBackend {
                 }
                 self.finalizing_started_ms = None;
             }
+            // Manage VU meter lifecycle
+            match intent.phase {
+                OverlayRenderPhase::Listening | OverlayRenderPhase::Interim => {
+                    if self.vu_state.is_none() {
+                        self.vu_state = Some(AudioVuState::new());
+                    }
+                }
+                OverlayRenderPhase::Hidden => {
+                    self.vu_state = None;
+                }
+                _ => {}
+            }
             if intent.phase == OverlayRenderPhase::Hidden {
                 let hidden_width = if self.ui.adaptive_width_enabled {
                     self.ui.min_surface_width()
@@ -1433,6 +1547,7 @@ impl OverlayBackend for WaylandOverlayBackend {
                 self.finalizing_started_ms,
                 effective_surface_width,
                 interim_fade,
+                self.vu_state.as_ref(),
             )
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind));
         self.prev_headline = intent.headline;
@@ -1447,6 +1562,25 @@ impl OverlayBackend for WaylandOverlayBackend {
             || self.success_flash.is_some()
             || self.headline_changed_ms.is_some()
             || (self.ui.adaptive_width_enabled && self.width_state.is_animating(self.now_ms()))
+            || self.vu_state.as_ref().is_some_and(|vu| vu.has_signal())
+    }
+
+    fn push_audio_level(&mut self, level_db: f32) {
+        if !level_db.is_finite() {
+            return;
+        }
+        if self.vu_state.is_none() {
+            self.vu_state = Some(AudioVuState::new());
+        }
+        if let Some(vu) = &mut self.vu_state {
+            vu.push(level_db);
+        }
+    }
+
+    fn decay_vu(&mut self) {
+        if let Some(vu) = &mut self.vu_state {
+            vu.decay();
+        }
     }
 }
 
@@ -1790,6 +1924,7 @@ impl WaylandRuntime {
         finalizing_started_ms: Option<u64>,
         effective_surface_width: u32,
         interim_fade: Option<(usize, f32)>,
+        vu_state: Option<&AudioVuState>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -1829,6 +1964,7 @@ impl WaylandRuntime {
                 now_ms,
                 finalizing_started_ms,
                 interim_fade,
+                vu_state,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -2393,6 +2529,7 @@ fn render_frame(
     now_ms: u64,
     finalizing_started_ms: Option<u64>,
     interim_fade: Option<(usize, f32)>,
+    vu_state: Option<&AudioVuState>,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -2451,17 +2588,32 @@ fn render_frame(
         argb_pixel(BORDER_COLOR.0, BORDER_COLOR.1, BORDER_COLOR.2, border_a),
     );
 
-    // 5. Draw accent stripe
-    if let Some(accent) = accent_color {
-        draw_accent_stripe(
-            frame,
-            dimensions,
-            content,
-            ACCENT_STRIPE_WIDTH,
-            ACCENT_STRIPE_MARGIN,
-            accent,
-            frame_alpha,
-        );
+    // 5. Draw VU bars or accent stripe
+    let vu_drawn = if matches!(
+        intent.phase,
+        OverlayRenderPhase::Listening | OverlayRenderPhase::Interim
+    ) {
+        if let Some(vu) = vu_state {
+            draw_vu_bars(frame, dimensions, content, vu, frame_alpha);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !vu_drawn {
+        if let Some(accent) = accent_color {
+            draw_accent_stripe(
+                frame,
+                dimensions,
+                content,
+                ACCENT_STRIPE_WIDTH,
+                ACCENT_STRIPE_MARGIN,
+                accent,
+                frame_alpha,
+            );
+        }
     }
 
     // 5b. Draw progress bar during Finalizing phase
@@ -2824,6 +2976,10 @@ async fn main() -> Result<()> {
                         let now_ms = started.elapsed().as_millis() as u64;
                         match serde_json::from_str::<OverlayIpcMessage>(&raw) {
                             Ok(message) => {
+                                // Extract audio level before state machine consumes the message
+                                if let OverlayIpcMessage::AudioLevel { level_db, .. } = &message {
+                                    built_backend.backend.push_audio_level(*level_db);
+                                }
                                 match machine.apply_event(message, now_ms) {
                                     ApplyOutcome::Applied => {
                                         built_backend
@@ -2857,6 +3013,7 @@ async fn main() -> Result<()> {
             _ = tick.tick() => {
                 let now_ms = started.elapsed().as_millis() as u64;
                 let time_advanced = machine.advance_time(now_ms);
+                built_backend.backend.decay_vu();
                 let fading = built_backend.backend.is_fading();
                 if time_advanced || fading {
                     built_backend
@@ -3100,6 +3257,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         );
         assert!(hidden_frame.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
@@ -3121,6 +3279,7 @@ mod tests {
             accent_color_for_phase(OverlayRenderPhase::Listening),
             None,
             0,
+            None,
             None,
             None,
         );
@@ -3179,6 +3338,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         );
 
         let mut low_alpha_frame = vec![0u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -3194,6 +3354,7 @@ mod tests {
             accent,
             None,
             0,
+            None,
             None,
             None,
         );

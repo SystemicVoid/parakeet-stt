@@ -19,6 +19,7 @@ from .audio import AudioInput
 from .config import ServerSettings
 from .messages import (
     AbortSession,
+    AudioLevelMessage,
     ClientMessageType,
     ErrorMessage,
     FinalResult,
@@ -462,6 +463,22 @@ class DaemonServer:
         )
         await self._send_overlay_message(websocket, message.model_dump(mode="json"))
 
+    async def _emit_audio_level(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        rms: float,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        if not np.isfinite(rms):
+            return
+        level_db = 20.0 * np.log10(max(rms, 1e-6))
+        if not np.isfinite(level_db):
+            return
+        message = AudioLevelMessage(session_id=session_id, level_db=level_db)
+        await self._send_overlay_message(websocket, message.model_dump(mode="json"))
+
     async def _collect_interim_text_updates(self, ready_chunks: list[np.ndarray]) -> list[str]:
         if not self.settings.overlay_events_enabled:
             return []
@@ -679,6 +696,9 @@ class DaemonServer:
 
         async def _drain() -> None:
             while self._stream_drain_running:
+                audio_levels = self.audio.take_audio_levels()
+                if audio_levels:
+                    await self._emit_audio_level(websocket, session_id, max(audio_levels))
                 chunks = self.audio.take_stream_chunks()
                 if self._active_stream:
                     for chunk in chunks:

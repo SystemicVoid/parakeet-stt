@@ -276,7 +276,7 @@ impl OverlayProcessManager {
         if let OverlayIpcMessage::OutputHint { output_name } = &message {
             self.pending_output_name = Some(output_name.clone());
             self.output_wait_started_at = None;
-        } else {
+        } else if is_replayable_overlay_message(&message) {
             self.latest_message = Some(message.clone());
         }
 
@@ -573,6 +573,15 @@ impl OverlayProcessManager {
     }
 }
 
+fn is_replayable_overlay_message(message: &OverlayIpcMessage) -> bool {
+    matches!(
+        message,
+        OverlayIpcMessage::InterimState { .. }
+            | OverlayIpcMessage::InterimText { .. }
+            | OverlayIpcMessage::SessionEnded { .. }
+    )
+}
+
 fn resolve_overlay_binary_path() -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
     let binary = current_exe.with_file_name("parakeet-overlay");
@@ -739,6 +748,65 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), rx_second.recv())
             .await
             .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_replay_ignores_audio_level_as_latest_state() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = queued_launcher(queue);
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::from_millis(0),
+        );
+
+        let session_id = Uuid::new_v4();
+        let state_message = OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 2,
+            text: "current-state".to_string(),
+        };
+        manager.send(state_message.clone());
+        let _ = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive state")
+            .expect("first sink should remain open");
+
+        let audio_level_message = OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db: -28.0,
+        };
+        manager.send(audio_level_message.clone());
+        let _ = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive audio level")
+            .expect("first sink should remain open");
+
+        drop(rx_first);
+
+        manager.send(audio_level_message);
+
+        let replayed = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replay")
+            .expect("second sink should remain open");
+        assert_eq!(replayed, state_message);
     }
 
     #[tokio::test(flavor = "current_thread")]
