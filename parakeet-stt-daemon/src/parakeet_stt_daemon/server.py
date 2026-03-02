@@ -426,6 +426,9 @@ class DaemonServer:
 
         # Offline fallback: run in-memory transcription to avoid temp-file I/O.
         trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
+        if trimmed.size == 0:
+            logger.info("Skipping offline transcription: silence trimming removed all samples")
+            return "", 0
         loop = asyncio.get_running_loop()
         infer_started = time.perf_counter()
         text = await loop.run_in_executor(

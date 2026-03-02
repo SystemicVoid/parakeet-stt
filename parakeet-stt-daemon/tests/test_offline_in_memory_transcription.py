@@ -76,6 +76,16 @@ def test_transcribe_samples_falls_back_to_file_when_array_path_fails(monkeypatch
     assert fallback_writer_calls[0][1] == 16_000
 
 
+def test_transcribe_samples_empty_audio_returns_empty_string_without_model_call() -> None:
+    model = _ArrayModel()
+    transcriber = ParakeetTranscriber(model=cast(Any, model))
+
+    result = transcriber.transcribe_samples(np.zeros((0,), dtype=np.float32), sample_rate=16_000)
+
+    assert result == ""
+    assert model.calls == []
+
+
 def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
     async def scenario() -> None:
         server = cast(Any, DaemonServer.__new__(DaemonServer))
@@ -100,5 +110,34 @@ def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
         forwarded_samples, forwarded_rate = recording.calls[0]
         assert forwarded_rate == 16_000
         assert forwarded_samples.size > 0
+
+    asyncio.run(scenario())
+
+
+def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty() -> None:
+    async def scenario() -> None:
+        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server.settings = ServerSettings(device="cpu", streaming_enabled=False)
+        server.audio = SimpleNamespace(sample_rate=16_000)
+        server.transcriber = _RecordingTranscriber()
+        server.streaming_transcriber = None
+        server._active_stream = None
+        server._vad_enabled = False
+        server._trim_tail_silence = lambda _samples, _sample_rate: np.zeros(
+            (0,),
+            dtype=np.float32,
+        )
+
+        samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
+        typed_server = cast(DaemonServer, server)
+        text, infer_ms = await typed_server._finalise_transcription(
+            samples,
+            ready_chunks=[],
+            tail=np.zeros((0,), dtype=np.float32),
+        )
+
+        assert text == ""
+        assert infer_ms == 0
+        assert server.transcriber.calls == []
 
     asyncio.run(scenario())

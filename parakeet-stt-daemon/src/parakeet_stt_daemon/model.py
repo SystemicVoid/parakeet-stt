@@ -197,6 +197,9 @@ class ParakeetTranscriber:
     def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
         """Transcribe in-memory audio and fall back to a temp wav on API mismatch."""
         audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            logger.debug("Skipping transcription for empty audio buffer")
+            return ""
         try:
             outputs = self.model.transcribe([audio], batch_size=1, verbose=False)  # type: ignore[operator]
             if not outputs:
