@@ -31,6 +31,7 @@ class ServerMessageType(str, Enum):
     INTERIM_STATE = "interim_state"
     INTERIM_TEXT = "interim_text"
     SESSION_ENDED = "session_ended"
+    AUDIO_LEVEL = "audio_level"
 
 
 class InterimStateValue(str, Enum):
@@ -155,6 +156,14 @@ class InterimTextMessage(BaseModel):
     text: str
 
 
+class AudioLevelMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.AUDIO_LEVEL] = Field(default=ServerMessageType.AUDIO_LEVEL)
+    session_id: UUID
+    level_db: float
+
+
 class SessionEndedMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -170,6 +179,7 @@ ServerMessage = (
     | StatusMessage
     | InterimStateMessage
     | InterimTextMessage
+    | AudioLevelMessage
     | SessionEndedMessage
 )
 
@@ -210,6 +220,7 @@ __all__ = [
     "StatusMessage",
     "InterimStateMessage",
     "InterimTextMessage",
+    "AudioLevelMessage",
     "SessionEndedMessage",
     "ParsedMessage",
     "parse_client_message",

@@ -142,6 +142,7 @@ impl OverlayStateMachine {
                 self.finalize_deadline_ms = None;
                 ApplyOutcome::Applied
             }
+            OverlayIpcMessage::AudioLevel { .. } => ApplyOutcome::Applied,
             OverlayIpcMessage::SessionEnded { session_id, reason } => {
                 if let Some(active_session_id) = self.active_session_id {
                     if active_session_id != session_id {

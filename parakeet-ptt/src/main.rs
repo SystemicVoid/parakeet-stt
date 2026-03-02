@@ -127,7 +127,7 @@ impl OverlayRoutingMetrics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum OverlayEvent {
     OutputHint {
         output_name: String,
@@ -141,6 +141,10 @@ enum OverlayEvent {
         session_id: Uuid,
         seq: u64,
         text: String,
+    },
+    AudioLevel {
+        session_id: Uuid,
+        level_db: f32,
     },
     SessionEnded {
         session_id: Uuid,
@@ -195,6 +199,13 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
             session_id,
             seq,
             text,
+        },
+        OverlayEvent::AudioLevel {
+            session_id,
+            level_db,
+        } => OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db,
         },
         OverlayEvent::SessionEnded { session_id, reason } => {
             OverlayIpcMessage::SessionEnded { session_id, reason }
@@ -299,6 +310,22 @@ impl<S: OverlaySink> OverlayRouter<S> {
             text,
         });
         self.metrics.note_interim_text();
+    }
+
+    fn route_audio_level(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        level_db: f32,
+    ) {
+        if !self.allow_session(expected_session_id, session_id) {
+            return;
+        }
+
+        self.sink.on_overlay_event(OverlayEvent::AudioLevel {
+            session_id,
+            level_db,
+        });
     }
 
     fn route_session_ended(
@@ -1304,6 +1331,12 @@ async fn handle_server_message(
             text,
         } => {
             overlay_router.route_interim_text(session_id_from_state(state), session_id, seq, text);
+        }
+        ServerMessage::AudioLevel {
+            session_id,
+            level_db,
+        } => {
+            overlay_router.route_audio_level(session_id_from_state(state), session_id, level_db);
         }
         ServerMessage::SessionEnded { session_id, reason } => {
             overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);

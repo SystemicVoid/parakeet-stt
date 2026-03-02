@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayIpcMessage {
     OutputHint {
@@ -16,6 +16,10 @@ pub enum OverlayIpcMessage {
         session_id: Uuid,
         seq: u64,
         text: String,
+    },
+    AudioLevel {
+        session_id: Uuid,
+        level_db: f32,
     },
     SessionEnded {
         session_id: Uuid,
@@ -40,6 +44,22 @@ mod tests {
 
         let encoded = serde_json::to_string(&message).expect("message should serialize");
         assert!(encoded.contains("\"type\":\"interim_text\""));
+
+        let decoded: OverlayIpcMessage =
+            serde_json::from_str(&encoded).expect("message should deserialize");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn audio_level_serialization_roundtrip() {
+        let session_id = Uuid::new_v4();
+        let message = OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db: -30.5,
+        };
+
+        let encoded = serde_json::to_string(&message).expect("message should serialize");
+        assert!(encoded.contains("\"type\":\"audio_level\""));
 
         let decoded: OverlayIpcMessage =
             serde_json::from_str(&encoded).expect("message should deserialize");

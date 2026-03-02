@@ -75,6 +75,10 @@ pub enum ServerMessage {
         seq: u64,
         text: String,
     },
+    AudioLevel {
+        session_id: Uuid,
+        level_db: f32,
+    },
     SessionEnded {
         session_id: Uuid,
         reason: Option<String>,
@@ -119,6 +123,7 @@ fn is_known_server_message_type(message_type: &str) -> bool {
             | "status"
             | "interim_state"
             | "interim_text"
+            | "audio_level"
             | "session_ended"
     )
 }
@@ -354,6 +359,10 @@ mod tests {
                 session_id,
                 seq: 2,
                 text: "hello".to_string(),
+            },
+            ServerMessage::AudioLevel {
+                session_id,
+                level_db: -25.5,
             },
             ServerMessage::SessionEnded {
                 session_id,
