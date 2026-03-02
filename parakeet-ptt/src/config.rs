@@ -148,7 +148,7 @@ pub fn resolve_overlay_adaptive_width(overlay_adaptive_width_override: Option<bo
         .ok()
         .as_deref()
         .and_then(parse_overlay_enabled_override)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -162,7 +162,7 @@ fn resolve_overlay_adaptive_width_with_env(
 
     overlay_adaptive_width_env
         .and_then(parse_overlay_enabled_override)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn probe_overlay_capability_with_inputs(
@@ -531,8 +531,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_overlay_adaptive_width_defaults_to_enabled() {
-        assert!(resolve_overlay_adaptive_width_with_env(None, None));
+    fn resolve_overlay_adaptive_width_defaults_to_disabled() {
+        assert!(!resolve_overlay_adaptive_width_with_env(None, None));
     }
 
     #[test]
@@ -557,7 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_overlay_adaptive_width_invalid_env_falls_back_to_enabled() {
-        assert!(resolve_overlay_adaptive_width_with_env(None, Some("maybe")));
+    fn resolve_overlay_adaptive_width_invalid_env_falls_back_to_disabled() {
+        assert!(!resolve_overlay_adaptive_width_with_env(
+            None,
+            Some("maybe")
+        ));
     }
 }
