@@ -29,8 +29,8 @@ use uuid::Uuid;
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::config::{
-    resolve_overlay_capability, ClientConfig, ClipboardOptions, InjectionConfig, OverlayMode,
-    DEFAULT_ENDPOINT,
+    resolve_overlay_adaptive_width, resolve_overlay_capability, ClientConfig, ClipboardOptions,
+    InjectionConfig, OverlayMode, DEFAULT_ENDPOINT,
 };
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
@@ -204,18 +204,20 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
 
 fn build_runtime_overlay_sink(
     mode: OverlayMode,
+    overlay_adaptive_width: bool,
     focus_cache: Option<WaylandFocusCache>,
 ) -> RuntimeOverlaySink {
     match mode {
         OverlayMode::Disabled => RuntimeOverlaySink::Noop(NoopOverlaySink),
         OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
-            let manager = OverlayProcessManager::new(mode, focus_cache);
+            let manager = OverlayProcessManager::new(mode, overlay_adaptive_width, focus_cache);
             let metrics = manager.metrics();
             info!(
                 overlay_spawn_attempt_total = metrics.spawn_attempt_total.load(Ordering::Relaxed),
                 overlay_spawn_success_total = metrics.spawn_success_total.load(Ordering::Relaxed),
                 overlay_spawn_failure_total = metrics.spawn_failure_total.load(Ordering::Relaxed),
                 overlay_active_sink = manager.has_active_sink(),
+                overlay_adaptive_width,
                 "overlay process routing enabled with respawn manager"
             );
             RuntimeOverlaySink::Process(manager)
@@ -690,6 +692,10 @@ struct Cli {
     /// Enable or disable overlay routing (CLI takes precedence over env).
     #[arg(long, action = clap::ArgAction::Set)]
     overlay_enabled: Option<bool>,
+
+    /// Enable or disable adaptive overlay width (CLI takes precedence over env).
+    #[arg(long, action = clap::ArgAction::Set)]
+    overlay_adaptive_width: Option<bool>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -789,7 +795,13 @@ async fn main() -> Result<()> {
         cli.completion_sound_path,
         cli.completion_sound_volume,
     );
-    run_hotkey_mode(config, audio_feedback, cli.overlay_enabled).await
+    run_hotkey_mode(
+        config,
+        audio_feedback,
+        cli.overlay_enabled,
+        cli.overlay_adaptive_width,
+    )
+    .await
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
@@ -991,13 +1003,16 @@ async fn run_hotkey_mode(
     config: ClientConfig,
     audio_feedback: AudioFeedback,
     overlay_enabled_override: Option<bool>,
+    overlay_adaptive_width_override: Option<bool>,
 ) -> Result<()> {
     let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
+    let overlay_adaptive_width = resolve_overlay_adaptive_width(overlay_adaptive_width_override);
     match overlay_capability.mode {
         OverlayMode::Disabled => {
             warn!(
                 overlay_mode = overlay_capability.mode.as_str(),
                 overlay_reason = %overlay_capability.reason,
+                overlay_adaptive_width,
                 "overlay capability probe completed with disabled mode"
             );
         }
@@ -1005,6 +1020,7 @@ async fn run_hotkey_mode(
             info!(
                 overlay_mode = overlay_capability.mode.as_str(),
                 overlay_reason = %overlay_capability.reason,
+                overlay_adaptive_width,
                 "overlay capability probe completed"
             );
         }
@@ -1021,7 +1037,11 @@ async fn run_hotkey_mode(
     let focus_cache = Some(WaylandFocusCache::new());
     let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
     let mut overlay_router = OverlayRouter::new(
-        build_runtime_overlay_sink(overlay_capability.mode, focus_cache.clone()),
+        build_runtime_overlay_sink(
+            overlay_capability.mode,
+            overlay_adaptive_width,
+            focus_cache.clone(),
+        ),
         focus_cache,
     );
     spawn_event_loop_lag_monitor();
@@ -1517,6 +1537,23 @@ mod tests {
         assert_eq!(cli_disabled.overlay_enabled, Some(false));
     }
 
+    #[test]
+    fn cli_overlay_adaptive_width_defaults_to_none() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.overlay_adaptive_width, None);
+    }
+
+    #[test]
+    fn cli_overlay_adaptive_width_accepts_boolean_values() {
+        let cli_enabled =
+            super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "true"]);
+        assert_eq!(cli_enabled.overlay_adaptive_width, Some(true));
+
+        let cli_disabled =
+            super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "false"]);
+        assert_eq!(cli_disabled.overlay_adaptive_width, Some(false));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
         let calls = Arc::new(AtomicU64::new(0));
@@ -1792,7 +1829,7 @@ mod tests {
         let sink_slot = Arc::new(Mutex::new(Some(first_sink)));
         let launcher = {
             let sink_slot = Arc::clone(&sink_slot);
-            Arc::new(move |_mode, _output_name| {
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
                 sink_slot
                     .lock()
                     .expect("sink slot lock should be available")
@@ -1800,8 +1837,12 @@ mod tests {
                     .ok_or_else(|| anyhow!("no overlay sink available"))
             })
         };
-        let manager =
-            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
         let manager_metrics = Arc::clone(manager.metrics());
         let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 
@@ -1894,7 +1935,7 @@ mod tests {
         ])));
         let launcher = {
             let spawn_queue = Arc::clone(&spawn_queue);
-            Arc::new(move |_mode, _output_name| {
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
                 spawn_queue
                     .lock()
                     .expect("spawn queue lock should be available")
@@ -1902,8 +1943,12 @@ mod tests {
                     .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
             })
         };
-        let manager =
-            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
         let manager_metrics = Arc::clone(manager.metrics());
         let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 
@@ -1998,7 +2043,7 @@ mod tests {
         ])));
         let launcher = {
             let spawn_queue = Arc::clone(&spawn_queue);
-            Arc::new(move |_mode, _output_name| {
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
                 spawn_queue
                     .lock()
                     .expect("spawn queue lock should be available")
@@ -2006,8 +2051,12 @@ mod tests {
                     .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
             })
         };
-        let manager =
-            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
         let manager_metrics = Arc::clone(manager.metrics());
         let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
 

@@ -11,6 +11,7 @@ status_url := "http://127.0.0.1:8765/status"
 #   just --justfile justfile.overlay-dev start
 #   just --justfile justfile.overlay-dev start auto
 #   just --justfile justfile.overlay-dev start fallback-window
+#   just --justfile justfile.overlay-dev start layer-shell false
 #   just --justfile justfile.overlay-dev status
 #   just --justfile justfile.overlay-dev overlay-kill
 #   just --justfile justfile.overlay-dev logs
@@ -44,8 +45,8 @@ doctor: _guard
 # Start helper in streaming mode with overlay events enabled.
 # Defaults to the simplest path: explicit layer-shell overlay backend.
 # This attaches tmux; detach with Ctrl+b then d.
-start mode="layer-shell": _guard
-    @bash -lc 'cd "{{repo_root}}" && mode="{{mode}}" && case "$mode" in auto|layer-shell|fallback-window|disabled) ;; *) echo "mode must be one of: auto|layer-shell|fallback-window|disabled" >&2; exit 2 ;; esac && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE="$mode" && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true'
+start mode="layer-shell" adaptive_width="true": _guard
+    @bash -lc 'cd "{{repo_root}}" && mode="{{mode}}" && adaptive_width="{{adaptive_width}}" && case "$mode" in auto|layer-shell|fallback-window|disabled) ;; *) echo "mode must be one of: auto|layer-shell|fallback-window|disabled" >&2; exit 2 ;; esac && case "${adaptive_width,,}" in true|false) ;; *) echo "adaptive_width must be true or false" >&2; exit 2 ;; esac && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_EVENTS_ENABLED=true && export PARAKEET_OVERLAY_MODE="$mode" && source scripts/stt-helper.sh && (stt stop || true) && stt start streaming --completion-sound false --overlay-enabled true --overlay-adaptive-width "$adaptive_width"'
 
 # Stop helper stack.
 stop: _guard

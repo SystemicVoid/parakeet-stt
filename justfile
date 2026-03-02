@@ -14,8 +14,8 @@ default:
     @just --list
 
 # Overlay dev shortcuts (delegates to justfile.overlay-dev).
-start mode="layer-shell":
-    @just --justfile "{{overlay_justfile}}" start "{{mode}}"
+start mode="layer-shell" adaptive_width="true":
+    @just --justfile "{{overlay_justfile}}" start "{{mode}}" "{{adaptive_width}}"
 
 stop:
     @just --justfile "{{overlay_justfile}}" stop

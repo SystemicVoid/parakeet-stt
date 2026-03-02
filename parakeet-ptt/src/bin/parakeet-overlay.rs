@@ -27,6 +27,7 @@ use parakeet_ptt::overlay_state::{
 
 const FALLBACK_WINDOW_TITLE: &str = "Parakeet Overlay";
 const LAYER_NAMESPACE: &str = "parakeet-overlay";
+const OVERLAY_ADAPTIVE_WIDTH_ENV: &str = "PARAKEET_OVERLAY_ADAPTIVE_WIDTH";
 const DEFAULT_FONT_FAMILY: &str = "Sans";
 const DEFAULT_FONT_SIZE_PX: f32 = 18.0;
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 10.0..=64.0;
@@ -133,6 +134,10 @@ struct Cli {
     /// Preferred wl_output name for the layer surface target.
     #[arg(long)]
     output_name: Option<String>,
+
+    /// Enable or disable adaptive overlay width.
+    #[arg(long, action = clap::ArgAction::Set)]
+    adaptive_width: Option<bool>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -150,6 +155,39 @@ enum CliAnchor {
     BottomLeft,
     BottomCenter,
     BottomRight,
+}
+
+fn parse_bool_override(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_adaptive_width_override(cli_override: Option<bool>) -> bool {
+    if let Some(adaptive_width) = cli_override {
+        return adaptive_width;
+    }
+
+    std::env::var(OVERLAY_ADAPTIVE_WIDTH_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_bool_override)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+fn resolve_adaptive_width_with_env_input(
+    cli_override: Option<bool>,
+    env_override: Option<&str>,
+) -> bool {
+    if let Some(adaptive_width) = cli_override {
+        return adaptive_width;
+    }
+
+    env_override.and_then(parse_bool_override).unwrap_or(true)
 }
 
 // --- Geometry & Rendering Primitives ---
@@ -808,6 +846,7 @@ struct OverlayUiConfig {
     margin_y: u32,
     max_width: u32,
     max_lines: u32,
+    adaptive_width_enabled: bool,
 }
 
 impl OverlayUiConfig {
@@ -1299,8 +1338,12 @@ impl OverlayBackend for WaylandOverlayBackend {
                 self.finalizing_started_ms = None;
             }
             if intent.phase == OverlayRenderPhase::Hidden {
-                self.width_state
-                    .snap(self.ui.min_surface_width() as f32, now);
+                let hidden_width = if self.ui.adaptive_width_enabled {
+                    self.ui.min_surface_width()
+                } else {
+                    self.ui.max_surface_width()
+                };
+                self.width_state.snap(hidden_width as f32, now);
             }
             self.last_phase = intent.phase;
         }
@@ -1346,21 +1389,26 @@ impl OverlayBackend for WaylandOverlayBackend {
             anim.tick(now);
         }
 
-        let mut target_width = self.target_surface_width(&intent);
-        if intent.phase == OverlayRenderPhase::Interim {
-            target_width = target_width.max(self.width_state.target_width);
-        }
-        if (target_width - self.width_state.target_width).abs() >= 0.5 {
-            self.width_state.start(target_width, now);
-        }
-        let effective_surface_width = self
-            .width_state
-            .animated_width(now)
-            .clamp(
-                self.ui.min_surface_width() as f32,
-                self.ui.max_surface_width() as f32,
-            )
-            .round() as u32;
+        let effective_surface_width = if self.ui.adaptive_width_enabled {
+            let mut target_width = self.target_surface_width(&intent);
+            if intent.phase == OverlayRenderPhase::Interim {
+                target_width = target_width.max(self.width_state.target_width);
+            }
+            if (target_width - self.width_state.target_width).abs() >= 0.5 {
+                self.width_state.start(target_width, now);
+            }
+            self.width_state
+                .animated_width(now)
+                .clamp(
+                    self.ui.min_surface_width() as f32,
+                    self.ui.max_surface_width() as f32,
+                )
+                .round() as u32
+        } else {
+            let fixed_width = self.ui.max_surface_width() as f32;
+            self.width_state.snap(fixed_width, now);
+            fixed_width.round() as u32
+        };
         let interim_fade = if intent.phase == OverlayRenderPhase::Interim {
             self.interim_fade_state(now)
         } else {
@@ -1398,7 +1446,7 @@ impl OverlayBackend for WaylandOverlayBackend {
             || self.finalizing_started_ms.is_some()
             || self.success_flash.is_some()
             || self.headline_changed_ms.is_some()
-            || self.width_state.is_animating(self.now_ms())
+            || (self.ui.adaptive_width_enabled && self.width_state.is_animating(self.now_ms()))
     }
 }
 
@@ -2707,6 +2755,7 @@ fn is_probably_cosmic_session() -> bool {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let adaptive_width_enabled = resolve_adaptive_width_override(cli.adaptive_width);
     let ui = OverlayUiConfig {
         opacity: cli.opacity.clamp(0.0, 1.0),
         font: cli.font,
@@ -2715,6 +2764,7 @@ async fn main() -> Result<()> {
         margin_y: cli.margin_y,
         max_width: cli.max_width,
         max_lines: cli.max_lines,
+        adaptive_width_enabled,
     };
 
     let mut built_backend = build_backend(cli.backend, ui.clone(), cli.output_name.as_deref());
@@ -2728,6 +2778,7 @@ async fn main() -> Result<()> {
         margin_y = ui.margin_y,
         max_width = ui.max_width,
         max_lines = ui.max_lines,
+        adaptive_width_enabled = ui.adaptive_width_enabled,
         "overlay process started"
     );
     if built_backend.kind == BackendKind::FallbackWindow && is_probably_cosmic_session() {
@@ -2821,11 +2872,11 @@ mod tests {
     use super::{
         accent_color_for_phase, apply_breathing_alpha, ease_out_cubic, interim_char_fade_alpha,
         layout_text_lines, output_name_match_index, parse_font_descriptor,
-        parse_generic_family_kind, render_frame, resolve_backend_selection, rounded_rect_coverage,
-        shared_prefix_len, should_apply_breathing, BackendSelection, BackendSignals, CliAnchor,
-        CliBackendMode, FadeDirection, FadeState, FontResolutionSummary, OverlayUiConfig,
-        ParsedFontDescriptor, Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS, CHAR_FADEIN_MS,
-        SHADOW_RADIUS,
+        parse_generic_family_kind, render_frame, resolve_adaptive_width_with_env_input,
+        resolve_backend_selection, rounded_rect_coverage, shared_prefix_len,
+        should_apply_breathing, BackendSelection, BackendSignals, CliAnchor, CliBackendMode,
+        FadeDirection, FadeState, FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor,
+        Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS, CHAR_FADEIN_MS, SHADOW_RADIUS,
     };
     use clap::Parser;
     use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
@@ -3003,6 +3054,7 @@ mod tests {
             margin_y: 24,
             max_width: 320,
             max_lines: 3,
+            adaptive_width_enabled: true,
         };
         let dimensions = ui.surface_dimensions();
         let content = ui.content_area();
@@ -3073,6 +3125,7 @@ mod tests {
             margin_y: 24,
             max_width: 320,
             max_lines: 3,
+            adaptive_width_enabled: true,
         };
         let low_opacity_ui = OverlayUiConfig {
             opacity: 0.35,
@@ -3163,6 +3216,7 @@ mod tests {
             margin_y: 24,
             max_width: 320,
             max_lines: 3,
+            adaptive_width_enabled: true,
         };
         let dims = ui.surface_dimensions();
         let content = ui.content_area();
@@ -3250,6 +3304,40 @@ mod tests {
     fn cli_parses_output_name_arg() {
         let cli = super::Cli::parse_from(["parakeet-overlay", "--output-name", "HDMI-A-1"]);
         assert_eq!(cli.output_name.as_deref(), Some("HDMI-A-1"));
+    }
+
+    #[test]
+    fn cli_adaptive_width_defaults_to_none() {
+        let cli = super::Cli::parse_from(["parakeet-overlay"]);
+        assert_eq!(cli.adaptive_width, None);
+    }
+
+    #[test]
+    fn cli_parses_adaptive_width_arg() {
+        let enabled = super::Cli::parse_from(["parakeet-overlay", "--adaptive-width", "true"]);
+        assert_eq!(enabled.adaptive_width, Some(true));
+
+        let disabled = super::Cli::parse_from(["parakeet-overlay", "--adaptive-width", "false"]);
+        assert_eq!(disabled.adaptive_width, Some(false));
+    }
+
+    #[test]
+    fn resolve_adaptive_width_override_defaults_to_enabled() {
+        assert!(resolve_adaptive_width_with_env_input(None, None));
+    }
+
+    #[test]
+    fn resolve_adaptive_width_override_honors_env_and_cli_precedence() {
+        assert!(!resolve_adaptive_width_with_env_input(None, Some("false")));
+        assert!(resolve_adaptive_width_with_env_input(None, Some("true")));
+        assert!(resolve_adaptive_width_with_env_input(
+            Some(true),
+            Some("false")
+        ));
+        assert!(!resolve_adaptive_width_with_env_input(
+            Some(false),
+            Some("true")
+        ));
     }
 
     #[test]
@@ -3477,6 +3565,7 @@ mod tests {
             margin_y: 32,
             max_width: 400,
             max_lines: 3,
+            adaptive_width_enabled: true,
         };
         let min_width = ui.min_surface_width() as f32;
         let target = OverlayUiConfig::surface_width_for_content(20) as f32;
@@ -3494,6 +3583,7 @@ mod tests {
             margin_y: 32,
             max_width: 420,
             max_lines: 3,
+            adaptive_width_enabled: true,
         };
         let huge = OverlayUiConfig::surface_width_for_content(2_000) as f32;
         let clamped = huge.clamp(ui.min_surface_width() as f32, ui.max_surface_width() as f32);

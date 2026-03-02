@@ -16,9 +16,10 @@ use crate::surface_focus::WaylandFocusCache;
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 
 const OVERLAY_RESPAWN_BACKOFF_MS: u64 = 750;
+const OVERLAY_OUTPUT_NAME_WATCHDOG_TIMEOUT_MS: u64 = 1_500;
 
 type OverlayLauncher =
-    dyn Fn(OverlayMode, Option<String>) -> Result<OverlayProcessSink> + Send + Sync;
+    dyn Fn(OverlayMode, Option<String>, bool) -> Result<OverlayProcessSink> + Send + Sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlaySendError {
@@ -99,7 +100,11 @@ pub struct OverlayProcessSink {
 }
 
 impl OverlayProcessSink {
-    pub fn spawn(mode: OverlayMode, output_name: Option<&str>) -> Result<Self> {
+    pub fn spawn(
+        mode: OverlayMode,
+        output_name: Option<&str>,
+        adaptive_width: bool,
+    ) -> Result<Self> {
         let backend = match mode {
             OverlayMode::LayerShell => "layer-shell",
             OverlayMode::FallbackWindow => "fallback-window",
@@ -116,6 +121,8 @@ impl OverlayProcessSink {
         command
             .arg("--backend")
             .arg(backend)
+            .arg("--adaptive-width")
+            .arg(if adaptive_width { "true" } else { "false" })
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -191,6 +198,7 @@ impl OverlayProcessSink {
         info!(
             binary = %overlay_binary.display(),
             backend,
+            adaptive_width,
             ?child_id,
             "overlay process spawned"
         );
@@ -221,6 +229,7 @@ impl OverlayProcessSink {
 
 pub struct OverlayProcessManager {
     mode: OverlayMode,
+    adaptive_width: bool,
     sink: Option<OverlayProcessSink>,
     latest_message: Option<OverlayIpcMessage>,
     focus_cache: Option<WaylandFocusCache>,
@@ -230,17 +239,28 @@ pub struct OverlayProcessManager {
     metrics: Arc<OverlayManagerMetrics>,
     respawn_backoff: Duration,
     next_spawn_allowed_at: Option<Instant>,
+    output_wait_started_at: Option<Instant>,
+    output_watchdog_timeout: Duration,
+    output_watchdog_fallback_used: bool,
 }
 
 impl OverlayProcessManager {
-    pub fn new(mode: OverlayMode, focus_cache: Option<WaylandFocusCache>) -> Self {
+    pub fn new(
+        mode: OverlayMode,
+        adaptive_width: bool,
+        focus_cache: Option<WaylandFocusCache>,
+    ) -> Self {
         let require_output_name_on_spawn = focus_cache.is_some();
-        Self::new_with_launcher_and_backoff(
+        Self::new_with_launcher_and_backoff_and_watchdog(
             mode,
+            adaptive_width,
             focus_cache,
             require_output_name_on_spawn,
-            Arc::new(|mode, output_name| OverlayProcessSink::spawn(mode, output_name.as_deref())),
+            Arc::new(|mode, output_name, adaptive_width| {
+                OverlayProcessSink::spawn(mode, output_name.as_deref(), adaptive_width)
+            }),
             Duration::from_millis(OVERLAY_RESPAWN_BACKOFF_MS),
+            Duration::from_millis(OVERLAY_OUTPUT_NAME_WATCHDOG_TIMEOUT_MS),
         )
     }
 
@@ -248,6 +268,7 @@ impl OverlayProcessManager {
         let is_output_hint = matches!(&message, OverlayIpcMessage::OutputHint { .. });
         if let OverlayIpcMessage::OutputHint { output_name } = &message {
             self.pending_output_name = Some(output_name.clone());
+            self.output_wait_started_at = None;
         } else {
             self.latest_message = Some(message.clone());
         }
@@ -309,17 +330,41 @@ impl OverlayProcessManager {
                 .as_ref()
                 .and_then(WaylandFocusCache::current_output_name)
         });
+        if output_name.is_some() {
+            self.output_wait_started_at = None;
+        }
         if self.pending_output_name.is_none() {
             self.pending_output_name = output_name.clone();
         }
 
         if self.require_output_name_on_spawn && output_name.is_none() {
-            debug!("deferring overlay process spawn until focused output is available");
-            return;
+            if self.output_watchdog_fallback_used {
+                debug!(
+                    "deferring overlay process spawn; output watchdog fallback already used once"
+                );
+                return;
+            }
+            let wait_started = self.output_wait_started_at.get_or_insert(now);
+            let waited = now.saturating_duration_since(*wait_started);
+            if waited < self.output_watchdog_timeout {
+                debug!(
+                    waited_ms = waited.as_millis(),
+                    timeout_ms = self.output_watchdog_timeout.as_millis(),
+                    "deferring overlay process spawn until focused output is available"
+                );
+                return;
+            }
+            self.output_watchdog_fallback_used = true;
+            self.output_wait_started_at = None;
+            warn!(
+                waited_ms = waited.as_millis(),
+                timeout_ms = self.output_watchdog_timeout.as_millis(),
+                "focused output unavailable after watchdog timeout; spawning overlay without output targeting once"
+            );
         }
 
         self.metrics.note_spawn_attempt();
-        match (self.launcher)(self.mode, output_name) {
+        match (self.launcher)(self.mode, output_name, self.adaptive_width) {
             Ok(sink) => {
                 self.metrics.note_spawn_success();
                 self.sink = Some(sink);
@@ -365,15 +410,38 @@ impl OverlayProcessManager {
         sink.send(message)
     }
 
+    #[cfg(test)]
     fn new_with_launcher_and_backoff(
         mode: OverlayMode,
+        adaptive_width: bool,
         focus_cache: Option<WaylandFocusCache>,
         require_output_name_on_spawn: bool,
         launcher: Arc<OverlayLauncher>,
         respawn_backoff: Duration,
     ) -> Self {
+        Self::new_with_launcher_and_backoff_and_watchdog(
+            mode,
+            adaptive_width,
+            focus_cache,
+            require_output_name_on_spawn,
+            launcher,
+            respawn_backoff,
+            Duration::from_millis(OVERLAY_OUTPUT_NAME_WATCHDOG_TIMEOUT_MS),
+        )
+    }
+
+    fn new_with_launcher_and_backoff_and_watchdog(
+        mode: OverlayMode,
+        adaptive_width: bool,
+        focus_cache: Option<WaylandFocusCache>,
+        require_output_name_on_spawn: bool,
+        launcher: Arc<OverlayLauncher>,
+        respawn_backoff: Duration,
+        output_watchdog_timeout: Duration,
+    ) -> Self {
         let mut manager = Self {
             mode,
+            adaptive_width,
             sink: None,
             latest_message: None,
             focus_cache,
@@ -383,6 +451,9 @@ impl OverlayProcessManager {
             metrics: Arc::new(OverlayManagerMetrics::default()),
             respawn_backoff,
             next_spawn_allowed_at: None,
+            output_wait_started_at: None,
+            output_watchdog_timeout,
+            output_watchdog_fallback_used: false,
         };
         if !manager.require_output_name_on_spawn {
             manager.try_spawn_sink();
@@ -393,19 +464,54 @@ impl OverlayProcessManager {
     #[cfg(test)]
     pub fn new_for_tests(
         mode: OverlayMode,
+        adaptive_width: bool,
         launcher: Arc<OverlayLauncher>,
         respawn_backoff: Duration,
     ) -> Self {
-        Self::new_with_launcher_and_backoff(mode, None, false, launcher, respawn_backoff)
+        Self::new_with_launcher_and_backoff(
+            mode,
+            adaptive_width,
+            None,
+            false,
+            launcher,
+            respawn_backoff,
+        )
     }
 
     #[cfg(test)]
     pub fn new_for_tests_with_output_targeting(
         mode: OverlayMode,
+        adaptive_width: bool,
         launcher: Arc<OverlayLauncher>,
         respawn_backoff: Duration,
     ) -> Self {
-        Self::new_with_launcher_and_backoff(mode, None, true, launcher, respawn_backoff)
+        Self::new_with_launcher_and_backoff(
+            mode,
+            adaptive_width,
+            None,
+            true,
+            launcher,
+            respawn_backoff,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn new_for_tests_with_output_targeting_and_watchdog(
+        mode: OverlayMode,
+        adaptive_width: bool,
+        launcher: Arc<OverlayLauncher>,
+        respawn_backoff: Duration,
+        output_watchdog_timeout: Duration,
+    ) -> Self {
+        Self::new_with_launcher_and_backoff_and_watchdog(
+            mode,
+            adaptive_width,
+            None,
+            true,
+            launcher,
+            respawn_backoff,
+            output_watchdog_timeout,
+        )
     }
 }
 
@@ -437,7 +543,7 @@ mod tests {
     fn queued_launcher(
         queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
     ) -> Arc<OverlayLauncher> {
-        Arc::new(move |_mode, _output_name| {
+        Arc::new(move |_mode, _output_name, _adaptive_width| {
             queue
                 .lock()
                 .expect("spawn queue lock should be available")
@@ -450,7 +556,7 @@ mod tests {
         seen_output_names: Arc<Mutex<Vec<Option<String>>>>,
         queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
     ) -> Arc<OverlayLauncher> {
-        Arc::new(move |_mode, output_name| {
+        Arc::new(move |_mode, output_name, _adaptive_width| {
             seen_output_names
                 .lock()
                 .expect("recorded output names lock should be available")
@@ -485,6 +591,7 @@ mod tests {
         let launcher = queued_launcher(queue);
         let mut manager = OverlayProcessManager::new_for_tests(
             OverlayMode::LayerShell,
+            true,
             launcher,
             Duration::from_millis(0),
         );
@@ -539,6 +646,7 @@ mod tests {
         let launcher = queued_launcher(queue);
         let mut manager = OverlayProcessManager::new_for_tests(
             OverlayMode::LayerShell,
+            true,
             launcher,
             Duration::from_millis(0),
         );
@@ -587,6 +695,7 @@ mod tests {
         let launcher = recording_launcher(Arc::clone(&seen_output_names), queue);
         let mut manager = OverlayProcessManager::new_for_tests_with_output_targeting(
             OverlayMode::LayerShell,
+            true,
             launcher,
             Duration::ZERO,
         );
@@ -639,15 +748,69 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_watchdog_spawns_once_without_output_targeting() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = OverlayProcessSink::from_sender_for_tests(
+            tx,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let queue = Arc::new(Mutex::new(VecDeque::from([Ok(sink)])));
+        let seen_output_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let launcher = recording_launcher(Arc::clone(&seen_output_names), queue);
+        let mut manager = OverlayProcessManager::new_for_tests_with_output_targeting_and_watchdog(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        let state = OverlayIpcMessage::InterimText {
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            text: "watchdog-fallback".to_string(),
+        };
+        manager.send(state.clone());
+        assert!(manager.has_active_sink());
+        assert_eq!(
+            manager
+                .metrics()
+                .spawn_attempt_total
+                .load(Ordering::Relaxed),
+            1,
+            "watchdog should trigger exactly one fallback spawn attempt"
+        );
+        assert_eq!(
+            seen_output_names
+                .lock()
+                .expect("recorded output names lock should be available")
+                .clone(),
+            vec![None],
+            "watchdog fallback spawn should omit output targeting exactly once"
+        );
+
+        let received = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("state should be delivered to fallback spawn sink")
+            .expect("sink should remain open");
+        assert_eq!(received, state);
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
     #[test]
     fn missing_overlay_binary_spawn_failures_remain_non_fatal() {
-        let launcher: Arc<OverlayLauncher> = Arc::new(|_mode, _output_name| {
+        let launcher: Arc<OverlayLauncher> = Arc::new(|_mode, _output_name, _adaptive_width| {
             Err(anyhow!(
                 "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
             ))
         });
-        let mut manager =
-            OverlayProcessManager::new_for_tests(OverlayMode::LayerShell, launcher, Duration::ZERO);
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
 
         manager.send(OverlayIpcMessage::InterimText {
             session_id: Uuid::new_v4(),
@@ -663,6 +826,51 @@ mod tests {
                 .load(Ordering::Relaxed)
                 >= 1,
             "missing binary should be counted as a non-fatal spawn failure"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_passes_adaptive_width_to_launcher() {
+        let seen_adaptive_width = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = OverlayProcessSink::from_sender_for_tests(
+            tx,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let queue = Arc::new(Mutex::new(VecDeque::from([Ok(sink)])));
+        let launcher: Arc<OverlayLauncher> = {
+            let seen_adaptive_width = Arc::clone(&seen_adaptive_width);
+            Arc::new(move |_mode, _output_name, adaptive_width| {
+                seen_adaptive_width
+                    .lock()
+                    .expect("adaptive width lock should be available")
+                    .push(adaptive_width);
+                queue
+                    .lock()
+                    .expect("spawn queue lock should be available")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("no spawn outcome configured")))
+            })
+        };
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            false,
+            launcher,
+            Duration::ZERO,
+        );
+
+        manager.send(OverlayIpcMessage::InterimText {
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            text: "check adaptive width forwarding".to_string(),
+        });
+
+        assert_eq!(
+            seen_adaptive_width
+                .lock()
+                .expect("adaptive width lock should be available")
+                .as_slice(),
+            &[false]
         );
     }
 }

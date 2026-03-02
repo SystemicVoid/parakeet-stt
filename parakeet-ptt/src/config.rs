@@ -12,6 +12,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
 const OVERLAY_ENABLED_ENV: &str = "PARAKEET_OVERLAY_ENABLED";
 const OVERLAY_MODE_ENV: &str = "PARAKEET_OVERLAY_MODE";
+const OVERLAY_ADAPTIVE_WIDTH_ENV: &str = "PARAKEET_OVERLAY_ADAPTIVE_WIDTH";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -136,6 +137,32 @@ fn parse_overlay_enabled_override(raw: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+pub fn resolve_overlay_adaptive_width(overlay_adaptive_width_override: Option<bool>) -> bool {
+    if let Some(overlay_adaptive_width) = overlay_adaptive_width_override {
+        return overlay_adaptive_width;
+    }
+
+    std::env::var(OVERLAY_ADAPTIVE_WIDTH_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_overlay_enabled_override)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+fn resolve_overlay_adaptive_width_with_env(
+    overlay_adaptive_width_override: Option<bool>,
+    overlay_adaptive_width_env: Option<&str>,
+) -> bool {
+    if let Some(overlay_adaptive_width) = overlay_adaptive_width_override {
+        return overlay_adaptive_width;
+    }
+
+    overlay_adaptive_width_env
+        .and_then(parse_overlay_enabled_override)
+        .unwrap_or(true)
 }
 
 fn probe_overlay_capability_with_inputs(
@@ -354,8 +381,8 @@ impl ClientConfig {
 mod tests {
     use super::{
         classify_overlay_capability, parse_overlay_enabled_override, parse_overlay_mode_override,
-        resolve_overlay_capability_with_inputs, resolve_overlay_enable_gate, OverlayEnableGate,
-        OverlayMode, OverlayProbeSignals,
+        resolve_overlay_adaptive_width_with_env, resolve_overlay_capability_with_inputs,
+        resolve_overlay_enable_gate, OverlayEnableGate, OverlayMode, OverlayProbeSignals,
     };
 
     #[test]
@@ -501,5 +528,36 @@ mod tests {
             capability.reason,
             "zwlr_layer_shell_v1_unavailable_using_xdg_toplevel_fallback"
         );
+    }
+
+    #[test]
+    fn resolve_overlay_adaptive_width_defaults_to_enabled() {
+        assert!(resolve_overlay_adaptive_width_with_env(None, None));
+    }
+
+    #[test]
+    fn resolve_overlay_adaptive_width_honors_env_when_cli_absent() {
+        assert!(!resolve_overlay_adaptive_width_with_env(
+            None,
+            Some("false")
+        ));
+        assert!(resolve_overlay_adaptive_width_with_env(None, Some("true")));
+    }
+
+    #[test]
+    fn resolve_overlay_adaptive_width_cli_takes_precedence_over_env() {
+        assert!(!resolve_overlay_adaptive_width_with_env(
+            Some(false),
+            Some("true")
+        ));
+        assert!(resolve_overlay_adaptive_width_with_env(
+            Some(true),
+            Some("false")
+        ));
+    }
+
+    #[test]
+    fn resolve_overlay_adaptive_width_invalid_env_falls_back_to_enabled() {
+        assert!(resolve_overlay_adaptive_width_with_env(None, Some("maybe")));
     }
 }
