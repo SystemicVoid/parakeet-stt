@@ -160,7 +160,7 @@ impl WaylandFocusCache {
             WaylandFocusObservation::Fresh { snapshot, .. } => snapshot.output_name,
             WaylandFocusObservation::LowConfidence {
                 snapshot,
-                reason: "wayland_transition_no_activated",
+                reason: "wayland_transition_no_activated" | "wayland_cache_stale",
                 ..
             } => snapshot.output_name,
             WaylandFocusObservation::Unavailable { .. } => None,
@@ -677,5 +677,32 @@ mod tests {
 
         let snapshot = entry.to_focus_snapshot(true);
         assert_eq!(snapshot.output_name.as_deref(), Some("DP-1"));
+    }
+
+    #[test]
+    fn current_output_name_accepts_stale_active_snapshot() {
+        let active = CachedToplevel {
+            identifier: Some("jkl".to_string()),
+            app_id: Some("Ghostty".to_string()),
+            title: Some("terminal".to_string()),
+            output_names: vec!["HDMI-A-1".to_string()],
+        };
+        let cache = WaylandFocusCache {
+            shared: Arc::new(Mutex::new(WaylandFocusSharedState {
+                connected: true,
+                protocols_supported: true,
+                active: Some(active.clone()),
+                activated_count: 1,
+                last_activated: Some(active),
+                last_commit_at: Some(Instant::now() - Duration::from_secs(5)),
+                last_activated_at: Some(Instant::now() - Duration::from_secs(5)),
+            })),
+        };
+
+        assert_eq!(
+            cache.current_output_name().as_deref(),
+            Some("HDMI-A-1"),
+            "overlay spawn should not deadlock on stale-but-populated active focus snapshots"
+        );
     }
 }
