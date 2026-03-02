@@ -231,9 +231,11 @@ pub struct OverlayProcessManager {
     mode: OverlayMode,
     adaptive_width: bool,
     sink: Option<OverlayProcessSink>,
+    active_output_name: Option<String>,
     latest_message: Option<OverlayIpcMessage>,
     focus_cache: Option<WaylandFocusCache>,
     pending_output_name: Option<String>,
+    utterance_active: bool,
     require_output_name_on_spawn: bool,
     launcher: Arc<OverlayLauncher>,
     metrics: Arc<OverlayManagerMetrics>,
@@ -266,11 +268,25 @@ impl OverlayProcessManager {
 
     pub fn send(&mut self, message: OverlayIpcMessage) {
         let is_output_hint = matches!(&message, OverlayIpcMessage::OutputHint { .. });
+        let starts_utterance = matches!(
+            &message,
+            OverlayIpcMessage::InterimState { .. } | OverlayIpcMessage::InterimText { .. }
+        );
+        let ends_utterance = matches!(&message, OverlayIpcMessage::SessionEnded { .. });
         if let OverlayIpcMessage::OutputHint { output_name } = &message {
             self.pending_output_name = Some(output_name.clone());
             self.output_wait_started_at = None;
         } else {
             self.latest_message = Some(message.clone());
+        }
+
+        if starts_utterance {
+            if !self.utterance_active {
+                self.maybe_retarget_for_next_utterance();
+            }
+            self.utterance_active = true;
+        } else if ends_utterance {
+            self.utterance_active = false;
         }
 
         if self.mode == OverlayMode::Disabled {
@@ -296,6 +312,7 @@ impl OverlayProcessManager {
             Err(OverlaySendError::Disconnected) => {
                 self.metrics.note_send_disconnect();
                 self.sink = None;
+                self.active_output_name = None;
             }
         }
 
@@ -364,10 +381,11 @@ impl OverlayProcessManager {
         }
 
         self.metrics.note_spawn_attempt();
-        match (self.launcher)(self.mode, output_name, self.adaptive_width) {
+        match (self.launcher)(self.mode, output_name.clone(), self.adaptive_width) {
             Ok(sink) => {
                 self.metrics.note_spawn_success();
                 self.sink = Some(sink);
+                self.active_output_name = output_name;
                 self.next_spawn_allowed_at = None;
             }
             Err(err) => {
@@ -394,7 +412,45 @@ impl OverlayProcessManager {
             }
             Err(err) => {
                 self.sink = None;
+                self.active_output_name = None;
                 Err(err)
+            }
+        }
+    }
+
+    fn maybe_retarget_for_next_utterance(&mut self) {
+        let Some(pending_output_name) = self.pending_output_name.clone() else {
+            return;
+        };
+        if self.active_output_name.as_deref() == Some(pending_output_name.as_str()) {
+            return;
+        }
+        if self.sink.is_none() {
+            return;
+        }
+
+        match (self.launcher)(
+            self.mode,
+            Some(pending_output_name.clone()),
+            self.adaptive_width,
+        ) {
+            Ok(sink) => {
+                info!(
+                    from_output = ?self.active_output_name,
+                    to_output = %pending_output_name,
+                    "retargeted overlay process for next utterance"
+                );
+                self.sink = Some(sink);
+                self.active_output_name = Some(pending_output_name);
+                self.next_spawn_allowed_at = None;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    from_output = ?self.active_output_name,
+                    to_output = %pending_output_name,
+                    "failed to retarget overlay process; keeping existing overlay sink"
+                );
             }
         }
     }
@@ -443,9 +499,11 @@ impl OverlayProcessManager {
             mode,
             adaptive_width,
             sink: None,
+            active_output_name: None,
             latest_message: None,
             focus_cache,
             pending_output_name: None,
+            utterance_active: false,
             require_output_name_on_spawn,
             launcher,
             metrics: Arc::new(OverlayManagerMetrics::default()),
@@ -871,6 +929,139 @@ mod tests {
                 .expect("adaptive width lock should be available")
                 .as_slice(),
             &[false]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_retargets_only_on_next_utterance_boundary() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let seen_output_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let launcher = recording_launcher(Arc::clone(&seen_output_names), queue);
+        let mut manager = OverlayProcessManager::new_for_tests_with_output_targeting(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
+
+        manager.send(OverlayIpcMessage::OutputHint {
+            output_name: "DP-1".to_string(),
+        });
+        let session_a = Uuid::new_v4();
+        manager.send(OverlayIpcMessage::InterimState {
+            session_id: session_a,
+            seq: 1,
+            state: "listening".to_string(),
+        });
+        manager.send(OverlayIpcMessage::OutputHint {
+            output_name: "HDMI-A-1".to_string(),
+        });
+        manager.send(OverlayIpcMessage::InterimText {
+            session_id: session_a,
+            seq: 2,
+            text: "still session a".to_string(),
+        });
+        manager.send(OverlayIpcMessage::SessionEnded {
+            session_id: session_a,
+            reason: None,
+        });
+
+        let first_hint = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive initial hint")
+            .expect("first sink should remain open");
+        assert_eq!(
+            first_hint,
+            OverlayIpcMessage::OutputHint {
+                output_name: "DP-1".to_string()
+            }
+        );
+        let first_interim = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive first utterance state")
+            .expect("first sink should remain open");
+        assert!(matches!(
+            first_interim,
+            OverlayIpcMessage::InterimState {
+                session_id,
+                seq: 1,
+                ..
+            } if session_id == session_a
+        ));
+        let changed_hint = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive changed output hint during active utterance")
+            .expect("first sink should remain open");
+        assert_eq!(
+            changed_hint,
+            OverlayIpcMessage::OutputHint {
+                output_name: "HDMI-A-1".to_string()
+            }
+        );
+
+        let first_text = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive interim text")
+            .expect("first sink should remain open");
+        assert!(matches!(
+            first_text,
+            OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 2,
+                ..
+            } if session_id == session_a
+        ));
+
+        let first_end = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive session end")
+            .expect("first sink should remain open");
+        assert!(matches!(
+            first_end,
+            OverlayIpcMessage::SessionEnded { session_id, .. } if session_id == session_a
+        ));
+
+        let session_b = Uuid::new_v4();
+        manager.send(OverlayIpcMessage::InterimState {
+            session_id: session_b,
+            seq: 1,
+            state: "listening".to_string(),
+        });
+
+        let retargeted_interim = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive first event of next utterance")
+            .expect("second sink should remain open");
+        assert!(matches!(
+            retargeted_interim,
+            OverlayIpcMessage::InterimState {
+                session_id,
+                seq: 1,
+                ..
+            } if session_id == session_b
+        ));
+
+        assert_eq!(
+            seen_output_names
+                .lock()
+                .expect("recorded output names lock should be available")
+                .clone(),
+            vec![Some("DP-1".to_string()), Some("HDMI-A-1".to_string())]
         );
     }
 }
