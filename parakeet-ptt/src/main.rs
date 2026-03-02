@@ -163,7 +163,7 @@ impl OverlaySink for NoopOverlaySink {
 
 enum RuntimeOverlaySink {
     Noop(NoopOverlaySink),
-    Process(OverlayProcessManager),
+    Process(Box<OverlayProcessManager>),
 }
 
 impl OverlaySink for RuntimeOverlaySink {
@@ -220,7 +220,7 @@ fn build_runtime_overlay_sink(
                 overlay_adaptive_width,
                 "overlay process routing enabled with respawn manager"
             );
-            RuntimeOverlaySink::Process(manager)
+            RuntimeOverlaySink::Process(Box::new(manager))
         }
     }
 }
@@ -1844,7 +1844,8 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -1950,7 +1951,8 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
@@ -2058,7 +2060,8 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(manager), None);
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingInjector {
