@@ -243,7 +243,6 @@ pub struct OverlayProcessManager {
     next_spawn_allowed_at: Option<Instant>,
     output_wait_started_at: Option<Instant>,
     output_watchdog_timeout: Duration,
-    output_watchdog_fallback_used: bool,
 }
 
 impl OverlayProcessManager {
@@ -355,12 +354,6 @@ impl OverlayProcessManager {
         }
 
         if self.require_output_name_on_spawn && output_name.is_none() {
-            if self.output_watchdog_fallback_used {
-                debug!(
-                    "deferring overlay process spawn; output watchdog fallback already used once"
-                );
-                return;
-            }
             let wait_started = self.output_wait_started_at.get_or_insert(now);
             let waited = now.saturating_duration_since(*wait_started);
             if waited < self.output_watchdog_timeout {
@@ -371,12 +364,11 @@ impl OverlayProcessManager {
                 );
                 return;
             }
-            self.output_watchdog_fallback_used = true;
             self.output_wait_started_at = None;
             warn!(
                 waited_ms = waited.as_millis(),
                 timeout_ms = self.output_watchdog_timeout.as_millis(),
-                "focused output unavailable after watchdog timeout; spawning overlay without output targeting once"
+                "focused output unavailable after watchdog timeout; spawning overlay without output targeting"
             );
         }
 
@@ -511,7 +503,6 @@ impl OverlayProcessManager {
             next_spawn_allowed_at: None,
             output_wait_started_at: None,
             output_watchdog_timeout,
-            output_watchdog_fallback_used: false,
         };
         if !manager.require_output_name_on_spawn {
             manager.try_spawn_sink();
@@ -936,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn output_watchdog_spawns_once_without_output_targeting() {
+    async fn output_watchdog_spawns_without_output_targeting() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = OverlayProcessSink::from_sender_for_tests(
             tx,
@@ -966,7 +957,7 @@ mod tests {
                 .spawn_attempt_total
                 .load(Ordering::Relaxed),
             1,
-            "watchdog should trigger exactly one fallback spawn attempt"
+            "watchdog should trigger fallback spawn when focused output is unavailable"
         );
         assert_eq!(
             seen_output_names
@@ -974,7 +965,7 @@ mod tests {
                 .expect("recorded output names lock should be available")
                 .clone(),
             vec![None],
-            "watchdog fallback spawn should omit output targeting exactly once"
+            "watchdog fallback spawn should omit output targeting"
         );
 
         let received = timeout(Duration::from_millis(100), rx.recv())
@@ -983,6 +974,78 @@ mod tests {
             .expect("sink should remain open");
         assert_eq!(received, state);
         assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_watchdog_allows_fallback_respawn_after_disconnect() {
+        let (tx_first, rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let seen_output_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let launcher = recording_launcher(Arc::clone(&seen_output_names), queue);
+        let mut manager = OverlayProcessManager::new_for_tests_with_output_targeting_and_watchdog(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        let session_id = Uuid::new_v4();
+        manager.send(OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 1,
+            text: "first fallback".to_string(),
+        });
+        assert!(manager.has_active_sink());
+
+        drop(rx_first);
+
+        manager.send(OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 2,
+            text: "second fallback".to_string(),
+        });
+
+        let replayed = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("respawned sink should receive replayed state")
+            .expect("respawned sink should remain open");
+        assert_eq!(
+            replayed,
+            OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "second fallback".to_string()
+            }
+        );
+        assert_eq!(
+            manager
+                .metrics()
+                .spawn_attempt_total
+                .load(Ordering::Relaxed),
+            2,
+            "watchdog fallback should allow later respawn attempts without output targeting"
+        );
+        assert_eq!(
+            seen_output_names
+                .lock()
+                .expect("recorded output names lock should be available")
+                .clone(),
+            vec![None, None]
+        );
     }
 
     #[test]
