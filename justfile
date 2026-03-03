@@ -17,6 +17,9 @@ default:
 start mode="layer-shell" adaptive_width="false":
     @just --justfile "{{overlay_justfile}}" start "{{mode}}" "{{adaptive_width}}"
 
+start-sound mode="layer-shell" adaptive_width="false" sound_path="sounds/completion.ogg":
+    @just --justfile "{{overlay_justfile}}" start-sound "{{mode}}" "{{adaptive_width}}" "{{sound_path}}"
+
 # Start with adaptive width enabled (opt-in).
 start-adaptive mode="layer-shell":
     @just --justfile "{{overlay_justfile}}" start "{{mode}}" "true"
