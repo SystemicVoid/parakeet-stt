@@ -8,6 +8,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import numpy as np
+from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import (
     AbortSession,
@@ -57,10 +58,12 @@ class FakeIncrementalTranscriber:
         self.outputs = outputs or []
         self.fail_at_call = fail_at_call
         self.calls = 0
+        self.sample_sizes: list[int] = []
 
-    def transcribe_samples(self, _samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
         del sample_rate
         self.calls += 1
+        self.sample_sizes.append(int(samples.size))
         if self.fail_at_call is not None and self.calls == self.fail_at_call:
             raise RuntimeError("incremental source failed")
         if self.calls <= len(self.outputs):
@@ -101,7 +104,7 @@ def _build_server(
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
-    server._live_interim_chunks = []
+    server._live_interim_audio = np.zeros((0,), dtype=np.float32)
     server._live_interim_failed = False
     server._overlay_event_seq_by_session = {}
     server._overlay_last_interim_text_by_session = {}
@@ -571,5 +574,28 @@ def test_phase6_overlay_crash_mid_session_contract_keeps_final_non_fatal(monkeyp
         status = server.status()
         assert status.overlay_events_dropped is not None
         assert status.overlay_events_dropped >= 2
+
+    asyncio.run(scenario())
+
+
+def test_live_interim_context_window_is_bounded() -> None:
+    async def scenario() -> None:
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=[f"chunk-{index}" for index in range(1, 10)],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        chunk = np.full((8_000,), 0.2, dtype=np.float32)
+        for _ in range(8):
+            await server._emit_live_interim_from_chunk(cast(Any, websocket), session_id, chunk)
+
+        max_seen = max(cast(Any, server.transcriber).sample_sizes)
+        expected_max = int(
+            server.audio.sample_rate * server_module.OVERLAY_INTERIM_CONTEXT_WINDOW_SECS
+        )
+        assert max_seen <= expected_max
 
     asyncio.run(scenario())

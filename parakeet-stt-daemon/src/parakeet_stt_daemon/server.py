@@ -51,6 +51,7 @@ ErrorCode = Literal[
     "INVALID_REQUEST",
     "UNEXPECTED",
 ]
+OVERLAY_INTERIM_CONTEXT_WINDOW_SECS = 2.0
 
 
 class DaemonServer:
@@ -91,7 +92,7 @@ class DaemonServer:
         self._last_finalize_ms: int | None = None
         self._last_infer_ms: int | None = None
         self._last_send_ms: int | None = None
-        self._live_interim_chunks: list[np.ndarray] = []
+        self._live_interim_audio = np.zeros((0,), dtype=np.float32)
         self._live_interim_failed = False
         self._vad_model: object | None = None
         self._vad_import_error: str | None = None
@@ -166,7 +167,7 @@ class DaemonServer:
             )
             return
         try:
-            self._live_interim_chunks = []
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             self._overlay_last_interim_text_by_session.pop(message.session_id, None)
             self.audio.start_session()
@@ -247,7 +248,7 @@ class DaemonServer:
                 overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
                 if isinstance(overlay_last_text, dict):
                     overlay_last_text.pop(session.session_id, None)
-                self._live_interim_chunks = []
+                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
                 self._live_interim_failed = False
                 return
 
@@ -290,7 +291,7 @@ class DaemonServer:
                 overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
                 if isinstance(overlay_last_text, dict):
                     overlay_last_text.pop(session.session_id, None)
-                self._live_interim_chunks = []
+                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
                 self._live_interim_failed = False
                 return
 
@@ -314,7 +315,7 @@ class DaemonServer:
             overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
             if isinstance(overlay_last_text, dict):
                 overlay_last_text.pop(session.session_id, None)
-            self._live_interim_chunks = []
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             self._last_audio_ms = audio_ms
             self._last_audio_stop_ms = audio_stop_ms
@@ -414,9 +415,23 @@ class DaemonServer:
                 if isinstance(overlay_last_text, dict):
                     overlay_last_text.pop(active_session_id, None)
             self._active_stream = None
-            self._live_interim_chunks = []
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             return active_session_id is not None
+
+    def _append_overlay_interim_context(
+        self,
+        existing: np.ndarray,
+        chunk_audio: np.ndarray,
+    ) -> np.ndarray:
+        if existing.size == 0:
+            combined = np.array(chunk_audio, copy=True)
+        else:
+            combined = np.concatenate((existing, chunk_audio))
+        max_samples = max(1, int(self.audio.sample_rate * OVERLAY_INTERIM_CONTEXT_WINDOW_SECS))
+        if combined.size > max_samples:
+            return combined[-max_samples:]
+        return combined
 
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
@@ -486,7 +501,7 @@ class DaemonServer:
             return []
 
         loop = asyncio.get_running_loop()
-        cumulative_chunks: list[np.ndarray] = []
+        rolling_audio = np.zeros((0,), dtype=np.float32)
         updates: list[str] = []
         last_text = ""
 
@@ -494,14 +509,13 @@ class DaemonServer:
             chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
             if chunk_audio.size == 0:
                 continue
-            cumulative_chunks.append(chunk_audio)
-            combined = np.concatenate(cumulative_chunks)
+            rolling_audio = self._append_overlay_interim_context(rolling_audio, chunk_audio)
             try:
                 candidate = await loop.run_in_executor(
                     None,
                     partial(
                         self.transcriber.transcribe_samples,
-                        combined,
+                        rolling_audio,
                         sample_rate=self.audio.sample_rate,
                     ),
                 )
@@ -572,15 +586,17 @@ class DaemonServer:
         chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
         if chunk_audio.size == 0:
             return
-        self._live_interim_chunks.append(np.array(chunk_audio, copy=True))
-        combined = np.concatenate(self._live_interim_chunks)
+        self._live_interim_audio = self._append_overlay_interim_context(
+            self._live_interim_audio,
+            chunk_audio,
+        )
         loop = asyncio.get_running_loop()
         try:
             candidate = await loop.run_in_executor(
                 None,
                 partial(
                     self.transcriber.transcribe_samples,
-                    combined,
+                    self._live_interim_audio,
                     sample_rate=self.audio.sample_rate,
                 ),
             )
