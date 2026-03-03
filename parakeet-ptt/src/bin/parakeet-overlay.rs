@@ -46,9 +46,9 @@ const TEXT_COLOR_RGB: (u8, u8, u8) = (245, 245, 250);
 const TEXT_SHADOW_COLOR: [u8; 4] = [0, 0, 0, 60];
 const PADDING_H: u32 = 24;
 const PADDING_V: u32 = 16;
-const PADDING_LEFT: u32 = 32;
+const PADDING_LEFT: u32 = 72;
 const ACCENT_STRIPE_WIDTH: f32 = 3.0;
-const ACCENT_STRIPE_MARGIN: f32 = 6.0;
+const ACCENT_STRIPE_MARGIN: f32 = 4.0;
 const ENTRANCE_DURATION_MS: u64 = 300;
 const EXIT_DURATION_MS: u64 = 250;
 const ACCENT_CROSSFADE_MS: u64 = 150;
@@ -58,7 +58,7 @@ const BREATHING_CYCLE_MS: u64 = 3000;
 const BREATHING_AMPLITUDE: f32 = 0.05;
 const CHAR_FADEIN_MS: u64 = 100;
 const CHAR_STAGGER_MS: u64 = 16;
-const MIN_PANEL_WIDTH: u32 = 200;
+const MIN_PANEL_WIDTH: u32 = 240;
 const WIDTH_ANIM_MS: u64 = 200;
 
 const PHRASE_ROTATE_MS: u64 = 3000;
@@ -87,15 +87,23 @@ const PROGRESS_SEGMENT_FRAC: f32 = 0.3;
 const SUCCESS_FLASH_MS: u64 = 200;
 const SUCCESS_FLASH_COLOR: [u8; 4] = [80, 220, 120, 255]; // green accent
 
-// --- Audio VU Meter ---
-const VU_BAR_COUNT: usize = 8;
-const VU_BAR_WIDTH: f32 = 2.0;
-const VU_BAR_GAP: f32 = 1.0;
-const VU_DB_FLOOR: f32 = -65.0;
-const VU_DB_CEIL: f32 = -3.0;
-const VU_DECAY_FACTOR: f32 = 0.9;
-const VU_COLOR: (u8, u8, u8) = (0, 210, 200);
-const VU_QUANTIZE_PX: f32 = 2.0;
+// --- Audio Waveform ---
+const WF_CANVAS_W: usize = 20;
+const WF_MAX_H: usize = 24;
+const WF_UPSCALE: usize = 3;
+const WF_COLOR: (u8, u8, u8) = (0, 220, 210);
+const WF_DB_FLOOR: f32 = -60.0;
+const WF_DB_CEIL: f32 = -5.0;
+const WF_ATTACK: f32 = 0.85;
+const WF_RELEASE: f32 = 0.05;
+const WF_TICK_DECAY: f32 = 0.96;
+const WF_DITHER_ZONE: f32 = 0.35;
+const WF_MARGIN_LEFT: f32 = 4.0;
+const WF_MARGIN_V: f32 = 6.0;
+const WF_VISUAL_GAIN: f32 = 1.2;
+const WF_WARMUP_MS: u64 = 250;
+const WF_GLOW_ALPHA: u8 = 40;
+const WF_GLOW_RADIUS_PX: i32 = 1;
 
 const PREFERRED_FONTS: &[&str] = &["Inter", "Cantarell", "Noto Sans"];
 
@@ -509,28 +517,41 @@ fn draw_accent_stripe(
     }
 }
 
-struct AudioVuState {
-    levels: [f32; VU_BAR_COUNT],
+const BAYER_4X4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+struct WaveformCanvas {
+    levels: [f32; WF_CANVAS_W],
     cursor: usize,
+    created_ms: u64,
 }
 
-impl AudioVuState {
-    fn new() -> Self {
+impl WaveformCanvas {
+    fn new(now_ms: u64) -> Self {
         Self {
-            levels: [0.0; VU_BAR_COUNT],
+            levels: [0.0; WF_CANVAS_W],
             cursor: 0,
+            created_ms: now_ms,
         }
     }
 
     fn push(&mut self, level_db: f32) {
-        let normalized = ((level_db - VU_DB_FLOOR) / (VU_DB_CEIL - VU_DB_FLOOR)).clamp(0.0, 1.0);
-        self.levels[self.cursor] = normalized;
-        self.cursor = (self.cursor + 1) % VU_BAR_COUNT;
+        let target = ((level_db - WF_DB_FLOOR) / (WF_DB_CEIL - WF_DB_FLOOR)).clamp(0.0, 1.0);
+        let previous = self.levels[self.cursor];
+        let rate = if target > previous {
+            WF_ATTACK
+        } else {
+            WF_RELEASE
+        };
+        self.levels[self.cursor] = previous + (target - previous) * rate;
+        self.cursor = (self.cursor + 1) % WF_CANVAS_W;
     }
 
-    fn decay(&mut self) {
-        for level in &mut self.levels {
-            *level *= VU_DECAY_FACTOR;
+    fn tick_decay(&mut self) {
+        for (index, level) in self.levels.iter_mut().enumerate() {
+            if index == self.cursor {
+                continue;
+            }
+            *level *= WF_TICK_DECAY;
             if *level < 0.01 {
                 *level = 0.0;
             }
@@ -541,57 +562,131 @@ impl AudioVuState {
         self.levels.iter().any(|&l| l > 0.0)
     }
 
-    /// Iterate levels oldest→newest (left→right rendering order).
-    fn bars(&self) -> impl Iterator<Item = f32> + '_ {
-        (0..VU_BAR_COUNT).map(move |i| self.levels[(self.cursor + i) % VU_BAR_COUNT])
+    fn visible_columns(&self, now_ms: u64) -> usize {
+        let elapsed = now_ms.saturating_sub(self.created_ms);
+        let visible = (elapsed.saturating_mul(WF_CANVAS_W as u64) / WF_WARMUP_MS.max(1)) as usize;
+        visible.clamp(0, WF_CANVAS_W)
     }
 }
 
-fn draw_vu_bars(
+fn draw_waveform(
     frame: &mut [u8],
     dims: SurfaceDimensions,
     content: ContentArea,
-    vu: &AudioVuState,
+    waveform: &WaveformCanvas,
+    now_ms: u64,
     frame_alpha: f32,
 ) {
-    let total_vu_width = VU_BAR_COUNT as f32 * (VU_BAR_WIDTH + VU_BAR_GAP) - VU_BAR_GAP;
-    let vu_x_start = content.x as f32 + PADDING_LEFT as f32
-        - ACCENT_STRIPE_MARGIN
-        - ACCENT_STRIPE_WIDTH
-        - total_vu_width;
-    let margin_v = PADDING_V as f32 + 2.0;
-    let y_top = content.y as f32 + margin_v;
-    let y_bottom = (content.y + content.height) as f32 - margin_v;
-    let max_height = y_bottom - y_top;
-    if max_height <= 0.0 {
+    let available_vertical = (content.height as f32 - 2.0 * WF_MARGIN_V).max(0.0);
+    if available_vertical < WF_UPSCALE as f32 {
         return;
     }
+    let canvas_h = ((available_vertical / WF_UPSCALE as f32).floor() as usize).clamp(1, WF_MAX_H);
+    let zone_x = (content.x as f32 + WF_MARGIN_LEFT).round() as i32;
+    let zone_h_px = (canvas_h * WF_UPSCALE) as i32;
+    let zone_y =
+        ((content.y + content.height) as f32 - WF_MARGIN_V - zone_h_px as f32).round() as i32;
 
-    for (i, level) in vu.bars().enumerate() {
-        if level <= 0.0 {
-            continue;
+    let mut shape_map = vec![0u8; WF_CANVAS_W * canvas_h];
+    let visible_columns = waveform.visible_columns(now_ms);
+
+    for cy in 0..canvas_h {
+        for cx in 0..visible_columns {
+            let level = waveform.levels[(waveform.cursor + cx) % WF_CANVAS_W];
+            if level <= 0.0 {
+                continue;
+            }
+
+            let fill_rows = (level * WF_VISUAL_GAIN).clamp(0.0, 1.0) * canvas_h as f32;
+            if fill_rows <= 0.0 {
+                continue;
+            }
+            let row_from_bottom = (canvas_h - 1 - cy) as f32;
+            if row_from_bottom >= fill_rows {
+                continue;
+            }
+
+            let bayer_value = BAYER_4X4[cy % 4][cx % 4] as f32 / 16.0;
+            let solid_boundary = fill_rows * (1.0 - WF_DITHER_ZONE);
+            let mut shape_type = 0u8; // 0: empty, 1: dot, 2: cross, 3: solid
+            if row_from_bottom < solid_boundary {
+                shape_type = 3;
+                // Keep the base dense, but allow slight porosity for imbricated texture.
+                let solid_progress = if solid_boundary <= f32::EPSILON {
+                    1.0
+                } else {
+                    1.0 - row_from_bottom / solid_boundary
+                };
+                let solid_density = (0.84 + 0.14 * solid_progress).clamp(0.0, 1.0);
+                if bayer_value > solid_density {
+                    shape_type = 2;
+                }
+            } else {
+                let dither_height = (fill_rows * WF_DITHER_ZONE).max(f32::EPSILON);
+                let coverage = 1.0 - (row_from_bottom - solid_boundary) / dither_height;
+                let combined = coverage - bayer_value;
+                if combined > 0.15 {
+                    shape_type = 3;
+                } else if combined > -0.15 {
+                    shape_type = 2;
+                } else if combined > -0.45 {
+                    shape_type = 1;
+                }
+            }
+
+            shape_map[cy * WF_CANVAS_W + cx] = shape_type;
         }
-        let bar_x = vu_x_start + i as f32 * (VU_BAR_WIDTH + VU_BAR_GAP);
-        // Quantize height to VU_QUANTIZE_PX steps for pixelated look
-        let raw_height = level * max_height;
-        let bar_height = (raw_height / VU_QUANTIZE_PX).round() * VU_QUANTIZE_PX;
-        if bar_height <= 0.0 {
-            continue;
+    }
+
+    let core_alpha = (frame_alpha * 255.0).round() as u8;
+    let core_pixel = argb_pixel_premul(WF_COLOR.0, WF_COLOR.1, WF_COLOR.2, core_alpha);
+    let glow_alpha = ((WF_GLOW_ALPHA as f32) * frame_alpha).round() as u8;
+    let glow_pixel = argb_pixel_premul(WF_COLOR.0, WF_COLOR.1, WF_COLOR.2, glow_alpha);
+
+    // Bloom pre-pass: low-alpha halo around denser waveform regions.
+    if glow_alpha > 0 {
+        for cy in 0..canvas_h {
+            for cx in 0..visible_columns {
+                let shape = shape_map[cy * WF_CANVAS_W + cx];
+                if shape < 2 {
+                    continue;
+                }
+                let tile_x = zone_x + (cx * WF_UPSCALE) as i32;
+                let tile_y = zone_y + (cy * WF_UPSCALE) as i32;
+                let x0 = tile_x - WF_GLOW_RADIUS_PX;
+                let y0 = tile_y - WF_GLOW_RADIUS_PX;
+                let x1 = tile_x + WF_UPSCALE as i32 + WF_GLOW_RADIUS_PX;
+                let y1 = tile_y + WF_UPSCALE as i32 + WF_GLOW_RADIUS_PX;
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        blend_pixel(frame, dims, px, py, glow_pixel);
+                    }
+                }
+            }
         }
+    }
 
-        let bar_top = y_bottom - bar_height;
-        let alpha = (level * 0.7 + 0.3).clamp(0.3, 1.0); // dim glow minimum
-        let a = (alpha * frame_alpha * 255.0).round() as u8;
-        let pixel = argb_pixel_premul(VU_COLOR.0, VU_COLOR.1, VU_COLOR.2, a);
-
-        let px0 = bar_x.floor() as i32;
-        let px1 = (bar_x + VU_BAR_WIDTH).ceil() as i32;
-        let py0 = bar_top.floor() as i32;
-        let py1 = y_bottom.ceil() as i32;
-
-        for py in py0..py1 {
-            for px in px0..px1 {
-                blend_pixel(frame, dims, px, py, pixel);
+    // Sharp pass: draw imbricated 3x3 shape tiles.
+    for cy in 0..canvas_h {
+        for cx in 0..visible_columns {
+            let shape = shape_map[cy * WF_CANVAS_W + cx];
+            if shape == 0 {
+                continue;
+            }
+            for dy in 0..WF_UPSCALE {
+                for dx in 0..WF_UPSCALE {
+                    let draw_pixel = match shape {
+                        3 => true,
+                        2 => dx == 1 || dy == 1,
+                        1 => dx == 1 && dy == 1,
+                        _ => false,
+                    };
+                    if draw_pixel {
+                        let px = zone_x + (cx * WF_UPSCALE + dx) as i32;
+                        let py = zone_y + (cy * WF_UPSCALE + dy) as i32;
+                        blend_pixel(frame, dims, px, py, core_pixel);
+                    }
+                }
             }
         }
     }
@@ -1305,7 +1400,7 @@ trait OverlayBackend {
         false
     }
     fn push_audio_level(&mut self, _level_db: f32) {}
-    fn decay_vu(&mut self) {}
+    fn tick_waveform(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -1337,7 +1432,7 @@ struct WaylandOverlayBackend {
     changed_char_end: usize,
     width_state: WidthState,
     listening_max_phrase_width: f32,
-    vu_state: Option<AudioVuState>,
+    waveform: Option<WaveformCanvas>,
     started: Instant,
 }
 
@@ -1369,7 +1464,7 @@ impl WaylandOverlayBackend {
             changed_char_end: 0,
             width_state: WidthState::new(initial_width, 0),
             listening_max_phrase_width,
-            vu_state: None,
+            waveform: None,
             started: Instant::now(),
         }
     }
@@ -1525,15 +1620,15 @@ impl OverlayBackend for WaylandOverlayBackend {
                 }
                 self.finalizing_started_ms = None;
             }
-            // Manage VU meter lifecycle
+            // Manage waveform lifecycle
             match intent.phase {
                 OverlayRenderPhase::Listening | OverlayRenderPhase::Interim => {
-                    if self.vu_state.is_none() {
-                        self.vu_state = Some(AudioVuState::new());
+                    if self.waveform.is_none() {
+                        self.waveform = Some(WaveformCanvas::new(now));
                     }
                 }
                 OverlayRenderPhase::Hidden => {
-                    self.vu_state = None;
+                    self.waveform = None;
                 }
                 _ => {}
             }
@@ -1633,7 +1728,7 @@ impl OverlayBackend for WaylandOverlayBackend {
                 self.finalizing_started_ms,
                 effective_surface_width,
                 interim_fade,
-                self.vu_state.as_ref(),
+                self.waveform.as_ref(),
             )
             .with_context(|| format!("overlay renderer backend failed for {:?}", self.kind));
         self.prev_headline = intent.headline;
@@ -1648,24 +1743,28 @@ impl OverlayBackend for WaylandOverlayBackend {
             || self.success_flash.is_some()
             || self.headline_changed_ms.is_some()
             || (self.ui.adaptive_width_enabled && self.width_state.is_animating(self.now_ms()))
-            || self.vu_state.as_ref().is_some_and(|vu| vu.has_signal())
+            || self
+                .waveform
+                .as_ref()
+                .is_some_and(|waveform| waveform.has_signal())
     }
 
     fn push_audio_level(&mut self, level_db: f32) {
         if !level_db.is_finite() {
             return;
         }
-        if self.vu_state.is_none() {
-            self.vu_state = Some(AudioVuState::new());
+        let now = self.now_ms();
+        if self.waveform.is_none() {
+            self.waveform = Some(WaveformCanvas::new(now));
         }
-        if let Some(vu) = &mut self.vu_state {
-            vu.push(level_db);
+        if let Some(waveform) = &mut self.waveform {
+            waveform.push(level_db);
         }
     }
 
-    fn decay_vu(&mut self) {
-        if let Some(vu) = &mut self.vu_state {
-            vu.decay();
+    fn tick_waveform(&mut self) {
+        if let Some(waveform) = &mut self.waveform {
+            waveform.tick_decay();
         }
     }
 }
@@ -2010,7 +2109,7 @@ impl WaylandRuntime {
         finalizing_started_ms: Option<u64>,
         effective_surface_width: u32,
         interim_fade: Option<(usize, usize, u64)>,
-        vu_state: Option<&AudioVuState>,
+        waveform: Option<&WaveformCanvas>,
     ) -> Result<()> {
         self.dispatch_pending("failed pre-render event dispatch")?;
 
@@ -2050,7 +2149,7 @@ impl WaylandRuntime {
                 now_ms,
                 finalizing_started_ms,
                 interim_fade,
-                vu_state,
+                waveform,
             );
             self.shm_buffer.sync_to_file()?;
             self.surface.attach(Some(&self.shm_buffer.buffer), 0, 0);
@@ -2615,7 +2714,7 @@ fn render_frame(
     now_ms: u64,
     finalizing_started_ms: Option<u64>,
     interim_fade: Option<(usize, usize, u64)>,
-    vu_state: Option<&AudioVuState>,
+    waveform: Option<&WaveformCanvas>,
 ) {
     // 1. Clear to transparent
     fill_frame(frame, [0, 0, 0, 0]);
@@ -2674,13 +2773,13 @@ fn render_frame(
         argb_pixel(BORDER_COLOR.0, BORDER_COLOR.1, BORDER_COLOR.2, border_a),
     );
 
-    // 5. Draw VU bars or accent stripe
-    let vu_drawn = if matches!(
+    // 5. Draw waveform or accent stripe
+    let waveform_drawn = if matches!(
         intent.phase,
         OverlayRenderPhase::Listening | OverlayRenderPhase::Interim
     ) {
-        if let Some(vu) = vu_state {
-            draw_vu_bars(frame, dimensions, content, vu, frame_alpha);
+        if let Some(waveform) = waveform {
+            draw_waveform(frame, dimensions, content, waveform, now_ms, frame_alpha);
             true
         } else {
             false
@@ -2688,7 +2787,7 @@ fn render_frame(
     } else {
         false
     };
-    if !vu_drawn {
+    if !waveform_drawn {
         if let Some(accent) = accent_color {
             draw_accent_stripe(
                 frame,
@@ -3072,7 +3171,7 @@ async fn main() -> Result<()> {
             _ = tick.tick() => {
                 let now_ms = started.elapsed().as_millis() as u64;
                 let time_advanced = machine.advance_time(now_ms);
-                built_backend.backend.decay_vu();
+                built_backend.backend.tick_waveform();
                 let fading = built_backend.backend.is_fading();
                 if time_advanced || fading {
                     built_backend
