@@ -559,3 +559,38 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 - Measure actual text width after layout. Set surface width to `max(text_width + padding, min_width)` clamped to `max_width`.
 - Animate width changes over ~200ms with ease-out to prevent jarring size jumps during interim text streaming.
 - This requires recreating the `wl_shm_pool`/`wl_buffer` on size change, or pre-allocating at `max_width` and only damage/commit the active region. The latter is simpler and wastes minimal memory.
+
+---
+
+## 2026-03-03 QA Latency Matrix (Main vs Overlay Branch)
+
+Full-corpus benchmark run completed across four comparison points (`main` vs `feature/overlay-phase0-capability-gate`, each in `offline` and `stream-seal`) using `check_model.py --bench-offline --bench-manifest bench_audio/personal --bench-append-legacy --bench-tier all`.
+
+### Summary Metrics (108 samples, 2 runs, median-of-runs aggregate)
+
+| Branch | Runtime | avg_wer | weighted_wer | infer_p95_ms | warm_finalize_p95_ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `feature/overlay-phase0-capability-gate` (`d255423`) | `offline` | `0.031434` | `0.039909` | `56.443` | `56.796` |
+| `feature/overlay-phase0-capability-gate` (`d255423`) | `stream-seal` | `0.030659` | `0.039239` | `58.163` | `57.165` |
+| `main` (`48958ae`) | `offline` | `0.030552` | `0.039147` | `56.505` | `56.714` |
+| `main` (`48958ae`) | `stream-seal` | `0.030835` | `0.039391` | `59.054` | `58.032` |
+
+### Key Comparison Notes
+
+- Overlay branch `stream-seal` remained within noise-level deltas vs `main` and showed slightly lower p95 latency than `main` `stream-seal` on this run (`warm_finalize_p95 -0.866 ms`, `infer_p95 -0.891 ms`).
+- No regression gate failures occurred in any of the four runs.
+- First-sample cold-start outlier (`cmd_001`) remained a warmup artifact and is excluded from warm metrics (`warmup_samples=1`).
+
+### JSON Result Artifacts
+
+- [Overlay branch / offline](file:///tmp/parakeet-qa-latency-20260303-184336/feature_overlay-phase0-capability-gate-d255423-offline.json)
+- [Overlay branch / stream-seal](file:///tmp/parakeet-qa-latency-20260303-184336/feature_overlay-phase0-capability-gate-d255423-stream-seal.json)
+- [Main branch / offline](file:///tmp/parakeet-qa-latency-20260303-184336/main-48958ae-offline.json)
+- [Main branch / stream-seal](file:///tmp/parakeet-qa-latency-20260303-184336/main-48958ae-stream-seal.json)
+
+### Helper Runtime Truth Snapshots
+
+- [Overlay helper status (offline)](file:///tmp/parakeet-qa-latency-20260303-184336/feature_overlay-phase0-capability-gate-offline-helper-status.json)
+- [Overlay helper status (streaming)](file:///tmp/parakeet-qa-latency-20260303-184336/feature_overlay-phase0-capability-gate-streaming-helper-status.json)
+- [Main helper status (offline)](file:///tmp/parakeet-qa-latency-20260303-184336/main-offline-helper-status.json)
+- [Main helper status (streaming)](file:///tmp/parakeet-qa-latency-20260303-184336/main-streaming-helper-status.json)
