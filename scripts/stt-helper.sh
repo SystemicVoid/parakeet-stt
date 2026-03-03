@@ -583,6 +583,7 @@ CLIENTCMD
             local daemon_right_context_secs="$default_daemon_right_context_secs"
             local daemon_left_context_secs="$default_daemon_left_context_secs"
             local daemon_batch_size="$default_daemon_batch_size"
+            local daemon_overlay_events_enabled="false"
             if [ "$launch_profile" = "stream-seal" ]; then
                 daemon_streaming_enabled="true"
             fi
@@ -598,6 +599,10 @@ CLIENTCMD
             elif [ "$parse_status" -ne 0 ]; then
                 return "$parse_status"
             fi
+
+            # Keep daemon overlay event emission in lockstep with the user-facing
+            # --overlay-enabled start control so one switch enables both paths.
+            daemon_overlay_events_enabled="$overlay_enabled"
 
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
@@ -618,6 +623,7 @@ CLIENTCMD
             echo "   - Overlay adaptive width: $overlay_adaptive_width"
             echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
+            echo "   - Daemon overlay events enabled: $daemon_overlay_events_enabled"
             echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
@@ -655,6 +661,7 @@ CLIENTCMD
                     PARAKEET_RIGHT_CONTEXT_SECS="$daemon_right_context_secs" \
                     PARAKEET_LEFT_CONTEXT_SECS="$daemon_left_context_secs" \
                     PARAKEET_BATCH_SIZE="$daemon_batch_size" \
+                    PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
                     nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
                     echo $! > "$DAEMON_PID_FILE"
@@ -845,14 +852,15 @@ CLIENTCMD
             echo "${HOST}:${PORT}" > "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
-
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
+
+            local daemon_overlay_events_enabled="$overlay_enabled"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_OVERLAY_EVENTS_ENABLED=\"$daemon_overlay_events_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
 
             if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                 echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
