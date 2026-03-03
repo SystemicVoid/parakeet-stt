@@ -1,6 +1,6 @@
 # Streaming Overlay + Seal-Final Injection: Canonical Plan
 
-_Last updated: 2026-03-02 (live UX findings: monitor targeting, listening text cycling, finalizing animation)_
+_Last updated: 2026-03-03 (live UX findings: audio-reactive waveform, interim rewrite polish, injection-aware finalizing dismiss)_
 
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
@@ -19,6 +19,7 @@ _Last updated: 2026-03-02 (live UX findings: monitor targeting, listening text c
 - [x] Phase 7: Visual overhaul — dark frosted-glass panel, rounded corners, soft shadow, accent stripe, text shadows, premultiplied alpha, font cascade, 250ms ease-out-cubic fade transitions.
 - [x] Phase 8 (P0–P2): Overlay UX polish — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress bar + success flash.
 - [x] Phase 8 (P3 follow-through): active-output tracking (8.4 Tier 1), interim text fade-in (8.6), idle breathing (8.7), adaptive width (8.8).
+- [x] Phase 8 (P4 follow-through): audio-level plumbing, real-time waveform rendering, and injection-aware Finalizing dismissal with text carry-through.
 - [ ] Phase 8 (remaining deferred): cursor-spawn placement (8.4 Tier 2). See **§ Overlay UX Roadmap**.
 
 ## Implementation Log
@@ -76,6 +77,9 @@ _Last updated: 2026-03-02 (live UX findings: monitor targeting, listening text c
 - 2026-03-01: Startup targeting hardening follow-up — added a one-shot output-name watchdog fallback in `OverlayProcessManager`: if focused output remains unavailable past a short timeout, spawn once without `--output-name` and log a warning to avoid permanent overlay invisibility.
 - 2026-03-01: Visual artifact finding (deferred) — after Finalizing→Hidden on adaptive-width utterances, residual frame slices can remain on-screen (ghosted previous widths). Logged from live run screenshot; renderer cleanup fix is deferred.
 - 2026-03-02: Ghosted slices fix — tracking previous committed width and damaging the width union on shrink paths ensures stale pixels are cleared. Added shrink-damage unit tests to overlay binary.
+- 2026-03-03: Added end-to-end audio level event plumbing (`AudioLevel`) across protocol routing and overlay process boundaries, then consumed it in the renderer to drive a real-time waveform/VU treatment.
+- 2026-03-03: Polished interim rewrite motion by stabilizing staged suffix animations and full-string replacement transitions to avoid visible jitter during rapid partial-result updates.
+- 2026-03-03: Finalizing now carries forward last recognized interim text, accepts `injection_complete` as a one-shot dismiss signal, and falls back to a shorter 600ms auto-hide timeout when completion signals are absent.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -114,6 +118,7 @@ _Last updated: 2026-03-02 (live UX findings: monitor targeting, listening text c
 - 2026-03-01 (post-review lint gate): `cd parakeet-ptt && cargo clippy --all-targets -- -D warnings` passed after startup race-fix follow-up cleanup.
 - 2026-03-01 (output watchdog fallback): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (`src/main.rs`: 61 tests), including new `overlay_process::tests::output_watchdog_spawns_once_without_output_targeting`.
 - 2026-03-02 (ghosted slices fix): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 51 tests), including new shrink-damage width tests proving stale pixels are cleared on adaptive width shrink. Fix tracks previous committed width and damages the width union on shrink paths.
+- 2026-03-03 (Phase 8 audio/waveform + injection-aware finalizing): `cd parakeet-ptt && cargo test -p parakeet-ptt && prek run --all-files && prek run --stage pre-push --all-files` passed, including new coverage for `overlay_ipc::tests::injection_complete_serialization_roundtrip`, `overlay_state::tests::injection_complete_hides_matching_finalizing_session`, and `overlay_process::tests::manager_replay_ignores_injection_complete_as_latest_state`.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
