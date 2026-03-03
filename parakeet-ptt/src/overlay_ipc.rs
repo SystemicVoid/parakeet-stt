@@ -21,6 +21,10 @@ pub enum OverlayIpcMessage {
         session_id: Uuid,
         level_db: f32,
     },
+    InjectionComplete {
+        session_id: Uuid,
+        success: bool,
+    },
     SessionEnded {
         session_id: Uuid,
         reason: Option<String>,
@@ -74,6 +78,22 @@ mod tests {
 
         let encoded = serde_json::to_string(&message).expect("message should serialize");
         assert!(encoded.contains("\"type\":\"output_hint\""));
+
+        let decoded: OverlayIpcMessage =
+            serde_json::from_str(&encoded).expect("message should deserialize");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn injection_complete_serialization_roundtrip() {
+        let session_id = Uuid::new_v4();
+        let message = OverlayIpcMessage::InjectionComplete {
+            session_id,
+            success: true,
+        };
+
+        let encoded = serde_json::to_string(&message).expect("message should serialize");
+        assert!(encoded.contains("\"type\":\"injection_complete\""));
 
         let decoded: OverlayIpcMessage =
             serde_json::from_str(&encoded).expect("message should deserialize");

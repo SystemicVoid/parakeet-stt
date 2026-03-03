@@ -150,6 +150,10 @@ enum OverlayEvent {
         session_id: Uuid,
         reason: Option<String>,
     },
+    InjectionComplete {
+        session_id: Uuid,
+        success: bool,
+    },
 }
 
 trait OverlaySink {
@@ -210,6 +214,13 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
         OverlayEvent::SessionEnded { session_id, reason } => {
             OverlayIpcMessage::SessionEnded { session_id, reason }
         }
+        OverlayEvent::InjectionComplete {
+            session_id,
+            success,
+        } => OverlayIpcMessage::InjectionComplete {
+            session_id,
+            success,
+        },
     }
 }
 
@@ -347,6 +358,13 @@ impl<S: OverlaySink> OverlayRouter<S> {
             self.last_seq = None;
             self.last_output_name = None;
         }
+    }
+
+    fn route_injection_complete(&mut self, session_id: Uuid, success: bool) {
+        self.sink.on_overlay_event(OverlayEvent::InjectionComplete {
+            session_id,
+            success,
+        });
     }
 
     fn maybe_emit_output_hint(&mut self) {
@@ -1154,7 +1172,7 @@ async fn run_hotkey_mode(
                                 }
                             }
                             Some(report) = injection_reports.recv() => {
-                                handle_injection_report(&injector_worker, report);
+                                handle_injection_report(&injector_worker, report, &mut overlay_router);
                             }
                         }
                     }
@@ -1192,8 +1210,13 @@ async fn send_message(
         .context("failed to send message")
 }
 
-fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionReport) {
+fn handle_injection_report(
+    worker: &InjectorWorkerHandle,
+    report: InjectionReport,
+    overlay_router: &mut OverlayRouter<impl OverlaySink>,
+) {
     worker.metrics().note_report(&report);
+    let success = report.error.is_none();
     match report.error {
         Some(error) => {
             warn!(
@@ -1246,6 +1269,8 @@ fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionRepor
             "injector stage metrics summary"
         );
     }
+
+    overlay_router.route_injection_complete(report.session_id, success);
 }
 
 async fn handle_server_message(

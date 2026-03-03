@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::overlay_ipc::OverlayIpcMessage;
 
-pub const DEFAULT_AUTO_HIDE_AFTER_MS: u64 = 1200;
+pub const DEFAULT_AUTO_HIDE_AFTER_MS: u64 = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayVisibility {
@@ -19,6 +19,7 @@ pub enum OverlayVisibility {
     Finalizing {
         session_id: Uuid,
         reason: Option<String>,
+        last_text: Option<String>,
     },
 }
 
@@ -63,13 +64,21 @@ impl OverlayVisibility {
                 },
                 detail: None,
             },
-            Self::Finalizing { reason, .. } => OverlayRenderIntent {
+            Self::Finalizing {
+                reason, last_text, ..
+            } => OverlayRenderIntent {
                 phase: OverlayRenderPhase::Finalizing,
                 visible: true,
-                headline: reason
+                headline: last_text
                     .as_ref()
                     .filter(|value| !value.trim().is_empty())
                     .cloned()
+                    .or_else(|| {
+                        reason
+                            .as_ref()
+                            .filter(|value| !value.trim().is_empty())
+                            .cloned()
+                    })
                     .unwrap_or_else(|| "Finalizing...".to_string()),
                 detail: None,
             },
@@ -150,12 +159,39 @@ impl OverlayStateMachine {
                     }
                 }
 
+                let last_text = match &self.visibility {
+                    OverlayVisibility::Interim { text, .. } if !text.trim().is_empty() => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                };
+
                 self.active_session_id = Some(session_id);
                 self.last_seq = None;
-                self.visibility = OverlayVisibility::Finalizing { session_id, reason };
+                self.visibility = OverlayVisibility::Finalizing {
+                    session_id,
+                    reason,
+                    last_text,
+                };
                 self.finalize_deadline_ms = Some(now_ms.saturating_add(self.auto_hide_after_ms));
                 ApplyOutcome::Applied
             }
+            OverlayIpcMessage::InjectionComplete {
+                session_id,
+                success: _,
+            } => match &self.visibility {
+                OverlayVisibility::Finalizing {
+                    session_id: finalizing_session,
+                    ..
+                } if *finalizing_session == session_id => {
+                    self.visibility = OverlayVisibility::Hidden;
+                    self.active_session_id = None;
+                    self.last_seq = None;
+                    self.finalize_deadline_ms = None;
+                    ApplyOutcome::Applied
+                }
+                _ => ApplyOutcome::DroppedSessionMismatch,
+            },
         }
     }
 
@@ -264,6 +300,7 @@ mod tests {
             &OverlayVisibility::Finalizing {
                 session_id,
                 reason: Some("normal".to_string()),
+                last_text: Some("hello".to_string()),
             }
         );
 
@@ -273,6 +310,7 @@ mod tests {
             &OverlayVisibility::Finalizing {
                 session_id,
                 reason: Some("normal".to_string()),
+                last_text: Some("hello".to_string()),
             }
         );
 
@@ -432,6 +470,7 @@ mod tests {
             OverlayVisibility::Finalizing {
                 session_id,
                 reason: None,
+                last_text: None,
             }
             .to_render_intent(),
             OverlayRenderIntent {
@@ -440,6 +479,84 @@ mod tests {
                 headline: "Finalizing...".to_string(),
                 detail: None,
             }
+        );
+    }
+
+    #[test]
+    fn finalizing_prefers_last_text_headline() {
+        let session_id = Uuid::new_v4();
+        assert_eq!(
+            OverlayVisibility::Finalizing {
+                session_id,
+                reason: Some("normal".to_string()),
+                last_text: Some("recognized text".to_string()),
+            }
+            .to_render_intent(),
+            OverlayRenderIntent {
+                phase: OverlayRenderPhase::Finalizing,
+                visible: true,
+                headline: "recognized text".to_string(),
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn injection_complete_hides_matching_finalizing_session() {
+        let mut machine = OverlayStateMachine::new(Duration::from_millis(500));
+        let session_id = Uuid::new_v4();
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimText {
+                    session_id,
+                    seq: 1,
+                    text: "hello".to_string(),
+                },
+                0
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::SessionEnded {
+                    session_id,
+                    reason: Some("normal".to_string()),
+                },
+                10
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InjectionComplete {
+                    session_id,
+                    success: true,
+                },
+                20
+            ),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(machine.visibility(), &OverlayVisibility::Hidden);
+        assert!(!machine.advance_time(510));
+    }
+
+    #[test]
+    fn injection_complete_before_finalizing_is_dropped() {
+        let mut machine = OverlayStateMachine::default();
+        let session_id = Uuid::new_v4();
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InjectionComplete {
+                    session_id,
+                    success: true,
+                },
+                0
+            ),
+            ApplyOutcome::DroppedSessionMismatch
         );
     }
 }

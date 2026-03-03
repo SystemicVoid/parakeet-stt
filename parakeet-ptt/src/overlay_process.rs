@@ -574,12 +574,14 @@ impl OverlayProcessManager {
 }
 
 fn is_replayable_overlay_message(message: &OverlayIpcMessage) -> bool {
-    matches!(
-        message,
+    match message {
         OverlayIpcMessage::InterimState { .. }
-            | OverlayIpcMessage::InterimText { .. }
-            | OverlayIpcMessage::SessionEnded { .. }
-    )
+        | OverlayIpcMessage::InterimText { .. }
+        | OverlayIpcMessage::SessionEnded { .. } => true,
+        OverlayIpcMessage::InjectionComplete { .. }
+        | OverlayIpcMessage::OutputHint { .. }
+        | OverlayIpcMessage::AudioLevel { .. } => false,
+    }
 }
 
 fn resolve_overlay_binary_path() -> Result<PathBuf> {
@@ -801,6 +803,65 @@ mod tests {
         drop(rx_first);
 
         manager.send(audio_level_message);
+
+        let replayed = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replay")
+            .expect("second sink should remain open");
+        assert_eq!(replayed, state_message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_replay_ignores_injection_complete_as_latest_state() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = queued_launcher(queue);
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::from_millis(0),
+        );
+
+        let session_id = Uuid::new_v4();
+        let state_message = OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 2,
+            text: "current-state".to_string(),
+        };
+        manager.send(state_message.clone());
+        let _ = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive state")
+            .expect("first sink should remain open");
+
+        let injection_complete_message = OverlayIpcMessage::InjectionComplete {
+            session_id,
+            success: true,
+        };
+        manager.send(injection_complete_message.clone());
+        let _ = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive injection complete")
+            .expect("first sink should remain open");
+
+        drop(rx_first);
+
+        manager.send(injection_complete_message);
 
         let replayed = timeout(Duration::from_millis(100), rx_second.recv())
             .await

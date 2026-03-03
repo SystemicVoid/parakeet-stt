@@ -119,7 +119,7 @@ struct Cli {
     backend: CliBackendMode,
 
     /// Auto-hide delay after session end.
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = 600)]
     auto_hide_ms: u64,
 
     /// Overlay opacity (0.0-1.0).
