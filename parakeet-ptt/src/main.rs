@@ -1001,7 +1001,6 @@ async fn run_demo(
                     audio_ms,
                     "final result received"
                 );
-                audio_feedback.play_completion();
                 injector_worker
                     .enqueue(InjectionJob::new(
                         session_id, to_inject, latency_ms, audio_ms,
@@ -1017,6 +1016,7 @@ async fn run_demo(
                 if let Some(error) = report.error {
                     return Err(anyhow!("demo injection failed: {error}"));
                 }
+                audio_feedback.play_completion();
                 state.reset();
                 break;
             }
@@ -1172,7 +1172,12 @@ async fn run_hotkey_mode(
                                 }
                             }
                             Some(report) = injection_reports.recv() => {
-                                handle_injection_report(&injector_worker, report, &mut overlay_router);
+                                handle_injection_report(
+                                    &injector_worker,
+                                    report,
+                                    &mut overlay_router,
+                                    &audio_feedback,
+                                );
                             }
                         }
                     }
@@ -1214,6 +1219,7 @@ fn handle_injection_report(
     worker: &InjectorWorkerHandle,
     report: InjectionReport,
     overlay_router: &mut OverlayRouter<impl OverlaySink>,
+    audio_feedback: &AudioFeedback,
 ) {
     worker.metrics().note_report(&report);
     let success = report.error.is_none();
@@ -1240,6 +1246,7 @@ fn handle_injection_report(
                 total_worker_ms = report.total_worker_ms,
                 "injector worker completed job"
             );
+            audio_feedback.play_completion();
         }
     }
 
@@ -1278,7 +1285,7 @@ async fn handle_server_message(
     state: &mut PttState,
     overlay_router: &mut OverlayRouter<impl OverlaySink>,
     injector_worker: &InjectorWorkerHandle,
-    audio_feedback: &AudioFeedback,
+    _audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -1298,7 +1305,6 @@ async fn handle_server_message(
                 audio_ms,
                 "final result received"
             );
-            audio_feedback.play_completion();
             match injector_worker
                 .enqueue(InjectionJob::new(session_id, text, latency_ms, audio_ms))
                 .await
