@@ -530,7 +530,7 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 - **Progress hint**: show a subtle horizontal progress bar along the bottom edge of the content area (1–2px tall, accent-colored). Even if we don't have real progress data, a smooth indeterminate animation (a short bright segment sweeping left-to-right over ~1.5s) signals that work is happening.
 - **Success flash**: on transition from `Finalizing` to `Hidden` (which means `final_result` was received and injection happened), flash the accent stripe green for ~200ms before starting the fade-out. This gives a satisfying "done" signal without text changes.
 
-### 8.6 — Interim Text Streaming Feel
+### 8.6 — Interim Text Streaming Feel (done)
 
 **Problem**: interim text currently appears as full string replacements — the entire headline swaps on each `interim_text` event. This looks like flickering rather than streaming.
 
@@ -546,7 +546,7 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 - Very subtle accent stripe brightness oscillation: ±5% alpha over a 3-second sine cycle. Just enough to suggest "alive" without being distracting.
 - Only active during `Listening` phase. Pauses during `Interim` (text is the focus) and `Finalizing` (progress bar takes over).
 
-### 8.8 — Adaptive Width
+### 8.8 — Adaptive Width (hidden behind flag - to be retired soon)
 
 **Problem**: the overlay is always `max_width` wide regardless of text length. Short messages like "Tuned in..." sit in an unnecessarily wide panel.
 
@@ -554,33 +554,3 @@ The overlay should feel like it belongs on a premium desktop — invisible when 
 - Measure actual text width after layout. Set surface width to `max(text_width + padding, min_width)` clamped to `max_width`.
 - Animate width changes over ~200ms with ease-out to prevent jarring size jumps during interim text streaming.
 - This requires recreating the `wl_shm_pool`/`wl_buffer` on size change, or pre-allocating at `max_width` and only damage/commit the active region. The latter is simpler and wastes minimal memory.
-
----
-
-### Implementation Priority (Suggested)
-
-| Priority | Item | Status | Effort | Impact |
-|----------|------|--------|--------|--------|
-| **P0** | 8.3 — Bottom-screen default | **Done** | Trivial | High — immediate spatial improvement |
-| **P1** | 8.1 — Entrance/exit slide animations | **Done** | Low | High — transforms perceived quality |
-| **P1** | 8.1 — Accent stripe cross-fade | **Done** | Low | Medium — smooth phase transitions |
-| **P1** | 8.2 — Animated ellipsis + flavor text | **Done** | Low-Medium | High — overlay feels alive |
-| **P2** | 8.5 — Finalizing progress + success flash | **Done** | Low | Medium — reduces anxiety |
-| **P2** | 8.4 Tier 1 — Active-output tracking | **Done** | Medium | High on multi-monitor setups |
-| **P2** | 8.4 Tier 2 — Cursor-spawn positioning | Deferred | Medium | Medium — spawn where user is looking |
-| **P3** | 8.6 — Interim text character fade-in | **Done** | Medium | Medium — polish for streaming feel |
-| **P3** | 8.7 — Idle breathing | **Done** | Trivial | Low — subtle polish |
-| **P3** | 8.8 — Adaptive width | **Done** | Medium | Medium — cleaner look for short text |
-
----
-
-## Suggested PR Slicing (Atomic)
-1. Phase 0 capability gate + logging.
-2. Phase 1 protocol and unknown-message tolerance.
-3. Phase 2 daemon emission behind flag + tests.
-4. Phase 3 PTT routing guards + boundary tests.
-5. Phase 4 overlay binary MVP + state-machine tests.
-6. Phase 5 config/flag wiring + precedence tests.
-7. Phase 6 E2E/reliability harness + rollout defaults.
-8. Phase 7 visual overhaul — design system, rounded corners, shadow, accent stripe, text shadows, premultiplied alpha, fade transitions.
-9. Phase 8 UX polish (landed) — bottom-screen default, entrance/exit slide animations, accent cross-fade, animated listening text, finalizing progress/success flash, active-output tracking, interim fade-in, listening breathing, and adaptive width. Remaining deferment: cursor-spawn placement (8.4 Tier 2).
