@@ -599,3 +599,28 @@ def test_live_interim_context_window_is_bounded() -> None:
         assert max_seen <= expected_max
 
     asyncio.run(scenario())
+
+
+def test_stop_path_interim_context_window_is_bounded(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        ready_chunks = [np.full((8_000,), 0.2, dtype=np.float32) for _ in range(8)]
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=ready_chunks,
+            incremental_outputs=[f"stop-{index}" for index in range(1, 20)],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        max_seen = max(cast(Any, server.transcriber).sample_sizes)
+        expected_max = int(
+            server.audio.sample_rate * server_module.OVERLAY_INTERIM_CONTEXT_WINDOW_SECS
+        )
+        assert max_seen <= expected_max
+
+    asyncio.run(scenario())
