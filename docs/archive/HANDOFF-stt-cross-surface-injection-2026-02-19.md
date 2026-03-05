@@ -455,7 +455,7 @@ Use persistent tmux-managed runtime for both:
 - `tmux new -As stt-runtime`
 
 2. In `stt-runtime`, run helper interactively (not one-shot):
-- `cd ~/Documents/Engineering/parakeet-stt`
+- `cd <repo-root>`
 - `source scripts/stt-helper.sh`
 - `PARAKEET_DEVICE=cpu stt start`
 
@@ -628,7 +628,7 @@ Observed globals include:
 2. `ext_foreign_toplevel_list_v1` provides identity metadata, not activation state.
 
 Reference:
-- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-protocols-0.32.10/protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml`
+- `$CARGO_HOME/registry/src/<crate-cache>/wayland-protocols-0.32.10/protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml`
 - line refs:
   - `interface name="ext_foreign_toplevel_list_v1"`: line `54`
   - `interface name="ext_foreign_toplevel_handle_v1"`: line `123`
@@ -642,7 +642,7 @@ Reference:
 3. COSMIC toplevel extension adds explicit activation state.
 
 Reference:
-- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-protocols-0.2.0/unstable/cosmic-toplevel-info-unstable-v1.xml`
+- `$CARGO_HOME/registry/src/<crate-cache>/cosmic-protocols-0.2.0/unstable/cosmic-toplevel-info-unstable-v1.xml`
 - line refs:
   - `interface name="zcosmic_toplevel_info_v1"`: line `30`
   - `request name="get_cosmic_toplevel"`: line `81`
@@ -655,7 +655,7 @@ Reference:
 4. COSMIC a11y protocol is not a focus-stream API.
 
 Reference:
-- `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cosmic-protocols-0.2.0/unstable/cosmic-a11y-unstable-v1.xml`
+- `$CARGO_HOME/registry/src/<crate-cache>/cosmic-protocols-0.2.0/unstable/cosmic-a11y-unstable-v1.xml`
 - line refs:
   - `interface name="cosmic_a11y_manager_v1"`: line `30`
   - `event name="magnifier"`: line `35`

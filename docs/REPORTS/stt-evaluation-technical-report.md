@@ -16,7 +16,7 @@ The evaluation system consists of several interconnected components:
 |-----------|----------|---------|
 | **Benchmark Harness** | `parakeet-stt-daemon/check_model.py` | Main evaluation engine with WER computation, command matching, and regression testing |
 | **Unit Tests** | `parakeet-stt-daemon/tests/test_offline_benchmark_harness.py` | Regression coverage for benchmark parsing and metrics |
-| **Dataset** | `parakeet-stt-daemon/bench_audio/personal/` | Personal eval corpus with 87+ command audio clips |
+| **Dataset** | `parakeet-stt-daemon/bench_audio/personal/` | Local eval corpus with 87+ command audio clips |
 | **Workflow** | `justfile` | Unified CLI for running evals and calibration |
 
 ### Two-Tier Evaluation Model
@@ -112,7 +112,7 @@ Location: `parakeet-stt-daemon/bench_audio/`
 - `sample_01.wav` ... `sample_08.wav` - 8 canonical audio samples
 - Used for regression testing and quick smoke validation
 
-### Personal Eval Corpus
+### Local Eval Corpus
 
 Location: `parakeet-stt-daemon/bench_audio/personal/`
 
@@ -321,7 +321,7 @@ Create `tests/diagnostics/test_mechanistic_failure.py`:
 ```python
 def test_logit_rank_on_failure():
     """For each critical token mismatch, output Top-10 logits."""
-    # 1. Load failure case from personal eval corpus
+    # 1. Load failure case from local eval corpus
     # 2. Run with hooks enabled
     # 3. Print: "Target 'git': rank=N, prob=X.XXe-N"
 ```
@@ -337,7 +337,7 @@ Current state: **Reliable eval system** - measures performance, detects regressi
 Target state: **Mechanistic telemetry** - understands *why* failures happen, enables targeted interventions instead of workarounds.
 
 **Homework (Immediate Next Steps):**
-1. Pick one failure case from Personal Eval Corpus (e.g., `cmd_073` or `cmd_087`)
+1. Pick one failure case from Local Eval Corpus (e.g., `cmd_073` or `cmd_087`)
 2. Write diagnostic script outputting **Logit Rank** of correct token at failure point
 3. Answer: Was the correct word in Top-10? If so, how far down?
 
