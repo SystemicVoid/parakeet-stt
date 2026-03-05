@@ -161,9 +161,9 @@ uv run python check_model.py \
   --max-p95-infer-ms 1800 \
   --max-p95-finalize-ms 2200
 ```
-Personal high-signal workflow (local-only assets):
+Local benchmark workflow (git-ignored assets):
 ```bash
-# Run-only flow on existing unified corpus (personal manifest + appended legacy 8 samples):
+# Run-only flow on existing unified corpus (local manifest + appended legacy 8 samples):
 just eval                  # same as: just eval compare
 just eval offline
 just eval stream
@@ -173,7 +173,7 @@ just eval calibrate-stream
 
 # Dataset maintenance (only when intentionally refreshing prompts/audio):
 just eval-dataset candidates
-# Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes.
+# Review parakeet-stt-daemon/bench_audio/personal/candidates.tsv and set include=yes rows.
 just eval-dataset materialize
 just eval-dataset record
 ```

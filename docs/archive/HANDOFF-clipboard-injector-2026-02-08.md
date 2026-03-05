@@ -181,7 +181,7 @@ stt start --copy-only
      - `WAYLAND_DISPLAY=wayland-1`
      - `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`
      - `DISPLAY=:0`
-   - Nu wrapper in `~/.config/forge/nushell/.config/nushell/config.nu` runs:
+   - Nu wrapper in `<forge-config>/nushell/.config/nushell/config.nu` runs:
      - `bash -lc "source .../scripts/stt-helper.sh && stt ..."`
    - Wrapper uses raw string-join argument interpolation (no shell escaping), which is fragile for special chars in args.
 

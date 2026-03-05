@@ -38,7 +38,7 @@ Historical-status note:
 - 2026-02-28: Added Rust protocol round-trip test coverage for all currently known server message variants.
 - 2026-02-28: Completed mixed-version compatibility matrix checks across `main` and `feature/overlay-phase0-capability-gate`.
 - 2026-02-28: Verified old-client + new-daemon safety gate by confirming Phase 1 daemon changes are schema/test only (no runtime emission path changes).
-- 2026-02-28: Ran stream-seal eval compare in overlay worktree with personal corpus; results stayed within baseline acceptance thresholds.
+- 2026-02-28: Ran stream-seal eval compare in overlay worktree with local benchmark corpus; results stayed within baseline acceptance thresholds.
 - 2026-02-28: Phase 2 started in daemon: state-first overlay emission path added behind `PARAKEET_OVERLAY_EVENTS_ENABLED` (default off).
 - 2026-02-28: Added structured overlay counters (`overlay_events_emitted`, `overlay_events_dropped`) and surfaced them through status/runtime logs.
 - 2026-02-28: Added overlay event stream invariants test suite covering ordering, per-session seq reset, abort terminal event, and non-fatal overlay send failures.
@@ -90,7 +90,7 @@ Historical-status note:
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_streaming_truth.py tests/test_session_cleanup.py` passed on overlay branch (32 tests).
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-stt-daemon && uv run pytest tests/test_streaming_truth.py tests/test_session_cleanup.py` passed on `main` baseline (28 tests).
-- 2026-02-28 (eval regression): `just eval compare` passed with personal corpus in overlay worktree.
+- 2026-02-28 (eval regression): `just eval compare` passed with local benchmark corpus in overlay worktree.
 - 2026-02-28 (eval regression): offline vs stream-seal deltas were WER `+0.000569`, strict command exact match `-0.010000`, critical token recall `+0.001297`, and warm finalize P95 `+1.769628 ms`.
 - 2026-02-28 (Phase 2 state-first): `cd parakeet-stt-daemon && uv run pytest tests/test_messages.py tests/test_overlay_event_stream.py tests/test_streaming_truth.py tests/test_session_cleanup.py tests/test_cli_precedence.py` passed (42 tests).
 - 2026-02-28 (Phase 2 eval regression): `just eval compare` passed; stream-seal vs offline deltas were WER `-0.002778`, strict command exact match `+0.020000`, critical token recall `+0.006485`, and warm finalize P95 `+0.697694 ms`.

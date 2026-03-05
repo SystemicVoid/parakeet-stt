@@ -88,9 +88,9 @@ scripts/harness-maintenance.sh run
 scripts/harness-maintenance.sh mark
 ```
 
-## Personal STT Eval Policy
+## Local STT Eval Policy
 
-- Keep eval assets local-first under `parakeet-stt-daemon/bench_audio/personal/` (ignored by git).
+- Keep eval assets local-first under `parakeet-stt-daemon/bench_audio/personal/` (git-ignored).
 - Build prompts from real Codex CLI prompt history by default, then require manual review before recording.
 - Daily gate is hybrid when baseline is supplied: absolute floors + relative drift checks.
 - Track punctuation explicitly (`punctuation_f1`, `terminal_punctuation_accuracy`) in addition to WER/token metrics.
@@ -98,7 +98,7 @@ scripts/harness-maintenance.sh mark
 ```bash
 cd <repo-root>
 
-# Run-only flow on existing unified corpus (personal manifest + legacy transcripts/audio append).
+# Run-only flow on existing unified corpus (local manifest + legacy transcripts/audio append).
 just eval
 just eval offline
 just eval stream
