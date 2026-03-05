@@ -231,7 +231,7 @@ small commits while protecting offline dictation behavior.
 
 ### SA1 Evidence (Installed NeMo 2.5.3)
 
-- Verified module path: `/home/hugo/Documents/Engineering/parakeet-stt/parakeet-stt-daemon/.venv/lib/python3.11/site-packages/nemo/collections/asr/parts/utils/streaming_utils.py`.
+- Verified module path: `<repo-root>/parakeet-stt-daemon/.venv/lib/python3.11/site-packages/nemo/collections/asr/parts/utils/streaming_utils.py`.
 - `BatchedFrameASRTDT.__init__(..., max_steps_per_timestep, stateful_decoding, tdt_search_boundary)` calls:
   - `super().__init__(asr_model, frame_len=frame_len, total_buffer=total_buffer, batch_size=batch_size)`
 - `BatchedFrameASRRNNT.__init__` signature is:
