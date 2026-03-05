@@ -2,6 +2,11 @@
 
 _Last updated: 2026-03-03 (live UX findings: audio-reactive waveform, interim rewrite polish, injection-aware finalizing dismiss)_
 
+Historical-status note:
+- This file is an implementation log for rollout history and verification evidence.
+- Canonical current operator defaults live in `README.md`, `docs/stt-troubleshooting.md`, and `AGENTS.md`.
+- When remaining deferred scope (Phase 8.4 Tier 2 cursor-spawn placement) is either delivered or formally dropped, this file should be moved under `docs/archive/`.
+
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).
 - [x] Phase 0: Capability and feasibility gate implemented in `parakeet-ptt`.

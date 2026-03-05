@@ -6,7 +6,7 @@ It has two runtime components:
 - `parakeet-stt-daemon` (Python/FastAPI): captures audio and runs NeMo Parakeet ASR.
 - `parakeet-ptt` (Rust): global hotkey client, daemon WebSocket client, and text injector.
 
-## Current State (Feb 2026)
+## Current State (Mar 2026)
 
 Since `21d8f74` and follow-up commits, the injection path is now reliability-first:
 
@@ -18,6 +18,9 @@ Since `21d8f74` and follow-up commits, the injection path is now reliability-fir
 - Clipboard readiness barrier and post-chord ownership timing controls are implemented.
 - `stt diag-injector` reports capability prechecks and runs reproducible injection tests.
 - Event-loop lag summaries are derived from Tokio tick scheduling (not a drifting baseline), so percentile windows recover after transient stalls.
+- Runtime helper launch is profile-based:
+  - `stt` / `stt start` defaults to online stream+seal + overlay enabled.
+  - `stt off` defaults to offline + overlay disabled.
 
 This keeps the system usable now while uinput behavior is hardened across app surfaces.
 
@@ -46,6 +49,8 @@ uv sync --dev --extra inference --prerelease allow \
 ```bash
 source scripts/stt-helper.sh
 stt start
+# Offline/no-overlay profile:
+stt off
 ```
 
 3. Inspect runtime:
@@ -64,25 +69,37 @@ Manual two-terminal start is still supported:
 ```bash
 # Terminal A
 cd parakeet-stt-daemon
-PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon
+PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon
 
 # Terminal B
 cd parakeet-ptt
-cargo run --release -- --endpoint ws://127.0.0.1:8765/ws
+cargo run --release -- --endpoint ws://127.0.0.1:8765/ws --overlay-enabled true
 ```
+Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror `stt off`.
 
-## Helper Defaults (`stt start`)
+## Helper Profiles (`stt start` / `stt off`)
 
-Default profile:
+Default `stt` / `stt start` profile:
 
 - `--injection-mode paste`
 - `--paste-key-backend auto` (ladder: uinput → ydotool)
 - `--paste-backend-failure-policy copy-only`
 - `--uinput-dwell-ms 18`
-- `PARAKEET_STREAMING_ENABLED=false` for daemon launch (set `PARAKEET_STREAMING_ENABLED=true` for streaming validation profile)
+- `PARAKEET_STREAMING_ENABLED=true`
+- `PARAKEET_OVERLAY_ENABLED=true`
+- `--overlay-adaptive-width=false`
 - Adaptive routing: Terminal → Ctrl+Shift+V, General → Ctrl+V, Unknown → Ctrl+Shift+V
 - Wayland focus cache: 30s stale threshold, 500ms transition grace
 - Clipboard: foreground wl-copy, 700ms post-chord hold, `text/plain;charset=utf-8`
+
+`stt off` profile switches to offline/no-overlay defaults:
+
+- `PARAKEET_STREAMING_ENABLED=false`
+- `PARAKEET_OVERLAY_ENABLED=false`
+
+Overlay backend mode override (both profiles):
+
+- `PARAKEET_OVERLAY_MODE=auto|layer-shell|fallback-window|disabled`
 
 Helper readiness timing:
 
@@ -177,6 +194,12 @@ prek install -t pre-commit -t pre-push
 prek run --all-files
 prek run --stage pre-push --all-files
 ```
+
+Overlay reliability gates (repo root):
+```bash
+just phase6-contract
+just phase6-promotion 3
+```
 Hook stages are split for speed:
 - `pre-commit`: maintenance cadence reminder, `ruff format`, `ruff check`, `ty check`, `cargo fmt`
 - `pre-push`: `pytest`, `cargo clippy`, `cargo test`
@@ -200,6 +223,7 @@ stt diag-injector
 - Protocol contract: `docs/SPEC.md`
 - Troubleshooting (canonical operator source): `docs/stt-troubleshooting.md`
 - Historical docs archive index (non-canonical): `docs/archive/README.md`
+- Streaming overlay rollout log (historical / pending archive): `STREAMING-OVERLAY-ROLL-OUT-AND-VERIFICATION-PLAN.md`
 - Historical injector handoff archive (non-canonical): `docs/archive/HANDOFF-clipboard-injector-2026-02-08.md`
 - Historical cross-surface incident handoff archive (non-canonical): `docs/archive/HANDOFF-stt-cross-surface-injection-2026-02-19.md`
 - Historical injection implementation roadmap (non-canonical): `docs/archive/STT-INPUT-INJECTION-ROADMAP-2026-02.md`

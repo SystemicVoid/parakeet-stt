@@ -1,4 +1,4 @@
-# STT helper status (updated 2026-02-21)
+# STT helper status (updated 2026-03-05)
 
 This document now has two parts:
 

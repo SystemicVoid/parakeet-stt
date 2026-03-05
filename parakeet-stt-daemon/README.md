@@ -2,7 +2,8 @@
 
 Canonical usage and commands live in the top-level `README.md`. Use this file only for daemon-specific notes.
 
-- Run the server (matches helper defaults): `PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
+- Run the server for default online profile parity (`stt` / `stt start`): `PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
+- Run the server for offline profile parity (`stt off`): `PARAKEET_STREAMING_ENABLED=false uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765`
 - Install deps: `uv sync --dev` (add `--extra inference --prerelease allow --index https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match` for GPU inference)
 - Offline benchmark harness (legacy transcripts mode): `uv run python check_model.py --bench-offline --bench-output bench_audio/latest-benchmark.json --max-avg-wer 0.45 --max-p95-infer-ms 1800 --max-p95-finalize-ms 2200`
 - Personal eval tooling (local-only corpus): use repo-root `just eval` for run/compare/calibrate on the existing unified corpus (`just eval`, `just eval offline`, `just eval stream`, `just eval compare`, `just eval calibrate-offline`, `just eval calibrate-stream`). Use `just eval-dataset ...` only when intentionally refreshing prompts/audio. Recorder defaults remain `bench_audio/personal/manifest.jsonl` -> `bench_audio/personal/audio` with key controls `s`, `r`, `n/p`, `q`.
