@@ -161,7 +161,7 @@ uv run python check_model.py \
   --max-p95-infer-ms 1800 \
   --max-p95-finalize-ms 2200
 ```
-Personal high-signal workflow (agent-prompt-heavy, local-only assets):
+Personal high-signal workflow (local-only assets):
 ```bash
 # Run-only flow on existing unified corpus (personal manifest + appended legacy 8 samples):
 just eval                  # same as: just eval compare
@@ -228,3 +228,7 @@ stt diag-injector
 - Historical cross-surface incident handoff archive (non-canonical): `docs/archive/HANDOFF-stt-cross-surface-injection-2026-02-19.md`
 - Historical injection implementation roadmap (non-canonical): `docs/archive/STT-INPUT-INJECTION-ROADMAP-2026-02.md`
 - UX roadmap (new): `ROADMAP.md`
+
+## License
+
+MIT (see `LICENSE`).

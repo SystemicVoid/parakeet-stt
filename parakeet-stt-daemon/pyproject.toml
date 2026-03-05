@@ -7,6 +7,7 @@ name = "parakeet-stt-daemon"
 version = "0.1.0"
 description = "Local Parakeet push-to-talk daemon (WebSocket API + NeMo streaming)."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11,<3.12"
 dependencies = [
   "fastapi>=0.115.5",
@@ -21,6 +22,10 @@ dependencies = [
   "soundfile>=0.13.1",
   "omegaconf>=2.3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SystemicVoid/parakeet-stt"
+Repository = "https://github.com/SystemicVoid/parakeet-stt"
 
 [project.optional-dependencies]
 inference = [

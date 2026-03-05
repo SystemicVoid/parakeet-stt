@@ -304,10 +304,25 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
 
 ## 8. Repo Operations
 
-- Remote `SystemicVoid/parakeet-stt` exists and is set to **private** (verified via `gh repo view`).
-- To recreate/replace the remote via CLI while keeping it private:
-  - `gh repo create SystemicVoid/parakeet-stt --private --source . --remote origin --push`
-- Sanity-check visibility any time with: `gh repo view --json isPrivate,visibility`.
+- Visibility check:
+  - `gh repo view --json nameWithOwner,isPrivate,visibility,url`
+- Make repo public when release-ready:
+  - `gh repo edit --visibility public --accept-visibility-change-consequences`
+- Protect `main` against direct pushes (require pull requests):
+  - `gh api --method PUT repos/<owner>/<repo>/branches/main/protection \
+    -H "Accept: application/vnd.github+json" \
+    -f required_status_checks='null' \
+    -f enforce_admins=true \
+    -f required_pull_request_reviews='{"dismiss_stale_reviews":true,"require_code_owner_reviews":false,"required_approving_review_count":0}' \
+    -f restrictions='null' \
+    -F required_linear_history=true \
+    -F allow_force_pushes=false \
+    -F allow_deletions=false \
+    -F required_conversation_resolution=true`
+- Create the initial release tag:
+  - `git tag -a v0.1.0 -m "v0.1.0"`
+  - `git push origin main --tags`
+  - `gh release create v0.1.0 --title "v0.1.0" --generate-notes`
 
 ---
 
