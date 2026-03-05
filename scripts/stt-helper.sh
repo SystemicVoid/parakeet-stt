@@ -40,8 +40,8 @@ stt() {
     local default_daemon_left_context_secs="10.0"
     local default_daemon_batch_size="32"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
-    # Local-only default: optimize for this workstation (Zen5 + AVX512), not portable builds.
-    local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
+    # Keep helper builds portable by default; users can opt in to host-specific flags.
+    local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:-}"
     local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
@@ -68,13 +68,8 @@ stt() {
     fi
     # Final guard: ensure the repo path actually has the expected subdirs.
     if [ ! -d "$REPO_ROOT/parakeet-stt-daemon" ] || [ ! -d "$REPO_ROOT/parakeet-ptt" ]; then
-        local guessed="$HOME/Documents/Engineering/parakeet-stt"
-        if [ -d "$guessed/parakeet-stt-daemon" ] && [ -d "$guessed/parakeet-ptt" ]; then
-            REPO_ROOT="$guessed"
-        else
-            echo "stt helper: could not locate repo root (REPO_ROOT='$REPO_ROOT'). Set PARAKEET_ROOT explicitly."
-            return 1
-        fi
+        echo "stt helper: could not locate repo root (REPO_ROOT='$REPO_ROOT'). Set PARAKEET_ROOT explicitly."
+        return 1
     fi
     DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
     CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
@@ -994,7 +989,7 @@ CLIENTCMD
                 cd "$CLIENT_DIR" || exit 1
                 set -e
                 local runner_mode runner_bin
-                local ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=znver5 -C target-feature=+avx512f,+avx512bw,+avx512cd,+avx512dq,+avx512vl,+avx512vnni}"
+                local ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:-}"
                 local ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
                 if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                     echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."

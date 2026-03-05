@@ -64,7 +64,7 @@ Canonical-source policy:
 
 ## Current helper behavior (after rewrite)
 - Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
-- Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
+- Resolves repo paths dynamically from the helper location (or `PARAKEET_ROOT`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
 - Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). Profile defaults determine whether `PARAKEET_STREAMING_ENABLED` is true (`stt`) or false (`stt off`). On failure, it prints the last daemon log lines.
 - Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint <resolved endpoint>`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
@@ -77,7 +77,7 @@ Canonical-source policy:
 - If `cargo`/`rustc` are missing in a shell, the build step would fail—this should now be visible in the log.
 
 ## Next debugging steps
-1) Reload the helper and try a clean start: `source ~/Documents/Engineering/parakeet-stt/74-aliases-functions.bash && stt stop && stt start`. It will detach after “Dictation ready”. Use `stt show` to view the tmux panes (top: client, bottom: live logs).
+1) Reload the helper and try a clean start: `source scripts/stt-helper.sh && stt stop && stt start`. It will detach after “Dictation ready”. Use `stt show` to view the tmux panes (top: client, bottom: live logs).
 2) If the daemon wait times out, grab the last 80 lines of `/tmp/parakeet-daemon.log` (printed automatically on failure).
 3) If the client drops to cargo fallback or still exits, tail `/tmp/parakeet-ptt.log` and look for helper markers. Share the log.
 4) Still empty logs? Capture env for that shell: `env | sort > /tmp/stt-env.txt`, set `RUST_LOG=debug`, and rerun `stt start`.

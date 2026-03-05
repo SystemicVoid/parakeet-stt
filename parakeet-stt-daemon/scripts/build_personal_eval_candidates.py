@@ -122,7 +122,6 @@ def _normalize_whitespace(text: str) -> str:
 def _intent_cleanup(command: str) -> str:
     cleaned = command.strip()
     cleaned = cleaned.replace(str(PROJECT_ROOT), "parakeet-stt")
-    cleaned = cleaned.replace("/home/hugo/Documents/Engineering/parakeet-stt", "parakeet-stt")
     cleaned = cleaned.replace("&&", " then ")
     cleaned = cleaned.replace("||", " or ")
     cleaned = re.sub(r"\s+-{2,}", " --", cleaned)
