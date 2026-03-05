@@ -307,7 +307,7 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
 - Visibility check:
   - `gh repo view --json nameWithOwner,isPrivate,visibility,url`
 - Make repo public when release-ready:
-  - `gh repo edit --visibility public --accept-visibility-change-consequences`
+  - `gh api --method PATCH repos/<owner>/<repo> -f private=false -f visibility=public`
 - Protect `main` against direct pushes (require pull requests):
   - `gh api --method PUT repos/<owner>/<repo>/branches/main/protection \
     -H "Accept: application/vnd.github+json" \
