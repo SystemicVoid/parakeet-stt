@@ -2,6 +2,11 @@
 
 Date: 2026-02-23
 
+Update: 2026-03-05
+
+- Runtime defaults are now profile-based: `stt`/`stt start` launches online stream+seal with overlay on (adaptive width off), while `stt off` launches offline/no-overlay.
+- Operator workflows are consolidated in root `justfile` (`just start|stop|status`, `just phase6-contract`, `just phase6-promotion`, `just eval ...`); legacy `justfile.overlay-dev` is removed.
+
 ## Goal
 
 Turn Parakeet STT from "works with logs" into a premium local dictation experience with clear, low-latency user feedback and predictable behavior across terminals and browsers.
@@ -28,7 +33,7 @@ Scope:
 - Fix configuration precedence for booleans (`CLI explicit > ENV > defaults`).
 - Make daemon truth visible (`requested` vs `effective` runtime state for device and streaming engine).
 - Add daemon test coverage for lifecycle and config regressions.
-- Keep helper/runtime defaults aligned with offline-first operation, while retaining an explicit streaming opt-in profile.
+- Keep helper/runtime profiles explicit and stable (`stt` online default, `stt off` offline default).
 - Remove default offline finalize temp-wav roundtrip by transcribing in-memory arrays first, with a guarded temp-wav fallback path.
 
 Implementation direction:
@@ -37,7 +42,7 @@ Implementation direction:
 - Parse CLI booleans with explicit intent (no implicit override when flags are omitted).
 - Enrich `/status` and startup logs with hard runtime truth signals and fallback reasons.
 - Add `pytest` plus focused tests for session lifecycle, precedence, and protocol mapping.
-- Keep helper default path offline (`stt start`), and use explicit streaming opt-in (`PARAKEET_STREAMING_ENABLED=true`) for targeted validation/soak runs.
+- Keep helper profile behavior explicit: `stt`/`stt start` for online stream+seal validation, `stt off` for offline-focused validation.
 - Use in-memory offline transcription as the default finalize path; keep temp-wav fallback only for compatibility failures.
 
 Acceptance:
@@ -206,7 +211,7 @@ Status legend: `todo` | `in-progress` | `done` | `blocked`
 4. `A4` — status: `in-progress`; owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
 5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
 6. `A6` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
-7. `A7` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`): default helper launch is offline-first (`PARAKEET_STREAMING_ENABLED=false`) with explicit streaming opt-in (`PARAKEET_STREAMING_ENABLED=true`).
+7. `A7` — status: `done` (2026-03-05 update); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`) now use profile defaults: `stt`/`stt start` for online stream+seal+overlay and `stt off` for offline/no-overlay.
 8. `A8` — status: `done` (2026-02-25); owner: `Owner-M1`; branch: `agent/a8-offline-bench-harness`; scope: Offline benchmark harness implemented in `check_model.py` with committed bench dataset inputs, per-sample + aggregate WER/infer/finalize metrics, JSON report output, and configurable regression thresholds with non-zero exit on failure.
 
 ## Metrics to Track
@@ -232,9 +237,7 @@ N ms) while the user is still holding, signaling they can release without trunca
 3. Confidence-based early termination: Detect silence plus high confidence to auto-stop
 session without waiting for button release.
 
-Current default policy uses offline helper launch (`stt start`,
-`PARAKEET_STREAMING_ENABLED=false`) with explicit streaming opt-in
-(`PARAKEET_STREAMING_ENABLED=true`) for targeted validation and troubleshooting.
+Current default policy uses profile-based helper launch: `stt`/`stt start` for online stream+seal and `stt off` for offline/no-overlay targeted validation and troubleshooting.
 
 ## Non-Goals (Near-Term)
 

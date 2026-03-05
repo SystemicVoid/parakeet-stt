@@ -4,6 +4,13 @@ The role of this file is to describe common mistakes and confusion points that a
 
 ## Build, Test, and Development Commands
 - Unified quality gate (repo root): `prek install -t pre-commit -t pre-push`, then `prek run --all-files` and `prek run --stage pre-push --all-files`.
+- Overlay reliability gate: `just phase6-contract` (single pass), `just phase6-promotion 3` (promotion gate with repeated clean runs + eval compare).
+- Eval shortcuts (existing dataset): `just eval compare` (default), `just eval offline`, `just eval stream`, `just eval calibrate-offline`, `just eval calibrate-stream`.
+
+## Runtime Operator Defaults (2026-03)
+- `stt` / `stt start`: online stream+seal profile with overlay enabled and adaptive width disabled by default.
+- `stt off`: offline profile defaults (no streaming, overlay disabled).
+- Overlay mode override remains `PARAKEET_OVERLAY_MODE=auto|layer-shell|fallback-window|disabled`.
 
 ## Coding Style & Naming Conventions
 - Maintain lazy imports in `model.py` to avoid GPU dependencies for protocol work. Use structured logging (`loguru`) and environment variables prefixed `PARAKEET_` for overrides.
