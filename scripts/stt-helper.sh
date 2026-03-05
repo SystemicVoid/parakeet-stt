@@ -86,7 +86,38 @@ stt() {
     if [ "$cmd" = "stream" ]; then
         cmd="start"
         set -- streaming "$@"
+    elif [ "$cmd" = "off" ]; then
+        cmd="start"
+        set -- offline "$@"
+    elif [ "$cmd" = "on" ]; then
+        cmd="start"
+        set -- streaming "$@"
     fi
+
+    _apply_launch_profile_defaults() {
+        local profile="$1"
+        if [ "$profile" = "stream-seal" ]; then
+            # Keep "stt" ergonomic for daily use: online stream+seal with overlay,
+            # but non-adaptive width so rendering remains predictable.
+            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+                default_overlay_enabled="true"
+            fi
+            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+                default_overlay_adaptive_width="false"
+            fi
+            return 0
+        fi
+
+        if [ "$profile" = "offline" ]; then
+            # "stt off" favors fastest accurate offline dictation with no overlay.
+            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+                default_overlay_enabled="false"
+            fi
+            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+                default_overlay_adaptive_width="false"
+            fi
+        fi
+    }
 
     _start_option_exists() {
         local target="$1"
@@ -421,11 +452,13 @@ PY
 Usage:
   stt start [options]
   stt stream [options]
+  stt off [options]
   stt <command> [args]
 
 Commands:
   start [options]        Start daemon + client (default command).
   stream [options]       Start daemon/client in stream+seal mode.
+  off [options]          Start daemon/client in offline mode (overlay off).
   stop                   Stop daemon/client and remove pid/port files.
   restart [options]      Restart with the same options as start.
   status                 Show daemon/client/tmux status.
@@ -439,13 +472,15 @@ Commands:
 EOF
     }
     _print_help_start() {
+        _apply_launch_profile_defaults "stream-seal"
         cat <<EOF
 Usage:
   stt start [streaming|offline] [options]
 
 Modes:
-  (default) offline      Launch daemon with streaming disabled.
+  (default) streaming    Launch daemon with stream+seal + overlay defaults.
   streaming|stream       Launch daemon with stream+seal enabled.
+  offline|off            Launch daemon with streaming disabled.
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
@@ -550,9 +585,15 @@ CLIENTCMD
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local -a ptt_args
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
+            local launch_profile="stream-seal"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
+                launch_profile="stream-seal"
+                shift
+            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
+                launch_profile="offline"
                 shift
             fi
+            _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
 
             local parse_status=0
@@ -570,11 +611,11 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local launch_profile="offline"
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ]; then
+            local launch_profile="stream-seal"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
                 launch_profile="stream-seal"
                 shift
-            elif [ "${1:-}" = "offline" ]; then
+            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
                 launch_profile="offline"
                 shift
             fi
@@ -590,6 +631,7 @@ CLIENTCMD
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
+            _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
 
             local parse_status=0
