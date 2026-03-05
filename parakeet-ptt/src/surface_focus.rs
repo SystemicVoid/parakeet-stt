@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1,
 };
-use wayland_client::protocol::wl_registry;
+use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
@@ -18,6 +18,7 @@ pub struct FocusSnapshot {
     pub object_name: Option<String>,
     pub object_path: Option<String>,
     pub service_name: Option<String>,
+    pub output_name: Option<String>,
     pub focused: bool,
     pub active: bool,
     pub resolver: &'static str,
@@ -153,6 +154,19 @@ impl WaylandFocusCache {
             cache_age_ms: Some(cache_age_ms),
         }
     }
+
+    pub fn current_output_name(&self) -> Option<String> {
+        match self.observe(1_500, 250) {
+            WaylandFocusObservation::Fresh { snapshot, .. } => snapshot.output_name,
+            WaylandFocusObservation::LowConfidence {
+                snapshot,
+                reason: "wayland_transition_no_activated" | "wayland_cache_stale",
+                ..
+            } => snapshot.output_name,
+            WaylandFocusObservation::Unavailable { .. } => None,
+            WaylandFocusObservation::LowConfidence { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +185,7 @@ struct WaylandRuntimeState {
     shared: Arc<Mutex<WaylandFocusSharedState>>,
     foreign_toplevel_list: Option<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1>,
     cosmic_toplevel_info: Option<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1>,
+    outputs: Vec<RuntimeOutput>,
     toplevels: Vec<RuntimeToplevel>,
 }
 
@@ -180,6 +195,7 @@ impl WaylandRuntimeState {
             shared,
             foreign_toplevel_list: None,
             cosmic_toplevel_info: None,
+            outputs: Vec::new(),
             toplevels: Vec::new(),
         }
     }
@@ -198,6 +214,11 @@ impl WaylandRuntimeState {
                 identifier: entry.identifier.clone(),
                 app_id: entry.app_id.clone(),
                 title: entry.title.clone(),
+                output_names: entry
+                    .outputs
+                    .iter()
+                    .filter_map(|output| self.output_name_for(output))
+                    .collect(),
             })
             .collect();
 
@@ -235,6 +256,25 @@ impl WaylandRuntimeState {
             .iter_mut()
             .find(|entry| entry.cosmic.as_ref() == Some(handle))
     }
+
+    fn find_output_mut(&mut self, output: &wl_output::WlOutput) -> Option<&mut RuntimeOutput> {
+        self.outputs
+            .iter_mut()
+            .find(|entry| &entry.output == output)
+    }
+
+    fn output_name_for(&self, output: &wl_output::WlOutput) -> Option<String> {
+        self.outputs
+            .iter()
+            .find(|entry| &entry.output == output)
+            .and_then(|entry| entry.name.clone())
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeOutput {
+    output: wl_output::WlOutput,
+    name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -244,6 +284,7 @@ struct RuntimeToplevel {
     identifier: Option<String>,
     app_id: Option<String>,
     title: Option<String>,
+    outputs: Vec<wl_output::WlOutput>,
     activated: bool,
 }
 
@@ -252,6 +293,7 @@ struct CachedToplevel {
     identifier: Option<String>,
     app_id: Option<String>,
     title: Option<String>,
+    output_names: Vec<String>,
 }
 
 impl CachedToplevel {
@@ -261,6 +303,7 @@ impl CachedToplevel {
             object_name: self.title.clone(),
             object_path: self.identifier.clone(),
             service_name: Some("wayland".to_string()),
+            output_name: self.output_names.first().cloned(),
             focused,
             active: true,
             resolver: "wayland",
@@ -343,6 +386,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandRuntimeState {
                             ),
                         );
                     }
+                    "wl_output" => {
+                        let output = registry.bind::<wl_output::WlOutput, _, _>(
+                            name,
+                            version.min(4),
+                            queue_handle,
+                            (),
+                        );
+                        runtime.outputs.push(RuntimeOutput { output, name: None });
+                    }
                     _ => {}
                 }
             }
@@ -373,6 +425,7 @@ impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for Wa
                 identifier: None,
                 app_id: None,
                 title: None,
+                outputs: Vec::new(),
                 activated: false,
             });
         }
@@ -469,14 +522,50 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for Wayla
         _: &QueueHandle<Self>,
     ) {
         let mut publish = false;
-        if let zcosmic_toplevel_handle_v1::Event::State { state } = event {
-            if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
-                entry.activated = parse_cosmic_state_has_activated(&state);
-                publish = true;
+        match event {
+            zcosmic_toplevel_handle_v1::Event::State { state } => {
+                if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
+                    entry.activated = parse_cosmic_state_has_activated(&state);
+                    publish = true;
+                }
             }
+            zcosmic_toplevel_handle_v1::Event::OutputEnter { output } => {
+                if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
+                    if !entry.outputs.iter().any(|current| current == &output) {
+                        entry.outputs.push(output);
+                        publish = true;
+                    }
+                }
+            }
+            zcosmic_toplevel_handle_v1::Event::OutputLeave { output } => {
+                if let Some(entry) = runtime.find_by_cosmic_handle_mut(handle) {
+                    let before = entry.outputs.len();
+                    entry.outputs.retain(|current| current != &output);
+                    publish = publish || entry.outputs.len() != before;
+                }
+            }
+            _ => {}
         }
         if publish {
             runtime.publish();
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for WaylandRuntimeState {
+    fn event(
+        runtime: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            if let Some(entry) = runtime.find_output_mut(output) {
+                entry.name = Some(name);
+                runtime.publish();
+            }
         }
     }
 }
@@ -517,6 +606,7 @@ mod tests {
             identifier: Some("abc".to_string()),
             app_id: Some("Brave".to_string()),
             title: Some("Title".to_string()),
+            output_names: vec!["HDMI-A-1".to_string()],
         };
         let cache = WaylandFocusCache {
             shared: Arc::new(Mutex::new(WaylandFocusSharedState {
@@ -549,6 +639,7 @@ mod tests {
             identifier: Some("def".to_string()),
             app_id: Some("Code".to_string()),
             title: Some("Editor".to_string()),
+            output_names: vec!["DP-1".to_string()],
         };
         let cache = WaylandFocusCache {
             shared: Arc::new(Mutex::new(WaylandFocusSharedState {
@@ -573,5 +664,45 @@ mod tests {
             }
             _ => panic!("expected low-confidence transition snapshot"),
         }
+    }
+
+    #[test]
+    fn focus_snapshot_includes_output_name() {
+        let entry = CachedToplevel {
+            identifier: Some("ghi".to_string()),
+            app_id: Some("Terminal".to_string()),
+            title: Some("shell".to_string()),
+            output_names: vec!["DP-1".to_string()],
+        };
+
+        let snapshot = entry.to_focus_snapshot(true);
+        assert_eq!(snapshot.output_name.as_deref(), Some("DP-1"));
+    }
+
+    #[test]
+    fn current_output_name_accepts_stale_active_snapshot() {
+        let active = CachedToplevel {
+            identifier: Some("jkl".to_string()),
+            app_id: Some("Ghostty".to_string()),
+            title: Some("terminal".to_string()),
+            output_names: vec!["HDMI-A-1".to_string()],
+        };
+        let cache = WaylandFocusCache {
+            shared: Arc::new(Mutex::new(WaylandFocusSharedState {
+                connected: true,
+                protocols_supported: true,
+                active: Some(active.clone()),
+                activated_count: 1,
+                last_activated: Some(active),
+                last_commit_at: Some(Instant::now() - Duration::from_secs(5)),
+                last_activated_at: Some(Instant::now() - Duration::from_secs(5)),
+            })),
+        };
+
+        assert_eq!(
+            cache.current_output_name().as_deref(),
+            Some("HDMI-A-1"),
+            "overlay spawn should not deadlock on stale-but-populated active focus snapshots"
+        );
     }
 }

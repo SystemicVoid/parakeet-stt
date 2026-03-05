@@ -28,6 +28,17 @@ class ServerMessageType(str, Enum):
     FINAL_RESULT = "final_result"
     ERROR = "error"
     STATUS = "status"
+    INTERIM_STATE = "interim_state"
+    INTERIM_TEXT = "interim_text"
+    SESSION_ENDED = "session_ended"
+    AUDIO_LEVEL = "audio_level"
+
+
+class InterimStateValue(str, Enum):
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    INTERIM = "interim"
+    FINALIZING = "finalizing"
 
 
 class StartSession(BaseModel):
@@ -113,6 +124,9 @@ class StatusMessage(BaseModel):
     streaming_enabled: bool | None = None
     stream_helper_active: bool | None = None
     stream_fallback_reason: str | None = None
+    overlay_events_enabled: bool | None = None
+    overlay_events_emitted: int | None = None
+    overlay_events_dropped: int | None = None
     chunk_secs: float | None = None
     active_session_age_ms: int | None = None
     audio_stop_ms: int | None = None
@@ -124,7 +138,50 @@ class StatusMessage(BaseModel):
     last_send_ms: int | None = None
 
 
-ServerMessage = SessionStarted | FinalResult | ErrorMessage | StatusMessage
+class InterimStateMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.INTERIM_STATE] = Field(default=ServerMessageType.INTERIM_STATE)
+    session_id: UUID
+    seq: int = Field(ge=0)
+    state: InterimStateValue
+
+
+class InterimTextMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.INTERIM_TEXT] = Field(default=ServerMessageType.INTERIM_TEXT)
+    session_id: UUID
+    seq: int = Field(ge=0)
+    text: str
+
+
+class AudioLevelMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.AUDIO_LEVEL] = Field(default=ServerMessageType.AUDIO_LEVEL)
+    session_id: UUID
+    level_db: float
+
+
+class SessionEndedMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.SESSION_ENDED] = Field(default=ServerMessageType.SESSION_ENDED)
+    session_id: UUID
+    reason: Literal["final", "abort", "error"] | None = None
+
+
+ServerMessage = (
+    SessionStarted
+    | FinalResult
+    | ErrorMessage
+    | StatusMessage
+    | InterimStateMessage
+    | InterimTextMessage
+    | AudioLevelMessage
+    | SessionEndedMessage
+)
 
 
 @dataclass(frozen=True)
@@ -153,6 +210,7 @@ __all__ = [
     "ClientMessageType",
     "ServerMessage",
     "ServerMessageType",
+    "InterimStateValue",
     "StartSession",
     "StopSession",
     "AbortSession",
@@ -160,6 +218,10 @@ __all__ = [
     "FinalResult",
     "ErrorMessage",
     "StatusMessage",
+    "InterimStateMessage",
+    "InterimTextMessage",
+    "AudioLevelMessage",
+    "SessionEndedMessage",
     "ParsedMessage",
     "parse_client_message",
 ]

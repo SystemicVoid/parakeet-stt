@@ -107,12 +107,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     settings = _build_settings(args)
     logger.info(
-        "Starting parakeet-stt-daemon on {}:{} (device: {}, mic: {}, streaming: {})",
+        (
+            "Starting parakeet-stt-daemon on {}:{} "
+            "(device: {}, mic: {}, streaming: {}, overlay_events: {})"
+        ),
         settings.host,
         settings.port,
         settings.device,
         settings.mic_device,
         settings.streaming_enabled,
+        settings.overlay_events_enabled,
     )
     if settings.streaming_enabled:
         logger.info(
@@ -172,12 +176,13 @@ def run_checks(settings: ServerSettings) -> None:
 
     logger.info(
         "Streaming config: enabled={}, chunk_secs={}, right_context_secs={}, "
-        "left_context_secs={}, batch_size={}",
+        "left_context_secs={}, batch_size={}, overlay_events_enabled={}",
         settings.streaming_enabled,
         settings.chunk_secs,
         settings.right_context_secs,
         settings.left_context_secs,
         settings.batch_size,
+        settings.overlay_events_enabled,
     )
     if settings.streaming_enabled:
         helper_active = server._stream_helper_active()

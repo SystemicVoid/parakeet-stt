@@ -32,6 +32,8 @@ stt() {
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
+    local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
+    local default_overlay_adaptive_width="${PARAKEET_OVERLAY_ADAPTIVE_WIDTH:-true}"
     local default_daemon_streaming_enabled="false"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
@@ -52,6 +54,8 @@ stt() {
         "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Stable controls|<v>|true|always|true"
         "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Stable controls|<path>|<system default>|nonempty|"
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
+        "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
+        "overlay-adaptive-width|overlay_adaptive_width|default_overlay_adaptive_width|PARAKEET_OVERLAY_ADAPTIVE_WIDTH|Stable controls|<v>|true|always|true"
     )
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
@@ -82,7 +86,38 @@ stt() {
     if [ "$cmd" = "stream" ]; then
         cmd="start"
         set -- streaming "$@"
+    elif [ "$cmd" = "off" ]; then
+        cmd="start"
+        set -- offline "$@"
+    elif [ "$cmd" = "on" ]; then
+        cmd="start"
+        set -- streaming "$@"
     fi
+
+    _apply_launch_profile_defaults() {
+        local profile="$1"
+        if [ "$profile" = "stream-seal" ]; then
+            # Keep "stt" ergonomic for daily use: online stream+seal with overlay,
+            # but non-adaptive width so rendering remains predictable.
+            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+                default_overlay_enabled="true"
+            fi
+            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+                default_overlay_adaptive_width="false"
+            fi
+            return 0
+        fi
+
+        if [ "$profile" = "offline" ]; then
+            # "stt off" favors fastest accurate offline dictation with no overlay.
+            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+                default_overlay_enabled="false"
+            fi
+            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+                default_overlay_adaptive_width="false"
+            fi
+        fi
+    }
 
     _start_option_exists() {
         local target="$1"
@@ -302,7 +337,7 @@ PY
 
     _client_build_in_progress() {
         [ -f "$LOG_CLIENT" ] || return 1
-        grep -Fq "[helper] running cargo run --release" "$LOG_CLIENT" || return 1
+        grep -Fq "[helper] running cargo run --release --bin parakeet-ptt" "$LOG_CLIENT" || return 1
         grep -Eq 'Compiling |Finished `release` profile' "$LOG_CLIENT" || return 1
         grep -Fq 'Running `target/release/parakeet-ptt' "$LOG_CLIENT" && return 1
         return 0
@@ -325,8 +360,8 @@ PY
                 pid=$(pgrep -n "[p]arakeet-ptt" || true)
                 if [ -n "$pid" ]; then
                     echo "$pid" > "$CLIENT_PID_FILE"
+                    return 0
                 fi
-                return 0
             fi
 
             if [ $((SECONDS - started_at)) -ge "$max_wait" ]; then
@@ -417,11 +452,13 @@ PY
 Usage:
   stt start [options]
   stt stream [options]
+  stt off [options]
   stt <command> [args]
 
 Commands:
   start [options]        Start daemon + client (default command).
   stream [options]       Start daemon/client in stream+seal mode.
+  off [options]          Start daemon/client in offline mode (overlay off).
   stop                   Stop daemon/client and remove pid/port files.
   restart [options]      Restart with the same options as start.
   status                 Show daemon/client/tmux status.
@@ -435,13 +472,15 @@ Commands:
 EOF
     }
     _print_help_start() {
+        _apply_launch_profile_defaults "stream-seal"
         cat <<EOF
 Usage:
   stt start [streaming|offline] [options]
 
 Modes:
-  (default) offline      Launch daemon with streaming disabled.
+  (default) streaming    Launch daemon with stream+seal + overlay defaults.
   streaming|stream       Launch daemon with stream+seal enabled.
+  offline|off            Launch daemon with streaming disabled.
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
@@ -459,6 +498,8 @@ Other environment overrides:
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
+  PARAKEET_OVERLAY_ENABLED=<true|false>
+  PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled>
 EOF
     }
 
@@ -478,7 +519,7 @@ EOF
                 if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    echo "[helper] running cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
                 fi
 
                 eval "set -- $PTT_ARGS_SHELL"
@@ -487,9 +528,36 @@ EOF
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 else
-                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release --bin parakeet-ptt -- "${args[@]}" 2>&1 | tee -a "$LOG_CLIENT"
                 fi
 CLIENTCMD
+    }
+
+    _ensure_overlay_release_binary() {
+        local ptt_rustflags="$1"
+        local overlay_binary="$CLIENT_DIR/target/release/parakeet-overlay"
+        local build_cmd="cargo build --release --bin parakeet-overlay"
+
+        if ! command -v cargo >/dev/null 2>&1; then
+            if [ ! -x "$overlay_binary" ]; then
+                echo "   - Overlay binary missing and cargo not found; overlay routing will remain best-effort noop."
+                echo "[helper] overlay binary missing at $overlay_binary and cargo unavailable; continuing without overlay process" >> "$LOG_CLIENT"
+            fi
+            return 0
+        fi
+
+        echo "   - Ensuring overlay binary is available (${build_cmd})..."
+        echo "[helper] ensuring overlay binary via ${build_cmd}" >> "$LOG_CLIENT"
+        if (
+            cd "$CLIENT_DIR" || exit 1
+            RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >> "$LOG_CLIENT" 2>&1
+        ); then
+            return 0
+        fi
+
+        echo "   - Overlay build failed; continuing without overlay (non-fatal)."
+        echo "[helper] overlay binary build failed; continuing without overlay process" >> "$LOG_CLIENT"
+        return 0
     }
 
     case "$cmd" in
@@ -515,11 +583,17 @@ CLIENTCMD
         __start-args)
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local -a ptt_args
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
+            local launch_profile="stream-seal"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
+                launch_profile="stream-seal"
+                shift
+            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
+                launch_profile="offline"
                 shift
             fi
+            _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
 
             local parse_status=0
@@ -536,12 +610,12 @@ CLIENTCMD
         start)
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
-            local launch_profile="offline"
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ]; then
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local launch_profile="stream-seal"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
                 launch_profile="stream-seal"
                 shift
-            elif [ "${1:-}" = "offline" ]; then
+            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
                 launch_profile="offline"
                 shift
             fi
@@ -550,12 +624,14 @@ CLIENTCMD
             local daemon_right_context_secs="$default_daemon_right_context_secs"
             local daemon_left_context_secs="$default_daemon_left_context_secs"
             local daemon_batch_size="$default_daemon_batch_size"
+            local daemon_overlay_events_enabled="false"
             if [ "$launch_profile" = "stream-seal" ]; then
                 daemon_streaming_enabled="true"
             fi
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
+            _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
 
             local parse_status=0
@@ -565,6 +641,10 @@ CLIENTCMD
             elif [ "$parse_status" -ne 0 ]; then
                 return "$parse_status"
             fi
+
+            # Keep daemon overlay event emission in lockstep with the user-facing
+            # --overlay-enabled start control so one switch enables both paths.
+            daemon_overlay_events_enabled="$overlay_enabled"
 
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
@@ -581,12 +661,16 @@ CLIENTCMD
             echo "   - Completion sound: $completion_sound"
             echo "   - Completion sound path: ${completion_sound_path:-<system default>}"
             echo "   - Completion sound volume: $completion_sound_volume"
+            echo "   - Overlay enabled: $overlay_enabled"
+            echo "   - Overlay adaptive width: $overlay_adaptive_width"
             echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
+            echo "   - Daemon overlay events enabled: $daemon_overlay_events_enabled"
             echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
             echo "   - Client ready timeout (s): $client_ready_timeout_seconds"
             echo "   - PTT runner preference: $ptt_runner_preference"
             echo "   - PTT RUSTFLAGS: $ptt_rustflags"
+            echo "   - Overlay mode override: ${PARAKEET_OVERLAY_MODE:-auto}"
 
             if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                 echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
@@ -619,6 +703,7 @@ CLIENTCMD
                     PARAKEET_RIGHT_CONTEXT_SECS="$daemon_right_context_secs" \
                     PARAKEET_LEFT_CONTEXT_SECS="$daemon_left_context_secs" \
                     PARAKEET_BATCH_SIZE="$daemon_batch_size" \
+                    PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
                     nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
                     echo $! > "$DAEMON_PID_FILE"
@@ -664,14 +749,15 @@ CLIENTCMD
             local runner_mode
             runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
+            _ensure_overlay_release_binary "$ptt_rustflags"
 
             local client_cmd
             client_cmd="$(_build_client_cmd)"
 
             tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$CLIENT_DIR" \
-                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+                "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
             tmux split-window -t "$TMUX_SESSION:$TMUX_WINDOW" -v -c /tmp "bash -lc 'tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\"'"
             tmux select-layout -t "$TMUX_SESSION:$TMUX_WINDOW" even-vertical
             local primary_pane
@@ -808,14 +894,15 @@ CLIENTCMD
             echo "${HOST}:${PORT}" > "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
-
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
-            local completion_sound completion_sound_path completion_sound_volume
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
+
+            local daemon_overlay_events_enabled="$overlay_enabled"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_OVERLAY_EVENTS_ENABLED=\"$daemon_overlay_events_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
 
             if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                 echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
@@ -830,8 +917,9 @@ CLIENTCMD
             local runner_mode
             runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                echo "[helper] release binary missing expected start flags; falling back to cargo run --release" >> "$LOG_CLIENT"
+                echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
+            _ensure_overlay_release_binary "$ptt_rustflags"
 
             local client_cmd='
                 set -e
@@ -839,7 +927,7 @@ CLIENTCMD
                 if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 else
-                    echo "[helper] running cargo run --release" >> "$LOG_CLIENT"
+                    echo "[helper] running cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
                 fi
 
                 eval "set -- $PTT_ARGS_SHELL"
@@ -848,12 +936,12 @@ CLIENTCMD
                 if [ -n "$runner_bin" ]; then
                     "$runner_bin" "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 else
-                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
+                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release --bin parakeet-ptt -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
                 fi
             '
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" bash -lc '$client_cmd'"
+            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
             tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
             tmux select-window -t "$TMUX_SESSION:daemon"
             tmux attach -t "$TMUX_SESSION"
@@ -883,7 +971,7 @@ CLIENTCMD
                 if [ "$runner_mode" = "release" ]; then
                     runner_bin="./target/release/parakeet-ptt"
                 elif [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                    echo "   - release binary missing expected start flags; using cargo run --release"
+                    echo "   - release binary missing expected start flags; using cargo run --release --bin parakeet-ptt"
                 fi
 
                 echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
@@ -915,7 +1003,7 @@ CLIENTCMD
                             "$runner_bin" --test-injection "${ptt_args[@]}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            RUSTFLAGS="$ptt_rustflags" cargo run --release -- --test-injection "${ptt_args[@]}"
+                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- --test-injection "${ptt_args[@]}"
                     fi
                 }
 

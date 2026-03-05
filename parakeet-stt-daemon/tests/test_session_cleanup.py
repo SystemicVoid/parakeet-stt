@@ -116,6 +116,12 @@ def _build_server() -> DaemonServer:
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
+    server._live_interim_chunks = []
+    server._live_interim_failed = False
+    server._overlay_event_seq_by_session = {}
+    server._overlay_last_interim_text_by_session = {}
+    server._overlay_events_emitted = 0
+    server._overlay_events_dropped = 0
     return cast(DaemonServer, server)
 
 
@@ -307,7 +313,7 @@ def test_start_session_rolls_back_when_drain_loop_start_fails() -> None:
         server.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
         session_id = uuid4()
 
-        def explode_start_stream_drain_loop() -> None:
+        def explode_start_stream_drain_loop(_websocket: Any, _session_id: UUID) -> None:
             raise RuntimeError("drain loop failed")
 
         server._start_stream_drain_loop = explode_start_stream_drain_loop  # type: ignore[method-assign]

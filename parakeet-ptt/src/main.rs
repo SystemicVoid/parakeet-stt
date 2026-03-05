@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod hotkey;
 mod injector;
+mod overlay_process;
 mod protocol;
 mod routing;
 mod state;
@@ -27,11 +28,19 @@ use uuid::Uuid;
 
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
-use crate::config::{ClientConfig, ClipboardOptions, InjectionConfig, DEFAULT_ENDPOINT};
+use crate::config::{
+    resolve_overlay_adaptive_width, resolve_overlay_capability, ClientConfig, ClipboardOptions,
+    InjectionConfig, OverlayMode, DEFAULT_ENDPOINT,
+};
 use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
-use crate::protocol::{start_message, stop_message, ServerMessage};
+use crate::overlay_process::OverlayProcessManager;
+use crate::protocol::{
+    decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
+};
 use crate::state::PttState;
+use crate::surface_focus::WaylandFocusCache;
+use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
@@ -81,6 +90,338 @@ struct InjectorQueueMetrics {
     worker_queue_wait_ms_total: AtomicU64,
     worker_run_ms_total: AtomicU64,
     queue_depth_high_water: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct OverlayRoutingMetrics {
+    routed_interim_state_total: AtomicU64,
+    routed_interim_text_total: AtomicU64,
+    routed_session_ended_total: AtomicU64,
+    dropped_stale_seq_total: AtomicU64,
+    dropped_session_mismatch_total: AtomicU64,
+}
+
+impl OverlayRoutingMetrics {
+    fn note_interim_state(&self) {
+        self.routed_interim_state_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_interim_text(&self) {
+        self.routed_interim_text_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_session_ended(&self) {
+        self.routed_session_ended_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_stale_seq_drop(&self) {
+        self.dropped_stale_seq_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_session_mismatch_drop(&self) {
+        self.dropped_session_mismatch_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OverlayEvent {
+    OutputHint {
+        output_name: String,
+    },
+    InterimState {
+        session_id: Uuid,
+        seq: u64,
+        state: String,
+    },
+    InterimText {
+        session_id: Uuid,
+        seq: u64,
+        text: String,
+    },
+    AudioLevel {
+        session_id: Uuid,
+        level_db: f32,
+    },
+    SessionEnded {
+        session_id: Uuid,
+        reason: Option<String>,
+    },
+    InjectionComplete {
+        session_id: Uuid,
+        success: bool,
+    },
+}
+
+trait OverlaySink {
+    fn on_overlay_event(&mut self, event: OverlayEvent);
+}
+
+#[derive(Debug, Default)]
+struct NoopOverlaySink;
+
+impl OverlaySink for NoopOverlaySink {
+    fn on_overlay_event(&mut self, event: OverlayEvent) {
+        debug!(?event, "overlay event dropped by noop sink");
+    }
+}
+
+enum RuntimeOverlaySink {
+    Noop(NoopOverlaySink),
+    Process(Box<OverlayProcessManager>),
+}
+
+impl OverlaySink for RuntimeOverlaySink {
+    fn on_overlay_event(&mut self, event: OverlayEvent) {
+        match self {
+            Self::Noop(sink) => sink.on_overlay_event(event),
+            Self::Process(manager) => manager.send(overlay_event_to_ipc(event)),
+        }
+    }
+}
+
+fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
+    match event {
+        OverlayEvent::OutputHint { output_name } => OverlayIpcMessage::OutputHint { output_name },
+        OverlayEvent::InterimState {
+            session_id,
+            seq,
+            state,
+        } => OverlayIpcMessage::InterimState {
+            session_id,
+            seq,
+            state,
+        },
+        OverlayEvent::InterimText {
+            session_id,
+            seq,
+            text,
+        } => OverlayIpcMessage::InterimText {
+            session_id,
+            seq,
+            text,
+        },
+        OverlayEvent::AudioLevel {
+            session_id,
+            level_db,
+        } => OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db,
+        },
+        OverlayEvent::SessionEnded { session_id, reason } => {
+            OverlayIpcMessage::SessionEnded { session_id, reason }
+        }
+        OverlayEvent::InjectionComplete {
+            session_id,
+            success,
+        } => OverlayIpcMessage::InjectionComplete {
+            session_id,
+            success,
+        },
+    }
+}
+
+fn build_runtime_overlay_sink(
+    mode: OverlayMode,
+    overlay_adaptive_width: bool,
+    focus_cache: Option<WaylandFocusCache>,
+) -> RuntimeOverlaySink {
+    match mode {
+        OverlayMode::Disabled => RuntimeOverlaySink::Noop(NoopOverlaySink),
+        OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
+            let manager = OverlayProcessManager::new(mode, overlay_adaptive_width, focus_cache);
+            let metrics = manager.metrics();
+            info!(
+                overlay_spawn_attempt_total = metrics.spawn_attempt_total.load(Ordering::Relaxed),
+                overlay_spawn_success_total = metrics.spawn_success_total.load(Ordering::Relaxed),
+                overlay_spawn_failure_total = metrics.spawn_failure_total.load(Ordering::Relaxed),
+                overlay_active_sink = manager.has_active_sink(),
+                overlay_adaptive_width,
+                "overlay process routing enabled with respawn manager"
+            );
+            RuntimeOverlaySink::Process(Box::new(manager))
+        }
+    }
+}
+
+struct OverlayRouter<S: OverlaySink> {
+    sink: S,
+    metrics: Arc<OverlayRoutingMetrics>,
+    active_session_id: Option<Uuid>,
+    last_seq: Option<u64>,
+    focus_cache: Option<WaylandFocusCache>,
+    last_output_name: Option<String>,
+}
+
+impl<S: OverlaySink> OverlayRouter<S> {
+    fn new(sink: S, focus_cache: Option<WaylandFocusCache>) -> Self {
+        Self {
+            sink,
+            metrics: Arc::new(OverlayRoutingMetrics::default()),
+            active_session_id: None,
+            last_seq: None,
+            focus_cache,
+            last_output_name: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> &Arc<OverlayRoutingMetrics> {
+        &self.metrics
+    }
+
+    fn note_session_started(&mut self, session_id: Uuid) {
+        if self.active_session_id != Some(session_id) {
+            self.active_session_id = Some(session_id);
+            self.last_seq = None;
+            self.last_output_name = None;
+        }
+    }
+
+    fn route_interim_state(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        seq: u64,
+        state: String,
+    ) {
+        if !self.allow_session(expected_session_id, session_id) || !self.accept_seq(session_id, seq)
+        {
+            return;
+        }
+
+        self.maybe_emit_output_hint();
+        self.sink.on_overlay_event(OverlayEvent::InterimState {
+            session_id,
+            seq,
+            state,
+        });
+        self.metrics.note_interim_state();
+    }
+
+    fn route_interim_text(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        seq: u64,
+        text: String,
+    ) {
+        if !self.allow_session(expected_session_id, session_id) || !self.accept_seq(session_id, seq)
+        {
+            return;
+        }
+
+        self.maybe_emit_output_hint();
+        self.sink.on_overlay_event(OverlayEvent::InterimText {
+            session_id,
+            seq,
+            text,
+        });
+        self.metrics.note_interim_text();
+    }
+
+    fn route_audio_level(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        level_db: f32,
+    ) {
+        if !self.allow_session(expected_session_id, session_id) {
+            return;
+        }
+
+        self.sink.on_overlay_event(OverlayEvent::AudioLevel {
+            session_id,
+            level_db,
+        });
+    }
+
+    fn route_session_ended(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        reason: Option<String>,
+    ) {
+        if !self.allow_session(expected_session_id, session_id) {
+            return;
+        }
+
+        self.sink
+            .on_overlay_event(OverlayEvent::SessionEnded { session_id, reason });
+        self.metrics.note_session_ended();
+
+        if self.active_session_id == Some(session_id) {
+            self.active_session_id = None;
+            self.last_seq = None;
+            self.last_output_name = None;
+        }
+    }
+
+    fn route_injection_complete(&mut self, session_id: Uuid, success: bool) {
+        self.sink.on_overlay_event(OverlayEvent::InjectionComplete {
+            session_id,
+            success,
+        });
+    }
+
+    fn maybe_emit_output_hint(&mut self) {
+        let Some(focus_cache) = self.focus_cache.as_ref() else {
+            return;
+        };
+
+        let Some(output_name) = focus_cache.current_output_name() else {
+            return;
+        };
+
+        if self.last_output_name.as_deref() == Some(output_name.as_str()) {
+            return;
+        }
+
+        self.last_output_name = Some(output_name.clone());
+        self.sink
+            .on_overlay_event(OverlayEvent::OutputHint { output_name });
+    }
+
+    fn allow_session(&self, expected_session_id: Option<Uuid>, incoming_session_id: Uuid) -> bool {
+        match expected_session_id {
+            Some(expected) if expected != incoming_session_id => {
+                self.metrics.note_session_mismatch_drop();
+                debug!(
+                    expected_session = %expected,
+                    incoming_session = %incoming_session_id,
+                    "dropping overlay event for mismatched active session"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn accept_seq(&mut self, incoming_session_id: Uuid, seq: u64) -> bool {
+        if self.active_session_id != Some(incoming_session_id) {
+            self.active_session_id = Some(incoming_session_id);
+            self.last_seq = None;
+        }
+
+        if let Some(last_seq) = self.last_seq {
+            if seq <= last_seq {
+                self.metrics.note_stale_seq_drop();
+                debug!(
+                    session = %incoming_session_id,
+                    seq,
+                    last_seq,
+                    "dropping stale overlay event sequence"
+                );
+                return false;
+            }
+        }
+
+        self.last_seq = Some(seq);
+        true
+    }
 }
 
 impl InjectorQueueMetrics {
@@ -392,6 +733,14 @@ struct Cli {
     /// Volume for completion sound (0-100).
     #[arg(long, default_value_t = 100)]
     completion_sound_volume: u8,
+
+    /// Enable or disable overlay routing (CLI takes precedence over env).
+    #[arg(long, action = clap::ArgAction::Set)]
+    overlay_enabled: Option<bool>,
+
+    /// Enable or disable adaptive overlay width (CLI takes precedence over env).
+    #[arg(long, action = clap::ArgAction::Set)]
+    overlay_adaptive_width: Option<bool>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -491,7 +840,13 @@ async fn main() -> Result<()> {
         cli.completion_sound_path,
         cli.completion_sound_volume,
     );
-    run_hotkey_mode(config, audio_feedback).await
+    run_hotkey_mode(
+        config,
+        audio_feedback,
+        cli.overlay_enabled,
+        cli.overlay_adaptive_width,
+    )
+    .await
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
@@ -646,7 +1001,6 @@ async fn run_demo(
                     audio_ms,
                     "final result received"
                 );
-                audio_feedback.play_completion();
                 injector_worker
                     .enqueue(InjectionJob::new(
                         session_id, to_inject, latency_ms, audio_ms,
@@ -662,6 +1016,7 @@ async fn run_demo(
                 if let Some(error) = report.error {
                     return Err(anyhow!("demo injection failed: {error}"));
                 }
+                audio_feedback.play_completion();
                 state.reset();
                 break;
             }
@@ -689,7 +1044,33 @@ async fn run_demo(
     Ok(())
 }
 
-async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) -> Result<()> {
+async fn run_hotkey_mode(
+    config: ClientConfig,
+    audio_feedback: AudioFeedback,
+    overlay_enabled_override: Option<bool>,
+    overlay_adaptive_width_override: Option<bool>,
+) -> Result<()> {
+    let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
+    let overlay_adaptive_width = resolve_overlay_adaptive_width(overlay_adaptive_width_override);
+    match overlay_capability.mode {
+        OverlayMode::Disabled => {
+            warn!(
+                overlay_mode = overlay_capability.mode.as_str(),
+                overlay_reason = %overlay_capability.reason,
+                overlay_adaptive_width,
+                "overlay capability probe completed with disabled mode"
+            );
+        }
+        OverlayMode::LayerShell | OverlayMode::FallbackWindow => {
+            info!(
+                overlay_mode = overlay_capability.mode.as_str(),
+                overlay_reason = %overlay_capability.reason,
+                overlay_adaptive_width,
+                "overlay capability probe completed"
+            );
+        }
+    }
+
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
@@ -698,7 +1079,16 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
     );
     ensure_input_access()?;
     let injector = build_injector(&config);
+    let focus_cache = Some(WaylandFocusCache::new());
     let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    let mut overlay_router = OverlayRouter::new(
+        build_runtime_overlay_sink(
+            overlay_capability.mode,
+            overlay_adaptive_width,
+            focus_cache.clone(),
+        ),
+        focus_cache,
+    );
     spawn_event_loop_lag_monitor();
 
     let mut state = PttState::new();
@@ -745,8 +1135,19 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
                                     Some(Ok(msg)) => {
                                         match msg {
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
-                                                match serde_json::from_str::<ServerMessage>(&txt) {
-                                                    Ok(message) => handle_server_message(message, &mut state, &injector_worker, &audio_feedback).await?,
+                                                match decode_server_message(&txt) {
+                                                    Ok(DecodedServerMessage::Known(message)) => {
+                                                        handle_server_message(
+                                                            *message,
+                                                            &mut state,
+                                                            &mut overlay_router,
+                                                            &injector_worker,
+                                                            &audio_feedback,
+                                                        ).await?
+                                                    }
+                                                    Ok(DecodedServerMessage::UnknownType { message_type }) => {
+                                                        debug!(%message_type, "ignoring unknown server message type");
+                                                    }
                                                     Err(err) => warn!("failed to decode server message: {}", err),
                                                 }
                                             }
@@ -771,7 +1172,12 @@ async fn run_hotkey_mode(config: ClientConfig, audio_feedback: AudioFeedback) ->
                                 }
                             }
                             Some(report) = injection_reports.recv() => {
-                                handle_injection_report(&injector_worker, report);
+                                handle_injection_report(
+                                    &injector_worker,
+                                    report,
+                                    &mut overlay_router,
+                                    &audio_feedback,
+                                );
                             }
                         }
                     }
@@ -809,8 +1215,14 @@ async fn send_message(
         .context("failed to send message")
 }
 
-fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionReport) {
+fn handle_injection_report(
+    worker: &InjectorWorkerHandle,
+    report: InjectionReport,
+    overlay_router: &mut OverlayRouter<impl OverlaySink>,
+    audio_feedback: &AudioFeedback,
+) {
     worker.metrics().note_report(&report);
+    let success = report.error.is_none();
     match report.error {
         Some(error) => {
             warn!(
@@ -834,6 +1246,7 @@ fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionRepor
                 total_worker_ms = report.total_worker_ms,
                 "injector worker completed job"
             );
+            audio_feedback.play_completion();
         }
     }
 
@@ -863,17 +1276,21 @@ fn handle_injection_report(worker: &InjectorWorkerHandle, report: InjectionRepor
             "injector stage metrics summary"
         );
     }
+
+    overlay_router.route_injection_complete(report.session_id, success);
 }
 
 async fn handle_server_message(
     message: ServerMessage,
     state: &mut PttState,
+    overlay_router: &mut OverlayRouter<impl OverlaySink>,
     injector_worker: &InjectorWorkerHandle,
-    audio_feedback: &AudioFeedback,
+    _audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
             info!(session = %session_id, "session started ack");
+            overlay_router.note_session_started(session_id);
         }
         ServerMessage::FinalResult {
             session_id,
@@ -888,7 +1305,6 @@ async fn handle_server_message(
                 audio_ms,
                 "final result received"
             );
-            audio_feedback.play_completion();
             match injector_worker
                 .enqueue(InjectionJob::new(session_id, text, latency_ms, audio_ms))
                 .await
@@ -928,11 +1344,46 @@ async fn handle_server_message(
             );
             state.reset();
         }
-        other => {
-            debug!(?other, "ignoring server message");
+        ServerMessage::InterimState {
+            session_id,
+            seq,
+            state: interim_state,
+        } => {
+            overlay_router.route_interim_state(
+                session_id_from_state(state),
+                session_id,
+                seq,
+                interim_state,
+            );
         }
+        ServerMessage::InterimText {
+            session_id,
+            seq,
+            text,
+        } => {
+            overlay_router.route_interim_text(session_id_from_state(state), session_id, seq, text);
+        }
+        ServerMessage::AudioLevel {
+            session_id,
+            level_db,
+        } => {
+            overlay_router.route_audio_level(session_id_from_state(state), session_id, level_db);
+        }
+        ServerMessage::SessionEnded { session_id, reason } => {
+            overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);
+        }
+        ServerMessage::Status { .. } => {}
     }
     Ok(())
+}
+
+fn session_id_from_state(state: &PttState) -> Option<Uuid> {
+    match *state {
+        PttState::Idle => None,
+        PttState::Listening { session_id } | PttState::WaitingResult { session_id } => {
+            Some(session_id)
+        }
+    }
 }
 
 fn classify_error_code(code: &str) -> &'static str {
@@ -1023,30 +1474,36 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::time::Instant;
 
-    use anyhow::Result;
+    use anyhow::{anyhow, Result};
     use clap::Parser;
+    use tokio::sync::mpsc;
     use tokio::task::yield_now;
     use tokio::time::timeout;
     use uuid::Uuid;
 
     use crate::audio_feedback::AudioFeedback;
     use crate::config::{
-        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
-        PasteKeyBackend,
+        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
+        PasteBackendFailurePolicy, PasteKeyBackend,
     };
     use crate::injector::TextInjector;
+    use crate::overlay_process::{
+        OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
+    };
     use crate::protocol::ServerMessage;
     use crate::state::PttState;
 
     use super::{
         build_injector, handle_server_message, spawn_injector_worker_with_capacity, EnqueueFailure,
-        InjectionJob,
+        InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
+        RuntimeOverlaySink,
     };
 
     struct SlowInjector {
@@ -1073,6 +1530,19 @@ mod tests {
                 .expect("recording lock should be available")
                 .push(text.to_string());
             Ok(())
+        }
+    }
+
+    struct RecordingOverlaySink {
+        seen: Arc<Mutex<Vec<OverlayEvent>>>,
+    }
+
+    impl OverlaySink for RecordingOverlaySink {
+        fn on_overlay_event(&mut self, event: OverlayEvent) {
+            self.seen
+                .lock()
+                .expect("overlay recording lock should be available")
+                .push(event);
         }
     }
 
@@ -1116,6 +1586,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cli_overlay_enabled_defaults_to_none() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.overlay_enabled, None);
+    }
+
+    #[test]
+    fn cli_overlay_enabled_accepts_boolean_values() {
+        let cli_enabled = super::Cli::parse_from(["parakeet-ptt", "--overlay-enabled", "true"]);
+        assert_eq!(cli_enabled.overlay_enabled, Some(true));
+
+        let cli_disabled = super::Cli::parse_from(["parakeet-ptt", "--overlay-enabled", "false"]);
+        assert_eq!(cli_disabled.overlay_enabled, Some(false));
+    }
+
+    #[test]
+    fn cli_overlay_adaptive_width_defaults_to_none() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.overlay_adaptive_width, None);
+    }
+
+    #[test]
+    fn cli_overlay_adaptive_width_accepts_boolean_values() {
+        let cli_enabled =
+            super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "true"]);
+        assert_eq!(cli_enabled.overlay_adaptive_width, Some(true));
+
+        let cli_disabled =
+            super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "false"]);
+        assert_eq!(cli_disabled.overlay_adaptive_width, Some(false));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
         let calls = Arc::new(AtomicU64::new(0));
@@ -1128,6 +1630,7 @@ mod tests {
         let mut state = PttState::new();
         let session_id = state.begin_listening().expect("state should start");
         state.stop_listening();
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
         let feedback = AudioFeedback::new(false, None, 100);
         let message = ServerMessage::FinalResult {
             session_id,
@@ -1139,7 +1642,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        handle_server_message(message, &mut state, &worker, &feedback)
+        handle_server_message(message, &mut state, &mut overlay_router, &worker, &feedback)
             .await
             .expect("server message should enqueue successfully");
         let elapsed = started.elapsed();
@@ -1197,6 +1700,616 @@ mod tests {
             .expect("recording lock should be available")
             .clone();
         assert_eq!(ordered, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interim_overlay_messages_route_without_injection_enqueue() {
+        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
+        let injector_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&injector_seen),
+        });
+        let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimState {
+                session_id,
+                seq: 1,
+                state: "listening".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim state should route to overlay");
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "hello".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim text should route to overlay");
+        handle_server_message(
+            ServerMessage::SessionEnded {
+                session_id,
+                reason: Some("normal".to_string()),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("session ended should route to overlay");
+
+        assert!(matches!(state, PttState::WaitingResult { session_id: id } if id == session_id));
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            injector_seen
+                .lock()
+                .expect("recording lock should be available")
+                .len(),
+            0
+        );
+
+        let overlay_events = seen_overlay_events
+            .lock()
+            .expect("overlay recording lock should be available")
+            .clone();
+        assert_eq!(
+            overlay_events,
+            vec![
+                OverlayEvent::InterimState {
+                    session_id,
+                    seq: 1,
+                    state: "listening".to_string(),
+                },
+                OverlayEvent::InterimText {
+                    session_id,
+                    seq: 2,
+                    text: "hello".to_string(),
+                },
+                OverlayEvent::SessionEnded {
+                    session_id,
+                    reason: Some("normal".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_stream_enqueues_exactly_one_final_result() {
+        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimState {
+                session_id,
+                seq: 1,
+                state: "processing".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim state should route");
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "only final injects".to_string(),
+                latency_ms: 40,
+                audio_ms: 1200,
+                lang: Some("en".to_string()),
+                confidence: Some(0.9),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should enqueue exactly once");
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "post-final overlay".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim text should stay in overlay route");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should produce one report")
+            .expect("report channel should remain open");
+        assert!(report.error.is_none());
+
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["only final injects".to_string()]
+        );
+        assert!(timeout(Duration::from_millis(150), reports.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlay_disconnect_does_not_block_final_result_injection() {
+        let (overlay_tx, overlay_rx) = mpsc::unbounded_channel();
+        drop(overlay_rx);
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            overlay_tx,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let sink_slot = Arc::new(Mutex::new(Some(first_sink)));
+        let launcher = {
+            let sink_slot = Arc::clone(&sink_slot);
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
+                sink_slot
+                    .lock()
+                    .expect("sink slot lock should be available")
+                    .take()
+                    .ok_or_else(|| anyhow!("no overlay sink available"))
+            })
+        };
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 1,
+                text: "overlay event while disconnected".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("overlay disconnect should be non-fatal");
+        assert_eq!(
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "final survives overlay disconnect".to_string(),
+                latency_ms: 33,
+                audio_ms: 777,
+                lang: Some("en".to_string()),
+                confidence: Some(0.95),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should still enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should report")
+            .expect("report stream should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["final survives overlay disconnect".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_overlay_failures_remain_non_fatal_to_final_injection() {
+        fn disconnected_test_sink() -> OverlayProcessSink {
+            let (overlay_tx, overlay_rx) = mpsc::unbounded_channel();
+            drop(overlay_rx);
+            OverlayProcessSink::from_sender_for_tests(
+                overlay_tx,
+                Arc::new(OverlayProcessMetrics::default()),
+            )
+        }
+
+        let spawn_queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(disconnected_test_sink()),
+            Err(anyhow!(
+                "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
+            )),
+            Ok(disconnected_test_sink()),
+            Err(anyhow!(
+                "failed to spawn overlay process '/tmp/parakeet-overlay': No such file or directory"
+            )),
+            Ok(disconnected_test_sink()),
+        ])));
+        let launcher = {
+            let spawn_queue = Arc::clone(&spawn_queue);
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
+                spawn_queue
+                    .lock()
+                    .expect("spawn queue lock should be available")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
+            })
+        };
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        for seq in 1..=4 {
+            handle_server_message(
+                ServerMessage::InterimText {
+                    session_id,
+                    seq,
+                    text: format!("overlay seq {seq}"),
+                },
+                &mut state,
+                &mut overlay_router,
+                &worker,
+                &feedback,
+            )
+            .await
+            .expect("overlay failures should remain non-fatal");
+        }
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "final survives repeated overlay failures".to_string(),
+                latency_ms: 12,
+                audio_ms: 345,
+                lang: Some("en".to_string()),
+                confidence: Some(0.99),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should still enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should report")
+            .expect("report stream should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["final survives repeated overlay failures".to_string()]
+        );
+        assert!(
+            manager_metrics.spawn_failure_total.load(Ordering::Relaxed) >= 1,
+            "at least one spawn failure should be recorded"
+        );
+        assert!(
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed)
+                >= 1,
+            "at least one disconnect should be recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlay_crash_restart_replays_current_state_and_preserves_final_injection() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let spawn_queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = {
+            let spawn_queue = Arc::clone(&spawn_queue);
+            Arc::new(move |_mode, _output_name, _adaptive_width| {
+                spawn_queue
+                    .lock()
+                    .expect("spawn queue lock should be available")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(anyhow!("no overlay sink available")))
+            })
+        };
+        let manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::ZERO,
+        );
+        let manager_metrics = Arc::clone(manager.metrics());
+        let mut overlay_router =
+            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 1,
+                text: "old-state".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("first interim text should route");
+        let first_seen = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive old state")
+            .expect("first sink channel should stay open");
+        assert_eq!(
+            first_seen,
+            parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 1,
+                text: "old-state".to_string(),
+            }
+        );
+
+        drop(rx_first);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "current-state".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("interim text after crash should remain non-fatal");
+
+        let second_seen = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed current state")
+            .expect("second sink channel should stay open");
+        assert_eq!(
+            second_seen,
+            parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
+                session_id,
+                seq: 2,
+                text: "current-state".to_string(),
+            }
+        );
+        assert!(timeout(Duration::from_millis(50), rx_second.recv())
+            .await
+            .is_err());
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "final after overlay restart".to_string(),
+                latency_ms: 45,
+                audio_ms: 1000,
+                lang: Some("en".to_string()),
+                confidence: Some(0.98),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("final result should still enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("final result should produce one report")
+            .expect("report channel should remain open");
+        assert!(report.error.is_none());
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen_injection
+                .lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["final after overlay restart".to_string()]
+        );
+        assert_eq!(
+            manager_metrics
+                .send_disconnect_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(manager_metrics.replay_sent_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager_metrics.spawn_success_total.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_interim_sequences_are_dropped_on_overlay_path_only() {
+        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
+        let mut overlay_router = OverlayRouter::new(
+            RecordingOverlaySink {
+                seen: Arc::clone(&seen_overlay_events),
+            },
+            None,
+        );
+        let injector = Arc::new(RecordingInjector {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 2);
+
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let feedback = AudioFeedback::new(false, None, 100);
+
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 10,
+                text: "newest".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("first interim text should route");
+        handle_server_message(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 9,
+                text: "stale".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("stale interim text should be dropped without failure");
+
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            overlay_router
+                .metrics()
+                .dropped_stale_seq_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        let overlay_events = seen_overlay_events
+            .lock()
+            .expect("overlay recording lock should be available")
+            .clone();
+        assert_eq!(overlay_events.len(), 1);
+        assert_eq!(
+            overlay_events[0],
+            OverlayEvent::InterimText {
+                session_id,
+                seq: 10,
+                text: "newest".to_string(),
+            }
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
