@@ -38,6 +38,7 @@ class AudioInput:
         self._stream_chunk_size: int | None = None
         self._stream_ready: list[np.ndarray] = []
         self._stream_buffer: np.ndarray = np.zeros((0,), dtype=np.float32)
+        self._level_ready: list[float] = []
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
 
@@ -74,6 +75,7 @@ class AudioInput:
             self._session_chunks = pre_roll_chunks
             self._session_active = True
             self._stream_ready = []
+            self._level_ready = []
             if self._stream_chunk_size:
                 # Seed the streaming buffer with the pre-roll so the streaming path
                 # sees the leading audio instead of starting from the first post-start chunk.
@@ -92,6 +94,7 @@ class AudioInput:
             chunks = self._session_chunks
             self._session_chunks = []
             self._stream_ready = []
+            self._level_ready = []
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
         if not chunks:
             return np.zeros((0,), dtype=self.dtype)
@@ -103,6 +106,7 @@ class AudioInput:
             self._session_active = False
             self._session_chunks = []
             self._stream_ready = []
+            self._level_ready = []
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
 
     def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
@@ -117,6 +121,7 @@ class AudioInput:
             ready = self._stream_ready
             tail = self._stream_buffer.copy()
             self._stream_ready = []
+            self._level_ready = []
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
         audio = (
             np.concatenate(chunks).astype(self.dtype, copy=False)
@@ -130,6 +135,7 @@ class AudioInput:
         with self._lock:
             self._stream_chunk_size = max(1, int(chunk_samples))
             self._stream_ready = []
+            self._level_ready = []
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
 
     def take_stream_chunks(self) -> list[np.ndarray]:
@@ -138,6 +144,13 @@ class AudioInput:
             ready = self._stream_ready
             self._stream_ready = []
         return ready
+
+    def take_audio_levels(self) -> list[float]:
+        """Take any ready-to-process RMS audio levels for the active session."""
+        with self._lock:
+            levels = self._level_ready
+            self._level_ready = []
+        return levels
 
     def _callback(
         self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags
@@ -154,6 +167,7 @@ class AudioInput:
             if self._session_active:
                 self._session_chunks.append(chunk)
                 self._collect_stream_chunks(chunk)
+                self._collect_audio_level(chunk)
 
     def _trim_pre_roll(self) -> None:
         while self._pre_roll_frames > self._pre_roll_capacity and self._pre_roll:
@@ -175,6 +189,19 @@ class AudioInput:
             self._stream_ready.append(np.array(combined[idx:next_idx], copy=True))
             idx = next_idx
         self._stream_buffer = combined[idx:]
+
+    def _collect_audio_level(self, chunk: np.ndarray) -> None:
+        audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return
+        finite = np.isfinite(audio)
+        if not bool(np.all(finite)):
+            audio = audio[finite]
+        if audio.size == 0:
+            return
+        rms = float(np.sqrt(np.mean(audio * audio)))
+        if np.isfinite(rms):
+            self._level_ready.append(rms)
 
 
 __all__ = ["AudioInput"]

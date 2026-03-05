@@ -15,11 +15,13 @@ def test_parse_args_boolean_flags_default_to_none() -> None:
 def test_env_values_apply_when_cli_flags_absent(monkeypatch) -> None:
     monkeypatch.setenv("PARAKEET_STATUS_ENABLED", "false")
     monkeypatch.setenv("PARAKEET_STREAMING_ENABLED", "true")
+    monkeypatch.setenv("PARAKEET_OVERLAY_EVENTS_ENABLED", "true")
 
     settings = _build_settings(_parse_args([]))
 
     assert settings.status_enabled is False
     assert settings.streaming_enabled is True
+    assert settings.overlay_events_enabled is True
 
 
 def test_cli_explicit_disable_overrides_env_true(monkeypatch) -> None:
@@ -47,8 +49,10 @@ def test_unrelated_cli_args_do_not_override_env_booleans(monkeypatch) -> None:
 def test_defaults_apply_without_env_or_cli(monkeypatch) -> None:
     monkeypatch.delenv("PARAKEET_STATUS_ENABLED", raising=False)
     monkeypatch.delenv("PARAKEET_STREAMING_ENABLED", raising=False)
+    monkeypatch.delenv("PARAKEET_OVERLAY_EVENTS_ENABLED", raising=False)
 
     settings = _build_settings(_parse_args([]))
 
     assert settings.status_enabled is True
     assert settings.streaming_enabled is False
+    assert settings.overlay_events_enabled is False

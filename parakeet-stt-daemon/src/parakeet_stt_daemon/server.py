@@ -19,10 +19,15 @@ from .audio import AudioInput
 from .config import ServerSettings
 from .messages import (
     AbortSession,
+    AudioLevelMessage,
     ClientMessageType,
     ErrorMessage,
     FinalResult,
+    InterimStateMessage,
+    InterimStateValue,
+    InterimTextMessage,
     ParsedMessage,
+    SessionEndedMessage,
     SessionStarted,
     StartSession,
     StatusMessage,
@@ -46,6 +51,7 @@ ErrorCode = Literal[
     "INVALID_REQUEST",
     "UNEXPECTED",
 ]
+OVERLAY_INTERIM_CONTEXT_WINDOW_SECS = 2.0
 
 
 class DaemonServer:
@@ -86,12 +92,18 @@ class DaemonServer:
         self._last_finalize_ms: int | None = None
         self._last_infer_ms: int | None = None
         self._last_send_ms: int | None = None
+        self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+        self._live_interim_failed = False
         self._vad_model: object | None = None
         self._vad_import_error: str | None = None
         self._vad_enabled = bool(settings.vad_enabled)
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
+        self._overlay_event_seq_by_session: dict[UUID, int] = {}
+        self._overlay_last_interim_text_by_session: dict[UUID, str] = {}
+        self._overlay_events_emitted = 0
+        self._overlay_events_dropped = 0
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -155,12 +167,15 @@ class DaemonServer:
             )
             return
         try:
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+            self._live_interim_failed = False
+            self._overlay_last_interim_text_by_session.pop(message.session_id, None)
             self.audio.start_session()
             if self.streaming_transcriber:
                 self._active_stream = self.streaming_transcriber.start_session(
                     self.audio.sample_rate
                 )
-                self._start_stream_drain_loop()
+                self._start_stream_drain_loop(websocket, message.session_id)
 
             response = SessionStarted(
                 session_id=message.session_id,
@@ -169,6 +184,11 @@ class DaemonServer:
                 lang=message.preferred_lang,
             )
             await websocket.send_json(response.model_dump(mode="json"))
+            await self._emit_interim_state(
+                websocket,
+                message.session_id,
+                state=InterimStateValue.LISTENING,
+            )
         except WebSocketDisconnect:
             await self._cleanup_active_session(
                 "start_session websocket disconnected",
@@ -204,6 +224,11 @@ class DaemonServer:
                     websocket, message.session_id, "SESSION_NOT_FOUND", "No matching active session"
                 )
                 return
+            await self._emit_interim_state(
+                websocket,
+                session.session_id,
+                state=InterimStateValue.PROCESSING,
+            )
             audio_stop_started = time.perf_counter()
             audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
             self._stop_stream_drain_loop()
@@ -215,12 +240,39 @@ class DaemonServer:
                 await self._send_error(
                     websocket, session.session_id, "AUDIO_DEVICE", "No audio captured for session"
                 )
+                await self._emit_session_ended(websocket, session.session_id, reason="error")
                 await self.sessions.clear(session.session_id)
+                overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
+                if isinstance(overlay_seq_by_session, dict):
+                    overlay_seq_by_session.pop(session.session_id, None)
+                overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+                if isinstance(overlay_last_text, dict):
+                    overlay_last_text.pop(session.session_id, None)
+                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+                self._live_interim_failed = False
                 return
 
             finalize_ms: int | None = None
             infer_ms: int | None = None
             try:
+                interim_updates = await self._collect_interim_text_updates(ready_chunks)
+                if interim_updates:
+                    await self._emit_interim_state(
+                        websocket,
+                        session.session_id,
+                        state=InterimStateValue.INTERIM,
+                    )
+                    for interim_text in interim_updates:
+                        await self._emit_interim_text(
+                            websocket,
+                            session.session_id,
+                            text=interim_text,
+                        )
+                await self._emit_interim_state(
+                    websocket,
+                    session.session_id,
+                    state=InterimStateValue.FINALIZING,
+                )
                 finalize_started = time.perf_counter()
                 text, infer_ms = await self._finalise_transcription(
                     audio_samples, ready_chunks, tail
@@ -231,7 +283,16 @@ class DaemonServer:
                 await self._send_error(
                     websocket, session.session_id, "MODEL", "Transcription failed"
                 )
+                await self._emit_session_ended(websocket, session.session_id, reason="error")
                 await self.sessions.clear(session.session_id)
+                overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
+                if isinstance(overlay_seq_by_session, dict):
+                    overlay_seq_by_session.pop(session.session_id, None)
+                overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+                if isinstance(overlay_last_text, dict):
+                    overlay_last_text.pop(session.session_id, None)
+                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+                self._live_interim_failed = False
                 return
 
             latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
@@ -246,7 +307,16 @@ class DaemonServer:
             send_started = datetime.now(tz=UTC)
             await websocket.send_json(completion.model_dump(mode="json"))
             send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
+            await self._emit_session_ended(websocket, session.session_id, reason="final")
             await self.sessions.clear(session.session_id)
+            overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
+            if isinstance(overlay_seq_by_session, dict):
+                overlay_seq_by_session.pop(session.session_id, None)
+            overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+            if isinstance(overlay_last_text, dict):
+                overlay_last_text.pop(session.session_id, None)
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+            self._live_interim_failed = False
             self._last_audio_ms = audio_ms
             self._last_audio_stop_ms = audio_stop_ms
             self._last_finalize_ms = finalize_ms
@@ -283,6 +353,7 @@ class DaemonServer:
             require_session_match=True,
         )
         if cleaned:
+            await self._emit_session_ended(websocket, message.session_id, reason="abort")
             code = "SESSION_ABORTED"
             error_message = f"Session aborted: {message.reason}"
         else:
@@ -337,14 +408,206 @@ class DaemonServer:
             self._stop_stream_drain_loop()
             if active_session_id is not None:
                 await self.sessions.clear(active_session_id)
+                overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
+                if isinstance(overlay_seq_by_session, dict):
+                    overlay_seq_by_session.pop(active_session_id, None)
+                overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+                if isinstance(overlay_last_text, dict):
+                    overlay_last_text.pop(active_session_id, None)
             self._active_stream = None
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+            self._live_interim_failed = False
             return active_session_id is not None
+
+    def _append_overlay_interim_context(
+        self,
+        existing: np.ndarray,
+        chunk_audio: np.ndarray,
+    ) -> np.ndarray:
+        if existing.size == 0:
+            combined = np.array(chunk_audio, copy=True)
+        else:
+            combined = np.concatenate((existing, chunk_audio))
+        max_samples = max(1, int(self.audio.sample_rate * OVERLAY_INTERIM_CONTEXT_WINDOW_SECS))
+        if combined.size > max_samples:
+            return combined[-max_samples:]
+        return combined
 
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
     ) -> None:
         err = ErrorMessage(session_id=session_id, code=code, message=message)
         await websocket.send_json(err.model_dump(mode="json"))
+
+    def _next_overlay_seq(self, session_id: UUID) -> int:
+        overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
+        if not isinstance(overlay_seq_by_session, dict):
+            overlay_seq_by_session = {}
+            self._overlay_event_seq_by_session = overlay_seq_by_session
+        current = overlay_seq_by_session.get(session_id, 0)
+        overlay_seq_by_session[session_id] = current + 1
+        return current
+
+    async def _send_overlay_message(self, websocket: WebSocket, payload: dict) -> bool:
+        if not self.settings.overlay_events_enabled:
+            return False
+        try:
+            await websocket.send_json(payload)
+            self._overlay_events_emitted = int(getattr(self, "_overlay_events_emitted", 0)) + 1
+            return True
+        except Exception as exc:  # noqa: BLE001
+            # Overlay events are display-only signals and must never break
+            # transcription/injection flow.
+            self._overlay_events_dropped = int(getattr(self, "_overlay_events_dropped", 0)) + 1
+            logger.debug("Dropping overlay event after send failure: {}", exc)
+            return False
+
+    async def _emit_interim_state(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        state: InterimStateValue,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        message = InterimStateMessage(
+            session_id=session_id,
+            seq=self._next_overlay_seq(session_id),
+            state=state,
+        )
+        await self._send_overlay_message(websocket, message.model_dump(mode="json"))
+
+    async def _emit_audio_level(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        rms: float,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        if not np.isfinite(rms):
+            return
+        level_db = 20.0 * np.log10(max(rms, 1e-6))
+        if not np.isfinite(level_db):
+            return
+        message = AudioLevelMessage(session_id=session_id, level_db=level_db)
+        await self._send_overlay_message(websocket, message.model_dump(mode="json"))
+
+    async def _collect_interim_text_updates(self, ready_chunks: list[np.ndarray]) -> list[str]:
+        if not self.settings.overlay_events_enabled:
+            return []
+        if not ready_chunks:
+            return []
+
+        loop = asyncio.get_running_loop()
+        rolling_audio = np.zeros((0,), dtype=np.float32)
+        updates: list[str] = []
+        last_text = ""
+
+        for chunk in ready_chunks:
+            chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+            if chunk_audio.size == 0:
+                continue
+            rolling_audio = self._append_overlay_interim_context(rolling_audio, chunk_audio)
+            try:
+                candidate = await loop.run_in_executor(
+                    None,
+                    partial(
+                        self.transcriber.transcribe_samples,
+                        rolling_audio,
+                        sample_rate=self.audio.sample_rate,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Incremental interim source unavailable for this session: {}",
+                    exc.__class__.__name__,
+                )
+                break
+            normalized = " ".join(candidate.split()).strip()
+            if not normalized or normalized == last_text:
+                continue
+            updates.append(normalized)
+            last_text = normalized
+        return updates
+
+    async def _emit_interim_text(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        text: str,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return
+        last_by_session = getattr(self, "_overlay_last_interim_text_by_session", None)
+        if isinstance(last_by_session, dict) and last_by_session.get(session_id) == normalized:
+            return
+        message = InterimTextMessage(
+            session_id=session_id,
+            seq=self._next_overlay_seq(session_id),
+            text=normalized,
+        )
+        if await self._send_overlay_message(websocket, message.model_dump(mode="json")):
+            if not isinstance(last_by_session, dict):
+                self._overlay_last_interim_text_by_session = {}
+                last_by_session = self._overlay_last_interim_text_by_session
+            last_by_session[session_id] = normalized
+
+    async def _emit_session_ended(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        reason: Literal["final", "abort", "error"],
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        message = SessionEndedMessage(session_id=session_id, reason=reason)
+        await self._send_overlay_message(websocket, message.model_dump(mode="json"))
+        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+        if isinstance(overlay_last_text, dict):
+            overlay_last_text.pop(session_id, None)
+
+    async def _emit_live_interim_from_chunk(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        chunk: np.ndarray,
+    ) -> None:
+        if not self.settings.overlay_events_enabled:
+            return
+        if self._live_interim_failed:
+            return
+        chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if chunk_audio.size == 0:
+            return
+        self._live_interim_audio = self._append_overlay_interim_context(
+            self._live_interim_audio,
+            chunk_audio,
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            candidate = await loop.run_in_executor(
+                None,
+                partial(
+                    self.transcriber.transcribe_samples,
+                    self._live_interim_audio,
+                    sample_rate=self.audio.sample_rate,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Live incremental interim source unavailable for this session: {}",
+                exc.__class__.__name__,
+            )
+            self._live_interim_failed = True
+            return
+        await self._emit_interim_text(websocket, session_id, text=candidate)
 
     def status(self) -> StatusMessage:
         active = self.sessions.active
@@ -360,6 +623,9 @@ class DaemonServer:
             streaming_enabled=self.settings.streaming_enabled,
             stream_helper_active=self._stream_helper_active(),
             stream_fallback_reason=self._stream_fallback_reason(),
+            overlay_events_enabled=self.settings.overlay_events_enabled,
+            overlay_events_emitted=getattr(self, "_overlay_events_emitted", 0),
+            overlay_events_dropped=getattr(self, "_overlay_events_dropped", 0),
             chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
             active_session_age_ms=active.audio_duration_ms if active else None,
             audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
@@ -439,17 +705,21 @@ class DaemonServer:
         infer_ms = int((time.perf_counter() - infer_started) * 1000)
         return text, infer_ms
 
-    def _start_stream_drain_loop(self) -> None:
+    def _start_stream_drain_loop(self, websocket: WebSocket, session_id: UUID) -> None:
         if self._stream_drain_task is not None:
             return
         self._stream_drain_running = True
 
         async def _drain() -> None:
             while self._stream_drain_running:
+                audio_levels = self.audio.take_audio_levels()
+                if audio_levels:
+                    await self._emit_audio_level(websocket, session_id, max(audio_levels))
                 chunks = self.audio.take_stream_chunks()
                 if self._active_stream:
                     for chunk in chunks:
                         self._active_stream.feed(chunk)
+                        await self._emit_live_interim_from_chunk(websocket, session_id, chunk)
                 await asyncio.sleep(0.05)
 
         self._stream_drain_task = asyncio.create_task(_drain())
@@ -547,12 +817,13 @@ def create_app(settings: ServerSettings) -> FastAPI:
         _log = logger.warning if streaming_degraded else logger.info
         _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
-            "stream_helper_active={}, stream_fallback_reason={}",
+            "stream_helper_active={}, stream_fallback_reason={}, overlay_events_enabled={}",
             server._requested_device,
             server._effective_device,
             server.settings.streaming_enabled,
             server._stream_helper_active(),
             server._stream_fallback_reason(),
+            server.settings.overlay_events_enabled,
         )
         yield
         logger.info("Stopping audio capture")

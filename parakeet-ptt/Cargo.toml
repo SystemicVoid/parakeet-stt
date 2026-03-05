@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Push-to-talk client for the Parakeet speech-to-text daemon"
 
+[[bin]]
+name = "parakeet-ptt"
+path = "src/main.rs"
+
+[[bin]]
+name = "parakeet-overlay"
+path = "src/bin/parakeet-overlay.rs"
+
 [dependencies]
 anyhow = "1.0.95"
 clap = { version = "4.5.21", features = ["derive"] }
@@ -23,4 +31,8 @@ reqwest = { version = "0.12.9", features = ["json", "rustls-tls"] }
 which = "6.0.1"
 wayland-client = "0.31.12"
 wayland-protocols = { version = "0.32.10", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.10", features = ["client"] }
 cosmic-protocols = { version = "0.2.0", default-features = false, features = ["client"] }
+tempfile = "3.16.0"
+fontdb = "0.17.0"
+fontdue = "0.9.3"

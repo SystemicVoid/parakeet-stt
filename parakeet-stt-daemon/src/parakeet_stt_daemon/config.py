@@ -36,6 +36,10 @@ class ServerSettings(BaseSettings):
     streaming_enabled: bool = Field(
         default=False, description="Enable streaming inference path when true."
     )
+    overlay_events_enabled: bool = Field(
+        default=False,
+        description="Emit overlay interim/session events over websocket when true.",
+    )
     chunk_secs: float = Field(
         default=2.4, ge=0.1, le=10.0, description="Chunk size (seconds) for streaming inference."
     )

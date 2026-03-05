@@ -1,6 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 daemon_dir := justfile_directory() + "/parakeet-stt-daemon"
+overlay_justfile := justfile_directory() + "/justfile.overlay-dev"
 personal_dir := "bench_audio/personal"
 manifest_path := personal_dir + "/manifest.jsonl"
 offline_baseline := personal_dir + "/baseline.json"
@@ -11,6 +12,47 @@ unified_flags := "--bench-offline --bench-manifest bench_audio/personal --bench-
 # Show available commands.
 default:
     @just --list
+
+# Overlay dev shortcuts (delegates to justfile.overlay-dev).
+start mode="layer-shell" adaptive_width="false":
+    @just --justfile "{{overlay_justfile}}" start "{{mode}}" "{{adaptive_width}}"
+
+start-sound mode="layer-shell" adaptive_width="false" sound_path="sounds/completion.ogg":
+    @just --justfile "{{overlay_justfile}}" start-sound "{{mode}}" "{{adaptive_width}}" "{{sound_path}}"
+
+# Start with adaptive width enabled (opt-in).
+start-adaptive mode="layer-shell":
+    @just --justfile "{{overlay_justfile}}" start "{{mode}}" "true"
+
+stop:
+    @just --justfile "{{overlay_justfile}}" stop
+
+status:
+    @just --justfile "{{overlay_justfile}}" status
+
+logs:
+    @just --justfile "{{overlay_justfile}}" logs
+
+logs-overlay:
+    @just --justfile "{{overlay_justfile}}" logs-overlay
+
+overlay-kill:
+    @just --justfile "{{overlay_justfile}}" overlay-kill
+
+runbook:
+    @just --justfile "{{overlay_justfile}}" runbook
+
+phase6-contract:
+    @just --justfile "{{overlay_justfile}}" phase6-contract
+
+phase6-promotion runs="3":
+    @just --justfile "{{overlay_justfile}}" phase6-promotion "{{runs}}"
+
+soak-perf duration_secs="600" sample_secs="1":
+    @just --justfile "{{overlay_justfile}}" soak-perf "{{duration_secs}}" "{{sample_secs}}"
+
+overlay-doctor:
+    @just --justfile "{{overlay_justfile}}" doctor
 
 # Unified personal STT eval runner (uses existing dataset only).
 # Usage:

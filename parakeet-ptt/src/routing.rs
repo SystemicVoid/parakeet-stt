@@ -172,6 +172,7 @@ mod tests {
             object_name: Some(object_name.to_string()),
             object_path: Some(object_path.to_string()),
             service_name: Some(":1.42".to_string()),
+            output_name: None,
             focused,
             active: true,
             resolver: "test",

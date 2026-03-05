@@ -19,4 +19,6 @@ The role of this file is to describe common mistakes and confusion points that a
 - Single source of truth: `scripts/stt-helper.sh` `start_option_rows`.
 - Do not hardcode `stt start` flag lists in parser/help/client args/diagnostics; derive behavior from metadata helpers.
 - Validation: run `bash -n scripts/stt-helper.sh` and `source scripts/stt-helper.sh && stt help start` after helper flag/default/env changes.
+- Multi-binary caveat: this repo has both `parakeet-ptt` and `parakeet-overlay`; any helper fallback using `cargo run` must pass `--bin parakeet-ptt`.
+- Runtime override: `PARAKEET_OVERLAY_MODE` supports `auto|layer-shell|fallback-window|disabled` for compositor-specific overlay bring-up.
 - Note: `scripts/check-stt-helper-flags.sh` is referenced in older docs/history but is currently not present in this repository.
