@@ -15,12 +15,13 @@ Canonical-source policy:
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
-- Default startup profile is now paste-mode with adaptive cross-surface shortcut routing using internal defaults:
+- Default startup profile is now online stream+seal (`stt` / `stt start`) with paste-mode and adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
   - `--paste-key-backend auto` (ladder: uinput → ydotool)
   - `--paste-backend-failure-policy copy-only`
-  - daemon launch default: `PARAKEET_STREAMING_ENABLED=false` (set `true` for streaming validation)
-  - overlay launch default: `PARAKEET_OVERLAY_ENABLED=false` (set `true` or pass `--overlay-enabled true` for overlay validation)
+  - daemon launch default: `PARAKEET_STREAMING_ENABLED=true` for the default profile
+  - overlay launch default: `PARAKEET_OVERLAY_ENABLED=true` with `--overlay-adaptive-width=false`
+  - `stt off` switches to offline profile defaults (`PARAKEET_STREAMING_ENABLED=false`, overlay disabled)
   - Wayland focus cache with 30s stale threshold, 500ms transition grace
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
@@ -64,10 +65,10 @@ Canonical-source policy:
 ## Current helper behavior (after rewrite)
 - Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
 - Uses absolute paths to the repo (`~/Documents/Engineering/parakeet-stt`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
-- Daemon start: `cd parakeet-stt-daemon && PARAKEET_STREAMING_ENABLED=false nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). On failure, it prints the last daemon log lines.
+- Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). Profile defaults determine whether `PARAKEET_STREAMING_ENABLED` is true (`stt`) or false (`stt off`). On failure, it prints the last daemon log lines.
 - Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint <resolved endpoint>`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
-- Commands: `stt start` (default detached tmux), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
+- Commands: `stt`/`stt start` (default detached tmux, stream+seal profile), `stt off` (offline profile), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
 
 ## Suspicions / hypotheses
 - The release binary may occasionally be in a bad state (stale build artifacts) and exits immediately; a rebuild should fix that, but we need logs to confirm.
@@ -99,7 +100,7 @@ Client knobs:
 - `--completion-sound true|false` (default: `true`)
 - `--completion-sound-path <path>` (optional)
 - `--completion-sound-volume <0-100>` (default: `100`)
-- `--overlay-enabled true|false` (default: `false`, env: `PARAKEET_OVERLAY_ENABLED`)
+- `--overlay-enabled true|false` (profile default: `true` for `stt`/`stt start`, `false` for `stt off`, env: `PARAKEET_OVERLAY_ENABLED`)
 
 Recommended baseline for Ghostty/COSMIC:
 

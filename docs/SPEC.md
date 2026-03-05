@@ -297,7 +297,7 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
 | Authentication | Decide whether to enforce shared secret or rely on localhost isolation. |
 | Multi-language hints | Add config to pin language or rely on auto-detect per user preference. |
 | Partial result overlay | Deferred; document design when prioritized. |
-| Streaming default policy | Use offline helper default (`stt start` with `PARAKEET_STREAMING_ENABLED=false`) and keep `PARAKEET_STREAMING_ENABLED=true` as an explicit streaming validation path. |
+| Streaming default policy | Default helper profile is online stream+seal (`stt` / `stt start`); use `stt off` for offline-first runs when you want no streaming and no overlay. |
 | GPU stack refresh timing | Run staged update lane after streaming API integration is validated on current lock baseline. |
 
 ---
