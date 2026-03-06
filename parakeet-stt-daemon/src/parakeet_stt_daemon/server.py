@@ -230,8 +230,11 @@ class DaemonServer:
                 state=InterimStateValue.PROCESSING,
             )
             audio_stop_started = time.perf_counter()
-            audio_samples, ready_chunks, tail = self.audio.stop_session_with_streaming()
+            audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
             self._stop_stream_drain_loop()
+            # Final correctness must come from the capture layer's canonical buffer,
+            # not whatever the drain task managed to mirror into `_active_stream`.
+            self._active_stream = None
             audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
             audio_duration_raw = len(audio_samples) / self.audio.sample_rate
             audio_ms = int(audio_duration_raw * 1000)
@@ -274,9 +277,7 @@ class DaemonServer:
                     state=InterimStateValue.FINALIZING,
                 )
                 finalize_started = time.perf_counter()
-                text, infer_ms = await self._finalise_transcription(
-                    audio_samples, ready_chunks, tail
-                )
+                text, infer_ms = await self._finalise_transcription(audio_samples)
                 finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
@@ -672,25 +673,8 @@ class DaemonServer:
         reserved_bytes = torch.cuda.memory_reserved(device_index or 0)
         return int(reserved_bytes / (1024 * 1024))
 
-    async def _finalise_transcription(
-        self, audio_samples: np.ndarray, ready_chunks: list[np.ndarray], tail: np.ndarray
-    ) -> tuple[str, int]:
-        if self.streaming_transcriber and self._active_stream:
-            try:
-                for chunk in ready_chunks:
-                    self._active_stream.feed(chunk)
-                if tail.size:
-                    trimmed_tail = self._trim_tail_silence(tail, self.audio.sample_rate)
-                    if trimmed_tail.size:
-                        self._active_stream.feed(trimmed_tail)
-                infer_started = time.perf_counter()
-                result = self._active_stream.finalize()
-                infer_ms = int((time.perf_counter() - infer_started) * 1000)
-                return result, infer_ms
-            finally:
-                self._active_stream = None
-
-        # Offline fallback: run in-memory transcription to avoid temp-file I/O.
+    async def _finalise_transcription(self, audio_samples: np.ndarray) -> tuple[str, int]:
+        # The full capture buffer is the only authoritative source for final decode.
         trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
         if trimmed.size == 0:
             logger.info("Skipping offline transcription: silence trimming removed all samples")

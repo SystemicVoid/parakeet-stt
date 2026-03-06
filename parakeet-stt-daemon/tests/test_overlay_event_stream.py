@@ -111,11 +111,7 @@ def _build_server(
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
 
-    async def fake_finalize(
-        _audio_samples: np.ndarray,
-        _ready_chunks: list[np.ndarray],
-        _tail: np.ndarray,
-    ) -> tuple[str, int]:
+    async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
         return "overlay test text", 7
 
     server._finalise_transcription = fake_finalize
