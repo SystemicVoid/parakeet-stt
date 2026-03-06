@@ -109,13 +109,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     logger.info(
         (
             "Starting parakeet-stt-daemon on {}:{} "
-            "(device: {}, mic: {}, streaming: {}, overlay_events: {})"
+            "(device: {}, mic: {}, streaming: {}, vad: {}, overlay_events: {})"
         ),
         settings.host,
         settings.port,
         settings.device,
         settings.mic_device,
         settings.streaming_enabled,
+        settings.vad_enabled,
         settings.overlay_events_enabled,
     )
     if settings.streaming_enabled:
@@ -157,6 +158,8 @@ def run_checks(settings: ServerSettings) -> None:
         logger.info("Model warmup completed")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model warmup skipped/failed: {}", exc)
+    if settings.vad_enabled:
+        server.prepare_vad()
 
     try:
         # sounddevice returns DeviceList; cast for static typing.
@@ -176,12 +179,13 @@ def run_checks(settings: ServerSettings) -> None:
 
     logger.info(
         "Streaming config: enabled={}, chunk_secs={}, right_context_secs={}, "
-        "left_context_secs={}, batch_size={}, overlay_events_enabled={}",
+        "left_context_secs={}, batch_size={}, vad_enabled={}, overlay_events_enabled={}",
         settings.streaming_enabled,
         settings.chunk_secs,
         settings.right_context_secs,
         settings.left_context_secs,
         settings.batch_size,
+        settings.vad_enabled,
         settings.overlay_events_enabled,
     )
     if settings.streaming_enabled:
@@ -190,14 +194,32 @@ def run_checks(settings: ServerSettings) -> None:
         helper_class = getattr(server.streaming_transcriber, "_helper_class_name", None)
         if helper_active:
             logger.info(
-                "Streaming helper: ACTIVE (class={})",
+                "Live session helper: ACTIVE (class={}, scope={})",
                 helper_class,
+                server._stream_helper_scope(),
             )
         else:
             logger.warning(
-                "Streaming helper: INACTIVE (reason={}). Transcription will use offline fallback.",
+                "Live session helper: INACTIVE (scope={}, reason={})",
+                server._stream_helper_scope(),
                 fallback_reason,
             )
+    logger.info(
+        "Final transcript path: {} (audio_source={}, tail_trim_mode={})",
+        server._finalization_mode(),
+        server._final_audio_source(),
+        server._tail_trim_mode(),
+    )
+    if settings.vad_enabled:
+        if server._vad_active():
+            logger.info("VAD trim: ACTIVE (backend=silero_onnx)")
+        else:
+            logger.warning(
+                "VAD trim: INACTIVE (reason={}). Tail trim will fall back to RMS.",
+                server._vad_fallback_reason(),
+            )
+    else:
+        logger.info("VAD trim: DISABLED")
 
 
 if __name__ == "__main__":

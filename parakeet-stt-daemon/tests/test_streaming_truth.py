@@ -80,8 +80,9 @@ def _build_server(
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     server._vad_model = None
-    server._vad_import_error = None
+    server._vad_failure_reason = None
     server._vad_enabled = vad_enabled
+    server._vad_load_attempted = False
     return cast(DaemonServer, server)
 
 
@@ -93,8 +94,15 @@ def test_status_streaming_disabled_by_config() -> None:
 
     assert status.streaming_enabled is False
     assert status.stream_helper_active is False
+    assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason is None
+    assert status.finalization_mode == "offline_seal"
+    assert status.final_audio_source == "canonical_session_audio"
+    assert status.tail_trim_mode == "rms"
     assert status.chunk_secs is None
+    assert status.vad_enabled is False
+    assert status.vad_active is False
+    assert status.vad_fallback_reason is None
 
 
 def test_status_streaming_enabled_helper_active() -> None:
@@ -109,7 +117,51 @@ def test_status_streaming_enabled_helper_active() -> None:
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is True
+    assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason is None
+    assert status.finalization_mode == "offline_seal"
+    assert status.final_audio_source == "canonical_session_audio"
+    assert status.tail_trim_mode == "rms"
+
+
+def test_status_vad_enabled_pending_load_is_explicit() -> None:
+    server = _build_server(streaming_enabled=False, vad_enabled=True)
+
+    status = server.status()
+
+    assert status.vad_enabled is True
+    assert status.vad_active is False
+    assert status.vad_fallback_reason == "load_not_attempted"
+    assert status.tail_trim_mode == "rms"
+
+
+def test_status_vad_enabled_and_loaded_is_active() -> None:
+    server = _build_server(streaming_enabled=False, vad_enabled=True)
+    server._vad_load_attempted = True
+    server._vad_model = object()
+
+    status = server.status()
+
+    assert status.vad_enabled is True
+    assert status.vad_active is True
+    assert status.vad_fallback_reason is None
+    assert status.tail_trim_mode == "vad"
+
+
+def test_prepare_vad_marks_missing_dependency_explicitly() -> None:
+    server = _build_server(streaming_enabled=False, vad_enabled=True)
+
+    def fake_load_vad_model() -> object:
+        exc = ModuleNotFoundError("No module named 'onnxruntime'")
+        exc.name = "onnxruntime"
+        raise exc
+
+    server._load_vad_model = fake_load_vad_model  # type: ignore[method-assign]
+
+    server.prepare_vad()
+
+    assert server._vad_active() is False
+    assert server._vad_fallback_reason() == "load_failed:missing_dependency:onnxruntime"
 
 
 def test_status_streaming_enabled_helper_inactive() -> None:
@@ -124,7 +176,10 @@ def test_status_streaming_enabled_helper_inactive() -> None:
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
+    assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason == "import_failed:ImportError"
+    assert status.finalization_mode == "offline_seal"
+    assert status.final_audio_source == "canonical_session_audio"
 
 
 def test_status_streaming_enabled_transcriber_none() -> None:
@@ -135,6 +190,7 @@ def test_status_streaming_enabled_transcriber_none() -> None:
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
+    assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason == "streaming_transcriber_unavailable"
 
 

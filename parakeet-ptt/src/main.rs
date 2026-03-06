@@ -9,6 +9,7 @@ mod routing;
 mod state;
 mod surface_focus;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::{
     sleep, timeout, Duration as TokioDuration, Instant as TokioInstant, MissedTickBehavior,
@@ -45,8 +47,49 @@ use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
+#[cfg(not(test))]
+const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
+#[cfg(test)]
+const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
+const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_RIGHTALT";
+const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+const DEFAULT_LLM_MODEL: &str = "local";
+const DEFAULT_LLM_SYSTEM_PROMPT: &str =
+    "You are a concise assistant. Return only the final answer text for direct insertion.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIntent {
+    Dictate,
+    LlmQuery,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRuntimeConfig {
+    base_url: url::Url,
+    model: String,
+    timeout: Duration,
+    max_tokens: u32,
+    temperature: f32,
+    system_prompt: String,
+    overlay_stream: bool,
+}
+
+#[derive(Debug)]
+enum LlmProgress {
+    Delta {
+        session_id: Uuid,
+        delta: String,
+    },
+    Finished {
+        session_id: Uuid,
+        transcript: String,
+        daemon_latency_ms: u64,
+        daemon_audio_ms: u64,
+        result: std::result::Result<String, String>,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct InjectionJob {
@@ -77,7 +120,25 @@ struct InjectionReport {
     queue_wait_ms: u64,
     run_ms: u64,
     total_worker_ms: u64,
+    error_kind: Option<InjectionErrorKind>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionErrorKind {
+    BackendFailure,
+    ExecutionTimeout,
+    WorkerTaskFailed,
+}
+
+impl InjectionErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendFailure => "backend_failure",
+            Self::ExecutionTimeout => "execution_timeout",
+            Self::WorkerTaskFailed => "worker_task_failed",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +149,9 @@ struct InjectorQueueMetrics {
     enqueue_worker_gone_total: AtomicU64,
     worker_success_total: AtomicU64,
     worker_failure_total: AtomicU64,
+    worker_backend_failure_total: AtomicU64,
+    worker_execution_timeout_total: AtomicU64,
+    worker_task_failed_total: AtomicU64,
     worker_queue_wait_ms_total: AtomicU64,
     worker_run_ms_total: AtomicU64,
     queue_depth_high_water: AtomicU64,
@@ -461,10 +525,25 @@ impl InjectorQueueMetrics {
             .fetch_add(report.queue_wait_ms, Ordering::Relaxed);
         self.worker_run_ms_total
             .fetch_add(report.run_ms, Ordering::Relaxed);
-        if report.error.is_some() {
-            self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.worker_success_total.fetch_add(1, Ordering::Relaxed);
+        match report.error_kind {
+            Some(InjectionErrorKind::BackendFailure) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_backend_failure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(InjectionErrorKind::ExecutionTimeout) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_execution_timeout_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(InjectionErrorKind::WorkerTaskFailed) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_task_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                self.worker_success_total.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -477,6 +556,11 @@ impl InjectorQueueMetrics {
                 self.enqueue_worker_gone_total.load(Ordering::Relaxed),
             worker_success_total = self.worker_success_total.load(Ordering::Relaxed),
             worker_failure_total = self.worker_failure_total.load(Ordering::Relaxed),
+            worker_backend_failure_total =
+                self.worker_backend_failure_total.load(Ordering::Relaxed),
+            worker_execution_timeout_total =
+                self.worker_execution_timeout_total.load(Ordering::Relaxed),
+            worker_task_failed_total = self.worker_task_failed_total.load(Ordering::Relaxed),
             worker_queue_wait_ms_total = self.worker_queue_wait_ms_total.load(Ordering::Relaxed),
             worker_run_ms_total = self.worker_run_ms_total.load(Ordering::Relaxed),
             queue_depth_high_water = self.queue_depth_high_water.load(Ordering::Relaxed),
@@ -567,14 +651,36 @@ fn spawn_injector_worker_with_capacity(
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
             let worker_started = TokioInstant::now();
             let injector_for_job = Arc::clone(&worker_injector);
-            let result = tokio::task::spawn_blocking(move || injector_for_job.inject(&text)).await;
+            let injection_task =
+                tokio::task::spawn_blocking(move || injector_for_job.inject(&text));
+            tokio::pin!(injection_task);
+            let result = timeout(
+                TokioDuration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+                &mut injection_task,
+            )
+            .await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
-            let error = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(err)) => Some(format!("{err:#}")),
-                Err(err) => Some(format!("injector worker task failed: {err}")),
+            let (error_kind, error) = match result {
+                Ok(Ok(Ok(()))) => (None, None),
+                Ok(Ok(Err(err))) => (
+                    Some(InjectionErrorKind::BackendFailure),
+                    Some(format!("{err:#}")),
+                ),
+                Ok(Err(err)) => (
+                    Some(InjectionErrorKind::WorkerTaskFailed),
+                    Some(format!("injector worker task failed: {err}")),
+                ),
+                Err(_) => {
+                    injection_task.as_ref().abort();
+                    (
+                        Some(InjectionErrorKind::ExecutionTimeout),
+                        Some(format!(
+                            "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                        )),
+                    )
+                }
             };
             let report = InjectionReport {
                 session_id,
@@ -583,6 +689,7 @@ fn spawn_injector_worker_with_capacity(
                 queue_wait_ms,
                 run_ms,
                 total_worker_ms,
+                error_kind,
                 error,
             };
 
@@ -671,9 +778,13 @@ struct Cli {
     #[arg(long)]
     shared_secret: Option<String>,
 
-    /// Hotkey to bind (currently unused placeholder)
+    /// Hold-to-talk key (evdev key name, e.g. KEY_RIGHTCTRL)
     #[arg(long, default_value = "KEY_RIGHTCTRL")]
     hotkey: String,
+
+    /// Query modifier key used during a PTT hold to route utterance to LLM.
+    #[arg(long, default_value = DEFAULT_QUERY_MODIFIER_KEY)]
+    query_modifier_key: String,
 
     /// Path to ydotool binary (used when paste key backend is ydotool/auto)
     #[arg(long)]
@@ -742,6 +853,34 @@ struct Cli {
     /// Enable or disable adaptive overlay width (CLI takes precedence over env).
     #[arg(long, action = clap::ArgAction::Set)]
     overlay_adaptive_width: Option<bool>,
+
+    /// Base URL for llama-server OpenAI-compatible API.
+    #[arg(long, default_value = DEFAULT_LLM_BASE_URL)]
+    llm_base_url: String,
+
+    /// Model name passed to llama-server.
+    #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+    llm_model: String,
+
+    /// Timeout in seconds for llama responses.
+    #[arg(long, default_value_t = 20)]
+    llm_timeout_seconds: u64,
+
+    /// Max tokens for llama responses.
+    #[arg(long, default_value_t = 512)]
+    llm_max_tokens: u32,
+
+    /// Temperature for llama responses.
+    #[arg(long, default_value_t = 0.7)]
+    llm_temperature: f32,
+
+    /// System prompt used for LLM query mode responses.
+    #[arg(long, default_value = DEFAULT_LLM_SYSTEM_PROMPT)]
+    llm_system_prompt: String,
+
+    /// Stream llama deltas to overlay while generating.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    llm_overlay_stream: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -835,6 +974,18 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
+    let llm_base_url = url::Url::parse(&cli.llm_base_url)
+        .with_context(|| format!("invalid LLM base URL: {}", cli.llm_base_url))?;
+    let llm_config = LlmRuntimeConfig {
+        base_url: llm_base_url,
+        model: cli.llm_model.clone(),
+        timeout: Duration::from_secs(cli.llm_timeout_seconds.max(1)),
+        max_tokens: cli.llm_max_tokens.max(1),
+        temperature: cli.llm_temperature.clamp(0.0, 2.0),
+        system_prompt: cli.llm_system_prompt.clone(),
+        overlay_stream: cli.llm_overlay_stream,
+    };
+
     if cli.test_injection {
         let injector = build_injector(&config);
         injector
@@ -864,6 +1015,8 @@ async fn main() -> Result<()> {
         audio_feedback,
         cli.overlay_enabled,
         cli.overlay_adaptive_width,
+        llm_config,
+        cli.query_modifier_key.clone(),
     )
     .await
 }
@@ -977,6 +1130,200 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
     ))
 }
 
+fn llm_chat_completions_url(base: &url::Url) -> Result<url::Url> {
+    let mut url = base.clone();
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    url.join("chat/completions")
+        .context("failed to build llama chat/completions URL")
+}
+
+fn llm_health_url(base: &url::Url) -> url::Url {
+    let mut url = base.clone();
+    url.set_path("/health");
+    url
+}
+
+fn extract_delta_content(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("choices")?
+        .get(0)?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+}
+
+fn sanitize_model_answer(raw: &str) -> String {
+    let mut output = raw.to_string();
+    while let Some(start) = output.find("<think>") {
+        let Some(end_relative) = output[start..].find("</think>") else {
+            output.truncate(start);
+            break;
+        };
+        let end = start + end_relative + "</think>".len();
+        output.replace_range(start..end, "");
+    }
+
+    let trimmed = output.trim();
+    trimmed.to_string()
+}
+
+fn drain_sse_lines(buffer: &mut Vec<u8>, flush_partial: bool) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    loop {
+        let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+
+        let mut raw_line = buffer.drain(..=line_end).collect::<Vec<_>>();
+        raw_line.pop();
+        if raw_line.ends_with(b"\r") {
+            raw_line.pop();
+        }
+        let line = std::str::from_utf8(&raw_line)
+            .context("llama SSE stream contained invalid UTF-8 in a line")?;
+        lines.push(line.to_string());
+    }
+
+    if flush_partial && !buffer.is_empty() {
+        let line = std::str::from_utf8(buffer)
+            .context("llama SSE stream ended with invalid UTF-8 in trailing bytes")?;
+        lines.push(line.trim_end_matches('\r').to_string());
+        buffer.clear();
+    }
+
+    Ok(lines)
+}
+
+fn maybe_defer_llm_session_end(
+    message: &ServerMessage,
+    state: &PttState,
+    active_intent: Option<SessionIntent>,
+    llm_in_flight_session: Option<Uuid>,
+) -> Option<(Uuid, Option<String>)> {
+    let ServerMessage::SessionEnded { session_id, reason } = message else {
+        return None;
+    };
+
+    let waiting_for_llm_final = active_intent == Some(SessionIntent::LlmQuery)
+        && session_id_from_state(state) == Some(*session_id);
+    let llm_generation_running = llm_in_flight_session == Some(*session_id);
+
+    if waiting_for_llm_final || llm_generation_running {
+        Some((*session_id, reason.clone()))
+    } else {
+        None
+    }
+}
+
+async fn fetch_llm_streamed_answer(
+    llm: &LlmRuntimeConfig,
+    session_id: Uuid,
+    transcript: &str,
+    progress_tx: &mpsc::UnboundedSender<LlmProgress>,
+) -> Result<String> {
+    let request_url = llm_chat_completions_url(&llm.base_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(llm.timeout)
+        .build()
+        .context("failed to build reqwest client for llama")?;
+
+    let request_body = json!({
+        "model": llm.model,
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": llm.system_prompt},
+            {"role": "user", "content": transcript},
+        ],
+        "max_tokens": llm.max_tokens,
+        "temperature": llm.temperature,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "reasoning_format": "none",
+        "reasoning_in_content": false
+    });
+
+    let response = client
+        .post(request_url.clone())
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach llama endpoint {}", request_url))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        anyhow::bail!("llama returned status {} with body: {}", status, body);
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::<u8>::new();
+    let mut assembled = String::new();
+
+    let mut process_sse_line = |line: &str| -> Result<bool> {
+        if line.is_empty() || !line.starts_with("data:") {
+            return Ok(false);
+        }
+
+        let payload = line[5..].trim();
+        if payload == "[DONE]" {
+            return Ok(true);
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(payload).with_context(|| {
+            format!("failed to parse llama SSE data payload as JSON: {payload}")
+        })?;
+        if let Some(delta) = extract_delta_content(&parsed).filter(|value| !value.is_empty()) {
+            assembled.push_str(delta);
+            if llm.overlay_stream {
+                let _ = progress_tx.send(LlmProgress::Delta {
+                    session_id,
+                    delta: delta.to_string(),
+                });
+            }
+        }
+
+        Ok(false)
+    };
+
+    while let Some(next_chunk) = stream.next().await {
+        let chunk = next_chunk.context("failed reading llama stream chunk")?;
+        buffer.extend_from_slice(&chunk);
+
+        for line in drain_sse_lines(&mut buffer, false)? {
+            if process_sse_line(line.trim())? {
+                return Ok(assembled);
+            }
+        }
+    }
+
+    for line in drain_sse_lines(&mut buffer, true)? {
+        if process_sse_line(line.trim())? {
+            return Ok(assembled);
+        }
+    }
+
+    Ok(assembled)
+}
+
+async fn probe_llm_health_once(llm: &LlmRuntimeConfig) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build();
+    let Ok(client) = client else {
+        return false;
+    };
+
+    match client.get(llm_health_url(&llm.base_url)).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 async fn run_demo(
     config: ClientConfig,
     override_text: Option<String>,
@@ -1068,7 +1415,19 @@ async fn run_hotkey_mode(
     audio_feedback: AudioFeedback,
     overlay_enabled_override: Option<bool>,
     overlay_adaptive_width_override: Option<bool>,
+    llm_config: LlmRuntimeConfig,
+    query_modifier_key_name: String,
 ) -> Result<()> {
+    let talk_key = crate::hotkey::parse_key_name(&config.hotkey)
+        .with_context(|| format!("invalid --hotkey value '{}'", config.hotkey))?;
+    let query_modifier_key =
+        crate::hotkey::parse_key_name(&query_modifier_key_name).with_context(|| {
+            format!(
+                "invalid --query-modifier-key value '{}'",
+                query_modifier_key_name
+            )
+        })?;
+
     let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
     let overlay_adaptive_width = resolve_overlay_adaptive_width(overlay_adaptive_width_override);
     match overlay_capability.mode {
@@ -1093,8 +1452,9 @@ async fn run_hotkey_mode(
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
+        query_modifier_key = %query_modifier_key_name,
         completion_sound = audio_feedback.is_enabled(),
-        "Starting hotkey loop; press Right Ctrl to talk"
+        "Starting hotkey loop"
     );
     ensure_input_access()?;
     let injector = build_injector(&config);
@@ -1112,15 +1472,37 @@ async fn run_hotkey_mode(
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let hotkey_tasks = spawn_hotkey_loop(hk_tx)?;
+    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, query_modifier_key)?;
     info!(
         devices = hotkey_tasks.len(),
-        "Hotkey listeners started for KEY_RIGHTCTRL"
+        talk_key = ?talk_key,
+        query_modifier_key = ?query_modifier_key,
+        "Hotkey listeners started"
     );
+
+    let llm_health = probe_llm_health_once(&llm_config).await;
+    if llm_health {
+        info!(base_url = %llm_config.base_url, "llama-server health probe succeeded");
+    } else {
+        warn!(
+            base_url = %llm_config.base_url,
+            "llama-server health probe failed; LLM query mode will fall back to raw transcript on error"
+        );
+    }
 
     fetch_status_once(&config).await;
 
     let mut backoff = TokioDuration::from_millis(500);
+    let mut llm_busy = false;
+    let mut active_intent: Option<SessionIntent> = None;
+    let mut llm_in_flight_session: Option<Uuid> = None;
+    let mut llm_seq: HashMap<Uuid, u64> = HashMap::new();
+    let mut llm_overlay_text: HashMap<Uuid, String> = HashMap::new();
+    let mut llm_deferred_session_end: HashMap<Uuid, Option<String>> = HashMap::new();
+    let mut llm_busy_overlay_seq: u64 = 0;
+    let llm_busy_overlay_session = Uuid::nil();
+    let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
+
     loop {
         match WsClient::connect(&config).await {
             Ok(ws_client) => {
@@ -1133,11 +1515,33 @@ async fn run_hotkey_mode(
                         tokio::select! {
                             Some(evt) = hk_rx.recv() => {
                                 match evt {
-                                    HotkeyEvent::Down => {
+                                    HotkeyEvent::Down { query_modifier_active } => {
+                                        if llm_busy {
+                                            warn!("ignoring hotkey down while LLM response is in progress");
+                                            llm_busy_overlay_seq = llm_busy_overlay_seq.saturating_add(1);
+                                            overlay_router.route_interim_state(
+                                                None,
+                                                llm_busy_overlay_session,
+                                                llm_busy_overlay_seq,
+                                                "LLM busy; wait for current answer".to_string(),
+                                            );
+                                            overlay_router.route_session_ended(
+                                                None,
+                                                llm_busy_overlay_session,
+                                                Some("busy".to_string()),
+                                            );
+                                            continue;
+                                        }
                                         if let Some(session_id) = state.begin_listening() {
+                                            let intent = if query_modifier_active {
+                                                SessionIntent::LlmQuery
+                                            } else {
+                                                SessionIntent::Dictate
+                                            };
+                                            active_intent = Some(intent);
                                             let message = start_message(session_id, Some("auto".to_string()));
                                             send_message(&mut ws_write, &message).await?;
-                                            info!(session = %session_id, "start_session sent (hotkey down)");
+                                            info!(session = %session_id, ?intent, "start_session sent (hotkey down)");
                                         }
                                     }
                                     HotkeyEvent::Up => {
@@ -1146,6 +1550,16 @@ async fn run_hotkey_mode(
                                             send_message(&mut ws_write, &message).await?;
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         }
+                                    }
+                                    HotkeyEvent::QueryModifierDown => {
+                                        if matches!(state, PttState::Listening { .. })
+                                            && active_intent != Some(SessionIntent::LlmQuery)
+                                        {
+                                            active_intent = Some(SessionIntent::LlmQuery);
+                                            info!("query modifier engaged; current utterance promoted to llm_query");
+                                        }
+                                    }
+                                    HotkeyEvent::QueryModifierUp => {
                                     }
                                 }
                             }
@@ -1156,13 +1570,84 @@ async fn run_hotkey_mode(
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
                                                 match decode_server_message(&txt) {
                                                     Ok(DecodedServerMessage::Known(message)) => {
-                                                        handle_server_message(
-                                                            *message,
-                                                            &mut state,
-                                                            &mut overlay_router,
-                                                            &injector_worker,
-                                                            &audio_feedback,
-                                                        ).await?
+                                                        let message = *message;
+                                                        if let Some((session_id, reason)) = maybe_defer_llm_session_end(
+                                                            &message,
+                                                            &state,
+                                                            active_intent,
+                                                            llm_in_flight_session,
+                                                        ) {
+                                                            llm_deferred_session_end.insert(session_id, reason);
+                                                            debug!(
+                                                                session = %session_id,
+                                                                "deferring daemon session_ended until llm answer injection"
+                                                            );
+                                                            continue;
+                                                        }
+
+                                                        match message {
+                                                            ServerMessage::FinalResult {
+                                                                session_id,
+                                                                text,
+                                                                latency_ms,
+                                                                audio_ms,
+                                                                ..
+                                                            } if active_intent == Some(SessionIntent::LlmQuery) => {
+                                                                info!(
+                                                                    session = %session_id,
+                                                                    latency_ms,
+                                                                    audio_ms,
+                                                                    "final result received in llm_query mode"
+                                                                );
+                                                                llm_busy = true;
+                                                                llm_in_flight_session = Some(session_id);
+                                                                let seq = llm_seq.entry(session_id).or_insert(0);
+                                                                *seq = seq.saturating_add(1);
+                                                                overlay_router.route_interim_state(
+                                                                    None,
+                                                                    session_id,
+                                                                    *seq,
+                                                                    "Generating answer...".to_string(),
+                                                                );
+                                                                state.reset();
+                                                                let llm = llm_config.clone();
+                                                                let progress_tx = llm_tx.clone();
+                                                                tokio::spawn(async move {
+                                                                    let llm_result = fetch_llm_streamed_answer(
+                                                                        &llm,
+                                                                        session_id,
+                                                                        &text,
+                                                                        &progress_tx
+                                                                    )
+                                                                    .await
+                                                                    .map_err(|err| format!("{err:#}"));
+                                                                    let _ = progress_tx.send(LlmProgress::Finished {
+                                                                        session_id,
+                                                                        transcript: text,
+                                                                        daemon_latency_ms: latency_ms,
+                                                                        daemon_audio_ms: audio_ms,
+                                                                        result: llm_result,
+                                                                    });
+                                                                });
+                                                                active_intent = None;
+                                                            }
+                                                            known => {
+                                                                let clear_intent = matches!(
+                                                                    &known,
+                                                                    ServerMessage::FinalResult { .. } | ServerMessage::Error { .. }
+                                                                );
+                                                                handle_server_message(
+                                                                    known,
+                                                                    &mut state,
+                                                                    &mut overlay_router,
+                                                                    &injector_worker,
+                                                                    &audio_feedback,
+                                                                ).await?;
+                                                                if clear_intent {
+                                                                    active_intent = None;
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     Ok(DecodedServerMessage::UnknownType { message_type }) => {
                                                         debug!(%message_type, "ignoring unknown server message type");
@@ -1198,6 +1683,93 @@ async fn run_hotkey_mode(
                                     &audio_feedback,
                                 );
                             }
+                            Some(progress) = llm_rx.recv() => {
+                                match progress {
+                                    LlmProgress::Delta { session_id, delta } => {
+                                        let entry = llm_overlay_text.entry(session_id).or_default();
+                                        entry.push_str(&delta);
+                                        let seq = llm_seq.entry(session_id).or_insert(0);
+                                        *seq = seq.saturating_add(1);
+                                        overlay_router.route_interim_text(None, session_id, *seq, entry.clone());
+                                    }
+                                    LlmProgress::Finished {
+                                        session_id,
+                                        transcript,
+                                        daemon_latency_ms,
+                                        daemon_audio_ms,
+                                        result,
+                                    } => {
+                                        if llm_in_flight_session != Some(session_id) {
+                                            warn!(
+                                                session = %session_id,
+                                                in_flight_session = ?llm_in_flight_session,
+                                                "ignoring stale llm completion for non-active session"
+                                            );
+                                            llm_seq.remove(&session_id);
+                                            llm_overlay_text.remove(&session_id);
+                                            llm_deferred_session_end.remove(&session_id);
+                                            continue;
+                                        }
+
+                                        llm_busy = false;
+                                        llm_in_flight_session = None;
+                                        llm_seq.remove(&session_id);
+                                        llm_overlay_text.remove(&session_id);
+                                        let session_end_reason =
+                                            llm_deferred_session_end.remove(&session_id).flatten();
+                                        overlay_router.route_session_ended(
+                                            None,
+                                            session_id,
+                                            session_end_reason,
+                                        );
+                                        let fallback_transcript = transcript.clone();
+                                        let response_text = match result {
+                                            Ok(answer) => {
+                                                let sanitized = sanitize_model_answer(&answer);
+                                                info!(
+                                                    session = %session_id,
+                                                    answer_chars = sanitized.chars().count(),
+                                                    "llm response completed"
+                                                );
+                                                sanitized
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    session = %session_id,
+                                                    error = %error,
+                                                    "llm generation failed; falling back to raw transcript"
+                                                );
+                                                fallback_transcript.clone()
+                                            }
+                                        };
+
+                                        let to_inject = if response_text.trim().is_empty() {
+                                            warn!(session = %session_id, "llm response empty after sanitization; falling back to transcript");
+                                            fallback_transcript
+                                        } else {
+                                            response_text
+                                        };
+
+                                        match injector_worker
+                                            .enqueue(InjectionJob::new(session_id, to_inject, daemon_latency_ms, daemon_audio_ms))
+                                            .await
+                                        {
+                                            Ok(()) => debug!(session = %session_id, "llm final answer queued for injector worker"),
+                                            Err(EnqueueFailure::Timeout) => {
+                                                warn!(
+                                                    session = %session_id,
+                                                    queue_capacity = INJECTION_QUEUE_CAPACITY,
+                                                    enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                                                    "injector queue remained full; dropping llm final answer"
+                                                );
+                                            }
+                                            Err(EnqueueFailure::WorkerGone) => {
+                                                warn!(session = %session_id, "injector worker unavailable; dropping llm final answer");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Result::<()>::Ok(())
@@ -1207,6 +1779,7 @@ async fn run_hotkey_mode(
                     warn!("session loop ended with error: {err}");
                 }
                 state.reset();
+                active_intent = None;
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -1241,11 +1814,12 @@ fn handle_injection_report(
     audio_feedback: &AudioFeedback,
 ) {
     worker.metrics().note_report(&report);
-    let success = report.error.is_none();
-    match report.error {
-        Some(error) => {
+    let success = report.error_kind.is_none() && report.error.is_none();
+    match (report.error_kind, report.error) {
+        (Some(error_kind), Some(error)) => {
             warn!(
                 session = %report.session_id,
+                error_kind = error_kind.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
@@ -1255,7 +1829,7 @@ fn handle_injection_report(
                 "injector worker reported failure"
             );
         }
-        None => {
+        (None, None) => {
             info!(
                 session = %report.session_id,
                 daemon_latency_ms = report.daemon_latency_ms,
@@ -1266,6 +1840,19 @@ fn handle_injection_report(
                 "injector worker completed job"
             );
             audio_feedback.play_completion();
+        }
+        (error_kind, error) => {
+            warn!(
+                session = %report.session_id,
+                error_kind = error_kind.map(InjectionErrorKind::as_str),
+                daemon_latency_ms = report.daemon_latency_ms,
+                daemon_audio_ms = report.daemon_audio_ms,
+                queue_wait_ms = report.queue_wait_ms,
+                run_ms = report.run_ms,
+                total_worker_ms = report.total_worker_ms,
+                error = ?error,
+                "injector worker reported inconsistent error classification"
+            );
         }
     }
 
@@ -1520,9 +2107,10 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, handle_server_message, spawn_injector_worker_with_capacity, EnqueueFailure,
-        InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
-        RuntimeOverlaySink,
+        build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
+        InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter,
+        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
     struct SlowInjector {
@@ -1544,6 +2132,28 @@ mod tests {
 
     impl TextInjector for RecordingInjector {
         fn inject(&self, text: &str) -> Result<()> {
+            self.seen
+                .lock()
+                .expect("recording lock should be available")
+                .push(text.to_string());
+            Ok(())
+        }
+    }
+
+    struct TimeoutThenRecordingInjector {
+        calls: Arc<AtomicU64>,
+        seen: Arc<Mutex<Vec<String>>>,
+        timeout_sleep_ms: u64,
+    }
+
+    impl TextInjector for TimeoutThenRecordingInjector {
+        fn inject(&self, text: &str) -> Result<()> {
+            let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call_index == 0 {
+                std::thread::sleep(Duration::from_millis(self.timeout_sleep_ms));
+                return Ok(());
+            }
+
             self.seen
                 .lock()
                 .expect("recording lock should be available")
@@ -1635,6 +2245,73 @@ mod tests {
         let cli_disabled =
             super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "false"]);
         assert_eq!(cli_disabled.overlay_adaptive_width, Some(false));
+    }
+
+    #[test]
+    fn cli_query_modifier_and_llm_defaults_are_set() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.query_modifier_key, super::DEFAULT_QUERY_MODIFIER_KEY);
+        assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
+        assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
+        assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn sanitize_model_answer_strips_think_blocks_without_raw_fallback() {
+        assert_eq!(sanitize_model_answer("<think>hidden</think>"), "");
+        assert_eq!(sanitize_model_answer("<think>hidden"), "");
+        assert_eq!(
+            sanitize_model_answer("<think>hidden</think> visible"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn drain_sse_lines_handles_utf8_split_across_chunks() {
+        let mut buffer = Vec::<u8>::new();
+
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"caf";
+        let second = b"\xC3\xA9\"}}]}\n";
+
+        buffer.extend_from_slice(first);
+        let first_lines = drain_sse_lines(&mut buffer, false).expect("first parse should succeed");
+        assert!(first_lines.is_empty());
+
+        buffer.extend_from_slice(second);
+        let lines = drain_sse_lines(&mut buffer, false).expect("second parse should succeed");
+        assert_eq!(
+            lines,
+            vec!["data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}"]
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn maybe_defer_llm_session_end_for_query_or_inflight() {
+        let session_id = Uuid::new_v4();
+        let state = PttState::Listening { session_id };
+        let message = ServerMessage::SessionEnded {
+            session_id,
+            reason: Some("normal".to_string()),
+        };
+
+        let deferred_for_query =
+            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::LlmQuery), None);
+        assert_eq!(
+            deferred_for_query,
+            Some((session_id, Some("normal".to_string())))
+        );
+
+        let deferred_for_inflight =
+            maybe_defer_llm_session_end(&message, &PttState::Idle, None, Some(session_id));
+        assert_eq!(
+            deferred_for_inflight,
+            Some((session_id, Some("normal".to_string())))
+        );
+
+        let not_deferred =
+            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::Dictate), None);
+        assert_eq!(not_deferred, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2328,6 +3005,86 @@ mod tests {
                 seq: 10,
                 text: "newest".to_string(),
             }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injector_worker_recovers_after_execution_timeout() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(TimeoutThenRecordingInjector {
+            calls: Arc::clone(&calls),
+            seen: Arc::clone(&seen),
+            timeout_sleep_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        worker
+            .enqueue(InjectionJob::new(
+                first_session,
+                "first wedges".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                second_session,
+                "second still works".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        let first_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("first report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(first_report.session_id, first_session);
+        assert_eq!(
+            first_report.error_kind,
+            Some(InjectionErrorKind::ExecutionTimeout)
+        );
+        assert!(
+            first_report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "timeout report should explain the failure"
+        );
+        worker.metrics().note_report(&first_report);
+
+        let second_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("second report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(second_report.session_id, second_session);
+        assert!(second_report.error.is_none());
+        assert_eq!(second_report.error_kind, None);
+        worker.metrics().note_report(&second_report);
+        assert_eq!(
+            seen.lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["second still works".to_string()]
+        );
+        assert_eq!(
+            worker
+                .metrics()
+                .worker_execution_timeout_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            worker
+                .metrics()
+                .worker_backend_failure_total
+                .load(Ordering::Relaxed),
+            0
         );
     }
 

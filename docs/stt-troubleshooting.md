@@ -39,6 +39,7 @@ Canonical-source policy:
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
 - Routing shortcuts (Terminal→CtrlShiftV, General→CtrlV, Unknown→CtrlShiftV), clipboard MIME type, and copy-foreground behavior are hardcoded constants — no longer configurable via CLI.
+- Machine-local LLM overrides should stay in `PARAKEET_LLM_*` env vars from your shell or an ignored repo-local file such as `.parakeet-stt.local.env`; do not commit workstation-specific endpoints or launcher paths.
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -65,6 +66,7 @@ Canonical-source policy:
 ## Current helper behavior (after rewrite)
 - Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
 - Resolves repo paths dynamically from the helper location (or `PARAKEET_ROOT`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
+- Daemon PID tracking now refreshes from the bound listener port after startup/status checks, because the initial `uv run` launcher PID may differ from the long-lived Python server PID.
 - Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). Profile defaults determine whether `PARAKEET_STREAMING_ENABLED` is true (`stt`) or false (`stt off`). On failure, it prints the last daemon log lines.
 - Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint <resolved endpoint>`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.

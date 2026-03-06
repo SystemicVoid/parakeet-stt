@@ -21,6 +21,7 @@ Since `21d8f74` and follow-up commits, the injection path is now reliability-fir
 - Runtime helper launch is profile-based:
   - `stt` / `stt start` defaults to online stream+seal + overlay enabled.
   - `stt off` defaults to offline + overlay disabled.
+- Public release track: the next semver tag should be `v0.2.0` because this line adds new user-facing capability and default-behavior changes, not just bugfixes.
 
 This keeps the system usable now while uinput behavior is hardened across app surfaces.
 
@@ -47,6 +48,8 @@ uv sync --dev --extra inference --prerelease allow \
 
 2. Start via helper (recommended):
 ```bash
+# Optional machine-local overrides belong in shell env or an ignored file
+# such as .parakeet-stt.local.env.
 source scripts/stt-helper.sh
 stt start
 # Offline/no-overlay profile:
@@ -100,6 +103,13 @@ Default `stt` / `stt start` profile:
 Overlay backend mode override (both profiles):
 
 - `PARAKEET_OVERLAY_MODE=auto|layer-shell|fallback-window|disabled`
+
+Local LLM query mode overrides:
+
+- `PARAKEET_LLM_BASE_URL`, `PARAKEET_LLM_MODEL`, `PARAKEET_LLM_TIMEOUT_SECONDS`
+- `PARAKEET_LLM_MAX_TOKENS`, `PARAKEET_LLM_TEMPERATURE`
+- `PARAKEET_LLM_SYSTEM_PROMPT`, `PARAKEET_LLM_OVERLAY_STREAM`
+- Keep workstation-specific LLM endpoints or launcher details in shell env or an ignored repo-local file such as `.parakeet-stt.local.env`, not in tracked docs/config.
 
 Helper readiness timing:
 
@@ -223,7 +233,8 @@ stt diag-injector
 - Protocol contract: `docs/SPEC.md`
 - Troubleshooting (canonical operator source): `docs/stt-troubleshooting.md`
 - Historical docs archive index (non-canonical): `docs/archive/README.md`
-- Streaming overlay rollout log (historical / pending archive): `STREAMING-OVERLAY-ROLL-OUT-AND-VERIFICATION-PLAN.md`
+- Historical streaming overlay rollout log: `docs/archive/STREAMING-OVERLAY-ROLL-OUT-AND-VERIFICATION-PLAN-2026-03-06.md`
+- Historical Gemini architectural review: `docs/archive/gemini-architectural-review-2026-03-06.md`
 - Historical injector handoff archive (non-canonical): `docs/archive/HANDOFF-clipboard-injector-2026-02-08.md`
 - Historical cross-surface incident handoff archive (non-canonical): `docs/archive/HANDOFF-stt-cross-surface-injection-2026-02-19.md`
 - Historical injection implementation roadmap (non-canonical): `docs/archive/STT-INPUT-INJECTION-ROADMAP-2026-02.md`

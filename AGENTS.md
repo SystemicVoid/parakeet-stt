@@ -20,12 +20,15 @@ The role of this file is to describe common mistakes and confusion points that a
 - Canonical playbook: `docs/engineering/harness-engineering-playbook.md`.
 - Keep `AGENTS.md` short and map-style; operational depth belongs in canonical docs and scripts.
 - Python static quality is consolidated on Ruff + ty. Prefer adding Ruff rules before adding overlapping one-off tools.
+- Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` (for example `uv run pytest ...`, `uv run ty check ...`); running them from repo root can miss that package environment/import path and give false failures.
+- Commit-hook caveat: pre-commit may rewrite staged Python files (typically Ruff import/order fixes), so after a failed `git commit` caused by hook-applied fixes, re-stage the touched files and retry the same commit.
 - Clarification: Ruff `BLE001` is blind exception handling; unreachable duplicate handler checks are `B014` / `B025`.
 
 ## STT Helper Flag Policy
 - Single source of truth: `scripts/stt-helper.sh` `start_option_rows`.
 - Do not hardcode `stt start` flag lists in parser/help/client args/diagnostics; derive behavior from metadata helpers.
 - Validation: run `bash -n scripts/stt-helper.sh` and `source scripts/stt-helper.sh && stt help start` after helper flag/default/env changes.
+- Daemon lifecycle caveat: `uv run parakeet-stt-daemon` can expose a launcher PID that differs from the long-lived listener PID; helper lifecycle checks should refresh `/tmp/parakeet-daemon.pid` from the bound port after startup/status probes instead of trusting the initial `$!`.
 - Multi-binary caveat: this repo has both `parakeet-ptt` and `parakeet-overlay`; any helper fallback using `cargo run` must pass `--bin parakeet-ptt`.
 - Runtime override: `PARAKEET_OVERLAY_MODE` supports `auto|layer-shell|fallback-window|disabled` for compositor-specific overlay bring-up.
 - Note: `scripts/check-stt-helper-flags.sh` is referenced in older docs/history but is currently not present in this repository.

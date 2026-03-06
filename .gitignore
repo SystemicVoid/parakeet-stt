@@ -18,6 +18,8 @@ parakeet-stt-daemon/test-run.py
 # Local shell helpers (keep personal aliases out of the repo)
 74-aliases-functions.bash
 parakeet-ptt/.claude/
+/.parakeet-stt.local.env
+/.parakeet-stt.local.sh
 
 # Wayland protocol XML scratch drops (kept under docs/protocol-references/)
 /cosmic-toplevel-info-unstable-v1.xml
