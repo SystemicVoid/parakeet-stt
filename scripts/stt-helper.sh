@@ -528,6 +528,25 @@ EOF
 CLIENTCMD
     }
 
+    _make_helper_temp_file() {
+        local prefix="$1"
+        local temp_path=""
+
+        if temp_path="$(mktemp "/tmp/${prefix}.XXXXXX" 2>/dev/null)"; then
+            printf "%s" "$temp_path"
+            return 0
+        fi
+
+        # Fallback if mktemp is unavailable or fails unexpectedly.
+        temp_path="/tmp/${prefix}.$$.$RANDOM.log"
+        if : >"$temp_path" 2>/dev/null; then
+            printf "%s" "$temp_path"
+            return 0
+        fi
+
+        return 1
+    }
+
     _ensure_overlay_release_binary() {
         local ptt_rustflags="$1"
         local overlay_required_raw="${2:-false}"
@@ -535,8 +554,10 @@ CLIENTCMD
         local overlay_binary="$CLIENT_DIR/target/release/parakeet-overlay"
         local build_cmd="cargo build --release --bin parakeet-overlay"
         local build_output=""
+        local build_status=0
         local build_attempt=1
         local max_build_attempts=2
+        local cargo_bin=""
 
         case "${overlay_required_raw,,}" in
             true|1|yes|on)
@@ -548,7 +569,8 @@ CLIENTCMD
             return 0
         fi
 
-        if ! command -v cargo >/dev/null 2>&1; then
+        cargo_bin="$(command -v cargo 2>/dev/null || true)"
+        if [ -z "$cargo_bin" ]; then
             if [ ! -x "$overlay_binary" ]; then
                 echo "   - ERROR: overlay is enabled, but cargo is unavailable and overlay binary is missing."
                 echo "   - Build manually when cargo is available:"
@@ -562,11 +584,19 @@ CLIENTCMD
 
         echo "   - Ensuring overlay binary is available (${build_cmd})..."
         echo "[helper] ensuring overlay binary via ${build_cmd}" >> "$LOG_CLIENT"
-        build_output="$(mktemp)"
+        printf "[helper] overlay build context: cwd=%s cargo=%s tmpdir=%s rustflags=%q\n" \
+            "$CLIENT_DIR" "$cargo_bin" "${TMPDIR:-<unset>}" "$ptt_rustflags" >> "$LOG_CLIENT"
+        build_output="$(_make_helper_temp_file "parakeet-overlay-build")"
+        if [ -z "$build_output" ]; then
+            echo "   - ERROR: could not allocate temp build log file under /tmp."
+            echo "[helper] could not allocate temp build log file under /tmp; aborting start" >> "$LOG_CLIENT"
+            return 1
+        fi
+
         while [ "$build_attempt" -le "$max_build_attempts" ]; do
             if (
                 cd "$CLIENT_DIR" || exit 1
-                RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >"$build_output" 2>&1
+                RUSTFLAGS="$ptt_rustflags" "$cargo_bin" build --release --bin parakeet-overlay >"$build_output" 2>&1
             ); then
                 cat "$build_output" >> "$LOG_CLIENT"
                 rm -f "$build_output"
@@ -579,8 +609,14 @@ CLIENTCMD
                 fi
                 return 0
             fi
+            build_status=$?
 
-            cat "$build_output" >> "$LOG_CLIENT"
+            if [ -s "$build_output" ]; then
+                cat "$build_output" >> "$LOG_CLIENT"
+            else
+                echo "[helper] overlay build attempt ${build_attempt}/${max_build_attempts} exited status=${build_status} with empty output" >> "$LOG_CLIENT"
+            fi
+
             if [ "$build_attempt" -lt "$max_build_attempts" ]; then
                 echo "   - Overlay build attempt ${build_attempt}/${max_build_attempts} failed; retrying..."
                 echo "[helper] overlay build attempt ${build_attempt}/${max_build_attempts} failed; retrying" >> "$LOG_CLIENT"
@@ -590,11 +626,16 @@ CLIENTCMD
 
             echo "   - ERROR: overlay is enabled and build failed (${build_cmd})."
             echo "   - Last overlay build output:"
-            tail -n 40 "$build_output"
+            if [ -s "$build_output" ]; then
+                tail -n 40 "$build_output"
+            else
+                echo "     <empty output>"
+            fi
             echo "   - Full output saved to: $LOG_CLIENT"
             echo "   - Retry manually:"
             echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
             echo "   - Or launch without overlay: stt start --overlay-enabled false"
+            echo "[helper] overlay build final failure status=${build_status}" >> "$LOG_CLIENT"
             echo "[helper] overlay build failed while required; aborting start" >> "$LOG_CLIENT"
             rm -f "$build_output"
             return 1
