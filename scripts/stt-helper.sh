@@ -347,14 +347,14 @@ PY
         while true; do
             pid=$(pgrep -n "[p]arakeet-ptt" || true)
             if [ -n "$pid" ]; then
-                echo "$pid" > "$CLIENT_PID_FILE"
+                echo "$pid" >| "$CLIENT_PID_FILE"
                 return 0
             fi
 
             if [ -f "$LOG_CLIENT" ] && grep -Eq "Starting hotkey loop; press Right Ctrl to talk|Hotkey listeners started for KEY_RIGHTCTRL|Connected to daemon" "$LOG_CLIENT"; then
                 pid=$(pgrep -n "[p]arakeet-ptt" || true)
                 if [ -n "$pid" ]; then
-                    echo "$pid" > "$CLIENT_PID_FILE"
+                    echo "$pid" >| "$CLIENT_PID_FILE"
                     return 0
                 fi
             fi
@@ -528,68 +528,6 @@ EOF
 CLIENTCMD
     }
 
-    _ensure_overlay_release_binary() {
-        local ptt_rustflags="$1"
-        local overlay_required_raw="${2:-false}"
-        local overlay_required="false"
-        local overlay_binary="$CLIENT_DIR/target/release/parakeet-overlay"
-        local build_cmd="cargo build --release --bin parakeet-overlay"
-        local build_output=""
-
-        case "${overlay_required_raw,,}" in
-            true|1|yes|on)
-                overlay_required="true"
-                ;;
-        esac
-
-        if [ "$overlay_required" != "true" ]; then
-            return 0
-        fi
-
-        if ! command -v cargo >/dev/null 2>&1; then
-            if [ ! -x "$overlay_binary" ]; then
-                echo "   - ERROR: overlay is enabled, but cargo is unavailable and overlay binary is missing."
-                echo "   - Build manually when cargo is available:"
-                echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
-                echo "   - Or launch without overlay: stt start --overlay-enabled false"
-                echo "[helper] overlay required but binary missing at $overlay_binary and cargo unavailable; aborting start" >> "$LOG_CLIENT"
-                return 1
-            fi
-            return 0
-        fi
-
-        echo "   - Ensuring overlay binary is available (${build_cmd})..."
-        echo "[helper] ensuring overlay binary via ${build_cmd}" >> "$LOG_CLIENT"
-        build_output="$(mktemp)"
-        if (
-            cd "$CLIENT_DIR" || exit 1
-            RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >"$build_output" 2>&1
-        ); then
-            cat "$build_output" >> "$LOG_CLIENT"
-            rm -f "$build_output"
-            if [ ! -x "$overlay_binary" ]; then
-                echo "   - ERROR: overlay build reported success but binary is missing at $overlay_binary."
-                echo "   - Retry manually:"
-                echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
-                echo "[helper] overlay build succeeded but binary missing at $overlay_binary; aborting start" >> "$LOG_CLIENT"
-                return 1
-            fi
-            return 0
-        fi
-
-        cat "$build_output" >> "$LOG_CLIENT"
-        echo "   - ERROR: overlay is enabled and build failed (${build_cmd})."
-        echo "   - Last overlay build output:"
-        tail -n 40 "$build_output"
-        echo "   - Full output saved to: $LOG_CLIENT"
-        echo "   - Retry manually:"
-        echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
-        echo "   - Or launch without overlay: stt start --overlay-enabled false"
-        echo "[helper] overlay build failed while required; aborting start" >> "$LOG_CLIENT"
-        rm -f "$build_output"
-        return 1
-    }
-
     case "$cmd" in
         help|--help|-h)
             case "${1:-}" in
@@ -736,14 +674,14 @@ CLIENTCMD
                     PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
                     nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
-                    echo $! > "$DAEMON_PID_FILE"
+                    echo $! >| "$DAEMON_PID_FILE"
                 )
             fi
 
             echo -n "   - Waiting for socket..."
             if _wait_for_socket "$DAEMON_PID_FILE" 60; then
                 echo " OK"
-                echo "${HOST}:${PORT}" > "$PORT_FILE"
+                echo "${HOST}:${PORT}" >| "$PORT_FILE"
             else
                 echo " not ready; last daemon log lines:"
                 tail -n 80 "$LOG_DAEMON"
@@ -781,7 +719,6 @@ CLIENTCMD
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
-            _ensure_overlay_release_binary "$ptt_rustflags" "$overlay_enabled" || return 1
 
             local client_cmd
             client_cmd="$(_build_client_cmd)"
@@ -921,7 +858,7 @@ CLIENTCMD
             echo "Creating tmux session '$TMUX_SESSION' (daemon | client | logs)..."
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
-            echo "${HOST}:${PORT}" > "$PORT_FILE"
+            echo "${HOST}:${PORT}" >| "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local injection_mode paste_key_backend paste_backend_failure_policy
@@ -949,7 +886,6 @@ CLIENTCMD
             if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
-            _ensure_overlay_release_binary "$ptt_rustflags" "$overlay_enabled" || return 1
 
             local client_cmd='
                 set -e

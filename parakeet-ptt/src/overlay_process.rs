@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -115,10 +114,12 @@ impl OverlayProcessSink {
             }
         };
 
-        let overlay_binary = resolve_overlay_binary_path()?;
+        let overlay_entrypoint = std::env::current_exe()
+            .context("failed to locate current executable for overlay subprocess")?;
         let metrics = Arc::new(OverlayProcessMetrics::default());
-        let mut command = Command::new(&overlay_binary);
+        let mut command = Command::new(&overlay_entrypoint);
         command
+            .arg(parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG)
             .arg("--backend")
             .arg(backend)
             .arg("--adaptive-width")
@@ -136,8 +137,8 @@ impl OverlayProcessSink {
                 metrics.note_launch_failure();
                 return Err(err).with_context(|| {
                     format!(
-                        "failed to spawn overlay process '{}'",
-                        overlay_binary.display()
+                        "failed to spawn overlay process via current executable '{}'",
+                        overlay_entrypoint.display()
                     )
                 });
             }
@@ -196,7 +197,7 @@ impl OverlayProcessSink {
 
         metrics.note_launch_success();
         info!(
-            binary = %overlay_binary.display(),
+            binary = %overlay_entrypoint.display(),
             backend,
             adaptive_width,
             ?child_id,
@@ -573,12 +574,6 @@ fn is_replayable_overlay_message(message: &OverlayIpcMessage) -> bool {
         | OverlayIpcMessage::OutputHint { .. }
         | OverlayIpcMessage::AudioLevel { .. } => false,
     }
-}
-
-fn resolve_overlay_binary_path() -> Result<PathBuf> {
-    let current_exe = std::env::current_exe().context("failed to locate current executable")?;
-    let binary = current_exe.with_file_name("parakeet-overlay");
-    Ok(binary)
 }
 
 #[cfg(test)]
