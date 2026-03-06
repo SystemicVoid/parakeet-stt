@@ -9,6 +9,7 @@ mod routing;
 mod state;
 mod surface_focus;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::{
     sleep, timeout, Duration as TokioDuration, Instant as TokioInstant, MissedTickBehavior,
@@ -47,6 +49,43 @@ const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
+const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_RIGHTALT";
+const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+const DEFAULT_LLM_MODEL: &str = "local";
+const DEFAULT_LLM_SYSTEM_PROMPT: &str =
+    "You are a concise assistant. Return only the final answer text for direct insertion.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIntent {
+    Dictate,
+    LlmQuery,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRuntimeConfig {
+    base_url: url::Url,
+    model: String,
+    timeout: Duration,
+    max_tokens: u32,
+    temperature: f32,
+    system_prompt: String,
+    overlay_stream: bool,
+}
+
+#[derive(Debug)]
+enum LlmProgress {
+    Delta {
+        session_id: Uuid,
+        delta: String,
+    },
+    Finished {
+        session_id: Uuid,
+        transcript: String,
+        daemon_latency_ms: u64,
+        daemon_audio_ms: u64,
+        result: std::result::Result<String, String>,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct InjectionJob {
@@ -671,9 +710,13 @@ struct Cli {
     #[arg(long)]
     shared_secret: Option<String>,
 
-    /// Hotkey to bind (currently unused placeholder)
+    /// Hold-to-talk key (evdev key name, e.g. KEY_RIGHTCTRL)
     #[arg(long, default_value = "KEY_RIGHTCTRL")]
     hotkey: String,
+
+    /// Query modifier key used during a PTT hold to route utterance to LLM.
+    #[arg(long, default_value = DEFAULT_QUERY_MODIFIER_KEY)]
+    query_modifier_key: String,
 
     /// Path to ydotool binary (used when paste key backend is ydotool/auto)
     #[arg(long)]
@@ -742,6 +785,34 @@ struct Cli {
     /// Enable or disable adaptive overlay width (CLI takes precedence over env).
     #[arg(long, action = clap::ArgAction::Set)]
     overlay_adaptive_width: Option<bool>,
+
+    /// Base URL for llama-server OpenAI-compatible API.
+    #[arg(long, default_value = DEFAULT_LLM_BASE_URL)]
+    llm_base_url: String,
+
+    /// Model name passed to llama-server.
+    #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+    llm_model: String,
+
+    /// Timeout in seconds for llama responses.
+    #[arg(long, default_value_t = 20)]
+    llm_timeout_seconds: u64,
+
+    /// Max tokens for llama responses.
+    #[arg(long, default_value_t = 512)]
+    llm_max_tokens: u32,
+
+    /// Temperature for llama responses.
+    #[arg(long, default_value_t = 0.7)]
+    llm_temperature: f32,
+
+    /// System prompt used for LLM query mode responses.
+    #[arg(long, default_value = DEFAULT_LLM_SYSTEM_PROMPT)]
+    llm_system_prompt: String,
+
+    /// Stream llama deltas to overlay while generating.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    llm_overlay_stream: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -835,6 +906,18 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
+    let llm_base_url = url::Url::parse(&cli.llm_base_url)
+        .with_context(|| format!("invalid LLM base URL: {}", cli.llm_base_url))?;
+    let llm_config = LlmRuntimeConfig {
+        base_url: llm_base_url,
+        model: cli.llm_model.clone(),
+        timeout: Duration::from_secs(cli.llm_timeout_seconds.max(1)),
+        max_tokens: cli.llm_max_tokens.max(1),
+        temperature: cli.llm_temperature.clamp(0.0, 2.0),
+        system_prompt: cli.llm_system_prompt.clone(),
+        overlay_stream: cli.llm_overlay_stream,
+    };
+
     if cli.test_injection {
         let injector = build_injector(&config);
         injector
@@ -864,6 +947,8 @@ async fn main() -> Result<()> {
         audio_feedback,
         cli.overlay_enabled,
         cli.overlay_adaptive_width,
+        llm_config,
+        cli.query_modifier_key.clone(),
     )
     .await
 }
@@ -977,6 +1062,183 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
     ))
 }
 
+fn llm_chat_completions_url(base: &url::Url) -> Result<url::Url> {
+    let mut url = base.clone();
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    url.join("chat/completions")
+        .context("failed to build llama chat/completions URL")
+}
+
+fn llm_health_url(base: &url::Url) -> url::Url {
+    let mut url = base.clone();
+    url.set_path("/health");
+    url
+}
+
+fn extract_delta_content(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("choices")?
+        .get(0)?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+}
+
+fn sanitize_model_answer(raw: &str) -> String {
+    let mut output = raw.to_string();
+    while let Some(start) = output.find("<think>") {
+        let Some(end_relative) = output[start..].find("</think>") else {
+            output.truncate(start);
+            break;
+        };
+        let end = start + end_relative + "</think>".len();
+        output.replace_range(start..end, "");
+    }
+
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        raw.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn drain_sse_lines(buffer: &mut Vec<u8>, flush_partial: bool) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    loop {
+        let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+
+        let mut raw_line = buffer.drain(..=line_end).collect::<Vec<_>>();
+        raw_line.pop();
+        if raw_line.ends_with(b"\r") {
+            raw_line.pop();
+        }
+        let line = std::str::from_utf8(&raw_line)
+            .context("llama SSE stream contained invalid UTF-8 in a line")?;
+        lines.push(line.to_string());
+    }
+
+    if flush_partial && !buffer.is_empty() {
+        let line = std::str::from_utf8(buffer)
+            .context("llama SSE stream ended with invalid UTF-8 in trailing bytes")?;
+        lines.push(line.trim_end_matches('\r').to_string());
+        buffer.clear();
+    }
+
+    Ok(lines)
+}
+
+async fn fetch_llm_streamed_answer(
+    llm: &LlmRuntimeConfig,
+    session_id: Uuid,
+    transcript: &str,
+    progress_tx: &mpsc::UnboundedSender<LlmProgress>,
+) -> Result<String> {
+    let request_url = llm_chat_completions_url(&llm.base_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(llm.timeout)
+        .build()
+        .context("failed to build reqwest client for llama")?;
+
+    let request_body = json!({
+        "model": llm.model,
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": llm.system_prompt},
+            {"role": "user", "content": transcript},
+        ],
+        "max_tokens": llm.max_tokens,
+        "temperature": llm.temperature,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "reasoning_format": "none",
+        "reasoning_in_content": false
+    });
+
+    let response = client
+        .post(request_url.clone())
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach llama endpoint {}", request_url))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        anyhow::bail!("llama returned status {} with body: {}", status, body);
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::<u8>::new();
+    let mut assembled = String::new();
+
+    let mut process_sse_line = |line: &str| -> Result<bool> {
+        if line.is_empty() || !line.starts_with("data:") {
+            return Ok(false);
+        }
+
+        let payload = line[5..].trim();
+        if payload == "[DONE]" {
+            return Ok(true);
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(payload).with_context(|| {
+            format!("failed to parse llama SSE data payload as JSON: {payload}")
+        })?;
+        if let Some(delta) = extract_delta_content(&parsed).filter(|value| !value.is_empty()) {
+            assembled.push_str(delta);
+            if llm.overlay_stream {
+                let _ = progress_tx.send(LlmProgress::Delta {
+                    session_id,
+                    delta: delta.to_string(),
+                });
+            }
+        }
+
+        Ok(false)
+    };
+
+    while let Some(next_chunk) = stream.next().await {
+        let chunk = next_chunk.context("failed reading llama stream chunk")?;
+        buffer.extend_from_slice(&chunk);
+
+        for line in drain_sse_lines(&mut buffer, false)? {
+            if process_sse_line(line.trim())? {
+                return Ok(assembled);
+            }
+        }
+    }
+
+    for line in drain_sse_lines(&mut buffer, true)? {
+        if process_sse_line(line.trim())? {
+            return Ok(assembled);
+        }
+    }
+
+    Ok(assembled)
+}
+
+async fn probe_llm_health_once(llm: &LlmRuntimeConfig) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build();
+    let Ok(client) = client else {
+        return false;
+    };
+
+    match client.get(llm_health_url(&llm.base_url)).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 async fn run_demo(
     config: ClientConfig,
     override_text: Option<String>,
@@ -1068,7 +1330,19 @@ async fn run_hotkey_mode(
     audio_feedback: AudioFeedback,
     overlay_enabled_override: Option<bool>,
     overlay_adaptive_width_override: Option<bool>,
+    llm_config: LlmRuntimeConfig,
+    query_modifier_key_name: String,
 ) -> Result<()> {
+    let talk_key = crate::hotkey::parse_key_name(&config.hotkey)
+        .with_context(|| format!("invalid --hotkey value '{}'", config.hotkey))?;
+    let query_modifier_key =
+        crate::hotkey::parse_key_name(&query_modifier_key_name).with_context(|| {
+            format!(
+                "invalid --query-modifier-key value '{}'",
+                query_modifier_key_name
+            )
+        })?;
+
     let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
     let overlay_adaptive_width = resolve_overlay_adaptive_width(overlay_adaptive_width_override);
     match overlay_capability.mode {
@@ -1093,8 +1367,9 @@ async fn run_hotkey_mode(
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
+        query_modifier_key = %query_modifier_key_name,
         completion_sound = audio_feedback.is_enabled(),
-        "Starting hotkey loop; press Right Ctrl to talk"
+        "Starting hotkey loop"
     );
     ensure_input_access()?;
     let injector = build_injector(&config);
@@ -1112,15 +1387,35 @@ async fn run_hotkey_mode(
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let hotkey_tasks = spawn_hotkey_loop(hk_tx)?;
+    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, query_modifier_key)?;
     info!(
         devices = hotkey_tasks.len(),
-        "Hotkey listeners started for KEY_RIGHTCTRL"
+        talk_key = ?talk_key,
+        query_modifier_key = ?query_modifier_key,
+        "Hotkey listeners started"
     );
+
+    let llm_health = probe_llm_health_once(&llm_config).await;
+    if llm_health {
+        info!(base_url = %llm_config.base_url, "llama-server health probe succeeded");
+    } else {
+        warn!(
+            base_url = %llm_config.base_url,
+            "llama-server health probe failed; LLM query mode will fall back to raw transcript on error"
+        );
+    }
 
     fetch_status_once(&config).await;
 
     let mut backoff = TokioDuration::from_millis(500);
+    let mut llm_busy = false;
+    let mut active_intent: Option<SessionIntent> = None;
+    let mut llm_seq: HashMap<Uuid, u64> = HashMap::new();
+    let mut llm_overlay_text: HashMap<Uuid, String> = HashMap::new();
+    let mut llm_busy_overlay_seq: u64 = 0;
+    let llm_busy_overlay_session = Uuid::nil();
+    let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
+
     loop {
         match WsClient::connect(&config).await {
             Ok(ws_client) => {
@@ -1133,11 +1428,33 @@ async fn run_hotkey_mode(
                         tokio::select! {
                             Some(evt) = hk_rx.recv() => {
                                 match evt {
-                                    HotkeyEvent::Down => {
+                                    HotkeyEvent::Down { query_modifier_active } => {
+                                        if llm_busy {
+                                            warn!("ignoring hotkey down while LLM response is in progress");
+                                            llm_busy_overlay_seq = llm_busy_overlay_seq.saturating_add(1);
+                                            overlay_router.route_interim_state(
+                                                None,
+                                                llm_busy_overlay_session,
+                                                llm_busy_overlay_seq,
+                                                "LLM busy; wait for current answer".to_string(),
+                                            );
+                                            overlay_router.route_session_ended(
+                                                None,
+                                                llm_busy_overlay_session,
+                                                Some("busy".to_string()),
+                                            );
+                                            continue;
+                                        }
                                         if let Some(session_id) = state.begin_listening() {
+                                            let intent = if query_modifier_active {
+                                                SessionIntent::LlmQuery
+                                            } else {
+                                                SessionIntent::Dictate
+                                            };
+                                            active_intent = Some(intent);
                                             let message = start_message(session_id, Some("auto".to_string()));
                                             send_message(&mut ws_write, &message).await?;
-                                            info!(session = %session_id, "start_session sent (hotkey down)");
+                                            info!(session = %session_id, ?intent, "start_session sent (hotkey down)");
                                         }
                                     }
                                     HotkeyEvent::Up => {
@@ -1146,6 +1463,16 @@ async fn run_hotkey_mode(
                                             send_message(&mut ws_write, &message).await?;
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         }
+                                    }
+                                    HotkeyEvent::QueryModifierDown => {
+                                        if matches!(state, PttState::Listening { .. }) {
+                                            if active_intent != Some(SessionIntent::LlmQuery) {
+                                                active_intent = Some(SessionIntent::LlmQuery);
+                                                info!("query modifier engaged; current utterance promoted to llm_query");
+                                            }
+                                        }
+                                    }
+                                    HotkeyEvent::QueryModifierUp => {
                                     }
                                 }
                             }
@@ -1156,13 +1483,60 @@ async fn run_hotkey_mode(
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
                                                 match decode_server_message(&txt) {
                                                     Ok(DecodedServerMessage::Known(message)) => {
-                                                        handle_server_message(
-                                                            *message,
-                                                            &mut state,
-                                                            &mut overlay_router,
-                                                            &injector_worker,
-                                                            &audio_feedback,
-                                                        ).await?
+                                                        match *message {
+                                                            ServerMessage::FinalResult {
+                                                                session_id,
+                                                                text,
+                                                                latency_ms,
+                                                                audio_ms,
+                                                                ..
+                                                            } if active_intent == Some(SessionIntent::LlmQuery) => {
+                                                                info!(
+                                                                    session = %session_id,
+                                                                    latency_ms,
+                                                                    audio_ms,
+                                                                    "final result received in llm_query mode"
+                                                                );
+                                                                llm_busy = true;
+                                                                state.reset();
+                                                                let llm = llm_config.clone();
+                                                                let progress_tx = llm_tx.clone();
+                                                                tokio::spawn(async move {
+                                                                    let llm_result = fetch_llm_streamed_answer(
+                                                                        &llm,
+                                                                        session_id,
+                                                                        &text,
+                                                                        &progress_tx
+                                                                    )
+                                                                    .await
+                                                                    .map_err(|err| format!("{err:#}"));
+                                                                    let _ = progress_tx.send(LlmProgress::Finished {
+                                                                        session_id,
+                                                                        transcript: text,
+                                                                        daemon_latency_ms: latency_ms,
+                                                                        daemon_audio_ms: audio_ms,
+                                                                        result: llm_result,
+                                                                    });
+                                                                });
+                                                                active_intent = None;
+                                                            }
+                                                            known => {
+                                                                let clear_intent = matches!(
+                                                                    &known,
+                                                                    ServerMessage::FinalResult { .. } | ServerMessage::Error { .. }
+                                                                );
+                                                                handle_server_message(
+                                                                    known,
+                                                                    &mut state,
+                                                                    &mut overlay_router,
+                                                                    &injector_worker,
+                                                                    &audio_feedback,
+                                                                ).await?;
+                                                                if clear_intent {
+                                                                    active_intent = None;
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     Ok(DecodedServerMessage::UnknownType { message_type }) => {
                                                         debug!(%message_type, "ignoring unknown server message type");
@@ -1198,6 +1572,73 @@ async fn run_hotkey_mode(
                                     &audio_feedback,
                                 );
                             }
+                            Some(progress) = llm_rx.recv() => {
+                                match progress {
+                                    LlmProgress::Delta { session_id, delta } => {
+                                        let entry = llm_overlay_text.entry(session_id).or_default();
+                                        entry.push_str(&delta);
+                                        let seq = llm_seq.entry(session_id).or_insert(0);
+                                        *seq = seq.saturating_add(1);
+                                        overlay_router.route_interim_text(None, session_id, *seq, entry.clone());
+                                    }
+                                    LlmProgress::Finished {
+                                        session_id,
+                                        transcript,
+                                        daemon_latency_ms,
+                                        daemon_audio_ms,
+                                        result,
+                                    } => {
+                                        llm_busy = false;
+                                        llm_seq.remove(&session_id);
+                                        llm_overlay_text.remove(&session_id);
+                                        let fallback_transcript = transcript.clone();
+                                        let response_text = match result {
+                                            Ok(answer) => {
+                                                let sanitized = sanitize_model_answer(&answer);
+                                                info!(
+                                                    session = %session_id,
+                                                    answer_chars = sanitized.chars().count(),
+                                                    "llm response completed"
+                                                );
+                                                sanitized
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    session = %session_id,
+                                                    error = %error,
+                                                    "llm generation failed; falling back to raw transcript"
+                                                );
+                                                fallback_transcript.clone()
+                                            }
+                                        };
+
+                                        let to_inject = if response_text.trim().is_empty() {
+                                            warn!(session = %session_id, "llm response empty after sanitization; falling back to transcript");
+                                            fallback_transcript
+                                        } else {
+                                            response_text
+                                        };
+
+                                        match injector_worker
+                                            .enqueue(InjectionJob::new(session_id, to_inject, daemon_latency_ms, daemon_audio_ms))
+                                            .await
+                                        {
+                                            Ok(()) => debug!(session = %session_id, "llm final answer queued for injector worker"),
+                                            Err(EnqueueFailure::Timeout) => {
+                                                warn!(
+                                                    session = %session_id,
+                                                    queue_capacity = INJECTION_QUEUE_CAPACITY,
+                                                    enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                                                    "injector queue remained full; dropping llm final answer"
+                                                );
+                                            }
+                                            Err(EnqueueFailure::WorkerGone) => {
+                                                warn!(session = %session_id, "injector worker unavailable; dropping llm final answer");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Result::<()>::Ok(())
@@ -1207,6 +1648,8 @@ async fn run_hotkey_mode(
                     warn!("session loop ended with error: {err}");
                 }
                 state.reset();
+                active_intent = None;
+                llm_busy = false;
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -1520,9 +1963,9 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, handle_server_message, spawn_injector_worker_with_capacity, EnqueueFailure,
-        InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
-        RuntimeOverlaySink,
+        build_injector, drain_sse_lines, handle_server_message,
+        spawn_injector_worker_with_capacity, EnqueueFailure, InjectionJob, NoopOverlaySink,
+        OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
     };
 
     struct SlowInjector {
@@ -1635,6 +2078,35 @@ mod tests {
         let cli_disabled =
             super::Cli::parse_from(["parakeet-ptt", "--overlay-adaptive-width", "false"]);
         assert_eq!(cli_disabled.overlay_adaptive_width, Some(false));
+    }
+
+    #[test]
+    fn cli_query_modifier_and_llm_defaults_are_set() {
+        let cli = super::Cli::parse_from(["parakeet-ptt"]);
+        assert_eq!(cli.query_modifier_key, super::DEFAULT_QUERY_MODIFIER_KEY);
+        assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
+        assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
+        assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn drain_sse_lines_handles_utf8_split_across_chunks() {
+        let mut buffer = Vec::<u8>::new();
+
+        let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"caf";
+        let second = b"\xC3\xA9\"}}]}\n";
+
+        buffer.extend_from_slice(first);
+        let first_lines = drain_sse_lines(&mut buffer, false).expect("first parse should succeed");
+        assert!(first_lines.is_empty());
+
+        buffer.extend_from_slice(second);
+        let lines = drain_sse_lines(&mut buffer, false).expect("second parse should succeed");
+        assert_eq!(
+            lines,
+            vec!["data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}"]
+        );
+        assert!(buffer.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -10,8 +10,10 @@ use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
-    Down,
+    Down { query_modifier_active: bool },
     Up,
+    QueryModifierDown,
+    QueryModifierUp,
 }
 
 pub struct HotkeyTasks {
@@ -74,10 +76,29 @@ pub fn ensure_input_access() -> Result<()> {
     bail!("No readable /dev/input/event* devices. {hint}")
 }
 
-pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyTasks> {
-    let devices = find_right_ctrl_devices()?;
+pub fn parse_key_name(name: &str) -> Result<Key> {
+    let normalized = name.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "KEY_RIGHTCTRL" | "RIGHTCTRL" | "RIGHT_CTRL" => Ok(Key::KEY_RIGHTCTRL),
+        "KEY_LEFTCTRL" | "LEFTCTRL" | "LEFT_CTRL" => Ok(Key::KEY_LEFTCTRL),
+        "KEY_RIGHTALT" | "RIGHTALT" | "RIGHT_ALT" => Ok(Key::KEY_RIGHTALT),
+        "KEY_LEFTALT" | "LEFTALT" | "LEFT_ALT" => Ok(Key::KEY_LEFTALT),
+        other => bail!("unsupported key name '{other}'"),
+    }
+}
+
+pub fn spawn_hotkey_loop(
+    tx: UnboundedSender<HotkeyEvent>,
+    talk_key: Key,
+    query_modifier_key: Key,
+) -> Result<HotkeyTasks> {
+    let devices = find_hotkey_devices(talk_key, query_modifier_key)?;
     if devices.is_empty() {
-        anyhow::bail!("no input devices exposing KEY_RIGHTCTRL were found");
+        anyhow::bail!(
+            "no input devices exposing talk key {:?} or query modifier {:?} were found",
+            talk_key,
+            query_modifier_key
+        );
     }
 
     let mut handles = Vec::new();
@@ -85,26 +106,50 @@ pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyTasks
     for mut device in devices {
         let tx = tx.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let mut is_down = false;
+            let mut talk_down = false;
+            let mut modifier_down = false;
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
-                            if let InputEventKind::Key(Key::KEY_RIGHTCTRL) = ev.kind() {
-                                match ev.value() {
-                                    1 => {
-                                        if !is_down {
-                                            let _ = tx.send(HotkeyEvent::Down);
-                                            is_down = true;
+                            if let InputEventKind::Key(key) = ev.kind() {
+                                if key == query_modifier_key {
+                                    match ev.value() {
+                                        1 => {
+                                            if !modifier_down {
+                                                let _ = tx.send(HotkeyEvent::QueryModifierDown);
+                                                modifier_down = true;
+                                            }
                                         }
-                                    }
-                                    0 => {
-                                        if is_down {
-                                            let _ = tx.send(HotkeyEvent::Up);
-                                            is_down = false;
+                                        0 => {
+                                            if modifier_down {
+                                                let _ = tx.send(HotkeyEvent::QueryModifierUp);
+                                                modifier_down = false;
+                                            }
                                         }
+                                        _ => {}
                                     }
-                                    _ => {}
+                                    continue;
+                                }
+
+                                if key == talk_key {
+                                    match ev.value() {
+                                        1 => {
+                                            if !talk_down {
+                                                let _ = tx.send(HotkeyEvent::Down {
+                                                    query_modifier_active: modifier_down,
+                                                });
+                                                talk_down = true;
+                                            }
+                                        }
+                                        0 => {
+                                            if talk_down {
+                                                let _ = tx.send(HotkeyEvent::Up);
+                                                talk_down = false;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -124,7 +169,7 @@ pub fn spawn_hotkey_loop(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyTasks
     Ok(HotkeyTasks { handles })
 }
 
-fn find_right_ctrl_devices() -> Result<Vec<Device>> {
+fn find_hotkey_devices(talk_key: Key, query_modifier_key: Key) -> Result<Vec<Device>> {
     let mut devices = Vec::new();
     let input_dir = Path::new("/dev/input");
     for entry in fs::read_dir(input_dir).context("failed to read /dev/input")? {
@@ -141,11 +186,9 @@ fn find_right_ctrl_devices() -> Result<Vec<Device>> {
 
         match Device::open(&path) {
             Ok(dev) => {
-                if dev
-                    .supported_keys()
-                    .map(|k| k.contains(Key::KEY_RIGHTCTRL))
-                    .unwrap_or(false)
-                {
+                if dev.supported_keys().is_some_and(|keys| {
+                    keys.contains(talk_key) || keys.contains(query_modifier_key)
+                }) {
                     // We intentionally do NOT set O_NONBLOCK so that fetch_events blocks.
                     // let raw_fd = dev.as_raw_fd();
                     // let _ = fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
@@ -158,4 +201,21 @@ fn find_right_ctrl_devices() -> Result<Vec<Device>> {
         }
     }
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_name;
+    use evdev::Key;
+
+    #[test]
+    fn parse_key_name_accepts_known_aliases() {
+        assert_eq!(parse_key_name("KEY_RIGHTCTRL").unwrap(), Key::KEY_RIGHTCTRL);
+        assert_eq!(parse_key_name("right_alt").unwrap(), Key::KEY_RIGHTALT);
+    }
+
+    #[test]
+    fn parse_key_name_rejects_unknown_values() {
+        assert!(parse_key_name("KEY_NOT_REAL").is_err());
+    }
 }
