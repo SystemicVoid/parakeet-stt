@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::ErrorKind;
 
@@ -87,17 +88,25 @@ pub fn parse_key_name(name: &str) -> Result<Key> {
     }
 }
 
+pub fn parse_modifier_key_names(name: &str) -> Result<Vec<Key>> {
+    let normalized = name.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "KEY_ALT" | "ALT" | "ANY_ALT" => Ok(vec![Key::KEY_LEFTALT, Key::KEY_RIGHTALT]),
+        _ => Ok(vec![parse_key_name(name)?]),
+    }
+}
+
 pub fn spawn_hotkey_loop(
     tx: UnboundedSender<HotkeyEvent>,
     talk_key: Key,
-    query_modifier_key: Key,
+    query_modifier_keys: Vec<Key>,
 ) -> Result<HotkeyTasks> {
-    let devices = find_hotkey_devices(talk_key, query_modifier_key)?;
+    let devices = find_hotkey_devices(talk_key, &query_modifier_keys)?;
     if devices.is_empty() {
         anyhow::bail!(
             "no input devices exposing talk key {:?} or query modifier {:?} were found",
             talk_key,
-            query_modifier_key
+            query_modifier_keys
         );
     }
 
@@ -105,26 +114,28 @@ pub fn spawn_hotkey_loop(
 
     for mut device in devices {
         let tx = tx.clone();
+        let query_modifier_keys = query_modifier_keys.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let mut talk_down = false;
-            let mut modifier_down = false;
+            let mut active_modifiers = HashSet::new();
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
                             if let InputEventKind::Key(key) = ev.kind() {
-                                if key == query_modifier_key {
+                                if query_modifier_keys.contains(&key) {
                                     match ev.value() {
                                         1 => {
-                                            if !modifier_down {
+                                            let was_empty = active_modifiers.is_empty();
+                                            if active_modifiers.insert(key) && was_empty {
                                                 let _ = tx.send(HotkeyEvent::QueryModifierDown);
-                                                modifier_down = true;
                                             }
                                         }
                                         0 => {
-                                            if modifier_down {
+                                            if active_modifiers.remove(&key)
+                                                && active_modifiers.is_empty()
+                                            {
                                                 let _ = tx.send(HotkeyEvent::QueryModifierUp);
-                                                modifier_down = false;
                                             }
                                         }
                                         _ => {}
@@ -137,7 +148,8 @@ pub fn spawn_hotkey_loop(
                                         1 => {
                                             if !talk_down {
                                                 let _ = tx.send(HotkeyEvent::Down {
-                                                    query_modifier_active: modifier_down,
+                                                    query_modifier_active: !active_modifiers
+                                                        .is_empty(),
                                                 });
                                                 talk_down = true;
                                             }
@@ -169,7 +181,7 @@ pub fn spawn_hotkey_loop(
     Ok(HotkeyTasks { handles })
 }
 
-fn find_hotkey_devices(talk_key: Key, query_modifier_key: Key) -> Result<Vec<Device>> {
+fn find_hotkey_devices(talk_key: Key, query_modifier_keys: &[Key]) -> Result<Vec<Device>> {
     let mut devices = Vec::new();
     let input_dir = Path::new("/dev/input");
     for entry in fs::read_dir(input_dir).context("failed to read /dev/input")? {
@@ -187,7 +199,10 @@ fn find_hotkey_devices(talk_key: Key, query_modifier_key: Key) -> Result<Vec<Dev
         match Device::open(&path) {
             Ok(dev) => {
                 if dev.supported_keys().is_some_and(|keys| {
-                    keys.contains(talk_key) || keys.contains(query_modifier_key)
+                    keys.contains(talk_key)
+                        || query_modifier_keys
+                            .iter()
+                            .any(|modifier| keys.contains(*modifier))
                 }) {
                     // We intentionally do NOT set O_NONBLOCK so that fetch_events blocks.
                     // let raw_fd = dev.as_raw_fd();
@@ -205,13 +220,21 @@ fn find_hotkey_devices(talk_key: Key, query_modifier_key: Key) -> Result<Vec<Dev
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_name;
+    use super::{parse_key_name, parse_modifier_key_names};
     use evdev::Key;
 
     #[test]
     fn parse_key_name_accepts_known_aliases() {
         assert_eq!(parse_key_name("KEY_RIGHTCTRL").unwrap(), Key::KEY_RIGHTCTRL);
         assert_eq!(parse_key_name("right_alt").unwrap(), Key::KEY_RIGHTALT);
+    }
+
+    #[test]
+    fn parse_modifier_key_names_accepts_any_alt_alias() {
+        assert_eq!(
+            parse_modifier_key_names("KEY_ALT").unwrap(),
+            vec![Key::KEY_LEFTALT, Key::KEY_RIGHTALT]
+        );
     }
 
     #[test]
