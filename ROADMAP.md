@@ -2,10 +2,11 @@
 
 Date: 2026-02-23
 
-Update: 2026-03-05
+Update: 2026-03-06
 
 - Runtime defaults are now profile-based: `stt`/`stt start` launches online stream+seal with overlay on (adaptive width off), while `stt off` launches offline/no-overlay.
 - Operator workflows are consolidated in root `justfile` (`just start|stop|status`, `just phase6-contract`, `just phase6-promotion`, `just eval ...`); legacy `justfile.overlay-dev` is removed.
+- Overlay rollout is complete enough for daily-driver use; the implementation log is now archived under `docs/archive/`.
 
 ## Goal
 
@@ -16,7 +17,7 @@ Turn Parakeet STT from "works with logs" into a premium local dictation experien
 - Core STT loop is operational and low-latency.
 - Injection stack has robust controls (`paste` mode, key backend, failure policy).
 - Daemon hardening gaps are now explicitly identified (disconnect cleanup invariants, CLI/env precedence, and streaming truthfulness).
-- Main UX gap is user feedback: state is visible in logs, not in an obvious UI channel.
+- Primary remaining UX gap is polish and ergonomics, not the absence of a feedback channel; overlay and status surfaces now exist.
 
 ## UX Principles
 
@@ -208,7 +209,7 @@ Status legend: `todo` | `in-progress` | `done` | `blocked`
 1. `A1` — status: `done` (2026-02-23); owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Disconnect/error cleanup invariant in daemon session lifecycle (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/audio.py`, `parakeet-stt-daemon/tests/test_session_cleanup.py`).
 2. `A2` — status: `done` (2026-02-23); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: CLI/env precedence fix for `status_enabled` and `streaming_enabled` (`parakeet-stt-daemon/src/parakeet_stt_daemon/__main__.py`).
 3. `A3` — status: `done` (2026-02-23); owner: `Owner-S1`; branch: `agent/a1-a3-session-hardening`; scope: Transactional start-session rollback semantics (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py`) plus disconnect-path session ownership guard.
-4. `A4` — status: `in-progress`; owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
+4. `A4` — status: `done` (2026-03-06); owner: `Owner-M1`; branch: `agent/b2-c1-observability`; scope: Runtime truth signals in `/status` and startup logging (`parakeet-stt-daemon/src/parakeet_stt_daemon/server.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`, `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`).
 5. `A5` — status: `done` (2026-02-23, bootstrap); owner: `Owner-M1`; branch: `agent/a2-config-precedence`; scope: Daemon test harness bootstrap + focused config precedence tests (`parakeet-stt-daemon/tests/`, `parakeet-stt-daemon/pyproject.toml`).
 6. `A6` — status: `done` (2026-02-23); owner: `Owner-S2`; branch: `agent/b1-streaming-integration`; scope: Streaming engine integration against supported NeMo API with explicit fallback signaling (`parakeet-stt-daemon/src/parakeet_stt_daemon/model.py`).
 7. `A7` — status: `done` (2026-03-05 update); owner: `Owner-S2`; branch: `agent/c2-c3-perf-guardrails`; scope: Helper policy and operator profiles (`scripts/stt-helper.sh`) now use profile defaults: `stt`/`stt start` for online stream+seal+overlay and `stt off` for offline/no-overlay.
