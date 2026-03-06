@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -71,6 +72,19 @@ class FakeIncrementalTranscriber:
         return ""
 
 
+class BlockingIncrementalTranscriber:
+    def __init__(self, output: str) -> None:
+        self.output = output
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del samples, sample_rate
+        self.started.set()
+        assert self.release.wait(timeout=1.0)
+        return self.output
+
+
 def _build_server(
     *,
     overlay_events_enabled: bool,
@@ -108,8 +122,10 @@ def _build_server(
     server._live_interim_failed = False
     server._overlay_event_seq_by_session = {}
     server._overlay_last_interim_text_by_session = {}
+    server._overlay_state_by_session = {}
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
+    server._websocket_send_locks = {}
 
     async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
         return "overlay test text", 7
@@ -385,6 +401,66 @@ def test_live_interim_chunk_emission_dedupes_repeated_text(monkeypatch) -> None:
             for payload in websocket.sent_json
             if payload["type"] in {"interim_state", "interim_text"}
         ] == [0, 1, 2]
+
+    asyncio.run(scenario())
+
+
+def test_late_live_interim_is_dropped_once_final_send_begins(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        server = _build_server(overlay_events_enabled=True)
+        transcriber = BlockingIncrementalTranscriber("late interim")
+        server.transcriber = transcriber
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+        final_started = asyncio.Event()
+        allow_final_send = asyncio.Event()
+
+        async def send_json(payload: dict[str, object]) -> None:
+            if payload.get("type") == "final_result":
+                final_started.set()
+                await allow_final_send.wait()
+            websocket.sent_json.append(payload)
+
+        websocket.send_json = send_json  # type: ignore[method-assign]
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        live_task = asyncio.create_task(
+            server._emit_live_interim_from_chunk(
+                cast(Any, websocket),
+                session_id,
+                np.full((400,), 0.2, dtype=np.float32),
+            )
+        )
+        await asyncio.to_thread(transcriber.started.wait)
+
+        stop_task = asyncio.create_task(
+            server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+        )
+        await final_started.wait()
+
+        transcriber.release.set()
+        allow_final_send.set()
+
+        await stop_task
+        await live_task
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types == [
+            "session_started",
+            "interim_state",
+            "interim_state",
+            "interim_state",
+            "final_result",
+            "session_ended",
+        ]
+        session_ended_index = sent_types.index("session_ended")
+        assert "interim_text" not in sent_types[session_ended_index + 1 :]
+
+        status = server.status()
+        assert status.overlay_events_emitted == 4
+        assert status.overlay_events_dropped == 1
 
     asyncio.run(scenario())
 
