@@ -39,7 +39,9 @@ Canonical-source policy:
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
 - Routing shortcuts (Terminal→CtrlShiftV, General→CtrlV, Unknown→CtrlShiftV), clipboard MIME type, and copy-foreground behavior are hardcoded constants — no longer configurable via CLI.
-- Machine-local LLM overrides should stay in `PARAKEET_LLM_*` env vars from your shell or an ignored repo-local file such as `.parakeet-stt.local.env`; do not commit workstation-specific endpoints or launcher paths.
+- `stt` auto-loads ignored repo-local files `.parakeet-stt.local.env` and `.parakeet-stt.local.sh` when present, so machine-local launcher paths stay out of tracked config.
+- `stt llm` manages a local `llama-server` in tmux session `parakeet-llm`, waits for `http://<host>:<port>/health`, then delegates to the normal `stt start` path.
+- Machine-local LLM overrides should stay in `PARAKEET_LLM_*` or `PARAKEET_LLM_SERVER_*` env vars from your shell or the ignored repo-local files; do not commit workstation-specific endpoints or launcher paths.
 
 ## Historical notes (pre-2026 migration hardening)
 
@@ -65,12 +67,13 @@ Canonical-source policy:
 
 ## Current helper behavior (after rewrite)
 - Default start uses tmux, detached: `stt` or `stt start` launches the daemon (nohup), then creates a tmux session `parakeet-stt` with a single window split into panes (top: client via `tee` to `/tmp/parakeet-ptt.log`; bottom: live `tail -f` of daemon+client logs). It waits for the daemon socket and a running client PID before printing “Dictation ready” and returning you to your shell.
-- Resolves repo paths dynamically from the helper location (or `PARAKEET_ROOT`), sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
+- Resolves repo paths dynamically from the helper location (or `PARAKEET_ROOT`), auto-loads ignored repo-local helper overrides, sets `RUST_LOG=info` if unset, and keeps `/tmp` PID files for the daemon (client PID is discovered after start).
 - Daemon PID tracking now refreshes from the bound listener port after startup/status checks, because the initial `uv run` launcher PID may differ from the long-lived Python server PID.
+- Managed LLM start (`stt llm`) uses a separate tmux session and log (`/tmp/parakeet-llama-server.log`), refreshes its PID from the bound listener port after health checks, and refuses mismatched `PARAKEET_LLM_BASE_URL` versus the managed host/port to avoid split-brain local config.
 - Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). Profile defaults determine whether `PARAKEET_STREAMING_ENABLED` is true (`stt`) or false (`stt off`). On failure, it prints the last daemon log lines.
 - Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, runs the release binary if present, otherwise `cargo run --release -- --endpoint <resolved endpoint>`; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
-- Commands: `stt`/`stt start` (default detached tmux, stream+seal profile), `stt off` (offline profile), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
+- Commands: `stt`/`stt start` (default detached tmux, stream+seal profile), `stt llm` (managed llama + STT), `stt off` (offline profile), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt llm logs`, `stt llm show`, `stt tmux [attach|kill]` (legacy direct tmux layout), `stt check` (daemon `--check`).
 
 ## Suspicions / hypotheses
 - The release binary may occasionally be in a bad state (stale build artifacts) and exits immediately; a rebuild should fix that, but we need logs to confirm.
