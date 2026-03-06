@@ -109,6 +109,7 @@ Local LLM query mode overrides:
 - `PARAKEET_LLM_BASE_URL`, `PARAKEET_LLM_MODEL`, `PARAKEET_LLM_TIMEOUT_SECONDS`
 - `PARAKEET_LLM_MAX_TOKENS`, `PARAKEET_LLM_TEMPERATURE`
 - `PARAKEET_LLM_SYSTEM_PROMPT`, `PARAKEET_LLM_OVERLAY_STREAM`
+- Managed local llama-server knobs for `stt llm`: `PARAKEET_LLM_SERVER_MODEL_PATH`, `PARAKEET_LLM_SERVER_MODEL_ALIAS`, `PARAKEET_LLM_SERVER_HOST`, `PARAKEET_LLM_SERVER_PORT`, `PARAKEET_LLM_SERVER_CTX_SIZE`, `PARAKEET_LLM_SERVER_GPU_LAYERS`, `PARAKEET_LLM_SERVER_PARALLEL`, `PARAKEET_LLM_SERVER_METRICS`, `PARAKEET_LLM_SERVER_EXTRA_ARGS`
 - Keep workstation-specific LLM endpoints or launcher details in shell env or an ignored repo-local file such as `.parakeet-stt.local.env`, not in tracked docs/config.
 
 Helper readiness timing:
@@ -124,11 +125,12 @@ COSMIC focus-navigation baseline for best adaptive behavior:
 Primary helper commands:
 
 - `stt start|restart|stop|status`
+- `stt llm [start|stop|restart|status|logs|show]` (managed llama-server + STT)
 - `stt show` (attach tmux)
 - `stt logs [client|daemon|both]`
 - `stt check` (daemon health)
 - `stt diag-injector` (injection diagnostics)
-- `stt help` and `stt help start` (full helper + start flag reference)
+- `stt help`, `stt help start`, and `stt help llm` (full helper reference)
 
 `stt start` flag parsing/help/runtime args are driven by a single metadata table in
 `scripts/stt-helper.sh` (`start_option_rows`).
