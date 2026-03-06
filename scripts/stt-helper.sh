@@ -535,6 +535,8 @@ CLIENTCMD
         local overlay_binary="$CLIENT_DIR/target/release/parakeet-overlay"
         local build_cmd="cargo build --release --bin parakeet-overlay"
         local build_output=""
+        local build_attempt=1
+        local max_build_attempts=2
 
         case "${overlay_required_raw,,}" in
             true|1|yes|on)
@@ -561,33 +563,42 @@ CLIENTCMD
         echo "   - Ensuring overlay binary is available (${build_cmd})..."
         echo "[helper] ensuring overlay binary via ${build_cmd}" >> "$LOG_CLIENT"
         build_output="$(mktemp)"
-        if (
-            cd "$CLIENT_DIR" || exit 1
-            RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >"$build_output" 2>&1
-        ); then
-            cat "$build_output" >> "$LOG_CLIENT"
-            rm -f "$build_output"
-            if [ ! -x "$overlay_binary" ]; then
-                echo "   - ERROR: overlay build reported success but binary is missing at $overlay_binary."
-                echo "   - Retry manually:"
-                echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
-                echo "[helper] overlay build succeeded but binary missing at $overlay_binary; aborting start" >> "$LOG_CLIENT"
-                return 1
+        while [ "$build_attempt" -le "$max_build_attempts" ]; do
+            if (
+                cd "$CLIENT_DIR" || exit 1
+                RUSTFLAGS="$ptt_rustflags" cargo build --release --bin parakeet-overlay >"$build_output" 2>&1
+            ); then
+                cat "$build_output" >> "$LOG_CLIENT"
+                rm -f "$build_output"
+                if [ ! -x "$overlay_binary" ]; then
+                    echo "   - ERROR: overlay build reported success but binary is missing at $overlay_binary."
+                    echo "   - Retry manually:"
+                    echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
+                    echo "[helper] overlay build succeeded but binary missing at $overlay_binary; aborting start" >> "$LOG_CLIENT"
+                    return 1
+                fi
+                return 0
             fi
-            return 0
-        fi
 
-        cat "$build_output" >> "$LOG_CLIENT"
-        echo "   - ERROR: overlay is enabled and build failed (${build_cmd})."
-        echo "   - Last overlay build output:"
-        tail -n 40 "$build_output"
-        echo "   - Full output saved to: $LOG_CLIENT"
-        echo "   - Retry manually:"
-        echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
-        echo "   - Or launch without overlay: stt start --overlay-enabled false"
-        echo "[helper] overlay build failed while required; aborting start" >> "$LOG_CLIENT"
-        rm -f "$build_output"
-        return 1
+            cat "$build_output" >> "$LOG_CLIENT"
+            if [ "$build_attempt" -lt "$max_build_attempts" ]; then
+                echo "   - Overlay build attempt ${build_attempt}/${max_build_attempts} failed; retrying..."
+                echo "[helper] overlay build attempt ${build_attempt}/${max_build_attempts} failed; retrying" >> "$LOG_CLIENT"
+                build_attempt=$((build_attempt + 1))
+                continue
+            fi
+
+            echo "   - ERROR: overlay is enabled and build failed (${build_cmd})."
+            echo "   - Last overlay build output:"
+            tail -n 40 "$build_output"
+            echo "   - Full output saved to: $LOG_CLIENT"
+            echo "   - Retry manually:"
+            echo "     cd \"$CLIENT_DIR\" && RUSTFLAGS=\"$ptt_rustflags\" $build_cmd"
+            echo "   - Or launch without overlay: stt start --overlay-enabled false"
+            echo "[helper] overlay build failed while required; aborting start" >> "$LOG_CLIENT"
+            rm -f "$build_output"
+            return 1
+        done
     }
 
     case "$cmd" in
