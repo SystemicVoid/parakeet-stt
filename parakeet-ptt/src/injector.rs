@@ -1,6 +1,7 @@
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -21,6 +22,11 @@ const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
 const STAGE_CLIPBOARD_READY: &str = "clipboard_ready";
 const STAGE_ROUTE_SHORTCUT: &str = "route_shortcut";
 const STAGE_BACKEND: &str = "backend";
+#[cfg(not(test))]
+const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 1_000;
+#[cfg(test)]
+const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 150;
+const INJECTOR_SUBPROCESS_POLL_MS: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
 enum InjectionStage {
@@ -147,6 +153,129 @@ fn injector_metrics() -> &'static InjectorMetrics {
 
 pub fn injector_metrics_snapshot() -> InjectorMetricsSnapshot {
     injector_metrics().snapshot()
+}
+
+#[derive(Debug)]
+struct TimedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let read_result = handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} reader thread panicked"))?;
+    read_result.with_context(|| format!("failed to read {label} pipe"))
+}
+
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+    trace_id: u64,
+    command_name: &'static str,
+) -> Result<ExitStatus> {
+    let started = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to query {command_name} process state"))?
+        {
+            Some(status) => return Ok(status),
+            None if started.elapsed() >= timeout => {
+                warn!(
+                    trace_id,
+                    command = command_name,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "subprocess exceeded timeout; killing child"
+                );
+                if let Err(err) = child.kill() {
+                    warn!(
+                        trace_id,
+                        command = command_name,
+                        error = %err,
+                        "failed to kill timed-out subprocess"
+                    );
+                }
+                if let Err(err) = child.wait() {
+                    warn!(
+                        trace_id,
+                        command = command_name,
+                        error = %err,
+                        "failed to reap timed-out subprocess"
+                    );
+                }
+                anyhow::bail!("{command_name} timed out after {} ms", timeout.as_millis());
+            }
+            None => std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_MS)),
+        }
+    }
+}
+
+fn command_status_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    trace_id: u64,
+    command_name: &'static str,
+) -> Result<ExitStatus> {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {command_name}"))?;
+    wait_for_child_exit(&mut child, timeout, trace_id, command_name)
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    trace_id: u64,
+    command_name: &'static str,
+) -> Result<TimedCommandOutput> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {command_name}"))?;
+    let stdout_reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{command_name} stdout pipe unavailable"))
+        .map(spawn_pipe_reader)?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("{command_name} stderr pipe unavailable"))
+        .map(spawn_pipe_reader)?;
+    let status = wait_for_child_exit(&mut child, timeout, trace_id, command_name);
+    let stdout = join_pipe_reader(stdout_reader, "stdout");
+    let stderr = join_pipe_reader(stderr_reader, "stderr");
+    let status = status?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+
+    if !stderr.is_empty() {
+        debug!(
+            trace_id,
+            command = command_name,
+            stderr = %String::from_utf8_lossy(&stderr),
+            "subprocess emitted stderr"
+        );
+    }
+
+    Ok(TimedCommandOutput { status, stdout })
 }
 
 pub trait TextInjector: Send + Sync {
@@ -337,7 +466,12 @@ impl ClipboardInjector {
             command.arg("--primary");
         }
 
-        let output = command.output().context("failed to spawn wl-paste")?;
+        let output = command_output_with_timeout(
+            command,
+            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            0,
+            "wl-paste",
+        )?;
 
         // It's okay if wl-paste fails (e.g. empty clipboard), we just return empty string.
         if !output.status.success() {
@@ -395,7 +529,13 @@ impl ClipboardInjector {
 
         // wl-copy forks a background helper by default. Piping stderr and reading
         // with wait_with_output can hang because the helper keeps the pipe open.
-        let status = child.wait().context("failed to wait for wl-copy")?;
+        let status = wait_for_child_exit(
+            &mut child,
+            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            0,
+            "wl-copy",
+        )
+        .context("failed to wait for wl-copy")?;
         debug!(?status, primary, "wl-copy finished");
         if !status.success() {
             anyhow::bail!("wl-copy exited with status {}", status);
@@ -564,11 +704,17 @@ impl ClipboardInjector {
                     args = ?Self::ydotool_shortcut_args(shortcut),
                     "sending paste chord"
                 );
-                let status = Command::new(binary)
+                let mut command = Command::new(binary);
+                command
                     .arg("key")
-                    .args(Self::ydotool_shortcut_args(shortcut))
-                    .status()
-                    .context("stage=backend failed to spawn ydotool for paste chord");
+                    .args(Self::ydotool_shortcut_args(shortcut));
+                let status = command_status_with_timeout(
+                    command,
+                    Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+                    trace_id,
+                    "ydotool",
+                )
+                .context("stage=backend failed to run ydotool for paste chord");
                 let status = match status {
                     Ok(status) => status,
                     Err(err) => {
@@ -1343,6 +1489,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn test_options() -> ClipboardOptions {
         ClipboardOptions {
@@ -1503,6 +1650,30 @@ mod tests {
         assert!(
             observed_delta >= attempts,
             "expected at least {attempts} backend failures recorded, observed {observed_delta}",
+        );
+    }
+
+    #[test]
+    fn timed_out_ydotool_backend_fails_fast_and_chain_recovers() {
+        let hanging_script = make_test_ydotool("#!/usr/bin/env bash\nsleep 5\n");
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Chain(vec![
+                PasteKeySender::Ydotool(hanging_script.clone()),
+                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
+            ]),
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+        };
+
+        let started = Instant::now();
+        let result = injector.run_shortcut(1, PasteShortcut::CtrlV);
+        fs::remove_file(&hanging_script).expect("test helper script should be removable");
+
+        assert!(result.is_ok(), "chain backend should recover after timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed out backend should be killed promptly"
         );
     }
 

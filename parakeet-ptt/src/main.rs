@@ -47,6 +47,10 @@ use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
+#[cfg(not(test))]
+const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
+#[cfg(test)]
+const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_RIGHTALT";
@@ -116,7 +120,25 @@ struct InjectionReport {
     queue_wait_ms: u64,
     run_ms: u64,
     total_worker_ms: u64,
+    error_kind: Option<InjectionErrorKind>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionErrorKind {
+    BackendFailure,
+    ExecutionTimeout,
+    WorkerTaskFailed,
+}
+
+impl InjectionErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendFailure => "backend_failure",
+            Self::ExecutionTimeout => "execution_timeout",
+            Self::WorkerTaskFailed => "worker_task_failed",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -127,6 +149,9 @@ struct InjectorQueueMetrics {
     enqueue_worker_gone_total: AtomicU64,
     worker_success_total: AtomicU64,
     worker_failure_total: AtomicU64,
+    worker_backend_failure_total: AtomicU64,
+    worker_execution_timeout_total: AtomicU64,
+    worker_task_failed_total: AtomicU64,
     worker_queue_wait_ms_total: AtomicU64,
     worker_run_ms_total: AtomicU64,
     queue_depth_high_water: AtomicU64,
@@ -500,10 +525,25 @@ impl InjectorQueueMetrics {
             .fetch_add(report.queue_wait_ms, Ordering::Relaxed);
         self.worker_run_ms_total
             .fetch_add(report.run_ms, Ordering::Relaxed);
-        if report.error.is_some() {
-            self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.worker_success_total.fetch_add(1, Ordering::Relaxed);
+        match report.error_kind {
+            Some(InjectionErrorKind::BackendFailure) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_backend_failure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(InjectionErrorKind::ExecutionTimeout) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_execution_timeout_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(InjectionErrorKind::WorkerTaskFailed) => {
+                self.worker_failure_total.fetch_add(1, Ordering::Relaxed);
+                self.worker_task_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                self.worker_success_total.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -516,6 +556,11 @@ impl InjectorQueueMetrics {
                 self.enqueue_worker_gone_total.load(Ordering::Relaxed),
             worker_success_total = self.worker_success_total.load(Ordering::Relaxed),
             worker_failure_total = self.worker_failure_total.load(Ordering::Relaxed),
+            worker_backend_failure_total =
+                self.worker_backend_failure_total.load(Ordering::Relaxed),
+            worker_execution_timeout_total =
+                self.worker_execution_timeout_total.load(Ordering::Relaxed),
+            worker_task_failed_total = self.worker_task_failed_total.load(Ordering::Relaxed),
             worker_queue_wait_ms_total = self.worker_queue_wait_ms_total.load(Ordering::Relaxed),
             worker_run_ms_total = self.worker_run_ms_total.load(Ordering::Relaxed),
             queue_depth_high_water = self.queue_depth_high_water.load(Ordering::Relaxed),
@@ -606,14 +651,36 @@ fn spawn_injector_worker_with_capacity(
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
             let worker_started = TokioInstant::now();
             let injector_for_job = Arc::clone(&worker_injector);
-            let result = tokio::task::spawn_blocking(move || injector_for_job.inject(&text)).await;
+            let injection_task =
+                tokio::task::spawn_blocking(move || injector_for_job.inject(&text));
+            tokio::pin!(injection_task);
+            let result = timeout(
+                TokioDuration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+                &mut injection_task,
+            )
+            .await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
-            let error = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(err)) => Some(format!("{err:#}")),
-                Err(err) => Some(format!("injector worker task failed: {err}")),
+            let (error_kind, error) = match result {
+                Ok(Ok(Ok(()))) => (None, None),
+                Ok(Ok(Err(err))) => (
+                    Some(InjectionErrorKind::BackendFailure),
+                    Some(format!("{err:#}")),
+                ),
+                Ok(Err(err)) => (
+                    Some(InjectionErrorKind::WorkerTaskFailed),
+                    Some(format!("injector worker task failed: {err}")),
+                ),
+                Err(_) => {
+                    injection_task.as_ref().abort();
+                    (
+                        Some(InjectionErrorKind::ExecutionTimeout),
+                        Some(format!(
+                            "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                        )),
+                    )
+                }
             };
             let report = InjectionReport {
                 session_id,
@@ -622,6 +689,7 @@ fn spawn_injector_worker_with_capacity(
                 queue_wait_ms,
                 run_ms,
                 total_worker_ms,
+                error_kind,
                 error,
             };
 
@@ -1746,11 +1814,12 @@ fn handle_injection_report(
     audio_feedback: &AudioFeedback,
 ) {
     worker.metrics().note_report(&report);
-    let success = report.error.is_none();
-    match report.error {
-        Some(error) => {
+    let success = report.error_kind.is_none() && report.error.is_none();
+    match (report.error_kind, report.error) {
+        (Some(error_kind), Some(error)) => {
             warn!(
                 session = %report.session_id,
+                error_kind = error_kind.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
@@ -1760,7 +1829,7 @@ fn handle_injection_report(
                 "injector worker reported failure"
             );
         }
-        None => {
+        (None, None) => {
             info!(
                 session = %report.session_id,
                 daemon_latency_ms = report.daemon_latency_ms,
@@ -1771,6 +1840,19 @@ fn handle_injection_report(
                 "injector worker completed job"
             );
             audio_feedback.play_completion();
+        }
+        (error_kind, error) => {
+            warn!(
+                session = %report.session_id,
+                error_kind = error_kind.map(InjectionErrorKind::as_str),
+                daemon_latency_ms = report.daemon_latency_ms,
+                daemon_audio_ms = report.daemon_audio_ms,
+                queue_wait_ms = report.queue_wait_ms,
+                run_ms = report.run_ms,
+                total_worker_ms = report.total_worker_ms,
+                error = ?error,
+                "injector worker reported inconsistent error classification"
+            );
         }
     }
 
@@ -2026,9 +2108,9 @@ mod tests {
 
     use super::{
         build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
-        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure, InjectionJob,
-        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
-        SessionIntent,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
+        InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter,
+        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
     struct SlowInjector {
@@ -2050,6 +2132,28 @@ mod tests {
 
     impl TextInjector for RecordingInjector {
         fn inject(&self, text: &str) -> Result<()> {
+            self.seen
+                .lock()
+                .expect("recording lock should be available")
+                .push(text.to_string());
+            Ok(())
+        }
+    }
+
+    struct TimeoutThenRecordingInjector {
+        calls: Arc<AtomicU64>,
+        seen: Arc<Mutex<Vec<String>>>,
+        timeout_sleep_ms: u64,
+    }
+
+    impl TextInjector for TimeoutThenRecordingInjector {
+        fn inject(&self, text: &str) -> Result<()> {
+            let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call_index == 0 {
+                std::thread::sleep(Duration::from_millis(self.timeout_sleep_ms));
+                return Ok(());
+            }
+
             self.seen
                 .lock()
                 .expect("recording lock should be available")
@@ -2901,6 +3005,86 @@ mod tests {
                 seq: 10,
                 text: "newest".to_string(),
             }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injector_worker_recovers_after_execution_timeout() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(TimeoutThenRecordingInjector {
+            calls: Arc::clone(&calls),
+            seen: Arc::clone(&seen),
+            timeout_sleep_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        worker
+            .enqueue(InjectionJob::new(
+                first_session,
+                "first wedges".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                second_session,
+                "second still works".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        let first_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("first report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(first_report.session_id, first_session);
+        assert_eq!(
+            first_report.error_kind,
+            Some(InjectionErrorKind::ExecutionTimeout)
+        );
+        assert!(
+            first_report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "timeout report should explain the failure"
+        );
+        worker.metrics().note_report(&first_report);
+
+        let second_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("second report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(second_report.session_id, second_session);
+        assert!(second_report.error.is_none());
+        assert_eq!(second_report.error_kind, None);
+        worker.metrics().note_report(&second_report);
+        assert_eq!(
+            seen.lock()
+                .expect("recording lock should be available")
+                .clone(),
+            vec!["second still works".to_string()]
+        );
+        assert_eq!(
+            worker
+                .metrics()
+                .worker_execution_timeout_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            worker
+                .metrics()
+                .worker_backend_failure_total
+                .load(Ordering::Relaxed),
+            0
         );
     }
 
