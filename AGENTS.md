@@ -20,6 +20,8 @@ The role of this file is to describe common mistakes and confusion points that a
 - Canonical playbook: `docs/engineering/harness-engineering-playbook.md`.
 - Keep `AGENTS.md` short and map-style; operational depth belongs in canonical docs and scripts.
 - Python static quality is consolidated on Ruff + ty. Prefer adding Ruff rules before adding overlapping one-off tools.
+- Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` (for example `uv run pytest ...`, `uv run ty check ...`); running them from repo root can miss that package environment/import path and give false failures.
+- Commit-hook caveat: pre-commit may rewrite staged Python files (typically Ruff import/order fixes), so after a failed `git commit` caused by hook-applied fixes, re-stage the touched files and retry the same commit.
 - Clarification: Ruff `BLE001` is blind exception handling; unreachable duplicate handler checks are `B014` / `B025`.
 
 ## STT Helper Flag Policy
