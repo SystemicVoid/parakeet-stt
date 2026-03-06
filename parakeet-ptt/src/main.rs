@@ -41,6 +41,7 @@ use crate::protocol::{
 use crate::state::PttState;
 use crate::surface_focus::WaylandFocusCache;
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
+use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
@@ -792,8 +793,26 @@ impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePo
     }
 }
 
+fn internal_overlay_args_from_env() -> Option<Vec<std::ffi::OsString>> {
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == INTERNAL_OVERLAY_MODE_ARG)
+    {
+        let mut overlay_args = Vec::with_capacity(raw_args.len().saturating_sub(1));
+        overlay_args.push(std::ffi::OsString::from("parakeet-overlay"));
+        overlay_args.extend(raw_args.into_iter().skip(2));
+        return Some(overlay_args);
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(overlay_args) = internal_overlay_args_from_env() {
+        return parakeet_ptt::overlay_renderer::run_from_args(overlay_args).await;
+    }
+
     let cli = Cli::parse();
     init_tracing();
 

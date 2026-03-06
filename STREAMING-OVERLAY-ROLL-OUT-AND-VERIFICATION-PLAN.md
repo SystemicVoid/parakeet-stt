@@ -1,6 +1,6 @@
 # Streaming Overlay + Seal-Final Injection: Canonical Plan
 
-_Last updated: 2026-03-03 (live UX findings: audio-reactive waveform, interim rewrite polish, injection-aware finalizing dismiss)_
+_Last updated: 2026-03-06 (renderer Phase A glyph cache landed with A/B perf evidence; helper overlay build path hardened with retry)_
 
 Historical-status note:
 - This file is an implementation log for rollout history and verification evidence.
@@ -85,6 +85,8 @@ Historical-status note:
 - 2026-03-03: Added end-to-end audio level event plumbing (`AudioLevel`) across protocol routing and overlay process boundaries, then consumed it in the renderer to drive a real-time waveform/VU treatment.
 - 2026-03-03: Polished interim rewrite motion by stabilizing staged suffix animations and full-string replacement transitions to avoid visible jitter during rapid partial-result updates.
 - 2026-03-03: Finalizing now carries forward last recognized interim text, accepts `injection_complete` as a one-shot dismiss signal, and falls back to a shorter 600ms auto-hide timeout when completion signals are absent.
+- 2026-03-06: Phase A renderer perf optimization landed: `TextRenderer` now uses a bounded per-glyph cache keyed by `(character, size_bits, font_identity)` with rollback switch `PARAKEET_OVERLAY_GLYPH_CACHE=true|false` (default enabled), preserving per-frame blending semantics.
+- 2026-03-06: `stt` helper startup hardened for transient cargo failures by retrying overlay build once before aborting (`scripts/stt-helper.sh` `_ensure_overlay_release_binary`), while keeping explicit failure output and manual retry instructions.
 
 ## Verification Ledger
 - 2026-02-28 (Phase 1 matrix): `cd parakeet-ptt && cargo test protocol` passed on overlay branch (6 protocol tests) and on `main` baseline (1 protocol test).
@@ -124,6 +126,8 @@ Historical-status note:
 - 2026-03-01 (output watchdog fallback): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (`src/main.rs`: 61 tests), including new `overlay_process::tests::output_watchdog_spawns_once_without_output_targeting`.
 - 2026-03-02 (ghosted slices fix): `cd parakeet-ptt && cargo fmt && cargo test && cargo clippy --all-targets -- -D warnings` passed (overlay binary unit target: 51 tests), including new shrink-damage width tests proving stale pixels are cleared on adaptive width shrink. Fix tracks previous committed width and damages the width union on shrink paths.
 - 2026-03-03 (Phase 8 audio/waveform + injection-aware finalizing): `cd parakeet-ptt && cargo test -p parakeet-ptt && prek run --all-files && prek run --stage pre-push --all-files` passed, including new coverage for `overlay_ipc::tests::injection_complete_serialization_roundtrip`, `overlay_state::tests::injection_complete_hides_matching_finalizing_session`, and `overlay_process::tests::manager_replay_ignores_injection_complete_as_latest_state`.
+- 2026-03-06 (Phase A glyph cache A/B benchmark): rebuilt optimized overlay binary (`RUSTFLAGS='-C target-cpu=native' cargo build --release --bin parakeet-overlay`) and ran cache ON/OFF synthetic workload comparison (`PARAKEET_OVERLAY_GLYPH_CACHE=true|false`) with `/usr/bin/time`; user CPU deltas were `-1.4%` (`960 stable`), `-2.2%` (`960 changing`), and `-2.2%` (`3840 stable`), with `960 listening_audio` effectively neutral (`+1.1%`, within short-run noise). Raw artifact: `/tmp/overlay-glyph-cache-bench-20260306.tsv`.
+- 2026-03-06 (helper overlay-build resilience): `bash -n scripts/stt-helper.sh`, `source scripts/stt-helper.sh && stt help start`, `prek run --files scripts/stt-helper.sh`, and end-to-end `stt` startup all passed with overlay enabled after retry-path hardening.
 
 ## Objective
 Implement a modern Rust overlay that displays session feedback (and interim text when available) during push-to-talk, while preserving the hard safety guarantee that only `final_result` triggers text injection.
