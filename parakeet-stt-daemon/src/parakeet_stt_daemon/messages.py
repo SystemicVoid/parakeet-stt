@@ -123,7 +123,11 @@ class StatusMessage(BaseModel):
     effective_device: str | None = None
     streaming_enabled: bool | None = None
     stream_helper_active: bool | None = None
+    stream_helper_scope: Literal["live_session_only"] | None = None
     stream_fallback_reason: str | None = None
+    finalization_mode: Literal["offline_seal"] | None = None
+    final_audio_source: Literal["canonical_session_audio"] | None = None
+    tail_trim_mode: Literal["rms", "vad"] | None = None
     vad_enabled: bool | None = None
     vad_active: bool | None = None
     vad_fallback_reason: str | None = None

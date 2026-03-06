@@ -327,9 +327,10 @@ class DaemonServer:
             logger.info(
                 "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
                 "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
-                "chars_per_sec={:.1f}, stream_helper_active={}, "
-                "stream_fallback_reason={}, vad_enabled={}, vad_active={}, "
-                "vad_fallback_reason={}",
+                "chars_per_sec={:.1f}, live_session_helper_active={}, "
+                "live_session_helper_scope={}, stream_fallback_reason={}, "
+                "finalization_mode={}, final_audio_source={}, tail_trim_mode={}, "
+                "vad_enabled={}, vad_active={}, vad_fallback_reason={}",
                 session.session_id,
                 audio_duration_raw,
                 audio_ms,
@@ -341,8 +342,12 @@ class DaemonServer:
                 text_len,
                 chars_per_sec,
                 self._stream_helper_active(),
+                self._stream_helper_scope(),
                 self._stream_fallback_reason(),
-                self._vad_enabled,
+                self._finalization_mode(),
+                self._final_audio_source(),
+                self._tail_trim_mode(),
+                bool(getattr(self, "_vad_enabled", False)),
                 self._vad_active(),
                 self._vad_fallback_reason(),
             )
@@ -688,8 +693,12 @@ class DaemonServer:
             effective_device=effective_device,
             streaming_enabled=self.settings.streaming_enabled,
             stream_helper_active=self._stream_helper_active(),
+            stream_helper_scope=self._stream_helper_scope(),
             stream_fallback_reason=self._stream_fallback_reason(),
-            vad_enabled=self._vad_enabled,
+            finalization_mode=self._finalization_mode(),
+            final_audio_source=self._final_audio_source(),
+            tail_trim_mode=self._tail_trim_mode(),
+            vad_enabled=bool(getattr(self, "_vad_enabled", False)),
             vad_active=self._vad_active(),
             vad_fallback_reason=self._vad_fallback_reason(),
             overlay_events_enabled=self.settings.overlay_events_enabled,
@@ -713,6 +722,9 @@ class DaemonServer:
             return False
         return self.streaming_transcriber.helper_active
 
+    def _stream_helper_scope(self) -> Literal["live_session_only"]:
+        return "live_session_only"
+
     def _stream_fallback_reason(self) -> str | None:
         if not self.settings.streaming_enabled:
             return None
@@ -720,13 +732,22 @@ class DaemonServer:
             return "streaming_transcriber_unavailable"
         return self.streaming_transcriber.fallback_reason
 
+    def _finalization_mode(self) -> Literal["offline_seal"]:
+        return "offline_seal"
+
+    def _final_audio_source(self) -> Literal["canonical_session_audio"]:
+        return "canonical_session_audio"
+
+    def _tail_trim_mode(self) -> Literal["rms", "vad"]:
+        return "vad" if self._vad_active() else "rms"
+
     def _vad_active(self) -> bool:
-        if not self._vad_enabled:
+        if not bool(getattr(self, "_vad_enabled", False)):
             return False
         return getattr(self, "_vad_model", None) is not None and self._vad_fallback_reason() is None
 
     def _vad_fallback_reason(self) -> str | None:
-        if not self._vad_enabled:
+        if not bool(getattr(self, "_vad_enabled", False)):
             return None
         failure_reason = getattr(self, "_vad_failure_reason", None)
         if failure_reason is not None:
@@ -943,13 +964,19 @@ def create_app(settings: ServerSettings) -> FastAPI:
         _log = logger.warning if runtime_degraded else logger.info
         _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
-            "stream_helper_active={}, stream_fallback_reason={}, vad_enabled={}, "
-            "vad_active={}, vad_fallback_reason={}, overlay_events_enabled={}",
+            "live_session_helper_active={}, live_session_helper_scope={}, "
+            "stream_fallback_reason={}, finalization_mode={}, final_audio_source={}, "
+            "tail_trim_mode={}, vad_enabled={}, vad_active={}, vad_fallback_reason={}, "
+            "overlay_events_enabled={}",
             server._requested_device,
             server._effective_device,
             server.settings.streaming_enabled,
             server._stream_helper_active(),
+            server._stream_helper_scope(),
             server._stream_fallback_reason(),
+            server._finalization_mode(),
+            server._final_audio_source(),
+            server._tail_trim_mode(),
             server._vad_enabled,
             server._vad_active(),
             server._vad_fallback_reason(),
