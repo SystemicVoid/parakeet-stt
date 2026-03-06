@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -172,5 +173,43 @@ def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() 
         stream = server._active_stream
         assert stream.feed_calls == []
         assert stream.finalize_called is False
+
+    asyncio.run(scenario())
+
+
+def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
+    async def scenario() -> None:
+        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server.settings = ServerSettings(device="cpu", streaming_enabled=False)
+        server.audio = SimpleNamespace(sample_rate=16_000)
+        server.transcriber = _RecordingTranscriber()
+        server.streaming_transcriber = None
+        server._active_stream = None
+
+        def slow_trim(samples: np.ndarray, _sample_rate: int) -> np.ndarray:
+            time.sleep(0.12)
+            return samples
+
+        server._trim_tail_silence = slow_trim
+
+        progress = asyncio.Event()
+
+        async def ticker() -> None:
+            await asyncio.sleep(0.02)
+            progress.set()
+
+        finalize_task = asyncio.create_task(
+            cast(DaemonServer, server)._finalise_transcription(
+                np.array([0.2, 0.1, 0.05], dtype=np.float32)
+            )
+        )
+        ticker_task = asyncio.create_task(ticker())
+
+        await asyncio.wait_for(progress.wait(), timeout=0.05)
+        text, infer_ms = await finalize_task
+        await ticker_task
+
+        assert text == "offline text"
+        assert infer_ms >= 0
 
     asyncio.run(scenario())

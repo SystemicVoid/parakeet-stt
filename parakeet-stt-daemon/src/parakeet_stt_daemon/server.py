@@ -96,8 +96,9 @@ class DaemonServer:
         self._live_interim_audio = np.zeros((0,), dtype=np.float32)
         self._live_interim_failed = False
         self._vad_model: object | None = None
-        self._vad_import_error: str | None = None
         self._vad_enabled = bool(settings.vad_enabled)
+        self._vad_failure_reason: str | None = None
+        self._vad_load_attempted = False
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
@@ -327,7 +328,8 @@ class DaemonServer:
                 "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
                 "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
                 "chars_per_sec={:.1f}, stream_helper_active={}, "
-                "stream_fallback_reason={}",
+                "stream_fallback_reason={}, vad_enabled={}, vad_active={}, "
+                "vad_fallback_reason={}",
                 session.session_id,
                 audio_duration_raw,
                 audio_ms,
@@ -340,6 +342,9 @@ class DaemonServer:
                 chars_per_sec,
                 self._stream_helper_active(),
                 self._stream_fallback_reason(),
+                self._vad_enabled,
+                self._vad_active(),
+                self._vad_fallback_reason(),
             )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
@@ -684,6 +689,9 @@ class DaemonServer:
             streaming_enabled=self.settings.streaming_enabled,
             stream_helper_active=self._stream_helper_active(),
             stream_fallback_reason=self._stream_fallback_reason(),
+            vad_enabled=self._vad_enabled,
+            vad_active=self._vad_active(),
+            vad_fallback_reason=self._vad_fallback_reason(),
             overlay_events_enabled=self.settings.overlay_events_enabled,
             overlay_events_emitted=getattr(self, "_overlay_events_emitted", 0),
             overlay_events_dropped=getattr(self, "_overlay_events_dropped", 0),
@@ -712,6 +720,93 @@ class DaemonServer:
             return "streaming_transcriber_unavailable"
         return self.streaming_transcriber.fallback_reason
 
+    def _vad_active(self) -> bool:
+        if not self._vad_enabled:
+            return False
+        return getattr(self, "_vad_model", None) is not None and self._vad_fallback_reason() is None
+
+    def _vad_fallback_reason(self) -> str | None:
+        if not self._vad_enabled:
+            return None
+        failure_reason = getattr(self, "_vad_failure_reason", None)
+        if failure_reason is not None:
+            return str(failure_reason)
+        if getattr(self, "_vad_model", None) is not None:
+            return None
+        if not bool(getattr(self, "_vad_load_attempted", False)):
+            return "load_not_attempted"
+        return "model_unavailable"
+
+    def _format_vad_failure_reason(
+        self,
+        stage: Literal["load_failed", "runtime_failed", "warmup_failed"],
+        exc: Exception,
+    ) -> str:
+        if isinstance(exc, ModuleNotFoundError):
+            missing_dependency = exc.name or "unknown"
+            return f"{stage}:missing_dependency:{missing_dependency}"
+        return f"{stage}:{exc.__class__.__name__}"
+
+    def _load_vad_model(self) -> object:
+        from silero_vad import load_silero_vad
+
+        return load_silero_vad(onnx=True)
+
+    def _ensure_vad_ready(self) -> bool:
+        if not self._vad_enabled:
+            return False
+        if (
+            getattr(self, "_vad_model", None) is not None
+            and getattr(self, "_vad_failure_reason", None) is None
+        ):
+            return True
+        if getattr(self, "_vad_failure_reason", None) is not None:
+            return False
+
+        self._vad_load_attempted = True
+        try:
+            self._vad_model = self._load_vad_model()
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._vad_failure_reason = self._format_vad_failure_reason("load_failed", exc)
+            logger.warning("Silero VAD unavailable; falling back to RMS trim: {}", exc)
+            return False
+        return True
+
+    def _run_vad_inference(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        import torch
+        from silero_vad import get_speech_timestamps
+
+        if self._vad_model is None:  # pragma: no cover - guarded by _ensure_vad_ready
+            raise RuntimeError("Silero VAD model not loaded")
+
+        audio = samples.astype(np.float32, copy=False)
+        waveform = torch.from_numpy(audio)
+        speech_spans = get_speech_timestamps(
+            waveform,
+            self._vad_model,
+            sampling_rate=sample_rate,
+        )
+        if not speech_spans:
+            return np.zeros((0,), dtype=np.float32)
+        end_sample = int(speech_spans[-1].get("end", 0))
+        end_sample = max(0, min(end_sample, audio.size))
+        return audio[:end_sample]
+
+    def prepare_vad(self) -> None:
+        if not self._vad_enabled:
+            return
+        if not self._ensure_vad_ready():
+            return
+        try:
+            _ = self._run_vad_inference(
+                np.zeros((self.audio.sample_rate,), dtype=np.float32),
+                self.audio.sample_rate,
+            )
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._vad_failure_reason = self._format_vad_failure_reason("warmup_failed", exc)
+            self._vad_model = None
+            logger.warning("Silero VAD warmup failed; disabling VAD tail trim: {}", exc)
+
     def _gpu_mem_mb(self) -> int | None:
         try:
             import torch
@@ -735,11 +830,14 @@ class DaemonServer:
 
     async def _finalise_transcription(self, audio_samples: np.ndarray) -> tuple[str, int]:
         # The full capture buffer is the only authoritative source for final decode.
-        trimmed = self._trim_tail_silence(audio_samples, self.audio.sample_rate)
+        loop = asyncio.get_running_loop()
+        trimmed = await loop.run_in_executor(
+            None,
+            partial(self._trim_tail_silence, audio_samples, self.audio.sample_rate),
+        )
         if trimmed.size == 0:
             logger.info("Skipping offline transcription: silence trimming removed all samples")
             return "", 0
-        loop = asyncio.get_running_loop()
         infer_started = time.perf_counter()
         text = await loop.run_in_executor(
             None,
@@ -795,35 +893,14 @@ class DaemonServer:
     def _trim_tail_with_vad(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
         if not bool(getattr(self, "_vad_enabled", False)):
             return None
-        if getattr(self, "_vad_import_error", None) is not None:
+        if not self._ensure_vad_ready():
             return None
-        if getattr(self, "_vad_model", None) is None:
-            try:
-                from silero_vad import load_silero_vad
-
-                self._vad_model = load_silero_vad(onnx=True)
-            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                self._vad_import_error = f"{exc.__class__.__name__}"
-                logger.warning("Silero VAD unavailable; falling back to RMS trim: {}", exc)
-                return None
 
         try:
-            import torch
-            from silero_vad import get_speech_timestamps
-
-            audio = samples.astype(np.float32, copy=False)
-            waveform = torch.from_numpy(audio)
-            speech_spans = get_speech_timestamps(
-                waveform,
-                self._vad_model,
-                sampling_rate=sample_rate,
-            )
-            if not speech_spans:
-                return np.zeros((0,), dtype=np.float32)
-            end_sample = int(speech_spans[-1].get("end", 0))
-            end_sample = max(0, min(end_sample, audio.size))
-            return audio[:end_sample]
+            return self._run_vad_inference(samples, sample_rate)
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._vad_failure_reason = self._format_vad_failure_reason("runtime_failed", exc)
+            self._vad_model = None
             logger.warning("Silero VAD tail trim failed; falling back to RMS trim: {}", exc)
             return None
 
@@ -858,18 +935,24 @@ def create_app(settings: ServerSettings) -> FastAPI:
             await asyncio.to_thread(server.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
-        streaming_degraded = (
+        if server._vad_enabled:
+            await asyncio.to_thread(server.prepare_vad)
+        runtime_degraded = (
             server.settings.streaming_enabled and not server._stream_helper_active()
-        )
-        _log = logger.warning if streaming_degraded else logger.info
+        ) or (server._vad_enabled and not server._vad_active())
+        _log = logger.warning if runtime_degraded else logger.info
         _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
-            "stream_helper_active={}, stream_fallback_reason={}, overlay_events_enabled={}",
+            "stream_helper_active={}, stream_fallback_reason={}, vad_enabled={}, "
+            "vad_active={}, vad_fallback_reason={}, overlay_events_enabled={}",
             server._requested_device,
             server._effective_device,
             server.settings.streaming_enabled,
             server._stream_helper_active(),
             server._stream_fallback_reason(),
+            server._vad_enabled,
+            server._vad_active(),
+            server._vad_fallback_reason(),
             server.settings.overlay_events_enabled,
         )
         yield

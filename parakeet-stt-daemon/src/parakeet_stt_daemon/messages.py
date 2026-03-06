@@ -124,6 +124,9 @@ class StatusMessage(BaseModel):
     streaming_enabled: bool | None = None
     stream_helper_active: bool | None = None
     stream_fallback_reason: str | None = None
+    vad_enabled: bool | None = None
+    vad_active: bool | None = None
+    vad_fallback_reason: str | None = None
     overlay_events_enabled: bool | None = None
     overlay_events_emitted: int | None = None
     overlay_events_dropped: int | None = None
