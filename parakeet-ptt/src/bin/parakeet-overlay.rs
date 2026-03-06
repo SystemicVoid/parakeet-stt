@@ -1,8 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::PI;
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -28,10 +30,12 @@ use parakeet_ptt::overlay_state::{
 const FALLBACK_WINDOW_TITLE: &str = "Parakeet Overlay";
 const LAYER_NAMESPACE: &str = "parakeet-overlay";
 const OVERLAY_ADAPTIVE_WIDTH_ENV: &str = "PARAKEET_OVERLAY_ADAPTIVE_WIDTH";
+const OVERLAY_GLYPH_CACHE_ENV: &str = "PARAKEET_OVERLAY_GLYPH_CACHE";
 const DEFAULT_FONT_FAMILY: &str = "Sans";
 const DEFAULT_FONT_SIZE_PX: f32 = 18.0;
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 10.0..=64.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.45;
+const GLYPH_CACHE_CAPACITY: usize = 512;
 
 // --- Design System ---
 const BG_COLOR: (u8, u8, u8) = (22, 22, 26);
@@ -195,6 +199,20 @@ fn resolve_adaptive_width_override(cli_override: Option<bool>) -> bool {
         .as_deref()
         .and_then(parse_bool_override)
         .unwrap_or(true)
+}
+
+fn resolve_glyph_cache_enabled() -> bool {
+    std::env::var(OVERLAY_GLYPH_CACHE_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_bool_override)
+        .unwrap_or(true)
+}
+
+fn font_identity_token(family: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    family.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -1157,9 +1175,128 @@ struct FontResolutionSummary {
     fallback_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphCacheKey {
+    character: char,
+    size_bits: u32,
+    font_identity: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlyphMetrics {
+    width: usize,
+    height: usize,
+    xmin: i32,
+    ymin: i32,
+    advance_width: f32,
+}
+
+impl GlyphMetrics {
+    fn from_fontdue(metrics: fontdue::Metrics) -> Self {
+        Self {
+            width: metrics.width,
+            height: metrics.height,
+            xmin: metrics.xmin,
+            ymin: metrics.ymin,
+            advance_width: metrics.advance_width,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedGlyph {
+    metrics: GlyphMetrics,
+    bitmap: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GlyphCacheStats {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+#[derive(Debug, Clone)]
+struct GlyphCache {
+    enabled: bool,
+    capacity: usize,
+    entries: HashMap<GlyphCacheKey, CachedGlyph>,
+    insertion_order: VecDeque<GlyphCacheKey>,
+    stats: GlyphCacheStats,
+}
+
+impl GlyphCache {
+    fn new(enabled: bool, capacity: usize) -> Self {
+        Self {
+            enabled,
+            capacity,
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            stats: GlyphCacheStats::default(),
+        }
+    }
+
+    fn get_or_insert_with<F>(
+        &mut self,
+        key: GlyphCacheKey,
+        rasterize: F,
+    ) -> (GlyphMetrics, Arc<[u8]>)
+    where
+        F: FnOnce() -> (GlyphMetrics, Vec<u8>),
+    {
+        if !self.enabled {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            let (metrics, bitmap) = rasterize();
+            return (metrics, Arc::<[u8]>::from(bitmap));
+        }
+
+        if let Some(entry) = self.entries.get(&key) {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            return (entry.metrics, Arc::clone(&entry.bitmap));
+        }
+
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        let (metrics, bitmap) = rasterize();
+        let bitmap = Arc::<[u8]>::from(bitmap);
+
+        if self.capacity > 0 && self.entries.len() >= self.capacity {
+            if let Some(evicted) = self.insertion_order.pop_front() {
+                if self.entries.remove(&evicted).is_some() {
+                    self.stats.evictions = self.stats.evictions.saturating_add(1);
+                }
+            }
+        }
+
+        if self.capacity > 0 {
+            self.insertion_order.push_back(key);
+            self.entries.insert(
+                key,
+                CachedGlyph {
+                    metrics,
+                    bitmap: Arc::clone(&bitmap),
+                },
+            );
+        }
+
+        (metrics, bitmap)
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> GlyphCacheStats {
+        self.stats
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &GlyphCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+}
+
 struct TextRenderer {
     summary: FontResolutionSummary,
     font: Option<Font>,
+    font_identity: u64,
+    glyph_cache: GlyphCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1277,21 +1414,51 @@ impl TextRenderer {
             size_px: parsed.size_px,
             fallback_reason,
         };
+        let glyph_cache_enabled = resolve_glyph_cache_enabled();
+        let font_identity = font_identity_token(&summary.family);
 
         info!(
             requested_font = %summary.requested,
             resolved_font_family = %summary.family,
             resolved_font_size_px = summary.size_px,
             fallback_reason = summary.fallback_reason.as_deref().unwrap_or("none"),
+            glyph_cache_enabled,
+            glyph_cache_capacity = GLYPH_CACHE_CAPACITY,
             "overlay font resolved"
         );
 
-        Self { summary, font }
+        Self {
+            summary,
+            font,
+            font_identity,
+            glyph_cache: GlyphCache::new(glyph_cache_enabled, GLYPH_CACHE_CAPACITY),
+        }
+    }
+
+    fn measure_char_advance(&self, character: char) -> f32 {
+        self.font
+            .as_ref()
+            .map(|font| font.metrics(character, self.summary.size_px).advance_width)
+            .unwrap_or(0.0)
+    }
+
+    fn rasterize_cached_glyph(&mut self, character: char) -> Option<(GlyphMetrics, Arc<[u8]>)> {
+        let font = self.font.as_ref()?;
+        let key = GlyphCacheKey {
+            character,
+            size_bits: self.summary.size_px.to_bits(),
+            font_identity: self.font_identity,
+        };
+        let size_px = self.summary.size_px;
+        Some(self.glyph_cache.get_or_insert_with(key, || {
+            let (metrics, bitmap) = font.rasterize(character, size_px);
+            (GlyphMetrics::from_fontdue(metrics), bitmap)
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn draw_headline(
-        &self,
+        &mut self,
         frame: &mut [u8],
         dimensions: SurfaceDimensions,
         content: ContentArea,
@@ -1301,16 +1468,16 @@ impl TextRenderer {
         fade_alpha: f32,
         interim_fade: Option<(usize, usize, u64)>,
     ) {
-        let Some(font) = &self.font else {
+        if self.font.is_none() {
             return;
-        };
+        }
 
         let text_area_width = max_width_px
             .clamp(64, content.width)
             .saturating_sub(PADDING_LEFT + PADDING_H);
         let line_limit = max_lines.clamp(1, 10);
         let lines = layout_text_lines(text, text_area_width, line_limit, |character| {
-            font.metrics(character, self.summary.size_px).advance_width
+            self.measure_char_advance(character)
         });
         if lines.is_empty() {
             return;
@@ -1340,11 +1507,12 @@ impl TextRenderer {
                     };
                 char_index = char_index.saturating_add(1);
                 if per_char_alpha <= 0.0 {
-                    let metrics = font.metrics(character, self.summary.size_px);
-                    cursor_x += metrics.advance_width;
+                    cursor_x += self.measure_char_advance(character);
                     continue;
                 }
-                let (metrics, bitmap) = font.rasterize(character, self.summary.size_px);
+                let Some((metrics, bitmap)) = self.rasterize_cached_glyph(character) else {
+                    continue;
+                };
                 let glyph_x = cursor_x.floor() as i32 + metrics.xmin;
                 let glyph_y = baseline - metrics.height as i32 - metrics.ymin;
                 let text_alpha = (per_char_alpha * 255.0).round() as u8;
@@ -1362,7 +1530,7 @@ impl TextRenderer {
                     dimensions,
                     (glyph_x, glyph_y + 1),
                     (metrics.width, metrics.height),
-                    &bitmap,
+                    bitmap.as_ref(),
                     text_shadow_premul,
                 );
                 // Main pass
@@ -1371,7 +1539,7 @@ impl TextRenderer {
                     dimensions,
                     (glyph_x, glyph_y),
                     (metrics.width, metrics.height),
-                    &bitmap,
+                    bitmap.as_ref(),
                     text_color_premul,
                 );
                 cursor_x += metrics.advance_width;
@@ -2140,7 +2308,7 @@ impl WaylandRuntime {
                 self.dimensions,
                 intent,
                 ui,
-                &self.text_renderer,
+                &mut self.text_renderer,
                 fade_alpha,
                 content,
                 y_offset,
@@ -2705,7 +2873,7 @@ fn render_frame(
     dimensions: SurfaceDimensions,
     intent: &OverlayRenderIntent,
     ui: &OverlayUiConfig,
-    text_renderer: &TextRenderer,
+    text_renderer: &mut TextRenderer,
     fade_alpha: f32,
     content: ContentArea,
     y_offset: f32,
@@ -3203,8 +3371,9 @@ mod tests {
         resolve_adaptive_width_with_env_input, resolve_backend_selection, rounded_rect_coverage,
         shared_prefix_len, shared_suffix_len, should_apply_breathing, staggered_char_fade_alpha,
         BackendSelection, BackendSignals, CliAnchor, CliBackendMode, FadeDirection, FadeState,
-        FontResolutionSummary, OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer,
-        WidthState, BREATHING_CYCLE_MS, CHAR_FADEIN_MS, CHAR_STAGGER_MS, SHADOW_RADIUS,
+        FontResolutionSummary, GlyphCache, GlyphCacheKey, GlyphCacheStats, GlyphMetrics,
+        OverlayUiConfig, ParsedFontDescriptor, Rect, TextRenderer, WidthState, BREATHING_CYCLE_MS,
+        CHAR_FADEIN_MS, CHAR_STAGGER_MS, GLYPH_CACHE_CAPACITY, SHADOW_RADIUS,
     };
     use clap::Parser;
     use parakeet_ptt::overlay_state::{OverlayRenderIntent, OverlayRenderPhase};
@@ -3357,6 +3526,126 @@ mod tests {
     }
 
     #[test]
+    fn glyph_cache_key_includes_font_identity_and_size_bits() {
+        let base = GlyphCacheKey {
+            character: 'a',
+            size_bits: 18.0f32.to_bits(),
+            font_identity: 11,
+        };
+        assert_ne!(
+            base,
+            GlyphCacheKey {
+                character: 'a',
+                size_bits: 19.0f32.to_bits(),
+                font_identity: 11,
+            }
+        );
+        assert_ne!(
+            base,
+            GlyphCacheKey {
+                character: 'a',
+                size_bits: 18.0f32.to_bits(),
+                font_identity: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_cache_tracks_hits_and_fifo_evictions() {
+        let mut cache = GlyphCache::new(true, 2);
+        let key_a = GlyphCacheKey {
+            character: 'a',
+            size_bits: 18.0f32.to_bits(),
+            font_identity: 1,
+        };
+        let key_b = GlyphCacheKey {
+            character: 'b',
+            size_bits: 18.0f32.to_bits(),
+            font_identity: 1,
+        };
+        let key_c = GlyphCacheKey {
+            character: 'c',
+            size_bits: 18.0f32.to_bits(),
+            font_identity: 1,
+        };
+
+        let make = || {
+            (
+                GlyphMetrics {
+                    width: 1,
+                    height: 1,
+                    xmin: 0,
+                    ymin: 0,
+                    advance_width: 1.0,
+                },
+                vec![255],
+            )
+        };
+
+        let _ = cache.get_or_insert_with(key_a, make);
+        let _ = cache.get_or_insert_with(key_a, || panic!("cache hit should avoid rasterize"));
+        let _ = cache.get_or_insert_with(key_b, make);
+        let _ = cache.get_or_insert_with(key_c, make);
+
+        assert!(!cache.contains(&key_a), "oldest entry should be evicted");
+        assert!(cache.contains(&key_b));
+        assert!(cache.contains(&key_c));
+        assert_eq!(
+            cache.stats(),
+            GlyphCacheStats {
+                hits: 1,
+                misses: 3,
+                evictions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_cache_disabled_never_reuses_entries() {
+        let mut cache = GlyphCache::new(false, 2);
+        let key = GlyphCacheKey {
+            character: 'z',
+            size_bits: 18.0f32.to_bits(),
+            font_identity: 9,
+        };
+
+        let _ = cache.get_or_insert_with(key, || {
+            (
+                GlyphMetrics {
+                    width: 1,
+                    height: 1,
+                    xmin: 0,
+                    ymin: 0,
+                    advance_width: 1.0,
+                },
+                vec![128],
+            )
+        });
+        let _ = cache.get_or_insert_with(key, || {
+            (
+                GlyphMetrics {
+                    width: 1,
+                    height: 1,
+                    xmin: 0,
+                    ymin: 0,
+                    advance_width: 1.0,
+                },
+                vec![64],
+            )
+        });
+
+        assert!(!cache.contains(&key));
+        assert_eq!(
+            cache.stats(),
+            GlyphCacheStats {
+                hits: 0,
+                misses: 2,
+                evictions: 0,
+            }
+        );
+    }
+
+    #[test]
     fn shared_prefix_detection() {
         assert_eq!(shared_prefix_len("hello world", "hello rust"), 6);
         assert_eq!(shared_prefix_len("alpha", "beta"), 0);
@@ -3421,7 +3710,7 @@ mod tests {
         };
         let dimensions = ui.surface_dimensions();
         let content = ui.content_area();
-        let text_renderer = TextRenderer {
+        let mut text_renderer = TextRenderer {
             summary: FontResolutionSummary {
                 requested: "Sans 18".to_string(),
                 family: "Sans".to_string(),
@@ -3429,6 +3718,8 @@ mod tests {
                 fallback_reason: None,
             },
             font: None,
+            font_identity: 0,
+            glyph_cache: GlyphCache::new(true, GLYPH_CACHE_CAPACITY),
         };
 
         let mut hidden_frame = vec![255u8; (dimensions.width * dimensions.height * 4) as usize];
@@ -3442,7 +3733,7 @@ mod tests {
                 detail: None,
             },
             &ui,
-            &text_renderer,
+            &mut text_renderer,
             0.0,
             content,
             0.0,
@@ -3466,7 +3757,7 @@ mod tests {
                 detail: None,
             },
             &ui,
-            &text_renderer,
+            &mut text_renderer,
             1.0,
             content,
             0.0,
@@ -3499,7 +3790,7 @@ mod tests {
 
         let dimensions = low_opacity_ui.surface_dimensions();
         let content = low_opacity_ui.content_area();
-        let text_renderer = TextRenderer {
+        let mut text_renderer = TextRenderer {
             summary: FontResolutionSummary {
                 requested: "Sans 18".to_string(),
                 family: "Sans".to_string(),
@@ -3507,6 +3798,8 @@ mod tests {
                 fallback_reason: None,
             },
             font: None,
+            font_identity: 0,
+            glyph_cache: GlyphCache::new(true, GLYPH_CACHE_CAPACITY),
         };
         let visible = OverlayRenderIntent {
             phase: OverlayRenderPhase::Listening,
@@ -3523,7 +3816,7 @@ mod tests {
             dimensions,
             &visible,
             &base_ui,
-            &text_renderer,
+            &mut text_renderer,
             1.0,
             content,
             0.0,
@@ -3541,7 +3834,7 @@ mod tests {
             dimensions,
             &visible,
             &low_opacity_ui,
-            &text_renderer,
+            &mut text_renderer,
             1.0,
             content,
             0.0,
