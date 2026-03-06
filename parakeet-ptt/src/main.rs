@@ -1099,11 +1099,7 @@ fn sanitize_model_answer(raw: &str) -> String {
     }
 
     let trimmed = output.trim();
-    if trimmed.is_empty() {
-        raw.trim().to_string()
-    } else {
-        trimmed.to_string()
-    }
+    trimmed.to_string()
 }
 
 fn drain_sse_lines(buffer: &mut Vec<u8>, flush_partial: bool) -> Result<Vec<String>> {
@@ -1963,7 +1959,7 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, drain_sse_lines, handle_server_message,
+        build_injector, drain_sse_lines, handle_server_message, sanitize_model_answer,
         spawn_injector_worker_with_capacity, EnqueueFailure, InjectionJob, NoopOverlaySink,
         OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
     };
@@ -2087,6 +2083,16 @@ mod tests {
         assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
         assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
         assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn sanitize_model_answer_strips_think_blocks_without_raw_fallback() {
+        assert_eq!(sanitize_model_answer("<think>hidden</think>"), "");
+        assert_eq!(sanitize_model_answer("<think>hidden"), "");
+        assert_eq!(
+            sanitize_model_answer("<think>hidden</think> visible"),
+            "visible"
+        );
     }
 
     #[test]
