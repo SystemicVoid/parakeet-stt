@@ -194,14 +194,22 @@ def run_checks(settings: ServerSettings) -> None:
         helper_class = getattr(server.streaming_transcriber, "_helper_class_name", None)
         if helper_active:
             logger.info(
-                "Streaming helper: ACTIVE (class={})",
+                "Live session helper: ACTIVE (class={}, scope={})",
                 helper_class,
+                server._stream_helper_scope(),
             )
         else:
             logger.warning(
-                "Streaming helper: INACTIVE (reason={}). Transcription will use offline fallback.",
+                "Live session helper: INACTIVE (scope={}, reason={})",
+                server._stream_helper_scope(),
                 fallback_reason,
             )
+    logger.info(
+        "Final transcript path: {} (audio_source={}, tail_trim_mode={})",
+        server._finalization_mode(),
+        server._final_audio_source(),
+        server._tail_trim_mode(),
+    )
     if settings.vad_enabled:
         if server._vad_active():
             logger.info("VAD trim: ACTIVE (backend=silero_onnx)")
