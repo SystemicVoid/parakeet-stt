@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "parakeet-stt-daemon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Parakeet push-to-talk daemon (WebSocket API + NeMo streaming)."
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,6 +21,7 @@ dependencies = [
   "silero-vad>=6,<7",
   "soundfile>=0.13.1",
   "omegaconf>=2.3.0",
+  "onnxruntime>=1.22,<2",
 ]
 
 [project.urls]
