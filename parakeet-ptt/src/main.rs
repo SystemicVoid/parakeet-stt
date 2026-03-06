@@ -1129,6 +1129,27 @@ fn drain_sse_lines(buffer: &mut Vec<u8>, flush_partial: bool) -> Result<Vec<Stri
     Ok(lines)
 }
 
+fn maybe_defer_llm_session_end(
+    message: &ServerMessage,
+    state: &PttState,
+    active_intent: Option<SessionIntent>,
+    llm_in_flight_session: Option<Uuid>,
+) -> Option<(Uuid, Option<String>)> {
+    let ServerMessage::SessionEnded { session_id, reason } = message else {
+        return None;
+    };
+
+    let waiting_for_llm_final = active_intent == Some(SessionIntent::LlmQuery)
+        && session_id_from_state(state) == Some(*session_id);
+    let llm_generation_running = llm_in_flight_session == Some(*session_id);
+
+    if waiting_for_llm_final || llm_generation_running {
+        Some((*session_id, reason.clone()))
+    } else {
+        None
+    }
+}
+
 async fn fetch_llm_streamed_answer(
     llm: &LlmRuntimeConfig,
     session_id: Uuid,
@@ -1406,8 +1427,10 @@ async fn run_hotkey_mode(
     let mut backoff = TokioDuration::from_millis(500);
     let mut llm_busy = false;
     let mut active_intent: Option<SessionIntent> = None;
+    let mut llm_in_flight_session: Option<Uuid> = None;
     let mut llm_seq: HashMap<Uuid, u64> = HashMap::new();
     let mut llm_overlay_text: HashMap<Uuid, String> = HashMap::new();
+    let mut llm_deferred_session_end: HashMap<Uuid, Option<String>> = HashMap::new();
     let mut llm_busy_overlay_seq: u64 = 0;
     let llm_busy_overlay_session = Uuid::nil();
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
@@ -1479,7 +1502,22 @@ async fn run_hotkey_mode(
                                             tokio_tungstenite::tungstenite::protocol::Message::Text(txt) => {
                                                 match decode_server_message(&txt) {
                                                     Ok(DecodedServerMessage::Known(message)) => {
-                                                        match *message {
+                                                        let message = *message;
+                                                        if let Some((session_id, reason)) = maybe_defer_llm_session_end(
+                                                            &message,
+                                                            &state,
+                                                            active_intent,
+                                                            llm_in_flight_session,
+                                                        ) {
+                                                            llm_deferred_session_end.insert(session_id, reason);
+                                                            debug!(
+                                                                session = %session_id,
+                                                                "deferring daemon session_ended until llm answer injection"
+                                                            );
+                                                            continue;
+                                                        }
+
+                                                        match message {
                                                             ServerMessage::FinalResult {
                                                                 session_id,
                                                                 text,
@@ -1494,6 +1532,15 @@ async fn run_hotkey_mode(
                                                                     "final result received in llm_query mode"
                                                                 );
                                                                 llm_busy = true;
+                                                                llm_in_flight_session = Some(session_id);
+                                                                let seq = llm_seq.entry(session_id).or_insert(0);
+                                                                *seq = seq.saturating_add(1);
+                                                                overlay_router.route_interim_state(
+                                                                    None,
+                                                                    session_id,
+                                                                    *seq,
+                                                                    "Generating answer...".to_string(),
+                                                                );
                                                                 state.reset();
                                                                 let llm = llm_config.clone();
                                                                 let progress_tx = llm_tx.clone();
@@ -1584,9 +1631,29 @@ async fn run_hotkey_mode(
                                         daemon_audio_ms,
                                         result,
                                     } => {
+                                        if llm_in_flight_session != Some(session_id) {
+                                            warn!(
+                                                session = %session_id,
+                                                in_flight_session = ?llm_in_flight_session,
+                                                "ignoring stale llm completion for non-active session"
+                                            );
+                                            llm_seq.remove(&session_id);
+                                            llm_overlay_text.remove(&session_id);
+                                            llm_deferred_session_end.remove(&session_id);
+                                            continue;
+                                        }
+
                                         llm_busy = false;
+                                        llm_in_flight_session = None;
                                         llm_seq.remove(&session_id);
                                         llm_overlay_text.remove(&session_id);
+                                        let session_end_reason =
+                                            llm_deferred_session_end.remove(&session_id).flatten();
+                                        overlay_router.route_session_ended(
+                                            None,
+                                            session_id,
+                                            session_end_reason,
+                                        );
                                         let fallback_transcript = transcript.clone();
                                         let response_text = match result {
                                             Ok(answer) => {
@@ -1645,7 +1712,6 @@ async fn run_hotkey_mode(
                 }
                 state.reset();
                 active_intent = None;
-                llm_busy = false;
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -1959,9 +2025,10 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, drain_sse_lines, handle_server_message, sanitize_model_answer,
-        spawn_injector_worker_with_capacity, EnqueueFailure, InjectionJob, NoopOverlaySink,
-        OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure, InjectionJob,
+        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        SessionIntent,
     };
 
     struct SlowInjector {
@@ -2113,6 +2180,34 @@ mod tests {
             vec!["data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}"]
         );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn maybe_defer_llm_session_end_for_query_or_inflight() {
+        let session_id = Uuid::new_v4();
+        let state = PttState::Listening { session_id };
+        let message = ServerMessage::SessionEnded {
+            session_id,
+            reason: Some("normal".to_string()),
+        };
+
+        let deferred_for_query =
+            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::LlmQuery), None);
+        assert_eq!(
+            deferred_for_query,
+            Some((session_id, Some("normal".to_string())))
+        );
+
+        let deferred_for_inflight =
+            maybe_defer_llm_session_end(&message, &PttState::Idle, None, Some(session_id));
+        assert_eq!(
+            deferred_for_inflight,
+            Some((session_id, Some("normal".to_string())))
+        );
+
+        let not_deferred =
+            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::Dictate), None);
+        assert_eq!(not_deferred, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
