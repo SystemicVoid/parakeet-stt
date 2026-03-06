@@ -347,14 +347,14 @@ PY
         while true; do
             pid=$(pgrep -n "[p]arakeet-ptt" || true)
             if [ -n "$pid" ]; then
-                echo "$pid" > "$CLIENT_PID_FILE"
+                echo "$pid" >| "$CLIENT_PID_FILE"
                 return 0
             fi
 
             if [ -f "$LOG_CLIENT" ] && grep -Eq "Starting hotkey loop; press Right Ctrl to talk|Hotkey listeners started for KEY_RIGHTCTRL|Connected to daemon" "$LOG_CLIENT"; then
                 pid=$(pgrep -n "[p]arakeet-ptt" || true)
                 if [ -n "$pid" ]; then
-                    echo "$pid" > "$CLIENT_PID_FILE"
+                    echo "$pid" >| "$CLIENT_PID_FILE"
                     return 0
                 fi
             fi
@@ -539,7 +539,7 @@ CLIENTCMD
 
         # Fallback if mktemp is unavailable or fails unexpectedly.
         temp_path="/tmp/${prefix}.$$.$RANDOM.log"
-        if : >"$temp_path" 2>/dev/null; then
+        if : >|"$temp_path" 2>/dev/null; then
             printf "%s" "$temp_path"
             return 0
         fi
@@ -594,10 +594,13 @@ CLIENTCMD
         fi
 
         while [ "$build_attempt" -le "$max_build_attempts" ]; do
-            if (
+            (
                 cd "$CLIENT_DIR" || exit 1
-                RUSTFLAGS="$ptt_rustflags" "$cargo_bin" build --release --bin parakeet-overlay >"$build_output" 2>&1
-            ); then
+                RUSTFLAGS="$ptt_rustflags" "$cargo_bin" build --release --bin parakeet-overlay >|"$build_output" 2>&1
+            )
+            build_status=$?
+
+            if [ "$build_status" -eq 0 ]; then
                 cat "$build_output" >> "$LOG_CLIENT"
                 rm -f "$build_output"
                 if [ ! -x "$overlay_binary" ]; then
@@ -609,7 +612,6 @@ CLIENTCMD
                 fi
                 return 0
             fi
-            build_status=$?
 
             if [ -s "$build_output" ]; then
                 cat "$build_output" >> "$LOG_CLIENT"
@@ -788,14 +790,14 @@ CLIENTCMD
                     PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
                     nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
-                    echo $! > "$DAEMON_PID_FILE"
+                    echo $! >| "$DAEMON_PID_FILE"
                 )
             fi
 
             echo -n "   - Waiting for socket..."
             if _wait_for_socket "$DAEMON_PID_FILE" 60; then
                 echo " OK"
-                echo "${HOST}:${PORT}" > "$PORT_FILE"
+                echo "${HOST}:${PORT}" >| "$PORT_FILE"
             else
                 echo " not ready; last daemon log lines:"
                 tail -n 80 "$LOG_DAEMON"
@@ -973,7 +975,7 @@ CLIENTCMD
             echo "Creating tmux session '$TMUX_SESSION' (daemon | client | logs)..."
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
-            echo "${HOST}:${PORT}" > "$PORT_FILE"
+            echo "${HOST}:${PORT}" >| "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local injection_mode paste_key_backend paste_backend_failure_policy
