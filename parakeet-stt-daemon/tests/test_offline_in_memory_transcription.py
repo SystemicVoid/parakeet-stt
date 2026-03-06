@@ -44,6 +44,19 @@ class _RecordingTranscriber:
         return "offline text"
 
 
+class _ExplodingStreamSession:
+    def __init__(self) -> None:
+        self.feed_calls: list[np.ndarray] = []
+        self.finalize_called = False
+
+    def feed(self, chunk: np.ndarray) -> None:
+        self.feed_calls.append(chunk.copy())
+
+    def finalize(self) -> str:
+        self.finalize_called = True
+        raise AssertionError("final transcript should not read from streaming mirror")
+
+
 def test_transcribe_samples_uses_array_path_when_supported() -> None:
     model = _ArrayModel()
     transcriber = ParakeetTranscriber(model=cast(Any, model))
@@ -97,11 +110,7 @@ def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
 
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
         typed_server = cast(DaemonServer, server)
-        text, infer_ms = await typed_server._finalise_transcription(
-            samples,
-            ready_chunks=[],
-            tail=np.zeros((0,), dtype=np.float32),
-        )
+        text, infer_ms = await typed_server._finalise_transcription(samples)
 
         assert text == "offline text"
         assert infer_ms >= 0
@@ -130,14 +139,38 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty() -> 
 
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
         typed_server = cast(DaemonServer, server)
-        text, infer_ms = await typed_server._finalise_transcription(
-            samples,
-            ready_chunks=[],
-            tail=np.zeros((0,), dtype=np.float32),
-        )
+        text, infer_ms = await typed_server._finalise_transcription(samples)
 
         assert text == ""
         assert infer_ms == 0
         assert server.transcriber.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() -> None:
+    async def scenario() -> None:
+        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server.settings = ServerSettings(device="cpu", streaming_enabled=True)
+        server.audio = SimpleNamespace(sample_rate=16_000)
+        server.transcriber = _RecordingTranscriber()
+        server.streaming_transcriber = object()
+        server._active_stream = _ExplodingStreamSession()
+        server._trim_tail_silence = lambda samples, _sample_rate: samples
+
+        samples = np.array([0.2, 0.1, 0.05, 0.4], dtype=np.float32)
+        typed_server = cast(DaemonServer, server)
+        text, infer_ms = await typed_server._finalise_transcription(samples)
+
+        assert text == "offline text"
+        assert infer_ms >= 0
+        recording = server.transcriber
+        assert len(recording.calls) == 1
+        forwarded_samples, forwarded_rate = recording.calls[0]
+        assert forwarded_rate == 16_000
+        np.testing.assert_array_equal(forwarded_samples, samples)
+        stream = server._active_stream
+        assert stream.feed_calls == []
+        assert stream.finalize_called is False
 
     asyncio.run(scenario())
