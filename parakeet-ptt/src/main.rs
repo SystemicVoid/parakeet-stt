@@ -34,7 +34,9 @@ use crate::config::{
     resolve_overlay_adaptive_width, resolve_overlay_capability, ClientConfig, ClipboardOptions,
     InjectionConfig, OverlayMode, DEFAULT_ENDPOINT,
 };
-use crate::hotkey::{ensure_input_access, spawn_hotkey_loop, HotkeyEvent};
+use crate::hotkey::{
+    ensure_input_access, parse_modifier_key_names, spawn_hotkey_loop, HotkeyEvent,
+};
 use crate::injector::{injector_metrics_snapshot, TextInjector};
 use crate::overlay_process::OverlayProcessManager;
 use crate::protocol::{
@@ -53,7 +55,7 @@ const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
-const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_RIGHTALT";
+const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_ALT";
 const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_LLM_MODEL: &str = "local";
 const DEFAULT_LLM_SYSTEM_PROMPT: &str =
@@ -1420,8 +1422,8 @@ async fn run_hotkey_mode(
 ) -> Result<()> {
     let talk_key = crate::hotkey::parse_key_name(&config.hotkey)
         .with_context(|| format!("invalid --hotkey value '{}'", config.hotkey))?;
-    let query_modifier_key =
-        crate::hotkey::parse_key_name(&query_modifier_key_name).with_context(|| {
+    let query_modifier_keys =
+        parse_modifier_key_names(&query_modifier_key_name).with_context(|| {
             format!(
                 "invalid --query-modifier-key value '{}'",
                 query_modifier_key_name
@@ -1472,11 +1474,11 @@ async fn run_hotkey_mode(
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, query_modifier_key)?;
+    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, query_modifier_keys.clone())?;
     info!(
         devices = hotkey_tasks.len(),
         talk_key = ?talk_key,
-        query_modifier_key = ?query_modifier_key,
+        query_modifier_keys = ?query_modifier_keys,
         "Hotkey listeners started"
     );
 
