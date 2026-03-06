@@ -1552,11 +1552,11 @@ async fn run_hotkey_mode(
                                         }
                                     }
                                     HotkeyEvent::QueryModifierDown => {
-                                        if matches!(state, PttState::Listening { .. }) {
-                                            if active_intent != Some(SessionIntent::LlmQuery) {
-                                                active_intent = Some(SessionIntent::LlmQuery);
-                                                info!("query modifier engaged; current utterance promoted to llm_query");
-                                            }
+                                        if matches!(state, PttState::Listening { .. })
+                                            && active_intent != Some(SessionIntent::LlmQuery)
+                                        {
+                                            active_intent = Some(SessionIntent::LlmQuery);
+                                            info!("query modifier engaged; current utterance promoted to llm_query");
                                         }
                                     }
                                     HotkeyEvent::QueryModifierUp => {
