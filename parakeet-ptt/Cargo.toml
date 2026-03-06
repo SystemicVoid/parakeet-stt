@@ -29,7 +29,7 @@ time = { version = "0.3.47", features = ["formatting", "macros", "serde"] }
 url = "2.5.4"
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 evdev = "0.12.2"
-reqwest = { version = "0.12.9", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.9", features = ["json", "rustls-tls", "stream"] }
 which = "6.0.1"
 wayland-client = "0.31.12"
 wayland-protocols = { version = "0.32.10", features = ["client", "staging"] }

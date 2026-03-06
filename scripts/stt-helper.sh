@@ -34,6 +34,14 @@ stt() {
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
     local default_overlay_adaptive_width="${PARAKEET_OVERLAY_ADAPTIVE_WIDTH:-true}"
+    local default_query_modifier_key="${PARAKEET_QUERY_MODIFIER_KEY:-KEY_RIGHTALT}"
+    local default_llm_base_url="${PARAKEET_LLM_BASE_URL:-http://127.0.0.1:8080/v1}"
+    local default_llm_model="${PARAKEET_LLM_MODEL:-local}"
+    local default_llm_timeout_seconds="${PARAKEET_LLM_TIMEOUT_SECONDS:-20}"
+    local default_llm_max_tokens="${PARAKEET_LLM_MAX_TOKENS:-512}"
+    local default_llm_temperature="${PARAKEET_LLM_TEMPERATURE:-0.7}"
+    local default_llm_system_prompt="${PARAKEET_LLM_SYSTEM_PROMPT:-You are a concise assistant. Return only the final answer text for direct insertion.}"
+    local default_llm_overlay_stream="${PARAKEET_LLM_OVERLAY_STREAM:-true}"
     local default_daemon_streaming_enabled="false"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
@@ -56,6 +64,14 @@ stt() {
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
         "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
         "overlay-adaptive-width|overlay_adaptive_width|default_overlay_adaptive_width|PARAKEET_OVERLAY_ADAPTIVE_WIDTH|Stable controls|<v>|true|always|true"
+        "query-modifier-key|query_modifier_key|default_query_modifier_key|PARAKEET_QUERY_MODIFIER_KEY|Stable controls|<key>|KEY_RIGHTALT|always|KEY_RIGHTALT"
+        "llm-base-url|llm_base_url|default_llm_base_url|PARAKEET_LLM_BASE_URL|Stable controls|<url>|http://127.0.0.1:8080/v1|always|http://127.0.0.1:8080/v1"
+        "llm-model|llm_model|default_llm_model|PARAKEET_LLM_MODEL|Stable controls|<name>|local|always|local"
+        "llm-timeout-seconds|llm_timeout_seconds|default_llm_timeout_seconds|PARAKEET_LLM_TIMEOUT_SECONDS|Stable controls|<n>|20|always|20"
+        "llm-max-tokens|llm_max_tokens|default_llm_max_tokens|PARAKEET_LLM_MAX_TOKENS|Stable controls|<n>|512|always|512"
+        "llm-temperature|llm_temperature|default_llm_temperature|PARAKEET_LLM_TEMPERATURE|Stable controls|<n>|0.7|always|0.7"
+        "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|"
+        "llm-overlay-stream|llm_overlay_stream|default_llm_overlay_stream|PARAKEET_LLM_OVERLAY_STREAM|Stable controls|<v>|true|always|true"
     )
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
@@ -552,6 +568,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local -a ptt_args
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
@@ -579,6 +596,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
                 launch_profile="stream-seal"
@@ -631,6 +649,13 @@ CLIENTCMD
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Overlay enabled: $overlay_enabled"
             echo "   - Overlay adaptive width: $overlay_adaptive_width"
+            echo "   - Query modifier key: $query_modifier_key"
+            echo "   - LLM base URL: $llm_base_url"
+            echo "   - LLM model: $llm_model"
+            echo "   - LLM timeout (s): $llm_timeout_seconds"
+            echo "   - LLM max tokens: $llm_max_tokens"
+            echo "   - LLM temperature: $llm_temperature"
+            echo "   - LLM overlay stream: $llm_overlay_stream"
             echo "   - Launch profile: $launch_profile"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
             echo "   - Daemon overlay events enabled: $daemon_overlay_events_enabled"
@@ -864,6 +889,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
@@ -956,6 +982,7 @@ CLIENTCMD
                     local injection_mode paste_key_backend paste_backend_failure_policy
                     local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
                     local completion_sound completion_sound_path completion_sound_volume
+                    local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
 
                     _load_start_vars_from_defaults
