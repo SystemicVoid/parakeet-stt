@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::ErrorKind;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use evdev::{Device, InputEventKind, Key};
@@ -19,6 +20,50 @@ pub enum HotkeyEvent {
 
 pub struct HotkeyTasks {
     handles: Vec<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct HotkeySharedState {
+    talk_down_count: usize,
+    modifier_down_counts: HashMap<Key, usize>,
+}
+
+impl HotkeySharedState {
+    fn note_modifier_down(&mut self, key: Key) -> bool {
+        let was_active = self.modifier_active();
+        *self.modifier_down_counts.entry(key).or_default() += 1;
+        !was_active
+    }
+
+    fn note_modifier_up(&mut self, key: Key) -> bool {
+        let Some(count) = self.modifier_down_counts.get_mut(&key) else {
+            return false;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return false;
+        }
+        self.modifier_down_counts.remove(&key);
+        !self.modifier_active()
+    }
+
+    fn note_talk_down(&mut self) -> bool {
+        let was_up = self.talk_down_count == 0;
+        self.talk_down_count += 1;
+        was_up
+    }
+
+    fn note_talk_up(&mut self) -> bool {
+        if self.talk_down_count == 0 {
+            return false;
+        }
+        self.talk_down_count -= 1;
+        self.talk_down_count == 0
+    }
+
+    fn modifier_active(&self) -> bool {
+        !self.modifier_down_counts.is_empty()
+    }
 }
 
 impl HotkeyTasks {
@@ -111,13 +156,13 @@ pub fn spawn_hotkey_loop(
     }
 
     let mut handles = Vec::new();
+    let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
 
     for mut device in devices {
         let tx = tx.clone();
         let query_modifier_keys = query_modifier_keys.clone();
+        let shared_state = Arc::clone(&shared_state);
         let handle = tokio::task::spawn_blocking(move || {
-            let mut talk_down = false;
-            let mut active_modifiers = HashSet::new();
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
@@ -126,15 +171,18 @@ pub fn spawn_hotkey_loop(
                                 if query_modifier_keys.contains(&key) {
                                     match ev.value() {
                                         1 => {
-                                            let was_empty = active_modifiers.is_empty();
-                                            if active_modifiers.insert(key) && was_empty {
+                                            let mut state = shared_state
+                                                .lock()
+                                                .expect("hotkey shared state lock poisoned");
+                                            if state.note_modifier_down(key) {
                                                 let _ = tx.send(HotkeyEvent::QueryModifierDown);
                                             }
                                         }
                                         0 => {
-                                            if active_modifiers.remove(&key)
-                                                && active_modifiers.is_empty()
-                                            {
+                                            let mut state = shared_state
+                                                .lock()
+                                                .expect("hotkey shared state lock poisoned");
+                                            if state.note_modifier_up(key) {
                                                 let _ = tx.send(HotkeyEvent::QueryModifierUp);
                                             }
                                         }
@@ -146,18 +194,21 @@ pub fn spawn_hotkey_loop(
                                 if key == talk_key {
                                     match ev.value() {
                                         1 => {
-                                            if !talk_down {
+                                            let mut state = shared_state
+                                                .lock()
+                                                .expect("hotkey shared state lock poisoned");
+                                            if state.note_talk_down() {
                                                 let _ = tx.send(HotkeyEvent::Down {
-                                                    query_modifier_active: !active_modifiers
-                                                        .is_empty(),
+                                                    query_modifier_active: state.modifier_active(),
                                                 });
-                                                talk_down = true;
                                             }
                                         }
                                         0 => {
-                                            if talk_down {
+                                            let mut state = shared_state
+                                                .lock()
+                                                .expect("hotkey shared state lock poisoned");
+                                            if state.note_talk_up() {
                                                 let _ = tx.send(HotkeyEvent::Up);
-                                                talk_down = false;
                                             }
                                         }
                                         _ => {}
@@ -220,7 +271,7 @@ fn find_hotkey_devices(talk_key: Key, query_modifier_keys: &[Key]) -> Result<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_key_name, parse_modifier_key_names};
+    use super::{parse_key_name, parse_modifier_key_names, HotkeySharedState};
     use evdev::Key;
 
     #[test]
@@ -240,5 +291,26 @@ mod tests {
     #[test]
     fn parse_key_name_rejects_unknown_values() {
         assert!(parse_key_name("KEY_NOT_REAL").is_err());
+    }
+
+    #[test]
+    fn shared_state_tracks_modifiers_globally() {
+        let mut state = HotkeySharedState::default();
+        assert!(state.note_modifier_down(Key::KEY_RIGHTALT));
+        assert!(state.modifier_active());
+        assert!(!state.note_modifier_down(Key::KEY_LEFTALT));
+        assert!(!state.note_modifier_up(Key::KEY_RIGHTALT));
+        assert!(state.modifier_active());
+        assert!(state.note_modifier_up(Key::KEY_LEFTALT));
+        assert!(!state.modifier_active());
+    }
+
+    #[test]
+    fn shared_state_deduplicates_talk_presses_across_devices() {
+        let mut state = HotkeySharedState::default();
+        assert!(state.note_talk_down());
+        assert!(!state.note_talk_down());
+        assert!(!state.note_talk_up());
+        assert!(state.note_talk_up());
     }
 }
