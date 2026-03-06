@@ -1,6 +1,6 @@
 # Parakeet STT – Canonical Specification (Living Document)
 
-_Last updated: 2026-02-23_
+_Last updated: 2026-03-06_
 
 This document is the single source of truth for the local, push-to-talk Parakeet speech-to-text solution on Pop!\_OS 24.04 (Wayland). Update it whenever significant design, implementation, or operational decisions are made so every agent and developer can stay in sync.
 
@@ -11,7 +11,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 - **Goals**
   - Local-only, GPU-accelerated speech-to-text using NVIDIA Parakeet-TDT 0.6B v3 with NeMo streaming.
   - Push-to-talk UX: Right Ctrl press starts listening; release stops and injected text appears in the focused field.
-  - Minimal UI (no overlay for v1); headless background services only.
+  - Minimal UI footprint: compact overlay feedback is supported, but the runtime remains primarily background-service driven.
   - Keep the pipeline simple yet performant (KISS) with clear separation between ML responsibilities (Python) and OS-facing UX/integration (Rust).
   - Fast end-to-end latency (<150 ms from key release to text injection for typical utterances).
   - Privacy-first: all processing local; no cloud dependencies.
@@ -19,10 +19,10 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Session lifecycle invariants are mandatory: disconnect/error paths must not leave orphaned active capture state.
 
 - **Non-Goals (v1)**
-  - On-screen transcription overlays or editing UI.
+  - Full desktop companion app or transcript editor.
   - Wake-word activation, toggle modes, or conversation history.
   - Multi-user concurrency (single desktop user only).
-  - Language model post-processing (LLMs). Can be future enhancement.
+  - Cloud speech or cloud LLM dependencies.
 
 ---
 
@@ -97,7 +97,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Startup logs must include streaming truth signals (`requested`, `active/fallback`, fallback reason) and effective runtime device.
   - Metrics aggregator (future) to feed UI/waybar when needed.
   - Quick smoke (from any directory):
-    - `repo=$HOME/Documents/Engineering/parakeet-stt`
+    - `repo=/path/to/parakeet-stt`
     - `(cd "$repo/parakeet-stt-daemon" && uv run parakeet-stt-daemon --check)`
     - `(cd "$repo/parakeet-stt-daemon" && uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765)`  # requires inference extra
     - In another shell: `(cd "$repo/parakeet-ptt" && cargo run --release)` (or `cargo run --manifest-path "$repo/parakeet-ptt/Cargo.toml" --release`)
@@ -110,6 +110,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Maintain simple state machine (Idle → Listening → WaitingResult → Idle).
   - Communicate over WebSocket; no audio capture in Rust for v1.
   - Inject resulting text using Wayland-friendly methods.
+  - Drive overlay feedback and optional local-LLM query mode without introducing cloud dependencies.
 
 - **Crates**
   - `tokio`, `tokio-tungstenite`, `serde`/`serde_json`, `evdev`, `anyhow`, `uuid`.
@@ -282,10 +283,10 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
    - Permission setup script/instructions.
 
 5. **M4 – Enhancements (future)**
-   - Virtual-keyboard implementation.
-   - Optional overlay with live partials.
-   - CLI for offline file transcription via same daemon.
-   - Post-processing (local LLM) and macros.
+  - Virtual-keyboard implementation.
+  - Overlay polish (placement presets, richer per-app behavior).
+  - CLI for offline file transcription via same daemon.
+  - Local post-processing policy/macros beyond the current query-mode path.
 
 ---
 
@@ -296,7 +297,7 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
 | Virtual keyboard support in COSMIC | Investigate compositor protocol availability before M3; fallback already defined. |
 | Authentication | Decide whether to enforce shared secret or rely on localhost isolation. |
 | Multi-language hints | Add config to pin language or rely on auto-detect per user preference. |
-| Partial result overlay | Deferred; document design when prioritized. |
+| Overlay polish | Current overlay is shipped; future work is placement, presets, and finer-grained UX polish. |
 | Streaming default policy | Default helper profile is online stream+seal (`stt` / `stt start`); use `stt off` for explicit offline-profile runs when you want no streaming and no overlay. |
 | GPU stack refresh timing | Run staged update lane after streaming API integration is validated on current lock baseline. |
 
@@ -319,10 +320,10 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
     -F allow_force_pushes=false \
     -F allow_deletions=false \
     -F required_conversation_resolution=true`
-- Create the initial release tag:
-  - `git tag -a v0.1.0 -m "v0.1.0"`
+- Create the next public release tag:
+  - `git tag -a v0.2.0 -m "v0.2.0"`
   - `git push origin main --tags`
-  - `gh release create v0.1.0 --title "v0.1.0" --generate-notes`
+  - `gh release create v0.2.0 --title "v0.2.0" --generate-notes`
 
 ---
 

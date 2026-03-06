@@ -986,7 +986,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         logger.info("Stopping audio capture")
         server.audio.stop()
 
-    app = FastAPI(title="Parakeet STT Daemon", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Parakeet STT Daemon", version="0.2.0", lifespan=lifespan)
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:

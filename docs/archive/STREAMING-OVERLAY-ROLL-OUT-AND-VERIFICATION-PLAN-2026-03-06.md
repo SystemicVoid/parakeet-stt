@@ -5,7 +5,7 @@ _Last updated: 2026-03-06 (renderer Phase A glyph cache landed with A/B perf evi
 Historical-status note:
 - This file is an implementation log for rollout history and verification evidence.
 - Canonical current operator defaults live in `README.md`, `docs/stt-troubleshooting.md`, and `AGENTS.md`.
-- When remaining deferred scope (Phase 8.4 Tier 2 cursor-spawn placement) is either delivered or formally dropped, this file should be moved under `docs/archive/`.
+- This file was archived on 2026-03-06 after rollout completion; treat remaining deferred scope as follow-up backlog, not active operator guidance.
 
 ## Progress Tracker
 - [x] Worktree policy in effect (`../parakeet-overlay-dev` on `feature/overlay-phase0-capability-gate`).

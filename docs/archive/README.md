@@ -8,3 +8,7 @@ Maintained docs live in:
 - `docs/SPEC.md`
 - `docs/stt-troubleshooting.md`
 - `ROADMAP.md`
+
+Recent archive additions:
+- `docs/archive/STREAMING-OVERLAY-ROLL-OUT-AND-VERIFICATION-PLAN-2026-03-06.md`
+- `docs/archive/gemini-architectural-review-2026-03-06.md`
