@@ -418,6 +418,29 @@ PY
         fi
     }
 
+    _listener_pid() {
+        local port="$1"
+        local pid=""
+        if command -v lsof >/dev/null 2>&1; then
+            pid="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -n1)"
+        elif command -v ss >/dev/null 2>&1; then
+            pid="$(ss -ltnp "sport = :$port" 2>/dev/null | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -n1)"
+        fi
+
+        if [ -n "$pid" ]; then
+            printf "%s" "$pid"
+            return 0
+        fi
+        return 1
+    }
+
+    _refresh_daemon_pid_file_from_listener() {
+        local listener_pid
+        listener_pid="$(_listener_pid "$PORT")" || return 1
+        printf "%s\n" "$listener_pid" >| "$DAEMON_PID_FILE"
+        return 0
+    }
+
     _find_free_port() {
         local start="$1"
         local end=$((start + 10))
@@ -677,6 +700,7 @@ CLIENTCMD
             local daemon_reused=0
             if _pid_alive "$DAEMON_PID_FILE"; then
                 if _socket_ready_once; then
+                    _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
                     echo "   - Daemon already running (pid $(cat "$DAEMON_PID_FILE"))."
                     daemon_reused=1
                 else
@@ -698,13 +722,14 @@ CLIENTCMD
                     PARAKEET_BATCH_SIZE="$daemon_batch_size" \
                     PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
-                    nohup uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" >> "$LOG_DAEMON" 2>&1 &
+                    setsid uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" </dev/null >> "$LOG_DAEMON" 2>&1 &
                     echo $! >| "$DAEMON_PID_FILE"
                 )
             fi
 
             echo -n "   - Waiting for socket..."
             if _wait_for_socket "$DAEMON_PID_FILE" 60; then
+                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
                 echo " OK"
                 echo "${HOST}:${PORT}" >| "$PORT_FILE"
             else
@@ -794,6 +819,9 @@ CLIENTCMD
                 tmux kill-session -t "$TMUX_SESSION"
             fi
 
+            if _socket_ready_once; then
+                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
+            fi
             if _pid_alive "$DAEMON_PID_FILE"; then
                 if _stop_pid "$DAEMON_PID_FILE"; then
                     echo "   - Daemon stopped"
@@ -832,6 +860,9 @@ CLIENTCMD
             ;;
         status)
             echo ">>> Status:"
+            if _socket_ready_once && _refresh_daemon_pid_file_from_listener >/dev/null 2>&1; then
+                :
+            fi
             if _pid_alive "$DAEMON_PID_FILE"; then
                 echo "   - Daemon running (pid $(cat "$DAEMON_PID_FILE"))"
             else
