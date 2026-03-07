@@ -38,3 +38,4 @@ cosmic-protocols = { version = "0.2.0", default-features = false, features = ["c
 tempfile = "3.16.0"
 fontdb = "0.17.0"
 fontdue = "0.9.3"
+libc = "0.2.177"
