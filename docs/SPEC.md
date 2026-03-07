@@ -322,7 +322,7 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
     -F required_conversation_resolution=true`
 - Create the next public release tag:
   - `git tag -a v0.2.1 -m "v0.2.1"`
-  - `git push origin main --tags`
+  - `git push origin v0.2.1`
   - `gh release create v0.2.1 --title "v0.2.1" --notes "Reliability: intent is now snapshotted at hotkey-down using llm-pre-modifier state. Config: renamed query-modifier controls to llm-pre-modifier (default KEY_SHIFT) for more reliable triggering."`
 
 ---
