@@ -45,6 +45,7 @@ enum ListenerExitReason {
 struct ListenerExit {
     path: PathBuf,
     reason: ListenerExitReason,
+    pressed: ListenerPressedState,
 }
 
 #[derive(Debug, Default)]
@@ -206,15 +207,53 @@ struct HotkeySharedState {
     pre_modifier_down_counts: HashMap<Key, usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HotkeySharedStateReset {
-    talk_down_count: usize,
-    pre_modifier_down_count: usize,
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ListenerPressedState {
+    talk_down: bool,
+    pre_modifier_down_keys: HashSet<Key>,
 }
 
-impl HotkeySharedStateReset {
+impl ListenerPressedState {
+    fn note_key_event(
+        &mut self,
+        talk_key: Key,
+        llm_pre_modifier_keys: &[Key],
+        key: Key,
+        value: i32,
+    ) {
+        if llm_pre_modifier_keys.contains(&key) {
+            match value {
+                1 => {
+                    self.pre_modifier_down_keys.insert(key);
+                }
+                0 => {
+                    self.pre_modifier_down_keys.remove(&key);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if key == talk_key {
+            match value {
+                1 => self.talk_down = true,
+                0 => self.talk_down = false,
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerExitCleanup {
+    released_talk_down: bool,
+    released_pre_modifier_count: usize,
+    emit_talk_up: bool,
+}
+
+impl ListenerExitCleanup {
     fn had_pressed_keys(self) -> bool {
-        self.talk_down_count > 0 || self.pre_modifier_down_count > 0
+        self.released_talk_down || self.released_pre_modifier_count > 0
     }
 }
 
@@ -252,14 +291,27 @@ impl HotkeySharedState {
         !self.pre_modifier_down_counts.is_empty()
     }
 
-    fn reset(&mut self) -> HotkeySharedStateReset {
-        let reset = HotkeySharedStateReset {
-            talk_down_count: self.talk_down_count,
-            pre_modifier_down_count: self.pre_modifier_down_counts.values().sum(),
+    fn release_listener_state(&mut self, pressed: &ListenerPressedState) -> ListenerExitCleanup {
+        let mut cleanup = ListenerExitCleanup {
+            released_talk_down: false,
+            released_pre_modifier_count: 0,
+            emit_talk_up: false,
         };
-        self.talk_down_count = 0;
-        self.pre_modifier_down_counts.clear();
-        reset
+
+        if pressed.talk_down && self.talk_down_count > 0 {
+            self.talk_down_count -= 1;
+            cleanup.released_talk_down = true;
+            cleanup.emit_talk_up = self.talk_down_count == 0;
+        }
+
+        for key in &pressed.pre_modifier_down_keys {
+            if self.pre_modifier_down_counts.contains_key(key) {
+                self.note_pre_modifier_up(*key);
+                cleanup.released_pre_modifier_count += 1;
+            }
+        }
+
+        cleanup
     }
 }
 
@@ -414,19 +466,28 @@ async fn run_hotkey_supervisor(
                         Ok(exit) => {
                             active_paths.remove(&exit.path);
                             diagnostics.note_listener_exit(&exit.reason);
-                            let reset = {
+                            let cleanup = {
                                 let mut state = shared_state
                                     .lock()
                                     .expect("hotkey shared state lock poisoned");
-                                state.reset()
+                                state.release_listener_state(&exit.pressed)
                             };
-                            if reset.had_pressed_keys() {
+                            if cleanup.had_pressed_keys() {
                                 warn!(
                                     path = %exit.path.display(),
-                                    talk_down_count = reset.talk_down_count,
-                                    pre_modifier_down_count = reset.pre_modifier_down_count,
-                                    "reset hotkey shared state after listener exit to avoid stuck hotkeys"
+                                    released_talk_down = cleanup.released_talk_down,
+                                    released_pre_modifier_count = cleanup.released_pre_modifier_count,
+                                    emit_talk_up = cleanup.emit_talk_up,
+                                    "released dead listener key state to avoid stuck hotkeys"
                                 );
+                            }
+                            if cleanup.emit_talk_up {
+                                diagnostics.note_emitted_event(HotkeyEvent::Up);
+                                if tx.send(HotkeyEvent::Up).is_err() {
+                                    diagnostics.note_send_failure();
+                                    warn!(path = %exit.path.display(), "hotkey supervisor channel closed while emitting synthetic key up");
+                                    break;
+                                }
                             }
                             match &exit.reason {
                                 ListenerExitReason::OpenError(err) => {
@@ -511,6 +572,7 @@ fn spawn_hotkey_listener(
             Err(err) => ListenerExit {
                 path: join_path,
                 reason: ListenerExitReason::TaskJoinError(err.to_string()),
+                pressed: ListenerPressedState::default(),
             },
         }
     });
@@ -524,12 +586,14 @@ fn hotkey_listener_for_path(
     shared_state: Arc<Mutex<HotkeySharedState>>,
     diagnostics: Arc<HotkeyDiagnostics>,
 ) -> ListenerExit {
+    let mut pressed = ListenerPressedState::default();
     let mut device = match Device::open(&path) {
         Ok(device) => device,
         Err(err) => {
             return ListenerExit {
                 path,
                 reason: ListenerExitReason::OpenError(err.to_string()),
+                pressed,
             };
         }
     };
@@ -557,6 +621,8 @@ fn hotkey_listener_for_path(
                         continue;
                     }
 
+                    pressed.note_key_event(talk_key, &llm_pre_modifier_keys, key, ev.value());
+
                     let event = {
                         let mut state = shared_state
                             .lock()
@@ -577,6 +643,7 @@ fn hotkey_listener_for_path(
                             return ListenerExit {
                                 path,
                                 reason: ListenerExitReason::ChannelClosed,
+                                pressed,
                             };
                         }
                     }
@@ -586,6 +653,7 @@ fn hotkey_listener_for_path(
                 return ListenerExit {
                     path,
                     reason: ListenerExitReason::FetchError(err.to_string()),
+                    pressed,
                 };
             }
         }
@@ -699,9 +767,10 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, is_event_device_path, parse_key_name, parse_pre_modifier_key_names,
-        HotkeyEvent, HotkeyIntent, HotkeySharedState, HotkeySharedStateReset,
+        HotkeyEvent, HotkeyIntent, HotkeySharedState, ListenerExitCleanup, ListenerPressedState,
     };
     use evdev::Key;
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
@@ -746,16 +815,43 @@ mod tests {
     }
 
     #[test]
-    fn shared_state_reset_clears_stuck_pressed_keys() {
+    fn shared_state_release_listener_state_only_removes_that_listener_keys() {
+        let mut state = HotkeySharedState::default();
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        assert!(state.note_talk_down());
+        assert!(!state.note_talk_down());
+
+        assert_eq!(
+            state.release_listener_state(&ListenerPressedState {
+                talk_down: true,
+                pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+            }),
+            ListenerExitCleanup {
+                released_talk_down: true,
+                released_pre_modifier_count: 1,
+                emit_talk_up: false,
+            }
+        );
+        assert!(state.pre_modifier_active());
+        assert!(state.note_talk_up());
+    }
+
+    #[test]
+    fn shared_state_release_listener_state_emits_up_when_last_talk_press_is_lost() {
         let mut state = HotkeySharedState::default();
         state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
         assert!(state.note_talk_down());
 
         assert_eq!(
-            state.reset(),
-            HotkeySharedStateReset {
-                talk_down_count: 1,
-                pre_modifier_down_count: 1
+            state.release_listener_state(&ListenerPressedState {
+                talk_down: true,
+                pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+            }),
+            ListenerExitCleanup {
+                released_talk_down: true,
+                released_pre_modifier_count: 1,
+                emit_talk_up: true,
             }
         );
         assert!(!state.pre_modifier_active());
