@@ -393,11 +393,22 @@ pub fn parse_pre_modifier_key_names(name: &str) -> Result<Vec<Key>> {
     }
 }
 
+fn validate_hotkey_binding_config(talk_key: Key, llm_pre_modifier_keys: &[Key]) -> Result<()> {
+    if llm_pre_modifier_keys.contains(&talk_key) {
+        bail!(
+            "talk key {:?} cannot also be used as an llm pre-modifier; choose distinct keys",
+            talk_key
+        );
+    }
+    Ok(())
+}
+
 pub fn spawn_hotkey_loop(
     tx: UnboundedSender<HotkeyEvent>,
     talk_key: Key,
     llm_pre_modifier_keys: Vec<Key>,
 ) -> Result<HotkeyTasks> {
+    validate_hotkey_binding_config(talk_key, &llm_pre_modifier_keys)?;
     let initial_paths = find_hotkey_device_paths(talk_key, &llm_pre_modifier_keys)?;
     if initial_paths.is_empty() {
         anyhow::bail!(
@@ -767,7 +778,8 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, is_event_device_path, parse_key_name, parse_pre_modifier_key_names,
-        HotkeyEvent, HotkeyIntent, HotkeySharedState, ListenerExitCleanup, ListenerPressedState,
+        validate_hotkey_binding_config, HotkeyEvent, HotkeyIntent, HotkeySharedState,
+        ListenerExitCleanup, ListenerPressedState,
     };
     use evdev::Key;
     use std::collections::HashSet;
@@ -791,6 +803,18 @@ mod tests {
     #[test]
     fn parse_key_name_rejects_unknown_values() {
         assert!(parse_key_name("KEY_NOT_REAL").is_err());
+    }
+
+    #[test]
+    fn validate_hotkey_binding_config_rejects_talk_key_overlap() {
+        let err = validate_hotkey_binding_config(
+            Key::KEY_RIGHTCTRL,
+            &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTCTRL],
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot also be used as an llm pre-modifier"));
     }
 
     #[test]
