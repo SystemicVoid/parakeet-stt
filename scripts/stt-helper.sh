@@ -14,14 +14,62 @@ stt() {
     local CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
     local LOG_CLIENT="/tmp/parakeet-ptt.log"
     local LOG_DAEMON="/tmp/parakeet-daemon.log"
+    local LOG_LLM="/tmp/parakeet-llama-server.log"
     local CLIENT_PID_FILE="/tmp/parakeet-ptt.pid"
     local DAEMON_PID_FILE="/tmp/parakeet-daemon.pid"
-    local HOST="${PARAKEET_HOST:-127.0.0.1}"
-    local PORT="${PARAKEET_PORT:-8765}"
+    local LLM_PID_FILE="/tmp/parakeet-llama-server.pid"
     local PORT_FILE="/tmp/parakeet-daemon.port"
-    local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
+    local LLM_PORT_FILE="/tmp/parakeet-llama-server.port"
     local TMUX_SESSION="parakeet-stt"
     local TMUX_WINDOW="run"
+    local LLM_TMUX_SESSION="parakeet-llm"
+    local LLM_TMUX_WINDOW="server"
+    local LOCAL_ENV_FILE=""
+    local LOCAL_SHELL_FILE=""
+    local skip_local_overrides="${_STT_SKIP_LOCAL_OVERRIDES:-0}"
+
+    # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
+    if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
+        local helper_path="${BASH_SOURCE[0]:-$__STT_HELPER_PATH}"
+        if command -v readlink >/dev/null 2>&1; then
+            helper_path="$(readlink -f "$helper_path" 2>/dev/null || echo "$helper_path")"
+        fi
+        REPO_ROOT="$(cd "$(dirname "$helper_path")/.." && pwd 2>/dev/null)"
+    fi
+    # Final guard: ensure the repo path actually has the expected subdirs.
+    if [ ! -d "$REPO_ROOT/parakeet-stt-daemon" ] || [ ! -d "$REPO_ROOT/parakeet-ptt" ]; then
+        echo "stt helper: could not locate repo root (REPO_ROOT='$REPO_ROOT'). Set PARAKEET_ROOT explicitly."
+        return 1
+    fi
+    DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
+    CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
+
+    if [ "$skip_local_overrides" != "1" ]; then
+        LOCAL_ENV_FILE="$REPO_ROOT/.parakeet-stt.local.env"
+        if [ -f "$LOCAL_ENV_FILE" ]; then
+            set -a
+            . "$LOCAL_ENV_FILE" || {
+                local rc=$?
+                set +a
+                echo "stt helper: failed to load $LOCAL_ENV_FILE"
+                return "$rc"
+            }
+            set +a
+        fi
+
+        LOCAL_SHELL_FILE="$REPO_ROOT/.parakeet-stt.local.sh"
+        if [ -f "$LOCAL_SHELL_FILE" ]; then
+            . "$LOCAL_SHELL_FILE" || {
+                local rc=$?
+                echo "stt helper: failed to load $LOCAL_SHELL_FILE"
+                return "$rc"
+            }
+        fi
+    fi
+
+    local HOST="${PARAKEET_HOST:-127.0.0.1}"
+    local PORT="${PARAKEET_PORT:-8765}"
+    local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
     local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
@@ -34,9 +82,19 @@ stt() {
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
     local default_overlay_adaptive_width="${PARAKEET_OVERLAY_ADAPTIVE_WIDTH:-true}"
-    local default_query_modifier_key="${PARAKEET_QUERY_MODIFIER_KEY:-KEY_RIGHTALT}"
-    local default_llm_base_url="${PARAKEET_LLM_BASE_URL:-http://127.0.0.1:8080/v1}"
-    local default_llm_model="${PARAKEET_LLM_MODEL:-local}"
+    local default_llm_pre_modifier_key="${PARAKEET_LLM_PRE_MODIFIER_KEY:-KEY_SHIFT}"
+    local default_llm_server_host="${PARAKEET_LLM_SERVER_HOST:-127.0.0.1}"
+    local default_llm_server_port="${PARAKEET_LLM_SERVER_PORT:-8080}"
+    local default_llm_server_bin="${PARAKEET_LLM_SERVER_BIN:-llama-server}"
+    local default_llm_server_model_path="${PARAKEET_LLM_SERVER_MODEL_PATH:-}"
+    local default_llm_server_model_alias="${PARAKEET_LLM_SERVER_MODEL_ALIAS:-${PARAKEET_LLM_MODEL:-local}}"
+    local default_llm_server_ctx_size="${PARAKEET_LLM_SERVER_CTX_SIZE:-16384}"
+    local default_llm_server_gpu_layers="${PARAKEET_LLM_SERVER_GPU_LAYERS:-99}"
+    local default_llm_server_parallel="${PARAKEET_LLM_SERVER_PARALLEL:-2}"
+    local default_llm_server_metrics="${PARAKEET_LLM_SERVER_METRICS:-true}"
+    local default_llm_server_extra_args="${PARAKEET_LLM_SERVER_EXTRA_ARGS:-}"
+    local default_llm_base_url="${PARAKEET_LLM_BASE_URL:-http://${default_llm_server_host}:${default_llm_server_port}/v1}"
+    local default_llm_model="${PARAKEET_LLM_MODEL:-$default_llm_server_model_alias}"
     local default_llm_timeout_seconds="${PARAKEET_LLM_TIMEOUT_SECONDS:-20}"
     local default_llm_max_tokens="${PARAKEET_LLM_MAX_TOKENS:-512}"
     local default_llm_temperature="${PARAKEET_LLM_TEMPERATURE:-0.7}"
@@ -64,7 +122,7 @@ stt() {
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
         "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
         "overlay-adaptive-width|overlay_adaptive_width|default_overlay_adaptive_width|PARAKEET_OVERLAY_ADAPTIVE_WIDTH|Stable controls|<v>|true|always|true"
-        "query-modifier-key|query_modifier_key|default_query_modifier_key|PARAKEET_QUERY_MODIFIER_KEY|Stable controls|<key>|KEY_RIGHTALT|always|KEY_RIGHTALT"
+        "llm-pre-modifier-key|llm_pre_modifier_key|default_llm_pre_modifier_key|PARAKEET_LLM_PRE_MODIFIER_KEY|Stable controls|<key>|KEY_SHIFT|always|KEY_SHIFT"
         "llm-base-url|llm_base_url|default_llm_base_url|PARAKEET_LLM_BASE_URL|Stable controls|<url>|http://127.0.0.1:8080/v1|always|http://127.0.0.1:8080/v1"
         "llm-model|llm_model|default_llm_model|PARAKEET_LLM_MODEL|Stable controls|<name>|local|always|local"
         "llm-timeout-seconds|llm_timeout_seconds|default_llm_timeout_seconds|PARAKEET_LLM_TIMEOUT_SECONDS|Stable controls|<n>|20|always|20"
@@ -73,22 +131,6 @@ stt() {
         "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|"
         "llm-overlay-stream|llm_overlay_stream|default_llm_overlay_stream|PARAKEET_LLM_OVERLAY_STREAM|Stable controls|<v>|true|always|true"
     )
-
-    # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
-    if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
-        local helper_path="${BASH_SOURCE[0]:-$__STT_HELPER_PATH}"
-        if command -v readlink >/dev/null 2>&1; then
-            helper_path="$(readlink -f "$helper_path" 2>/dev/null || echo "$helper_path")"
-        fi
-        REPO_ROOT="$(cd "$(dirname "$helper_path")/.." && pwd 2>/dev/null)"
-    fi
-    # Final guard: ensure the repo path actually has the expected subdirs.
-    if [ ! -d "$REPO_ROOT/parakeet-stt-daemon" ] || [ ! -d "$REPO_ROOT/parakeet-ptt" ]; then
-        echo "stt helper: could not locate repo root (REPO_ROOT='$REPO_ROOT'). Set PARAKEET_ROOT explicitly."
-        return 1
-    fi
-    DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
-    CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
 
     export RUST_LOG="${RUST_LOG:-info}"
 
@@ -334,6 +376,42 @@ PY
         [ "$ready" -eq 1 ]
     }
 
+    _http_ok_once() {
+        local url="$1"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsS --max-time 2 "$url" >/dev/null 2>&1
+            return $?
+        fi
+
+        python3 - "$url" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+
+req = urllib.request.Request(sys.argv[1], method="GET")
+with urllib.request.urlopen(req, timeout=2) as response:
+    sys.exit(0 if 200 <= response.status < 300 else 1)
+PY
+        return $?
+    }
+
+    _wait_for_http() {
+        local url="$1"
+        local pid_file="$2"
+        local tries="${3:-60}"
+        local ready=0
+        for _ in $(seq 1 "$tries"); do
+            if _http_ok_once "$url"; then
+                ready=1
+                break
+            fi
+            if [ -n "$pid_file" ] && [ -f "$pid_file" ] && ! ps -p "$(cat "$pid_file")" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+        done
+        [ "$ready" -eq 1 ]
+    }
+
     _wait_pid_alive() {
         local pid_file="$1"
         local tries="${2:-8}"
@@ -441,6 +519,150 @@ PY
         return 0
     }
 
+    _refresh_pid_file_from_listener() {
+        local port="$1"
+        local pid_file="$2"
+        local listener_pid
+        listener_pid="$(_listener_pid "$port")" || return 1
+        printf "%s\n" "$listener_pid" >| "$pid_file"
+        return 0
+    }
+
+    _llm_health_url() {
+        printf "http://%s:%s/health" "$default_llm_server_host" "$default_llm_server_port"
+    }
+
+    _llm_api_base_url() {
+        printf "http://%s:%s/v1" "$default_llm_server_host" "$default_llm_server_port"
+    }
+
+    _build_llm_server_args() {
+        local -n out_ref="$1"
+        out_ref=("$default_llm_server_bin")
+        if [ -n "$default_llm_server_model_path" ]; then
+            out_ref+=(-m "$default_llm_server_model_path")
+        fi
+        if [ -n "$default_llm_server_model_alias" ]; then
+            out_ref+=(--alias "$default_llm_server_model_alias")
+        fi
+        out_ref+=(
+            --host "$default_llm_server_host"
+            --port "$default_llm_server_port"
+            --ctx-size "$default_llm_server_ctx_size"
+            --parallel "$default_llm_server_parallel"
+        )
+        if [ -n "$default_llm_server_gpu_layers" ]; then
+            out_ref+=(--gpu-layers "$default_llm_server_gpu_layers")
+        fi
+        if [ "$default_llm_server_metrics" = "true" ]; then
+            out_ref+=(--metrics)
+        fi
+        if [ -n "$default_llm_server_extra_args" ]; then
+            eval "set -- $default_llm_server_extra_args"
+            out_ref+=("$@")
+        fi
+    }
+
+    _llm_validate_server_config() {
+        if ! command -v tmux >/dev/null 2>&1; then
+            echo "   - tmux is required for 'stt llm'. Install with: sudo apt install tmux"
+            return 1
+        fi
+        if ! command -v "$default_llm_server_bin" >/dev/null 2>&1; then
+            echo "   - LLM server binary '$default_llm_server_bin' was not found in PATH."
+            return 1
+        fi
+        if ! [[ "$default_llm_server_port" =~ ^[0-9]+$ ]] || [ "$default_llm_server_port" -lt 1 ] || [ "$default_llm_server_port" -gt 65535 ]; then
+            echo "   - Invalid PARAKEET_LLM_SERVER_PORT='$default_llm_server_port'."
+            return 1
+        fi
+        if [ -n "$default_llm_server_model_path" ] && [ ! -f "$default_llm_server_model_path" ]; then
+            echo "   - LLM model path not found: $default_llm_server_model_path"
+            return 1
+        fi
+        if [ -z "$default_llm_server_model_path" ] && [ -z "$default_llm_server_extra_args" ]; then
+            echo "   - Set PARAKEET_LLM_SERVER_MODEL_PATH (recommended) or PARAKEET_LLM_SERVER_EXTRA_ARGS before 'stt llm start'."
+            return 1
+        fi
+        if [ "$default_llm_base_url" != "$(_llm_api_base_url)" ]; then
+            echo "   - PARAKEET_LLM_BASE_URL is '$default_llm_base_url' but managed llama-server expects '$(_llm_api_base_url)'."
+            echo "   - Unset PARAKEET_LLM_BASE_URL or align PARAKEET_LLM_SERVER_HOST/PORT before using 'stt llm'."
+            return 1
+        fi
+        return 0
+    }
+
+    _ensure_llm_server() {
+        local llm_health_url owner llm_cmd_shell
+        local -a llm_cmd
+
+        if ! _llm_validate_server_config; then
+            return 1
+        fi
+
+        llm_health_url="$(_llm_health_url)"
+        owner="$(_port_owner "$default_llm_server_port")"
+        if [ -n "$owner" ] && ! grep -qi "llama" <<<"$owner"; then
+            echo "   - LLM port $default_llm_server_port is in use by $owner."
+            echo "   - Stop that process or set PARAKEET_LLM_SERVER_PORT to a free port."
+            return 1
+        fi
+
+        if _http_ok_once "$llm_health_url"; then
+            _refresh_pid_file_from_listener "$default_llm_server_port" "$LLM_PID_FILE" >/dev/null 2>&1 || true
+            printf "%s:%s\n" "$default_llm_server_host" "$default_llm_server_port" >| "$LLM_PORT_FILE"
+            echo "   - LLM server already healthy on $llm_health_url"
+            return 0
+        fi
+
+        if tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+            tmux kill-session -t "$LLM_TMUX_SESSION"
+        fi
+        if _pid_alive "$LLM_PID_FILE"; then
+            _stop_pid "$LLM_PID_FILE" >/dev/null 2>&1 || true
+        fi
+        rm -f "$LLM_PID_FILE"
+
+        _build_llm_server_args llm_cmd
+        llm_cmd_shell="$(_args_to_shell_words llm_cmd)"
+
+        echo "--- LLM session start: $(date -Is) ---" >> "$LOG_LLM"
+        echo "[$(date -Is)] [helper] managed llama-server start" >> "$LOG_LLM"
+
+        tmux new-session -d -s "$LLM_TMUX_SESSION" -n "$LLM_TMUX_WINDOW" -c "$REPO_ROOT" \
+            "LOG_LLM=\"$LOG_LLM\" LLM_CMD_SHELL=\"$llm_cmd_shell\" bash -lc 'echo \"[helper] exec $LLM_CMD_SHELL\" >> \"$LOG_LLM\"; eval \"set -- $LLM_CMD_SHELL\"; exec \"$@\" >> \"$LOG_LLM\" 2>&1'"
+
+        echo -n "   - Waiting for llama-server health..."
+        if _wait_for_http "$llm_health_url" "$LLM_PID_FILE" 120; then
+            _refresh_pid_file_from_listener "$default_llm_server_port" "$LLM_PID_FILE" >/dev/null 2>&1 || true
+            printf "%s:%s\n" "$default_llm_server_host" "$default_llm_server_port" >| "$LLM_PORT_FILE"
+            echo " OK"
+            return 0
+        fi
+
+        echo " not ready; last llama log lines:"
+        tail -n 80 "$LOG_LLM"
+        return 1
+    }
+
+    _stop_llm_server() {
+        local stopped=0
+        if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+            tmux kill-session -t "$LLM_TMUX_SESSION"
+            stopped=1
+        fi
+        if _http_ok_once "$(_llm_health_url)"; then
+            _refresh_pid_file_from_listener "$default_llm_server_port" "$LLM_PID_FILE" >/dev/null 2>&1 || true
+        fi
+        if _pid_alive "$LLM_PID_FILE"; then
+            if _stop_pid "$LLM_PID_FILE"; then
+                stopped=1
+            fi
+        fi
+        rm -f "$LLM_PID_FILE" "$LLM_PORT_FILE"
+        [ "$stopped" -eq 1 ]
+    }
+
     _find_free_port() {
         local start="$1"
         local end=$((start + 10))
@@ -493,6 +715,7 @@ Commands:
   start [options]        Start daemon + client (default command).
   stream [options]       Start daemon/client in stream+seal mode.
   off [options]          Start daemon/client in offline mode (overlay off).
+  llm [args]             Start/stop/status the managed llama + STT stack.
   stop                   Stop daemon/client and remove pid/port files.
   restart [options]      Restart with the same options as start.
   status                 Show daemon/client/tmux status.
@@ -502,7 +725,7 @@ Commands:
   tmux [attach|kill]     Attach/kill helper tmux session.
   check                  Run daemon health check.
   diag-injector          Run clipboard injector diagnostics.
-  help [start]           Show this help or start help.
+  help [start|llm]       Show this help or command-specific help.
 EOF
     }
     _print_help_start() {
@@ -534,6 +757,46 @@ Other environment overrides:
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
   PARAKEET_OVERLAY_ENABLED=<true|false>
   PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled>
+EOF
+    }
+
+    _print_help_llm() {
+        cat <<EOF
+Usage:
+  stt llm [streaming|offline] [stt-start-options...]
+  stt llm start [streaming|offline] [stt-start-options...]
+  stt llm stop
+  stt llm restart [streaming|offline] [stt-start-options...]
+  stt llm status
+  stt llm logs
+  stt llm show
+
+Behavior:
+  stt llm               Start managed llama-server, then delegate to 'stt start'.
+  stt llm stop          Stop both the STT stack and the managed llama-server.
+  stt llm status        Show managed llama status, then normal STT status.
+  stt llm logs          Tail /tmp/parakeet-llama-server.log.
+  stt llm show          Attach to the llama tmux session.
+
+Managed llama configuration (use shell env or $LOCAL_ENV_FILE):
+  PARAKEET_LLM_SERVER_BIN=$default_llm_server_bin
+  PARAKEET_LLM_SERVER_MODEL_PATH=<path-to-model.gguf>
+  PARAKEET_LLM_SERVER_MODEL_ALIAS=$default_llm_server_model_alias
+  PARAKEET_LLM_SERVER_HOST=$default_llm_server_host
+  PARAKEET_LLM_SERVER_PORT=$default_llm_server_port
+  PARAKEET_LLM_SERVER_CTX_SIZE=$default_llm_server_ctx_size
+  PARAKEET_LLM_SERVER_GPU_LAYERS=$default_llm_server_gpu_layers
+  PARAKEET_LLM_SERVER_PARALLEL=$default_llm_server_parallel
+  PARAKEET_LLM_SERVER_METRICS=$default_llm_server_metrics
+  PARAKEET_LLM_SERVER_EXTRA_ARGS=<shell-quoted extra args>
+
+Resolved client wiring:
+  PARAKEET_LLM_BASE_URL=$default_llm_base_url
+  PARAKEET_LLM_MODEL=$default_llm_model
+
+Notes:
+  - Keep workstation-specific llama settings in the ignored repo-local files.
+  - 'stt llm' refuses mismatched LLM_BASE_URL vs managed host/port to avoid split-brain config.
 EOF
     }
 
@@ -576,6 +839,9 @@ CLIENTCMD
                 start)
                     _print_help_start
                     ;;
+                llm)
+                    _print_help_llm
+                    ;;
                 *)
                     echo "Unknown help topic: $1"
                     echo
@@ -591,7 +857,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local -a ptt_args
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
@@ -619,7 +885,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
                 launch_profile="stream-seal"
@@ -672,7 +938,7 @@ CLIENTCMD
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Overlay enabled: $overlay_enabled"
             echo "   - Overlay adaptive width: $overlay_adaptive_width"
-            echo "   - Query modifier key: $query_modifier_key"
+            echo "   - LLM pre-modifier key: $llm_pre_modifier_key"
             echo "   - LLM base URL: $llm_base_url"
             echo "   - LLM model: $llm_model"
             echo "   - LLM timeout (s): $llm_timeout_seconds"
@@ -795,6 +1061,123 @@ CLIENTCMD
 
             echo "   - Dictation ready (tmux session: $TMUX_SESSION)."
             echo "     Use 'stt show' to view panes; Ctrl+b d to detach."
+            ;;
+        llm)
+            local llm_action="${1:-start}"
+            case "$llm_action" in
+                help|--help|-h)
+                    _print_help_llm
+                    ;;
+                start|"")
+                    [ "$llm_action" = "start" ] && shift
+                    local llm_base_url
+                    echo ">>> Starting managed llama + Parakeet STT..."
+                    echo "   - LLM binary: $default_llm_server_bin"
+                    echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
+                    echo "   - LLM model alias: $default_llm_server_model_alias"
+                    echo "   - LLM API base URL: $(_llm_api_base_url)"
+                    echo "   - LLM context/gpu/parallel: ${default_llm_server_ctx_size}/${default_llm_server_gpu_layers}/${default_llm_server_parallel}"
+                    echo "   - LLM metrics: $default_llm_server_metrics"
+                    if ! _ensure_llm_server; then
+                        return 1
+                    fi
+                    if ! llm_base_url="$(_llm_api_base_url)"; then
+                        echo "   - Failed to resolve managed LLM API base URL."
+                        return 1
+                    fi
+                    if [ -z "$llm_base_url" ]; then
+                        echo "   - Managed LLM API base URL is empty."
+                        return 1
+                    fi
+                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
+                    export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
+                    local _STT_SKIP_LOCAL_OVERRIDES=1
+                    stt start "$@"
+                    ;;
+                stream|streaming|offline|off|on|--*)
+                    local llm_base_url
+                    echo ">>> Starting managed llama + Parakeet STT..."
+                    echo "   - LLM binary: $default_llm_server_bin"
+                    echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
+                    echo "   - LLM model alias: $default_llm_server_model_alias"
+                    echo "   - LLM API base URL: $(_llm_api_base_url)"
+                    if ! _ensure_llm_server; then
+                        return 1
+                    fi
+                    if ! llm_base_url="$(_llm_api_base_url)"; then
+                        echo "   - Failed to resolve managed LLM API base URL."
+                        return 1
+                    fi
+                    if [ -z "$llm_base_url" ]; then
+                        echo "   - Managed LLM API base URL is empty."
+                        return 1
+                    fi
+                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
+                    export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
+                    local _STT_SKIP_LOCAL_OVERRIDES=1
+                    stt start "$llm_action" "$@"
+                    ;;
+                restart)
+                    shift
+                    stt llm stop >/dev/null 2>&1 || true
+                    stt llm start "$@"
+                    ;;
+                stop)
+                    shift
+                    stt stop
+                    echo ">>> Stopping managed llama-server..."
+                    if _stop_llm_server; then
+                        echo "   - LLM server stopped"
+                    else
+                        echo "   - LLM server not running"
+                    fi
+                    ;;
+                status)
+                    local llm_health_url
+                    llm_health_url="$(_llm_health_url)"
+                    echo ">>> Managed LLM:"
+                    if _http_ok_once "$llm_health_url" && _refresh_pid_file_from_listener "$default_llm_server_port" "$LLM_PID_FILE" >/dev/null 2>&1; then
+                        :
+                    fi
+                    if _pid_alive "$LLM_PID_FILE"; then
+                        echo "   - LLM server running (pid $(cat "$LLM_PID_FILE"))"
+                    else
+                        echo "   - LLM server not running"
+                    fi
+                    echo "   - LLM API base URL: $(_llm_api_base_url)"
+                    echo "   - LLM health URL: $llm_health_url"
+                    echo "   - LLM model alias: $default_llm_server_model_alias"
+                    if [ -f "$LLM_PORT_FILE" ]; then
+                        echo "   - LLM port file: $(cat "$LLM_PORT_FILE")"
+                    fi
+                    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+                        echo "   - LLM tmux session: $LLM_TMUX_SESSION"
+                    fi
+                    stt status
+                    ;;
+                logs)
+                    echo ">>> LLM Logs ($LOG_LLM):"
+                    tail -f "$LOG_LLM"
+                    ;;
+                show|attach)
+                    if ! command -v tmux >/dev/null 2>&1; then
+                        echo "tmux is not installed; install it first (sudo apt install tmux)."
+                        return 1
+                    fi
+                    if tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+                        echo "Attaching to llama tmux session '$LLM_TMUX_SESSION' (Ctrl+b d to detach)..."
+                        tmux attach -t "$LLM_TMUX_SESSION"
+                    else
+                        echo "No llama tmux session '$LLM_TMUX_SESSION' found. Start with 'stt llm'."
+                    fi
+                    ;;
+                *)
+                    echo "Unknown llm subcommand: $llm_action"
+                    echo
+                    _print_help_llm
+                    return 1
+                    ;;
+            esac
             ;;
         restart)
             local restart_mode=""
@@ -920,7 +1303,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
@@ -1013,7 +1396,7 @@ CLIENTCMD
                     local injection_mode paste_key_backend paste_backend_failure_policy
                     local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
                     local completion_sound completion_sound_path completion_sound_volume
-                    local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+                    local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
 
                     _load_start_vars_from_defaults
