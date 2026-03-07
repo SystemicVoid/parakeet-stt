@@ -13,27 +13,49 @@ Critical boundaries audited:
 2. Rust PTT client hotkey event ingestion, async worker lifecycle, and injection serialization guarantees.
 3. Cross-process resilience assumptions under disconnects, stalled subprocesses, and partial failures.
 
+## Post-Merge Reassessment (Commit 5c976fe, merged 2026-03-07)
+
+1. Scope of code changes
+The merged release changes the Rust client hotkey path (`parakeet-ptt/src/hotkey.rs`, `parakeet-ptt/src/main.rs`) plus operator/helper surfaces. It does **not** change the daemon session manager, daemon audio buffering, or injector timeout implementation.
+2. Finding status summary
+   - Findings 1-4 remain materially unchanged by this merge.
+   - The original Finding 5 is no longer accurate as written. The merged hotkey implementation now has listener supervision, periodic rescans, synthetic key-up cleanup, and richer diagnostics (`parakeet-ptt/src/hotkey.rs`, lines 371-424 and 555-645).
+3. Replacement risk
+The hotkey area still has a narrower residual issue: listeners do not reconstruct already-held modifier state when they attach or re-attach, so the first utterance after startup or device recovery can still be misrouted.
+
+## Post-Fix Reassessment (Commit efe286a, 2026-03-07)
+
+1. Finding 1 is now resolved in code
+The daemon now binds each active session to the WebSocket that started it, then checks that owner token before stop, abort, disconnect cleanup, and rollback cleanup paths run.
+2. Implementation evidence
+   - `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py` now stores `owner_token` on `Session` and enforces that token in `start_session`, `stop_session`, and `clear`.
+   - `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py` now derives `owner_token = id(websocket)` and requires owner matches in `handle_websocket`, `_handle_start`, `_handle_stop`, `_handle_abort`, and `_cleanup_active_session`.
+   - `parakeet-stt-daemon/tests/test_session_cleanup.py` now covers non-owner disconnect, stop, and abort attempts, plus the existing disconnect-during-start interleaving race.
+3. Practical effect
+This closes the original boundary flaw: one connected client can no longer tear down another client’s active capture just by disconnecting or by replaying the other session ID.
+
 ---
 
 ## Finding 1
 
 1. Title
-Session ownership is not bound to a specific WebSocket, so unrelated disconnects can terminate active capture.
-2. Severity: High
+Session ownership is now bound to the creating WebSocket; non-owner teardown paths are rejected.
+2. Severity: Resolved locally (was High before fix)
 3. Confidence: High
 4. Why this matters
-The daemon allows only one active session globally, but it does not track which WebSocket owns that session. That creates a boundary flaw: connection lifecycle from one client can tear down another client’s active session.
+This was a real correctness bug before the fix. The daemon still allows only one active session globally, but it now records which WebSocket owns that session and refuses teardown from unrelated sockets.
 5. Evidence
-   - `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py` (`handle_websocket`, lines 132-139) resolves `expected_session_id` from global `self.sessions.active` and calls cleanup on disconnect.
-   - No owner binding is recorded at session start (`_handle_start`, lines 168-187) beyond the `session_id` itself.
-6. Failure mode
-Concrete scenario: client A starts dictation; client B is also connected (or an old reconnecting socket still exists). Client B disconnects first. The disconnect path reads global active session (A’s), then cleans it up, abruptly aborting A’s capture and dropping user speech.
-7. Why tests/linters might miss it
-Current tests focus heavily on single-client cleanup invariants and interleaving races, but not multi-client ownership conflicts. Static checks cannot infer this distributed ownership invariant.
-8. Recommended fix
-Track `session_owner` (for example, `id(websocket)` or a per-connection UUID) alongside active session metadata. Only allow disconnect-triggered cleanup when the disconnecting socket matches the owner. If multi-client is intentionally unsupported, enforce that explicitly by rejecting second active control connections with a protocol-level error.
+   - `parakeet-stt-daemon/src/parakeet_stt_daemon/session.py` now records `Session.owner_token` and enforces owner matches in `stop_session` and `clear`.
+   - `parakeet-stt-daemon/src/parakeet_stt_daemon/server.py` binds `owner_token = id(websocket)` at connection entry and requires that owner for disconnect cleanup, stop, abort, and start rollback.
+   - `parakeet-stt-daemon/tests/test_session_cleanup.py` now proves that non-owner disconnect, stop, and abort paths leave the owner’s active session intact.
+6. Current status
+Resolved in commit `efe286a` on 2026-03-07. Non-owner sockets now receive `SESSION_NOT_FOUND` for stop/abort attempts, and unrelated disconnects no longer clear the active session.
+7. Remaining caveat
+The daemon still intentionally runs as a single-active-session service. A second client can connect, but it cannot mutate or terminate a session it does not own.
+8. Recommended follow-through
+Keep the new owner-binding regressions in the release gate. If multi-client operator UX becomes confusing later, consider an explicit protocol error that says "another controller owns the active session" instead of the current privacy-preserving `SESSION_NOT_FOUND`.
 9. Is this a real issue or just a preference?
-Real issue. This is a correctness boundary violation under plausible runtime topology, not a style preference.
+Real issue, now fixed locally.
 
 ## Finding 2
 
@@ -100,22 +122,24 @@ Real issue. This is a production robustness and resource-safety defect.
 ## Finding 5
 
 1. Title
-Hotkey device listeners fail closed and are not self-healing after device errors.
-2. Severity: Medium
-3. Confidence: High
+Hotkey listeners now self-heal after device churn, but intent capture does not reconstruct already-held modifier state on attach/recovery.
+2. Severity: Low
+3. Confidence: Medium
 4. Why this matters
-Input-device failures are normal on Linux desktops (suspend/resume, USB re-enumeration, transient evdev errors). If listeners exit permanently, push-to-talk silently dies until manual restart.
+The merge closes the larger availability bug, but the new pre-modifier design still depends on seeing a modifier-down event after a listener attaches. If Shift is already held during startup, resume, or device re-enumeration, the first talk-down can still be classified as `Dictate` instead of `llm_query`.
 5. Evidence
-   - `parakeet-ptt/src/hotkey.rs` (`spawn_hotkey_loop`, lines 220-224) logs `hotkey device error` and `break`s from the device loop.
-   - No device reopen/rescan supervision exists in the same module.
+   - `parakeet-ptt/src/hotkey.rs` (`run_hotkey_supervisor`, lines 555-645) now supervises listener exits, periodically rescans `/dev/input/event*`, and respawns listeners for recovered devices.
+   - `parakeet-ptt/src/hotkey.rs` (`handle_listener_exit`, lines 371-424) releases dead listener state and can emit a synthetic `HotkeyEvent::Up`, so the original fail-closed/stuck-key defect is materially fixed.
+   - `parakeet-ptt/src/hotkey.rs` (`hotkey_listener_for_path`, lines 669-708) opens the device and immediately starts consuming future events; it does not seed state from the device's current pressed-key bitmap.
+   - `parakeet-ptt/src/hotkey.rs` (`derive_hotkey_event`, lines 800-828) snapshots intent from `state.pre_modifier_active()`, which is only updated from observed modifier transitions.
 6. Failure mode
-Concrete scenario: keyboard device path resets after resume. `fetch_events()` errors once; listener thread exits. App remains connected to daemon and appears healthy, but hotkey presses do nothing for the rest of the session.
+Concrete scenario: the keyboard re-enumerates after resume while the user is already holding Shift. The replacement listener attaches after the Shift-down event already happened, so shared state still says "modifier up." The next RightCtrl press starts a plain dictate session for that first utterance.
 7. Why tests/linters might miss it
-Tests cover parser/shared-state logic, not device churn over long-running process lifetimes. Static checks do not model hardware lifecycle behavior.
+The new tests cover shared-state cleanup, supervised exits, and post-attach event handling, but they do not model "listener attaches while modifier is already held." Static checks cannot infer this temporal hardware-state edge.
 8. Recommended fix
-Replace fail-closed break with a supervised reopen loop: on error, backoff, reopen the same path, and periodically rescan `/dev/input/event*` for replacement devices. Emit health metrics/counters when listener count drops.
+On listener attach and reattach, read the device's current pressed-key state and seed `ListenerPressedState` / `HotkeySharedState` before processing new events. If evdev state cannot be trusted everywhere, add an explicit diagnostic when the first talk-down after attach occurs with no observed modifier history.
 9. Is this a real issue or just a preference?
-Real issue. This is an availability and operability gap under common runtime conditions.
+Real issue, but much narrower than the original finding. The availability hole was materially fixed; this is a residual intent-capture edge case.
 
 ---
 
@@ -128,9 +152,9 @@ Later sessions show only `start_session ... intent=Dictate` and plain `final res
 3. Why this matters for prioritization
 This isolates the failure boundary to **client-side modifier-intent capture/promotion**, not daemon transcription, not injection backend, and not LLM residency/health.
 4. Connection to findings
-This maps directly to **Finding 5** (hotkey/input lifecycle fragility) and elevates it from a theoretical availability risk to a currently observed user-impacting defect class.
+This mapped directly to the **original** Finding 5 and explains why commit `5c976fe` targeted the hotkey/input lifecycle path first.
 5. Priority update
-Treat the hotkey/modifier path as an immediate reliability fix target: add self-healing input listener recovery, plus explicit modifier-event observability counters/logging so dropped modifier transitions are diagnosable in production.
+That original priority action has now been shipped. The remaining hotkey follow-up is narrower: seed already-held modifier state on listener attach/recovery so the first post-recovery utterance cannot be misclassified.
 
 ## Implementation Status Update (2026-03-07, Hotkey Reliability Pass)
 
@@ -140,29 +164,36 @@ The incident evidence above remains the original trigger signal, including histo
 Runtime intent selection is now a single deterministic path: **Shift (any) held before RightCtrl** selects `llm_query`, and intent is snapshotted on hotkey-down for the full utterance.
 3. Simplification decision
 Mid-utterance promotion behavior was intentionally removed. This trades flexibility for reliability and avoids ambiguous modifier-transition races during active capture.
-4. Reliability boundary addressed
-The shipped change targets **client hotkey/input lifecycle robustness** (listener supervision, re-enumeration, and clearer diagnostics), directly addressing the boundary identified in Finding 5.
+4. Reliability boundary materially addressed
+The shipped change closes the original hotkey listener availability gap: listener exits are supervised, device paths are rescanned, dead listeners release key state, and diagnostics now expose listener churn.
 5. Not an LLM availability fix
 This pass does **not** alter LLM model/server readiness semantics. If an utterance is captured with `Dictate` intent, the LLM path is intentionally bypassed regardless of LLM health.
-6. Operational interpretation change
-After this change, absence of LLM routing for a given utterance should be interpreted first as an intent-capture outcome (pre-modifier not active at talk-down) before suspecting LLM runtime outages.
-7. Terminology migration completed
+6. Residual edge still open
+The merged implementation does **not** reconstruct modifier state that was already held when a listener attached or re-attached. Operationally, a first utterance after startup/recovery can still be misrouted unless the modifier is re-pressed.
+7. Operational interpretation change
+After this change, absence of LLM routing for a given utterance should be interpreted first as an intent-capture outcome (pre-modifier not active at talk-down), then as a possible attach-state blind spot if device recovery just occurred, before suspecting LLM runtime outages.
+8. Terminology migration completed
 Operator-facing surfaces use `llm_pre_modifier` naming (default `KEY_SHIFT`) instead of `query_modifier`, aligning CLI/helper UX with the canonical trigger model.
 
 ---
 
-## Ranked Top-5 Risk List
+## ROI-Prioritized Backlog
 
-1. Unbounded session audio accumulation can OOM the daemon (Finding 4).
-2. Concurrent transcriber/model use across executor paths can yield non-deterministic failures (Finding 2).
-3. Injector timeout semantics can violate serialized side effects (Finding 3).
-4. WebSocket disconnect ownership ambiguity can abort the wrong active session (Finding 1).
-5. Hotkey listeners are not self-healing after device churn (Finding 5).
+Finding 1 is closed in commit `efe286a`, so it drops out of the remaining backlog.
+
+1. Session audio hard limits (Finding 4).
+Why this ranks first: this is still the best resilience-per-line-item trade. A hard cap is a simple circuit breaker against daemon-wide OOM and does not require protocol redesign.
+2. Attach-time modifier-state seeding (Finding 5).
+Why this ranks second: the impact is narrower than Finding 4, but the cost is very low because the hotkey supervision rewrite already centralizes attach/re-attach behavior. This is like fixing the last loose hinge while the door is already off the frame.
+3. Unified transcriber inference gate (Finding 2).
+Why this ranks third: the reliability payoff is high, but it touches the live-interim/finalization boundary and needs careful latency/regression validation around shared model access.
+4. Killable injector timeout boundary (Finding 3).
+Why this ranks fourth: the user-facing corruption risk is real, but the durable fix likely needs a subprocess or worker-process boundary, which makes it materially more expensive than the remaining daemon and hotkey work.
 
 ## Likely AI-Generated Anti-Patterns
 
 1. Fail-open/fail-soft behavior without preserving invariants (timeouts and fallback paths that keep progressing while hidden work may still run).
-2. Global state with implicit ownership (active session tracked globally, but no explicit owner boundary).
+2. Global singleton runtime objects that depend on explicit serialization/ownership discipline.
 3. “Best effort” cancellation that reports success semantics stronger than actual runtime guarantees.
 4. Silent resource growth assumptions (in-memory accumulation trusted to external control flow correctness).
 5. Runtime degradation paths that log warnings but do not enforce safe operational contracts.
@@ -175,8 +206,8 @@ Operator-facing surfaces use `llm_pre_modifier` naming (default `KEY_SHIFT`) ins
 
 ## What I Would Inspect Next
 
-1. End-to-end stress test with synthetic hotkey jitter/disconnects to validate daemon/client session invariants under reconnect storms.
-2. NeMo/CUDA thread-safety assumptions in real hardware runs with forced overlap to confirm race manifestation frequency.
-3. Long-duration soak tests for daemon memory profile under intentionally stuck sessions and partial control-plane failure.
-4. Injection correctness under timeout/retry pressure with deterministic clipboard probes and ordering assertions.
-5. Security trust boundary hardening for local WebSocket control (auth defaults, optional Unix socket, and privilege separation posture).
+1. Release-gate multi-client reconnect/disconnect runs that keep the new owner-binding invariant from regressing.
+2. Long-duration soak tests with intentional stuck sessions to validate daemon memory caps once implemented.
+3. Hotkey attach/recovery tests where Shift is already held before the listener comes online.
+4. NeMo/CUDA overlap stress runs with forced interim/final decode contention to validate the inference-gate fix.
+5. Injection ordering tests around real timeout/retry behavior after moving the worker to a killable boundary.
