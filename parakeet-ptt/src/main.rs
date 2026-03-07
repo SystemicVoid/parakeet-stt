@@ -35,7 +35,7 @@ use crate::config::{
     InjectionConfig, OverlayMode, DEFAULT_ENDPOINT,
 };
 use crate::hotkey::{
-    ensure_input_access, parse_modifier_key_names, spawn_hotkey_loop, HotkeyEvent,
+    ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent, HotkeyIntent,
 };
 use crate::injector::{injector_metrics_snapshot, TextInjector};
 use crate::overlay_process::OverlayProcessManager;
@@ -55,7 +55,8 @@ const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
-const DEFAULT_QUERY_MODIFIER_KEY: &str = "KEY_ALT";
+const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
+const DEFAULT_LLM_PRE_MODIFIER_KEY: &str = "KEY_SHIFT";
 const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_LLM_MODEL: &str = "local";
 const DEFAULT_LLM_SYSTEM_PROMPT: &str =
@@ -191,6 +192,75 @@ impl OverlayRoutingMetrics {
     fn note_session_mismatch_drop(&self) {
         self.dropped_session_mismatch_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
+struct HotkeyIntentDiagnostics {
+    hotkey_down_total: u64,
+    hotkey_down_dictate_total: u64,
+    hotkey_down_llm_query_total: u64,
+    hotkey_down_ignored_total: u64,
+    hotkey_up_total: u64,
+    hotkey_up_ignored_total: u64,
+    llm_busy_reject_total: u64,
+    last_logged_hotkey_events: u64,
+}
+
+impl HotkeyIntentDiagnostics {
+    fn note_hotkey_down(&mut self, intent: SessionIntent) {
+        self.hotkey_down_total += 1;
+        match intent {
+            SessionIntent::Dictate => self.hotkey_down_dictate_total += 1,
+            SessionIntent::LlmQuery => self.hotkey_down_llm_query_total += 1,
+        }
+    }
+
+    fn note_hotkey_down_ignored(&mut self) {
+        self.hotkey_down_ignored_total += 1;
+    }
+
+    fn note_hotkey_up(&mut self) {
+        self.hotkey_up_total += 1;
+    }
+
+    fn note_hotkey_up_ignored(&mut self) {
+        self.hotkey_up_ignored_total += 1;
+    }
+
+    fn note_llm_busy_reject(&mut self) {
+        self.llm_busy_reject_total += 1;
+    }
+
+    fn maybe_log_summary(&mut self, reason: &'static str) {
+        let hotkey_events = self.hotkey_down_total + self.hotkey_up_total;
+        if hotkey_events == 0 {
+            return;
+        }
+        if hotkey_events
+            < self.last_logged_hotkey_events + HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS
+        {
+            return;
+        }
+        self.last_logged_hotkey_events = hotkey_events;
+        self.log_summary(reason);
+    }
+
+    fn log_summary(&self, reason: &'static str) {
+        if self.hotkey_down_total == 0 && self.hotkey_up_total == 0 {
+            return;
+        }
+        info!(
+            reason,
+            hotkey_down_total = self.hotkey_down_total,
+            hotkey_down_dictate_total = self.hotkey_down_dictate_total,
+            hotkey_down_llm_query_total = self.hotkey_down_llm_query_total,
+            hotkey_down_ignored_total = self.hotkey_down_ignored_total,
+            hotkey_up_total = self.hotkey_up_total,
+            hotkey_up_ignored_total = self.hotkey_up_ignored_total,
+            llm_busy_reject_total = self.llm_busy_reject_total,
+            "hotkey intent routing diagnostics"
+        );
     }
 }
 
@@ -784,9 +854,9 @@ struct Cli {
     #[arg(long, default_value = "KEY_RIGHTCTRL")]
     hotkey: String,
 
-    /// Query modifier key used during a PTT hold to route utterance to LLM.
-    #[arg(long, default_value = DEFAULT_QUERY_MODIFIER_KEY)]
-    query_modifier_key: String,
+    /// Pre-modifier key held before hotkey down to start in LLM query mode.
+    #[arg(long, default_value = DEFAULT_LLM_PRE_MODIFIER_KEY)]
+    llm_pre_modifier_key: String,
 
     /// Path to ydotool binary (used when paste key backend is ydotool/auto)
     #[arg(long)]
@@ -1018,7 +1088,7 @@ async fn main() -> Result<()> {
         cli.overlay_enabled,
         cli.overlay_adaptive_width,
         llm_config,
-        cli.query_modifier_key.clone(),
+        cli.llm_pre_modifier_key.clone(),
     )
     .await
 }
@@ -1418,15 +1488,15 @@ async fn run_hotkey_mode(
     overlay_enabled_override: Option<bool>,
     overlay_adaptive_width_override: Option<bool>,
     llm_config: LlmRuntimeConfig,
-    query_modifier_key_name: String,
+    llm_pre_modifier_key_name: String,
 ) -> Result<()> {
     let talk_key = crate::hotkey::parse_key_name(&config.hotkey)
         .with_context(|| format!("invalid --hotkey value '{}'", config.hotkey))?;
-    let query_modifier_keys =
-        parse_modifier_key_names(&query_modifier_key_name).with_context(|| {
+    let llm_pre_modifier_keys = parse_pre_modifier_key_names(&llm_pre_modifier_key_name)
+        .with_context(|| {
             format!(
-                "invalid --query-modifier-key value '{}'",
-                query_modifier_key_name
+                "invalid --llm-pre-modifier-key value '{}'",
+                llm_pre_modifier_key_name
             )
         })?;
 
@@ -1454,7 +1524,7 @@ async fn run_hotkey_mode(
     info!(
         endpoint = %config.endpoint,
         hotkey = %config.hotkey,
-        query_modifier_key = %query_modifier_key_name,
+        llm_pre_modifier_key = %llm_pre_modifier_key_name,
         completion_sound = audio_feedback.is_enabled(),
         "Starting hotkey loop"
     );
@@ -1474,11 +1544,11 @@ async fn run_hotkey_mode(
 
     let mut state = PttState::new();
     let (hk_tx, mut hk_rx) = mpsc::unbounded_channel();
-    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, query_modifier_keys.clone())?;
+    let hotkey_tasks = spawn_hotkey_loop(hk_tx, talk_key, llm_pre_modifier_keys.clone())?;
     info!(
         devices = hotkey_tasks.len(),
         talk_key = ?talk_key,
-        query_modifier_keys = ?query_modifier_keys,
+        llm_pre_modifier_keys = ?llm_pre_modifier_keys,
         "Hotkey listeners started"
     );
 
@@ -1504,6 +1574,7 @@ async fn run_hotkey_mode(
     let mut llm_busy_overlay_seq: u64 = 0;
     let llm_busy_overlay_session = Uuid::nil();
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
+    let mut hotkey_intent_diagnostics = HotkeyIntentDiagnostics::default();
 
     loop {
         match WsClient::connect(&config).await {
@@ -1517,7 +1588,9 @@ async fn run_hotkey_mode(
                         tokio::select! {
                             Some(evt) = hk_rx.recv() => {
                                 match evt {
-                                    HotkeyEvent::Down { query_modifier_active } => {
+                                    HotkeyEvent::Down { intent } => {
+                                        let intent = session_intent_from_hotkey(intent);
+                                        hotkey_intent_diagnostics.note_hotkey_down(intent);
                                         if llm_busy {
                                             warn!("ignoring hotkey down while LLM response is in progress");
                                             llm_busy_overlay_seq = llm_busy_overlay_seq.saturating_add(1);
@@ -1532,36 +1605,40 @@ async fn run_hotkey_mode(
                                                 llm_busy_overlay_session,
                                                 Some("busy".to_string()),
                                             );
+                                            hotkey_intent_diagnostics.note_llm_busy_reject();
+                                            hotkey_intent_diagnostics.maybe_log_summary("hotkey_down_busy");
                                             continue;
                                         }
                                         if let Some(session_id) = state.begin_listening() {
-                                            let intent = if query_modifier_active {
-                                                SessionIntent::LlmQuery
-                                            } else {
-                                                SessionIntent::Dictate
-                                            };
                                             active_intent = Some(intent);
                                             let message = start_message(session_id, Some("auto".to_string()));
                                             send_message(&mut ws_write, &message).await?;
                                             info!(session = %session_id, ?intent, "start_session sent (hotkey down)");
+                                        } else {
+                                            hotkey_intent_diagnostics.note_hotkey_down_ignored();
+                                            debug!(
+                                                ?state,
+                                                ?active_intent,
+                                                "ignoring hotkey down because client is not idle"
+                                            );
                                         }
+                                        hotkey_intent_diagnostics.maybe_log_summary("hotkey_down");
                                     }
                                     HotkeyEvent::Up => {
+                                        hotkey_intent_diagnostics.note_hotkey_up();
                                         if let Some(session_id) = state.stop_listening() {
                                             let message = stop_message(session_id);
                                             send_message(&mut ws_write, &message).await?;
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
+                                        } else {
+                                            hotkey_intent_diagnostics.note_hotkey_up_ignored();
+                                            debug!(
+                                                ?state,
+                                                ?active_intent,
+                                                "ignoring hotkey up because no listening session is active"
+                                            );
                                         }
-                                    }
-                                    HotkeyEvent::QueryModifierDown => {
-                                        if matches!(state, PttState::Listening { .. })
-                                            && active_intent != Some(SessionIntent::LlmQuery)
-                                        {
-                                            active_intent = Some(SessionIntent::LlmQuery);
-                                            info!("query modifier engaged; current utterance promoted to llm_query");
-                                        }
-                                    }
-                                    HotkeyEvent::QueryModifierUp => {
+                                        hotkey_intent_diagnostics.maybe_log_summary("hotkey_up");
                                     }
                                 }
                             }
@@ -1780,6 +1857,7 @@ async fn run_hotkey_mode(
                 if let Err(err) = run_loop {
                     warn!("session loop ended with error: {err}");
                 }
+                hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
                 state.reset();
                 active_intent = None;
                 warn!("Reconnecting to daemon after drop");
@@ -1994,6 +2072,13 @@ fn session_id_from_state(state: &PttState) -> Option<Uuid> {
     }
 }
 
+fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
+    match intent {
+        HotkeyIntent::Dictate => SessionIntent::Dictate,
+        HotkeyIntent::LlmQuery => SessionIntent::LlmQuery,
+    }
+}
+
 fn classify_error_code(code: &str) -> &'static str {
     match code {
         "SESSION_BUSY" => "session_busy",
@@ -2111,8 +2196,9 @@ mod tests {
     use super::{
         build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
         sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
-        InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent, OverlayRouter,
-        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
+        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent,
+        OverlayRouter, OverlaySink, RuntimeOverlaySink, SessionIntent,
+        INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
     struct SlowInjector {
@@ -2250,12 +2336,41 @@ mod tests {
     }
 
     #[test]
-    fn cli_query_modifier_and_llm_defaults_are_set() {
+    fn cli_llm_pre_modifier_and_llm_defaults_are_set() {
         let cli = super::Cli::parse_from(["parakeet-ptt"]);
-        assert_eq!(cli.query_modifier_key, super::DEFAULT_QUERY_MODIFIER_KEY);
+        assert_eq!(
+            cli.llm_pre_modifier_key,
+            super::DEFAULT_LLM_PRE_MODIFIER_KEY
+        );
         assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
         assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
         assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn hotkey_intent_diagnostics_tracks_intent_split_and_ignored_paths() {
+        let mut diagnostics = HotkeyIntentDiagnostics::default();
+        diagnostics.note_hotkey_down(SessionIntent::Dictate);
+        diagnostics.note_hotkey_down(SessionIntent::LlmQuery);
+        diagnostics.note_hotkey_down_ignored();
+        diagnostics.note_hotkey_up();
+        diagnostics.note_hotkey_up_ignored();
+
+        assert_eq!(diagnostics.hotkey_down_total, 2);
+        assert_eq!(diagnostics.hotkey_down_dictate_total, 1);
+        assert_eq!(diagnostics.hotkey_down_llm_query_total, 1);
+        assert_eq!(diagnostics.hotkey_down_ignored_total, 1);
+        assert_eq!(diagnostics.hotkey_up_total, 1);
+        assert_eq!(diagnostics.hotkey_up_ignored_total, 1);
+    }
+
+    #[test]
+    fn hotkey_intent_diagnostics_tracks_llm_busy_rejections() {
+        let mut diagnostics = HotkeyIntentDiagnostics::default();
+        diagnostics.note_llm_busy_reject();
+        diagnostics.note_llm_busy_reject();
+
+        assert_eq!(diagnostics.llm_busy_reject_total, 2);
     }
 
     #[test]
