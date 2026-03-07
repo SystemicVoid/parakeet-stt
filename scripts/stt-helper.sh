@@ -1070,6 +1070,7 @@ CLIENTCMD
                     ;;
                 start|"")
                     [ "$llm_action" = "start" ] && shift
+                    local llm_base_url
                     echo ">>> Starting managed llama + Parakeet STT..."
                     echo "   - LLM binary: $default_llm_server_bin"
                     echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
@@ -1080,12 +1081,21 @@ CLIENTCMD
                     if ! _ensure_llm_server; then
                         return 1
                     fi
-                    export PARAKEET_LLM_BASE_URL="$(_llm_api_base_url)"
+                    if ! llm_base_url="$(_llm_api_base_url)"; then
+                        echo "   - Failed to resolve managed LLM API base URL."
+                        return 1
+                    fi
+                    if [ -z "$llm_base_url" ]; then
+                        echo "   - Managed LLM API base URL is empty."
+                        return 1
+                    fi
+                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
                     export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
                     local _STT_SKIP_LOCAL_OVERRIDES=1
                     stt start "$@"
                     ;;
                 stream|streaming|offline|off|on|--*)
+                    local llm_base_url
                     echo ">>> Starting managed llama + Parakeet STT..."
                     echo "   - LLM binary: $default_llm_server_bin"
                     echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
@@ -1094,7 +1104,15 @@ CLIENTCMD
                     if ! _ensure_llm_server; then
                         return 1
                     fi
-                    export PARAKEET_LLM_BASE_URL="$(_llm_api_base_url)"
+                    if ! llm_base_url="$(_llm_api_base_url)"; then
+                        echo "   - Failed to resolve managed LLM API base URL."
+                        return 1
+                    fi
+                    if [ -z "$llm_base_url" ]; then
+                        echo "   - Managed LLM API base URL is empty."
+                        return 1
+                    fi
+                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
                     export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
                     local _STT_SKIP_LOCAL_OVERRIDES=1
                     stt start "$llm_action" "$@"
