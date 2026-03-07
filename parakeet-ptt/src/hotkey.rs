@@ -362,6 +362,68 @@ fn hotkey_stop_requested(stop: &AtomicBool) -> bool {
     stop.load(Ordering::Acquire)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerExitAction {
+    Continue,
+    StopSupervisor,
+}
+
+fn handle_listener_exit(
+    listener_context: &HotkeyListenerContext,
+    active_paths: &mut HashSet<PathBuf>,
+    exit: ListenerExit,
+) -> ListenerExitAction {
+    active_paths.remove(&exit.path);
+    listener_context
+        .diagnostics
+        .note_listener_exit(&exit.reason);
+    let cleanup = {
+        let mut state = listener_context
+            .shared_state
+            .lock()
+            .expect("hotkey shared state lock poisoned");
+        state.release_listener_state(&exit.pressed)
+    };
+    if cleanup.had_pressed_keys() {
+        warn!(
+            path = %exit.path.display(),
+            released_talk_down = cleanup.released_talk_down,
+            released_pre_modifier_count = cleanup.released_pre_modifier_count,
+            emit_talk_up = cleanup.emit_talk_up,
+            "released dead listener key state to avoid stuck hotkeys"
+        );
+    }
+    if cleanup.emit_talk_up {
+        listener_context
+            .diagnostics
+            .note_emitted_event(HotkeyEvent::Up);
+        if listener_context.tx.send(HotkeyEvent::Up).is_err() {
+            listener_context.diagnostics.note_send_failure();
+            warn!(path = %exit.path.display(), "hotkey supervisor channel closed while emitting synthetic key up");
+            return ListenerExitAction::StopSupervisor;
+        }
+    }
+    match &exit.reason {
+        ListenerExitReason::Cancelled => ListenerExitAction::Continue,
+        ListenerExitReason::OpenError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener failed to open device; waiting for rescan");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::FetchError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener device stream failed; waiting for rescan");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::TaskJoinError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener task failed unexpectedly");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::ChannelClosed => {
+            warn!(path = %exit.path.display(), "hotkey listener channel closed; stopping hotkey supervisor");
+            ListenerExitAction::StopSupervisor
+        }
+    }
+}
+
 fn set_device_nonblocking(device: &Device) -> io::Result<()> {
     let fd = device.as_raw_fd();
     // Make fetch_events return WouldBlock while idle so listener threads can observe shutdown.
@@ -525,46 +587,10 @@ async fn run_hotkey_supervisor(
                 if let Some(result) = maybe_exit {
                     match result {
                         Ok(exit) => {
-                            active_paths.remove(&exit.path);
-                            listener_context.diagnostics.note_listener_exit(&exit.reason);
-                            let cleanup = {
-                                let mut state = listener_context.shared_state
-                                    .lock()
-                                    .expect("hotkey shared state lock poisoned");
-                                state.release_listener_state(&exit.pressed)
-                            };
-                            if cleanup.had_pressed_keys() {
-                                warn!(
-                                    path = %exit.path.display(),
-                                    released_talk_down = cleanup.released_talk_down,
-                                    released_pre_modifier_count = cleanup.released_pre_modifier_count,
-                                    emit_talk_up = cleanup.emit_talk_up,
-                                    "released dead listener key state to avoid stuck hotkeys"
-                                );
-                            }
-                            if cleanup.emit_talk_up {
-                                listener_context.diagnostics.note_emitted_event(HotkeyEvent::Up);
-                                if listener_context.tx.send(HotkeyEvent::Up).is_err() {
-                                    listener_context.diagnostics.note_send_failure();
-                                    warn!(path = %exit.path.display(), "hotkey supervisor channel closed while emitting synthetic key up");
-                                    break;
-                                }
-                            }
-                            match &exit.reason {
-                                ListenerExitReason::Cancelled => {}
-                                ListenerExitReason::OpenError(err) => {
-                                    warn!(path = %exit.path.display(), error = %err, "hotkey listener failed to open device; waiting for rescan");
-                                }
-                                ListenerExitReason::FetchError(err) => {
-                                    warn!(path = %exit.path.display(), error = %err, "hotkey listener device stream failed; waiting for rescan");
-                                }
-                                ListenerExitReason::TaskJoinError(err) => {
-                                    warn!(path = %exit.path.display(), error = %err, "hotkey listener task failed unexpectedly");
-                                }
-                                ListenerExitReason::ChannelClosed => {
-                                    warn!(path = %exit.path.display(), "hotkey listener channel closed; stopping hotkey supervisor");
-                                    break;
-                                }
+                            if handle_listener_exit(&listener_context, &mut active_paths, exit)
+                                == ListenerExitAction::StopSupervisor
+                            {
+                                break;
                             }
                         }
                         Err(err) => {
@@ -608,10 +634,9 @@ async fn run_hotkey_supervisor(
     while let Some(result) = listeners.join_next().await {
         match result {
             Ok(exit) => {
-                active_paths.remove(&exit.path);
-                listener_context
-                    .diagnostics
-                    .note_listener_exit(&exit.reason);
+                // Shutdown is already in progress; keep draining exits so every listener
+                // releases shared key state even if one reports a fatal stop condition.
+                let _ = handle_listener_exit(&listener_context, &mut active_paths, exit);
             }
             Err(err) => {
                 warn!(error = %err, "hotkey listener join failed during shutdown");
@@ -850,15 +875,19 @@ fn is_event_device_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_hotkey_event, is_event_device_path, parse_key_name, parse_pre_modifier_key_names,
-        validate_hotkey_binding_config, HotkeyEvent, HotkeyIntent, HotkeySharedState, HotkeyTasks,
-        ListenerExitCleanup, ListenerPressedState,
+        derive_hotkey_event, handle_listener_exit, is_event_device_path, parse_key_name,
+        parse_pre_modifier_key_names, validate_hotkey_binding_config, HotkeyDiagnostics,
+        HotkeyEvent, HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks,
+        ListenerExit, ListenerExitAction, ListenerExitCleanup, ListenerExitReason,
+        ListenerPressedState,
     };
     use evdev::Key;
     use std::collections::HashSet;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::task::yield_now;
 
     #[test]
@@ -956,6 +985,60 @@ mod tests {
         );
         assert!(!state.pre_modifier_active());
         assert!(state.note_talk_down());
+    }
+
+    #[test]
+    fn handle_listener_exit_releases_state_and_emits_synthetic_up() {
+        let (tx, mut rx) = unbounded_channel();
+        let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
+        {
+            let mut state = shared_state
+                .lock()
+                .expect("hotkey shared state lock poisoned");
+            state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+            assert!(state.note_talk_down());
+        }
+        let diagnostics = Arc::new(HotkeyDiagnostics::default());
+        let listener_context = HotkeyListenerContext {
+            tx,
+            talk_key: Key::KEY_RIGHTCTRL,
+            llm_pre_modifier_keys: vec![Key::KEY_LEFTSHIFT],
+            shared_state: Arc::clone(&shared_state),
+            diagnostics: Arc::clone(&diagnostics),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let path = PathBuf::from("/dev/input/event42");
+        let mut active_paths = HashSet::from([path.clone()]);
+
+        assert_eq!(
+            handle_listener_exit(
+                &listener_context,
+                &mut active_paths,
+                ListenerExit {
+                    path: path.clone(),
+                    reason: ListenerExitReason::Cancelled,
+                    pressed: ListenerPressedState {
+                        talk_down: true,
+                        pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+                    },
+                },
+            ),
+            ListenerExitAction::Continue
+        );
+
+        assert!(!active_paths.contains(&path));
+        assert_eq!(rx.try_recv().unwrap(), HotkeyEvent::Up);
+        {
+            let mut state = shared_state
+                .lock()
+                .expect("hotkey shared state lock poisoned");
+            assert!(!state.pre_modifier_active());
+            assert!(state.note_talk_down());
+        }
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.listener_exit_total, 1);
+        assert_eq!(snapshot.talk_up_emitted_total, 1);
+        assert_eq!(snapshot.channel_send_fail_total, 0);
     }
 
     #[test]
