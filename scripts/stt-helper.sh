@@ -26,6 +26,7 @@ stt() {
     local LLM_TMUX_WINDOW="server"
     local LOCAL_ENV_FILE=""
     local LOCAL_SHELL_FILE=""
+    local skip_local_overrides="${_STT_SKIP_LOCAL_OVERRIDES:-0}"
 
     # Fall back if REPO_ROOT failed to resolve (e.g., unusual sourcing path).
     if [ -z "$REPO_ROOT" ] || [ "$REPO_ROOT" = "/" ]; then
@@ -43,25 +44,27 @@ stt() {
     DAEMON_DIR="$REPO_ROOT/parakeet-stt-daemon"
     CLIENT_DIR="$REPO_ROOT/parakeet-ptt"
 
-    LOCAL_ENV_FILE="$REPO_ROOT/.parakeet-stt.local.env"
-    if [ -f "$LOCAL_ENV_FILE" ]; then
-        set -a
-        . "$LOCAL_ENV_FILE" || {
-            local rc=$?
+    if [ "$skip_local_overrides" != "1" ]; then
+        LOCAL_ENV_FILE="$REPO_ROOT/.parakeet-stt.local.env"
+        if [ -f "$LOCAL_ENV_FILE" ]; then
+            set -a
+            . "$LOCAL_ENV_FILE" || {
+                local rc=$?
+                set +a
+                echo "stt helper: failed to load $LOCAL_ENV_FILE"
+                return "$rc"
+            }
             set +a
-            echo "stt helper: failed to load $LOCAL_ENV_FILE"
-            return "$rc"
-        }
-        set +a
-    fi
+        fi
 
-    LOCAL_SHELL_FILE="$REPO_ROOT/.parakeet-stt.local.sh"
-    if [ -f "$LOCAL_SHELL_FILE" ]; then
-        . "$LOCAL_SHELL_FILE" || {
-            local rc=$?
-            echo "stt helper: failed to load $LOCAL_SHELL_FILE"
-            return "$rc"
-        }
+        LOCAL_SHELL_FILE="$REPO_ROOT/.parakeet-stt.local.sh"
+        if [ -f "$LOCAL_SHELL_FILE" ]; then
+            . "$LOCAL_SHELL_FILE" || {
+                local rc=$?
+                echo "stt helper: failed to load $LOCAL_SHELL_FILE"
+                return "$rc"
+            }
+        fi
     fi
 
     local HOST="${PARAKEET_HOST:-127.0.0.1}"
@@ -1079,6 +1082,7 @@ CLIENTCMD
                     fi
                     export PARAKEET_LLM_BASE_URL="$(_llm_api_base_url)"
                     export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
+                    local _STT_SKIP_LOCAL_OVERRIDES=1
                     stt start "$@"
                     ;;
                 stream|streaming|offline|off|on|--*)
@@ -1092,6 +1096,7 @@ CLIENTCMD
                     fi
                     export PARAKEET_LLM_BASE_URL="$(_llm_api_base_url)"
                     export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
+                    local _STT_SKIP_LOCAL_OVERRIDES=1
                     stt start "$llm_action" "$@"
                     ;;
                 restart)
