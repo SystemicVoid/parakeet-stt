@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 const HOTKEY_DEVICE_RESCAN_INTERVAL_MS: u64 = 750;
+const HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS: u64 = 50;
 const HOTKEY_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,10 +33,12 @@ pub enum HotkeyEvent {
 pub struct HotkeyTasks {
     handles: Vec<JoinHandle<()>>,
     listener_count: usize,
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
 enum ListenerExitReason {
+    Cancelled,
     OpenError(String),
     FetchError(String),
     ChannelClosed,
@@ -104,6 +108,7 @@ impl HotkeyDiagnostics {
                 self.listener_open_error_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+            ListenerExitReason::Cancelled => {}
             ListenerExitReason::FetchError(_) => {
                 self.listener_fetch_error_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -319,14 +324,48 @@ impl HotkeyTasks {
     pub fn len(&self) -> usize {
         self.listener_count
     }
+
+    pub async fn stop(mut self) {
+        request_hotkey_stop(&self.stop);
+        let handles = std::mem::take(&mut self.handles);
+        for handle in handles {
+            if let Err(err) = handle.await {
+                warn!(error = %err, "hotkey task join failed during shutdown");
+            }
+        }
+    }
 }
 
 impl Drop for HotkeyTasks {
     fn drop(&mut self) {
-        for handle in &self.handles {
-            handle.abort();
-        }
+        request_hotkey_stop(&self.stop);
     }
+}
+
+fn request_hotkey_stop(stop: &AtomicBool) {
+    stop.store(true, Ordering::Release);
+}
+
+fn hotkey_stop_requested(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Acquire)
+}
+
+fn set_device_nonblocking(device: &Device) -> io::Result<()> {
+    let fd = device.as_raw_fd();
+    // Make fetch_events return WouldBlock while idle so listener threads can observe shutdown.
+    let current_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if current_flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+
+    let updated_flags = unsafe { libc::fcntl(fd, libc::F_SETFL, current_flags | libc::O_NONBLOCK) };
+    if updated_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn ensure_input_access() -> Result<()> {
@@ -419,8 +458,8 @@ pub fn spawn_hotkey_loop(
     }
     let listener_count = initial_paths.len();
     let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
-
     let diagnostics = Arc::new(HotkeyDiagnostics::default());
+    let stop = Arc::new(AtomicBool::new(false));
     diagnostics.note_scan(initial_paths.len());
     let supervisor = tokio::spawn(run_hotkey_supervisor(
         tx,
@@ -429,11 +468,13 @@ pub fn spawn_hotkey_loop(
         initial_paths,
         shared_state,
         diagnostics,
+        Arc::clone(&stop),
     ));
 
     Ok(HotkeyTasks {
         handles: vec![supervisor],
         listener_count,
+        stop,
     })
 }
 
@@ -444,11 +485,15 @@ async fn run_hotkey_supervisor(
     initial_paths: Vec<PathBuf>,
     shared_state: Arc<Mutex<HotkeySharedState>>,
     diagnostics: Arc<HotkeyDiagnostics>,
+    stop: Arc<AtomicBool>,
 ) {
     let mut listeners: JoinSet<ListenerExit> = JoinSet::new();
     let mut active_paths: HashSet<PathBuf> = HashSet::new();
 
     for path in initial_paths {
+        if hotkey_stop_requested(&stop) {
+            break;
+        }
         let active_path = path.clone();
         spawn_hotkey_listener(
             &mut listeners,
@@ -458,6 +503,7 @@ async fn run_hotkey_supervisor(
             llm_pre_modifier_keys.clone(),
             Arc::clone(&shared_state),
             Arc::clone(&diagnostics),
+            Arc::clone(&stop),
         );
         active_paths.insert(active_path);
     }
@@ -468,8 +514,14 @@ async fn run_hotkey_supervisor(
     let mut metrics_tick =
         tokio::time::interval(Duration::from_secs(HOTKEY_METRICS_LOG_INTERVAL_SECS));
     metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut shutdown_tick =
+        tokio::time::interval(Duration::from_millis(HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS));
+    shutdown_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if hotkey_stop_requested(&stop) {
+            break;
+        }
         tokio::select! {
             maybe_exit = listeners.join_next(), if !listeners.is_empty() => {
                 if let Some(result) = maybe_exit {
@@ -501,6 +553,7 @@ async fn run_hotkey_supervisor(
                                 }
                             }
                             match &exit.reason {
+                                ListenerExitReason::Cancelled => {}
                                 ListenerExitReason::OpenError(err) => {
                                     warn!(path = %exit.path.display(), error = %err, "hotkey listener failed to open device; waiting for rescan");
                                 }
@@ -536,6 +589,7 @@ async fn run_hotkey_supervisor(
                                     llm_pre_modifier_keys.clone(),
                                     Arc::clone(&shared_state),
                                     Arc::clone(&diagnostics),
+                                    Arc::clone(&stop),
                                 );
                             }
                         }
@@ -551,6 +605,19 @@ async fn run_hotkey_supervisor(
             _ = metrics_tick.tick() => {
                 diagnostics.log_summary(active_paths.len());
             }
+            _ = shutdown_tick.tick() => {}
+        }
+    }
+
+    while let Some(result) = listeners.join_next().await {
+        match result {
+            Ok(exit) => {
+                active_paths.remove(&exit.path);
+                diagnostics.note_listener_exit(&exit.reason);
+            }
+            Err(err) => {
+                warn!(error = %err, "hotkey listener join failed during shutdown");
+            }
         }
     }
 }
@@ -563,6 +630,7 @@ fn spawn_hotkey_listener(
     llm_pre_modifier_keys: Vec<Key>,
     shared_state: Arc<Mutex<HotkeySharedState>>,
     diagnostics: Arc<HotkeyDiagnostics>,
+    stop: Arc<AtomicBool>,
 ) {
     diagnostics.note_listener_started();
     listeners.spawn(async move {
@@ -575,6 +643,7 @@ fn spawn_hotkey_listener(
                 llm_pre_modifier_keys,
                 shared_state,
                 diagnostics,
+                stop,
             )
         })
         .await
@@ -596,6 +665,7 @@ fn hotkey_listener_for_path(
     llm_pre_modifier_keys: Vec<Key>,
     shared_state: Arc<Mutex<HotkeySharedState>>,
     diagnostics: Arc<HotkeyDiagnostics>,
+    stop: Arc<AtomicBool>,
 ) -> ListenerExit {
     let mut pressed = ListenerPressedState::default();
     let mut device = match Device::open(&path) {
@@ -608,6 +678,15 @@ fn hotkey_listener_for_path(
             };
         }
     };
+    if let Err(err) = set_device_nonblocking(&device) {
+        return ListenerExit {
+            path,
+            reason: ListenerExitReason::OpenError(format!(
+                "failed to enable nonblocking mode: {err}"
+            )),
+            pressed,
+        };
+    }
 
     debug!(
         path = %path.display(),
@@ -616,6 +695,13 @@ fn hotkey_listener_for_path(
     );
 
     loop {
+        if hotkey_stop_requested(&stop) {
+            return ListenerExit {
+                path,
+                reason: ListenerExitReason::Cancelled,
+                pressed,
+            };
+        }
         match device.fetch_events() {
             Ok(events) => {
                 for ev in events {
@@ -659,6 +745,9 @@ fn hotkey_listener_for_path(
                         }
                     }
                 }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS));
             }
             Err(err) => {
                 return ListenerExit {
@@ -778,12 +867,15 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, is_event_device_path, parse_key_name, parse_pre_modifier_key_names,
-        validate_hotkey_binding_config, HotkeyEvent, HotkeyIntent, HotkeySharedState,
+        validate_hotkey_binding_config, HotkeyEvent, HotkeyIntent, HotkeySharedState, HotkeyTasks,
         ListenerExitCleanup, ListenerPressedState,
     };
     use evdev::Key;
     use std::collections::HashSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::task::yield_now;
 
     #[test]
     fn parse_key_name_accepts_known_aliases() {
@@ -961,5 +1053,44 @@ mod tests {
         assert!(!is_event_device_path(Path::new(
             "/dev/input/by-id/keyboard"
         )));
+    }
+
+    #[tokio::test]
+    async fn hotkey_tasks_stop_sets_flag_and_waits_for_handles() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_observed_stop = Arc::clone(&observed_stop);
+        let handle = tokio::spawn(async move {
+            while !worker_stop.load(Ordering::Acquire) {
+                yield_now().await;
+            }
+            worker_observed_stop.store(true, Ordering::Release);
+        });
+
+        HotkeyTasks {
+            handles: vec![handle],
+            listener_count: 0,
+            stop: Arc::clone(&stop),
+        }
+        .stop()
+        .await;
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(observed_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hotkey_tasks_drop_requests_stop_without_aborting() {
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _tasks = HotkeyTasks {
+                handles: Vec::new(),
+                listener_count: 0,
+                stop: Arc::clone(&stop),
+            };
+        }
+
+        assert!(stop.load(Ordering::Acquire));
     }
 }
