@@ -630,7 +630,7 @@ PY
         echo "[$(date -Is)] [helper] managed llama-server start" >> "$LOG_LLM"
 
         tmux new-session -d -s "$LLM_TMUX_SESSION" -n "$LLM_TMUX_WINDOW" -c "$REPO_ROOT" \
-            "LOG_LLM=\"$LOG_LLM\" bash -lc 'echo \"[helper] exec $llm_cmd_shell\" >> \"$LOG_LLM\"; exec $llm_cmd_shell >> \"$LOG_LLM\" 2>&1'"
+            "LOG_LLM=\"$LOG_LLM\" LLM_CMD_SHELL=\"$llm_cmd_shell\" bash -lc 'echo \"[helper] exec $LLM_CMD_SHELL\" >> \"$LOG_LLM\"; eval \"set -- $LLM_CMD_SHELL\"; exec \"$@\" >> \"$LOG_LLM\" 2>&1'"
 
         echo -n "   - Waiting for llama-server health..."
         if _wait_for_http "$llm_health_url" "$LLM_PID_FILE" 120; then
