@@ -618,6 +618,7 @@ PY
         if _pid_alive "$LLM_PID_FILE"; then
             _stop_pid "$LLM_PID_FILE" >/dev/null 2>&1 || true
         fi
+        rm -f "$LLM_PID_FILE"
 
         _build_llm_server_args llm_cmd
         llm_cmd_shell="$(_args_to_shell_words llm_cmd)"
