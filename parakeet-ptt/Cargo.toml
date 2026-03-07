@@ -1,6 +1,6 @@
 [package]
 name = "parakeet-ptt"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Push-to-talk client for the Parakeet speech-to-text daemon"
 license = "MIT"
@@ -38,3 +38,4 @@ cosmic-protocols = { version = "0.2.0", default-features = false, features = ["c
 tempfile = "3.16.0"
 fontdb = "0.17.0"
 fontdue = "0.9.3"
+libc = "0.2.177"

@@ -1,37 +1,445 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use evdev::{Device, InputEventKind, Key};
-use std::path::Path;
-
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone, Copy)]
+const HOTKEY_DEVICE_RESCAN_INTERVAL_MS: u64 = 750;
+const HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS: u64 = 50;
+const HOTKEY_METRICS_LOG_INTERVAL_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyIntent {
+    Dictate,
+    LlmQuery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    Down { query_modifier_active: bool },
+    Down { intent: HotkeyIntent },
     Up,
-    QueryModifierDown,
-    QueryModifierUp,
 }
 
 pub struct HotkeyTasks {
+    #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
+    listener_count: usize,
+    stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct HotkeyListenerContext {
+    tx: UnboundedSender<HotkeyEvent>,
+    talk_key: Key,
+    llm_pre_modifier_keys: Vec<Key>,
+    shared_state: Arc<Mutex<HotkeySharedState>>,
+    diagnostics: Arc<HotkeyDiagnostics>,
+    stop: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+enum ListenerExitReason {
+    Cancelled,
+    OpenError(String),
+    FetchError(String),
+    ChannelClosed,
+    TaskJoinError(String),
+}
+
+#[derive(Debug)]
+struct ListenerExit {
+    path: PathBuf,
+    reason: ListenerExitReason,
+    pressed: ListenerPressedState,
+}
+
+#[derive(Debug, Default)]
+struct HotkeyDiagnostics {
+    scan_runs_total: AtomicU64,
+    scan_matching_device_total: AtomicU64,
+    listener_start_total: AtomicU64,
+    listener_exit_total: AtomicU64,
+    listener_open_error_total: AtomicU64,
+    listener_fetch_error_total: AtomicU64,
+    listener_task_join_error_total: AtomicU64,
+    talk_down_raw_total: AtomicU64,
+    talk_up_raw_total: AtomicU64,
+    pre_modifier_down_raw_total: AtomicU64,
+    pre_modifier_up_raw_total: AtomicU64,
+    talk_down_emitted_total: AtomicU64,
+    talk_down_llm_query_emitted_total: AtomicU64,
+    talk_up_emitted_total: AtomicU64,
+    channel_send_fail_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HotkeyDiagnosticsSnapshot {
+    scan_runs_total: u64,
+    scan_matching_device_total: u64,
+    listener_start_total: u64,
+    listener_exit_total: u64,
+    listener_open_error_total: u64,
+    listener_fetch_error_total: u64,
+    listener_task_join_error_total: u64,
+    talk_down_raw_total: u64,
+    talk_up_raw_total: u64,
+    pre_modifier_down_raw_total: u64,
+    pre_modifier_up_raw_total: u64,
+    talk_down_emitted_total: u64,
+    talk_down_llm_query_emitted_total: u64,
+    talk_up_emitted_total: u64,
+    channel_send_fail_total: u64,
+}
+
+impl HotkeyDiagnostics {
+    fn note_scan(&self, matching_devices: usize) {
+        self.scan_runs_total.fetch_add(1, Ordering::Relaxed);
+        self.scan_matching_device_total
+            .fetch_add(matching_devices as u64, Ordering::Relaxed);
+    }
+
+    fn note_listener_started(&self) {
+        self.listener_start_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_listener_exit(&self, reason: &ListenerExitReason) {
+        self.listener_exit_total.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            ListenerExitReason::OpenError(_) => {
+                self.listener_open_error_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ListenerExitReason::Cancelled => {}
+            ListenerExitReason::FetchError(_) => {
+                self.listener_fetch_error_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ListenerExitReason::TaskJoinError(_) => {
+                self.listener_task_join_error_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ListenerExitReason::ChannelClosed => {}
+        }
+    }
+
+    fn note_talk_down_raw(&self) {
+        self.talk_down_raw_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_talk_up_raw(&self) {
+        self.talk_up_raw_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_pre_modifier_down_raw(&self) {
+        self.pre_modifier_down_raw_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_pre_modifier_up_raw(&self) {
+        self.pre_modifier_up_raw_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_emitted_event(&self, event: HotkeyEvent) {
+        match event {
+            HotkeyEvent::Down { intent } => {
+                self.talk_down_emitted_total.fetch_add(1, Ordering::Relaxed);
+                if intent == HotkeyIntent::LlmQuery {
+                    self.talk_down_llm_query_emitted_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            HotkeyEvent::Up => {
+                self.talk_up_emitted_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn note_send_failure(&self) {
+        self.channel_send_fail_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> HotkeyDiagnosticsSnapshot {
+        HotkeyDiagnosticsSnapshot {
+            scan_runs_total: self.scan_runs_total.load(Ordering::Relaxed),
+            scan_matching_device_total: self.scan_matching_device_total.load(Ordering::Relaxed),
+            listener_start_total: self.listener_start_total.load(Ordering::Relaxed),
+            listener_exit_total: self.listener_exit_total.load(Ordering::Relaxed),
+            listener_open_error_total: self.listener_open_error_total.load(Ordering::Relaxed),
+            listener_fetch_error_total: self.listener_fetch_error_total.load(Ordering::Relaxed),
+            listener_task_join_error_total: self
+                .listener_task_join_error_total
+                .load(Ordering::Relaxed),
+            talk_down_raw_total: self.talk_down_raw_total.load(Ordering::Relaxed),
+            talk_up_raw_total: self.talk_up_raw_total.load(Ordering::Relaxed),
+            pre_modifier_down_raw_total: self.pre_modifier_down_raw_total.load(Ordering::Relaxed),
+            pre_modifier_up_raw_total: self.pre_modifier_up_raw_total.load(Ordering::Relaxed),
+            talk_down_emitted_total: self.talk_down_emitted_total.load(Ordering::Relaxed),
+            talk_down_llm_query_emitted_total: self
+                .talk_down_llm_query_emitted_total
+                .load(Ordering::Relaxed),
+            talk_up_emitted_total: self.talk_up_emitted_total.load(Ordering::Relaxed),
+            channel_send_fail_total: self.channel_send_fail_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn log_summary(&self, active_listeners: usize) {
+        let snapshot = self.snapshot();
+        info!(
+            active_listeners,
+            scan_runs_total = snapshot.scan_runs_total,
+            scan_matching_device_total = snapshot.scan_matching_device_total,
+            listener_start_total = snapshot.listener_start_total,
+            listener_exit_total = snapshot.listener_exit_total,
+            listener_open_error_total = snapshot.listener_open_error_total,
+            listener_fetch_error_total = snapshot.listener_fetch_error_total,
+            listener_task_join_error_total = snapshot.listener_task_join_error_total,
+            talk_down_raw_total = snapshot.talk_down_raw_total,
+            talk_up_raw_total = snapshot.talk_up_raw_total,
+            pre_modifier_down_raw_total = snapshot.pre_modifier_down_raw_total,
+            pre_modifier_up_raw_total = snapshot.pre_modifier_up_raw_total,
+            talk_down_emitted_total = snapshot.talk_down_emitted_total,
+            talk_down_llm_query_emitted_total = snapshot.talk_down_llm_query_emitted_total,
+            talk_up_emitted_total = snapshot.talk_up_emitted_total,
+            channel_send_fail_total = snapshot.channel_send_fail_total,
+            "hotkey listener diagnostics"
+        );
+    }
+}
+
+#[derive(Default)]
+struct HotkeySharedState {
+    talk_down_count: usize,
+    pre_modifier_down_counts: HashMap<Key, usize>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ListenerPressedState {
+    talk_down: bool,
+    pre_modifier_down_keys: HashSet<Key>,
+}
+
+impl ListenerPressedState {
+    fn note_key_event(
+        &mut self,
+        talk_key: Key,
+        llm_pre_modifier_keys: &[Key],
+        key: Key,
+        value: i32,
+    ) {
+        if llm_pre_modifier_keys.contains(&key) {
+            match value {
+                1 => {
+                    self.pre_modifier_down_keys.insert(key);
+                }
+                0 => {
+                    self.pre_modifier_down_keys.remove(&key);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if key == talk_key {
+            match value {
+                1 => self.talk_down = true,
+                0 => self.talk_down = false,
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerExitCleanup {
+    released_talk_down: bool,
+    released_pre_modifier_count: usize,
+    emit_talk_up: bool,
+}
+
+impl ListenerExitCleanup {
+    fn had_pressed_keys(self) -> bool {
+        self.released_talk_down || self.released_pre_modifier_count > 0
+    }
+}
+
+impl HotkeySharedState {
+    fn note_pre_modifier_down(&mut self, key: Key) {
+        *self.pre_modifier_down_counts.entry(key).or_default() += 1;
+    }
+
+    fn note_pre_modifier_up(&mut self, key: Key) {
+        let Some(count) = self.pre_modifier_down_counts.get_mut(&key) else {
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+        self.pre_modifier_down_counts.remove(&key);
+    }
+
+    fn note_talk_down(&mut self) -> bool {
+        let was_up = self.talk_down_count == 0;
+        self.talk_down_count += 1;
+        was_up
+    }
+
+    fn note_talk_up(&mut self) -> bool {
+        if self.talk_down_count == 0 {
+            return false;
+        }
+        self.talk_down_count -= 1;
+        self.talk_down_count == 0
+    }
+
+    fn pre_modifier_active(&self) -> bool {
+        !self.pre_modifier_down_counts.is_empty()
+    }
+
+    fn release_listener_state(&mut self, pressed: &ListenerPressedState) -> ListenerExitCleanup {
+        let mut cleanup = ListenerExitCleanup {
+            released_talk_down: false,
+            released_pre_modifier_count: 0,
+            emit_talk_up: false,
+        };
+
+        if pressed.talk_down && self.talk_down_count > 0 {
+            self.talk_down_count -= 1;
+            cleanup.released_talk_down = true;
+            cleanup.emit_talk_up = self.talk_down_count == 0;
+        }
+
+        for key in &pressed.pre_modifier_down_keys {
+            if self.pre_modifier_down_counts.contains_key(key) {
+                self.note_pre_modifier_up(*key);
+                cleanup.released_pre_modifier_count += 1;
+            }
+        }
+
+        cleanup
+    }
 }
 
 impl HotkeyTasks {
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.listener_count
+    }
+
+    #[allow(dead_code)]
+    pub async fn stop(mut self) {
+        request_hotkey_stop(&self.stop);
+        let handles = std::mem::take(&mut self.handles);
+        for handle in handles {
+            if let Err(err) = handle.await {
+                warn!(error = %err, "hotkey task join failed during shutdown");
+            }
+        }
     }
 }
 
 impl Drop for HotkeyTasks {
     fn drop(&mut self) {
-        for handle in &self.handles {
-            handle.abort();
+        request_hotkey_stop(&self.stop);
+    }
+}
+
+fn request_hotkey_stop(stop: &AtomicBool) {
+    stop.store(true, Ordering::Release);
+}
+
+fn hotkey_stop_requested(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Acquire)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerExitAction {
+    Continue,
+    StopSupervisor,
+}
+
+fn handle_listener_exit(
+    listener_context: &HotkeyListenerContext,
+    active_paths: &mut HashSet<PathBuf>,
+    exit: ListenerExit,
+) -> ListenerExitAction {
+    active_paths.remove(&exit.path);
+    listener_context
+        .diagnostics
+        .note_listener_exit(&exit.reason);
+    let cleanup = {
+        let mut state = listener_context
+            .shared_state
+            .lock()
+            .expect("hotkey shared state lock poisoned");
+        state.release_listener_state(&exit.pressed)
+    };
+    if cleanup.had_pressed_keys() {
+        warn!(
+            path = %exit.path.display(),
+            released_talk_down = cleanup.released_talk_down,
+            released_pre_modifier_count = cleanup.released_pre_modifier_count,
+            emit_talk_up = cleanup.emit_talk_up,
+            "released dead listener key state to avoid stuck hotkeys"
+        );
+    }
+    if cleanup.emit_talk_up {
+        listener_context
+            .diagnostics
+            .note_emitted_event(HotkeyEvent::Up);
+        if listener_context.tx.send(HotkeyEvent::Up).is_err() {
+            listener_context.diagnostics.note_send_failure();
+            warn!(path = %exit.path.display(), "hotkey supervisor channel closed while emitting synthetic key up");
+            return ListenerExitAction::StopSupervisor;
         }
     }
+    match &exit.reason {
+        ListenerExitReason::Cancelled => ListenerExitAction::Continue,
+        ListenerExitReason::OpenError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener failed to open device; waiting for rescan");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::FetchError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener device stream failed; waiting for rescan");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::TaskJoinError(err) => {
+            warn!(path = %exit.path.display(), error = %err, "hotkey listener task failed unexpectedly");
+            ListenerExitAction::Continue
+        }
+        ListenerExitReason::ChannelClosed => {
+            warn!(path = %exit.path.display(), "hotkey listener channel closed; stopping hotkey supervisor");
+            ListenerExitAction::StopSupervisor
+        }
+    }
+}
+
+fn set_device_nonblocking(device: &Device) -> io::Result<()> {
+    let fd = device.as_raw_fd();
+    // Make fetch_events return WouldBlock while idle so listener threads can observe shutdown.
+    let current_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if current_flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+
+    let updated_flags = unsafe { libc::fcntl(fd, libc::F_SETFL, current_flags | libc::O_NONBLOCK) };
+    if updated_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn ensure_input_access() -> Result<()> {
@@ -83,139 +491,673 @@ pub fn parse_key_name(name: &str) -> Result<Key> {
         "KEY_LEFTCTRL" | "LEFTCTRL" | "LEFT_CTRL" => Ok(Key::KEY_LEFTCTRL),
         "KEY_RIGHTALT" | "RIGHTALT" | "RIGHT_ALT" => Ok(Key::KEY_RIGHTALT),
         "KEY_LEFTALT" | "LEFTALT" | "LEFT_ALT" => Ok(Key::KEY_LEFTALT),
+        "KEY_RIGHTSHIFT" | "RIGHTSHIFT" | "RIGHT_SHIFT" => Ok(Key::KEY_RIGHTSHIFT),
+        "KEY_LEFTSHIFT" | "LEFTSHIFT" | "LEFT_SHIFT" => Ok(Key::KEY_LEFTSHIFT),
         other => bail!("unsupported key name '{other}'"),
     }
+}
+
+pub fn parse_pre_modifier_key_names(name: &str) -> Result<Vec<Key>> {
+    let normalized = name.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "KEY_SHIFT" | "SHIFT" | "ANY_SHIFT" => Ok(vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT]),
+        "KEY_ALT" | "ALT" | "ANY_ALT" => Ok(vec![Key::KEY_LEFTALT, Key::KEY_RIGHTALT]),
+        _ => Ok(vec![parse_key_name(name)?]),
+    }
+}
+
+fn validate_hotkey_binding_config(talk_key: Key, llm_pre_modifier_keys: &[Key]) -> Result<()> {
+    if llm_pre_modifier_keys.contains(&talk_key) {
+        bail!(
+            "talk key {:?} cannot also be used as an llm pre-modifier; choose distinct keys",
+            talk_key
+        );
+    }
+    Ok(())
 }
 
 pub fn spawn_hotkey_loop(
     tx: UnboundedSender<HotkeyEvent>,
     talk_key: Key,
-    query_modifier_key: Key,
+    llm_pre_modifier_keys: Vec<Key>,
 ) -> Result<HotkeyTasks> {
-    let devices = find_hotkey_devices(talk_key, query_modifier_key)?;
-    if devices.is_empty() {
+    validate_hotkey_binding_config(talk_key, &llm_pre_modifier_keys)?;
+    let initial_paths = find_hotkey_device_paths(talk_key, &llm_pre_modifier_keys)?;
+    if initial_paths.is_empty() {
         anyhow::bail!(
-            "no input devices exposing talk key {:?} or query modifier {:?} were found",
+            "no input devices exposing talk key {:?} or llm pre-modifier {:?} were found",
             talk_key,
-            query_modifier_key
+            llm_pre_modifier_keys
         );
     }
+    let listener_count = initial_paths.len();
+    let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
+    let diagnostics = Arc::new(HotkeyDiagnostics::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener_context = HotkeyListenerContext {
+        tx,
+        talk_key,
+        llm_pre_modifier_keys,
+        shared_state,
+        diagnostics,
+        stop: Arc::clone(&stop),
+    };
+    listener_context.diagnostics.note_scan(initial_paths.len());
+    let supervisor = tokio::spawn(run_hotkey_supervisor(initial_paths, listener_context));
 
-    let mut handles = Vec::new();
+    Ok(HotkeyTasks {
+        handles: vec![supervisor],
+        listener_count,
+        stop,
+    })
+}
 
-    for mut device in devices {
-        let tx = tx.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            let mut talk_down = false;
-            let mut modifier_down = false;
-            loop {
-                match device.fetch_events() {
-                    Ok(events) => {
-                        for ev in events {
-                            if let InputEventKind::Key(key) = ev.kind() {
-                                if key == query_modifier_key {
-                                    match ev.value() {
-                                        1 => {
-                                            if !modifier_down {
-                                                let _ = tx.send(HotkeyEvent::QueryModifierDown);
-                                                modifier_down = true;
-                                            }
-                                        }
-                                        0 => {
-                                            if modifier_down {
-                                                let _ = tx.send(HotkeyEvent::QueryModifierUp);
-                                                modifier_down = false;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                    continue;
-                                }
+async fn run_hotkey_supervisor(
+    initial_paths: Vec<PathBuf>,
+    listener_context: HotkeyListenerContext,
+) {
+    let mut listeners: JoinSet<ListenerExit> = JoinSet::new();
+    let mut active_paths: HashSet<PathBuf> = HashSet::new();
 
-                                if key == talk_key {
-                                    match ev.value() {
-                                        1 => {
-                                            if !talk_down {
-                                                let _ = tx.send(HotkeyEvent::Down {
-                                                    query_modifier_active: modifier_down,
-                                                });
-                                                talk_down = true;
-                                            }
-                                        }
-                                        0 => {
-                                            if talk_down {
-                                                let _ = tx.send(HotkeyEvent::Up);
-                                                talk_down = false;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+    for path in initial_paths {
+        if hotkey_stop_requested(&listener_context.stop) {
+            break;
+        }
+        let active_path = path.clone();
+        spawn_hotkey_listener(&mut listeners, path, listener_context.clone());
+        active_paths.insert(active_path);
+    }
+
+    let mut rescan_tick =
+        tokio::time::interval(Duration::from_millis(HOTKEY_DEVICE_RESCAN_INTERVAL_MS));
+    rescan_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut metrics_tick =
+        tokio::time::interval(Duration::from_secs(HOTKEY_METRICS_LOG_INTERVAL_SECS));
+    metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut shutdown_tick =
+        tokio::time::interval(Duration::from_millis(HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS));
+    shutdown_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        if hotkey_stop_requested(&listener_context.stop) {
+            break;
+        }
+        tokio::select! {
+            maybe_exit = listeners.join_next(), if !listeners.is_empty() => {
+                if let Some(result) = maybe_exit {
+                    match result {
+                        Ok(exit) => {
+                            if handle_listener_exit(&listener_context, &mut active_paths, exit)
+                                == ListenerExitAction::StopSupervisor
+                            {
+                                break;
                             }
                         }
-                    }
-                    Err(err) => {
-                        eprintln!("hotkey device error: {err}");
-                        // If the device is gone or errored, we probably can't recover in this loop easily without re-opening.
-                        // For now, we break to exit the thread for this device.
-                        break;
+                        Err(err) => {
+                            warn!(error = %err, "hotkey listener join failed");
+                        }
                     }
                 }
             }
-        });
-        handles.push(handle);
+            _ = rescan_tick.tick() => {
+                match find_hotkey_device_paths(
+                    listener_context.talk_key,
+                    &listener_context.llm_pre_modifier_keys,
+                ) {
+                    Ok(paths) => {
+                        listener_context.diagnostics.note_scan(paths.len());
+                        for path in paths {
+                            if active_paths.insert(path.clone()) {
+                                spawn_hotkey_listener(
+                                    &mut listeners,
+                                    path,
+                                    listener_context.clone(),
+                                );
+                            }
+                        }
+                        if active_paths.is_empty() {
+                            warn!("hotkey supervisor has no active listeners; waiting for /dev/input/event* recovery");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "hotkey device rescan failed");
+                    }
+                }
+            }
+            _ = metrics_tick.tick() => {
+                listener_context.diagnostics.log_summary(active_paths.len());
+            }
+            _ = shutdown_tick.tick() => {}
+        }
     }
 
-    Ok(HotkeyTasks { handles })
+    while let Some(result) = listeners.join_next().await {
+        match result {
+            Ok(exit) => {
+                // Shutdown is already in progress; keep draining exits so every listener
+                // releases shared key state even if one reports a fatal stop condition.
+                let _ = handle_listener_exit(&listener_context, &mut active_paths, exit);
+            }
+            Err(err) => {
+                warn!(error = %err, "hotkey listener join failed during shutdown");
+            }
+        }
+    }
 }
 
-fn find_hotkey_devices(talk_key: Key, query_modifier_key: Key) -> Result<Vec<Device>> {
-    let mut devices = Vec::new();
+fn spawn_hotkey_listener(
+    listeners: &mut JoinSet<ListenerExit>,
+    path: PathBuf,
+    listener_context: HotkeyListenerContext,
+) {
+    listener_context.diagnostics.note_listener_started();
+    listeners.spawn(async move {
+        let join_path = path.clone();
+        match tokio::task::spawn_blocking(move || hotkey_listener_for_path(path, listener_context))
+            .await
+        {
+            Ok(exit) => exit,
+            Err(err) => ListenerExit {
+                path: join_path,
+                reason: ListenerExitReason::TaskJoinError(err.to_string()),
+                pressed: ListenerPressedState::default(),
+            },
+        }
+    });
+}
+
+fn hotkey_listener_for_path(
+    path: PathBuf,
+    listener_context: HotkeyListenerContext,
+) -> ListenerExit {
+    let mut pressed = ListenerPressedState::default();
+    let mut device = match Device::open(&path) {
+        Ok(device) => device,
+        Err(err) => {
+            return ListenerExit {
+                path,
+                reason: ListenerExitReason::OpenError(err.to_string()),
+                pressed,
+            };
+        }
+    };
+    if let Err(err) = set_device_nonblocking(&device) {
+        return ListenerExit {
+            path,
+            reason: ListenerExitReason::OpenError(format!(
+                "failed to enable nonblocking mode: {err}"
+            )),
+            pressed,
+        };
+    }
+
+    debug!(
+        path = %path.display(),
+        name = ?device.name(),
+        "hotkey listener attached"
+    );
+
+    loop {
+        if hotkey_stop_requested(&listener_context.stop) {
+            return ListenerExit {
+                path,
+                reason: ListenerExitReason::Cancelled,
+                pressed,
+            };
+        }
+        match device.fetch_events() {
+            Ok(events) => {
+                for ev in events {
+                    let InputEventKind::Key(key) = ev.kind() else {
+                        continue;
+                    };
+                    if !record_raw_key_event(
+                        &listener_context.diagnostics,
+                        listener_context.talk_key,
+                        &listener_context.llm_pre_modifier_keys,
+                        key,
+                        ev.value(),
+                    ) {
+                        continue;
+                    }
+
+                    pressed.note_key_event(
+                        listener_context.talk_key,
+                        &listener_context.llm_pre_modifier_keys,
+                        key,
+                        ev.value(),
+                    );
+
+                    let event = {
+                        let mut state = listener_context
+                            .shared_state
+                            .lock()
+                            .expect("hotkey shared state lock poisoned");
+                        derive_hotkey_event(
+                            &mut state,
+                            listener_context.talk_key,
+                            &listener_context.llm_pre_modifier_keys,
+                            key,
+                            ev.value(),
+                        )
+                    };
+
+                    if let Some(event) = event {
+                        listener_context.diagnostics.note_emitted_event(event);
+                        if listener_context.tx.send(event).is_err() {
+                            listener_context.diagnostics.note_send_failure();
+                            return ListenerExit {
+                                path,
+                                reason: ListenerExitReason::ChannelClosed,
+                                pressed,
+                            };
+                        }
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(HOTKEY_LISTENER_STOP_POLL_INTERVAL_MS));
+            }
+            Err(err) => {
+                return ListenerExit {
+                    path,
+                    reason: ListenerExitReason::FetchError(err.to_string()),
+                    pressed,
+                };
+            }
+        }
+    }
+}
+
+fn record_raw_key_event(
+    diagnostics: &HotkeyDiagnostics,
+    talk_key: Key,
+    llm_pre_modifier_keys: &[Key],
+    key: Key,
+    value: i32,
+) -> bool {
+    if llm_pre_modifier_keys.contains(&key) {
+        match value {
+            1 => diagnostics.note_pre_modifier_down_raw(),
+            0 => diagnostics.note_pre_modifier_up_raw(),
+            _ => return false,
+        }
+        return true;
+    }
+
+    if key == talk_key {
+        match value {
+            1 => diagnostics.note_talk_down_raw(),
+            0 => diagnostics.note_talk_up_raw(),
+            _ => return false,
+        }
+        return true;
+    }
+
+    false
+}
+
+fn derive_hotkey_event(
+    state: &mut HotkeySharedState,
+    talk_key: Key,
+    llm_pre_modifier_keys: &[Key],
+    key: Key,
+    value: i32,
+) -> Option<HotkeyEvent> {
+    if llm_pre_modifier_keys.contains(&key) {
+        match value {
+            1 => state.note_pre_modifier_down(key),
+            0 => state.note_pre_modifier_up(key),
+            _ => {}
+        }
+        return None;
+    }
+
+    if key == talk_key {
+        return match value {
+            1 if state.note_talk_down() => {
+                let intent = if state.pre_modifier_active() {
+                    HotkeyIntent::LlmQuery
+                } else {
+                    HotkeyIntent::Dictate
+                };
+                Some(HotkeyEvent::Down { intent })
+            }
+            0 if state.note_talk_up() => Some(HotkeyEvent::Up),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn find_hotkey_device_paths(talk_key: Key, llm_pre_modifier_keys: &[Key]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
     let input_dir = Path::new("/dev/input");
     for entry in fs::read_dir(input_dir).context("failed to read /dev/input")? {
         let entry = entry?;
         let path = entry.path();
-        if !path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("event"))
-            .unwrap_or(false)
-        {
+        if !is_event_device_path(&path) {
             continue;
         }
 
         match Device::open(&path) {
             Ok(dev) => {
-                if dev.supported_keys().is_some_and(|keys| {
-                    keys.contains(talk_key) || keys.contains(query_modifier_key)
-                }) {
-                    // We intentionally do NOT set O_NONBLOCK so that fetch_events blocks.
-                    // let raw_fd = dev.as_raw_fd();
-                    // let _ = fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
-                    devices.push(dev);
+                if is_hotkey_capable_device(&dev, talk_key, llm_pre_modifier_keys) {
+                    paths.push(path);
                 }
             }
             Err(err) => {
-                eprintln!("failed to open {:?}: {}", path, err);
+                debug!(path = %path.display(), error = %err, "failed to open input device");
             }
         }
     }
-    Ok(devices)
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn is_hotkey_capable_device(device: &Device, talk_key: Key, llm_pre_modifier_keys: &[Key]) -> bool {
+    device.supported_keys().is_some_and(|keys| {
+        keys.contains(talk_key)
+            || llm_pre_modifier_keys
+                .iter()
+                .any(|modifier| keys.contains(*modifier))
+    })
+}
+
+fn is_event_device_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("event"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_name;
+    use super::{
+        derive_hotkey_event, handle_listener_exit, is_event_device_path, parse_key_name,
+        parse_pre_modifier_key_names, validate_hotkey_binding_config, HotkeyDiagnostics,
+        HotkeyEvent, HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks,
+        ListenerExit, ListenerExitAction, ListenerExitCleanup, ListenerExitReason,
+        ListenerPressedState,
+    };
     use evdev::Key;
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
 
     #[test]
     fn parse_key_name_accepts_known_aliases() {
         assert_eq!(parse_key_name("KEY_RIGHTCTRL").unwrap(), Key::KEY_RIGHTCTRL);
         assert_eq!(parse_key_name("right_alt").unwrap(), Key::KEY_RIGHTALT);
+        assert_eq!(parse_key_name("left_shift").unwrap(), Key::KEY_LEFTSHIFT);
+    }
+
+    #[test]
+    fn parse_pre_modifier_key_names_accepts_any_shift_alias() {
+        assert_eq!(
+            parse_pre_modifier_key_names("KEY_SHIFT").unwrap(),
+            vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT]
+        );
     }
 
     #[test]
     fn parse_key_name_rejects_unknown_values() {
         assert!(parse_key_name("KEY_NOT_REAL").is_err());
+    }
+
+    #[test]
+    fn validate_hotkey_binding_config_rejects_talk_key_overlap() {
+        let err = validate_hotkey_binding_config(
+            Key::KEY_RIGHTCTRL,
+            &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTCTRL],
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot also be used as an llm pre-modifier"));
+    }
+
+    #[test]
+    fn shared_state_tracks_pre_modifiers_globally() {
+        let mut state = HotkeySharedState::default();
+        state.note_pre_modifier_down(Key::KEY_RIGHTSHIFT);
+        assert!(state.pre_modifier_active());
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        state.note_pre_modifier_up(Key::KEY_RIGHTSHIFT);
+        assert!(state.pre_modifier_active());
+        state.note_pre_modifier_up(Key::KEY_LEFTSHIFT);
+        assert!(!state.pre_modifier_active());
+    }
+
+    #[test]
+    fn shared_state_deduplicates_talk_presses_across_devices() {
+        let mut state = HotkeySharedState::default();
+        assert!(state.note_talk_down());
+        assert!(!state.note_talk_down());
+        assert!(!state.note_talk_up());
+        assert!(state.note_talk_up());
+    }
+
+    #[test]
+    fn shared_state_release_listener_state_only_removes_that_listener_keys() {
+        let mut state = HotkeySharedState::default();
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        assert!(state.note_talk_down());
+        assert!(!state.note_talk_down());
+
+        assert_eq!(
+            state.release_listener_state(&ListenerPressedState {
+                talk_down: true,
+                pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+            }),
+            ListenerExitCleanup {
+                released_talk_down: true,
+                released_pre_modifier_count: 1,
+                emit_talk_up: false,
+            }
+        );
+        assert!(state.pre_modifier_active());
+        assert!(state.note_talk_up());
+    }
+
+    #[test]
+    fn shared_state_release_listener_state_emits_up_when_last_talk_press_is_lost() {
+        let mut state = HotkeySharedState::default();
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        assert!(state.note_talk_down());
+
+        assert_eq!(
+            state.release_listener_state(&ListenerPressedState {
+                talk_down: true,
+                pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+            }),
+            ListenerExitCleanup {
+                released_talk_down: true,
+                released_pre_modifier_count: 1,
+                emit_talk_up: true,
+            }
+        );
+        assert!(!state.pre_modifier_active());
+        assert!(state.note_talk_down());
+    }
+
+    #[test]
+    fn handle_listener_exit_releases_state_and_emits_synthetic_up() {
+        let (tx, mut rx) = unbounded_channel();
+        let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
+        {
+            let mut state = shared_state
+                .lock()
+                .expect("hotkey shared state lock poisoned");
+            state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+            assert!(state.note_talk_down());
+        }
+        let diagnostics = Arc::new(HotkeyDiagnostics::default());
+        let listener_context = HotkeyListenerContext {
+            tx,
+            talk_key: Key::KEY_RIGHTCTRL,
+            llm_pre_modifier_keys: vec![Key::KEY_LEFTSHIFT],
+            shared_state: Arc::clone(&shared_state),
+            diagnostics: Arc::clone(&diagnostics),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let path = PathBuf::from("/dev/input/event42");
+        let mut active_paths = HashSet::from([path.clone()]);
+
+        assert_eq!(
+            handle_listener_exit(
+                &listener_context,
+                &mut active_paths,
+                ListenerExit {
+                    path: path.clone(),
+                    reason: ListenerExitReason::Cancelled,
+                    pressed: ListenerPressedState {
+                        talk_down: true,
+                        pre_modifier_down_keys: HashSet::from([Key::KEY_LEFTSHIFT]),
+                    },
+                },
+            ),
+            ListenerExitAction::Continue
+        );
+
+        assert!(!active_paths.contains(&path));
+        assert_eq!(rx.try_recv().unwrap(), HotkeyEvent::Up);
+        {
+            let mut state = shared_state
+                .lock()
+                .expect("hotkey shared state lock poisoned");
+            assert!(!state.pre_modifier_active());
+            assert!(state.note_talk_down());
+        }
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.listener_exit_total, 1);
+        assert_eq!(snapshot.talk_up_emitted_total, 1);
+        assert_eq!(snapshot.channel_send_fail_total, 0);
+    }
+
+    #[test]
+    fn derive_hotkey_event_snapshots_llm_intent_on_talk_press() {
+        let mut state = HotkeySharedState::default();
+        let llm_pre_modifiers = vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT];
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_LEFTSHIFT,
+                1
+            ),
+            None
+        );
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_RIGHTCTRL,
+                1
+            ),
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::LlmQuery
+            })
+        );
+    }
+
+    #[test]
+    fn derive_hotkey_event_defaults_to_dictate_without_pre_modifier() {
+        let mut state = HotkeySharedState::default();
+        let llm_pre_modifiers = vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT];
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_RIGHTCTRL,
+                1
+            ),
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::Dictate
+            })
+        );
+    }
+
+    #[test]
+    fn derive_hotkey_event_ignores_key_repeat_values() {
+        let mut state = HotkeySharedState::default();
+        let llm_pre_modifiers = vec![Key::KEY_LEFTSHIFT];
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_LEFTSHIFT,
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_RIGHTCTRL,
+                2
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn event_device_path_filter_is_strict() {
+        assert!(is_event_device_path(Path::new("/dev/input/event6")));
+        assert!(!is_event_device_path(Path::new("/dev/input/mouse0")));
+        assert!(!is_event_device_path(Path::new(
+            "/dev/input/by-id/keyboard"
+        )));
+    }
+
+    #[tokio::test]
+    async fn hotkey_tasks_stop_sets_flag_and_waits_for_handles() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_observed_stop = Arc::clone(&observed_stop);
+        let handle = tokio::spawn(async move {
+            while !worker_stop.load(Ordering::Acquire) {
+                yield_now().await;
+            }
+            worker_observed_stop.store(true, Ordering::Release);
+        });
+
+        HotkeyTasks {
+            handles: vec![handle],
+            listener_count: 0,
+            stop: Arc::clone(&stop),
+        }
+        .stop()
+        .await;
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(observed_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hotkey_tasks_drop_requests_stop_without_aborting() {
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _tasks = HotkeyTasks {
+                handles: Vec::new(),
+                listener_count: 0,
+                stop: Arc::clone(&stop),
+            };
+        }
+
+        assert!(stop.load(Ordering::Acquire));
     }
 }
