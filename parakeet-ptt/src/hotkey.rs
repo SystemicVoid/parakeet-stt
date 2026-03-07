@@ -206,6 +206,18 @@ struct HotkeySharedState {
     pre_modifier_down_counts: HashMap<Key, usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HotkeySharedStateReset {
+    talk_down_count: usize,
+    pre_modifier_down_count: usize,
+}
+
+impl HotkeySharedStateReset {
+    fn had_pressed_keys(self) -> bool {
+        self.talk_down_count > 0 || self.pre_modifier_down_count > 0
+    }
+}
+
 impl HotkeySharedState {
     fn note_pre_modifier_down(&mut self, key: Key) {
         *self.pre_modifier_down_counts.entry(key).or_default() += 1;
@@ -238,6 +250,16 @@ impl HotkeySharedState {
 
     fn pre_modifier_active(&self) -> bool {
         !self.pre_modifier_down_counts.is_empty()
+    }
+
+    fn reset(&mut self) -> HotkeySharedStateReset {
+        let reset = HotkeySharedStateReset {
+            talk_down_count: self.talk_down_count,
+            pre_modifier_down_count: self.pre_modifier_down_counts.values().sum(),
+        };
+        self.talk_down_count = 0;
+        self.pre_modifier_down_counts.clear();
+        reset
     }
 }
 
@@ -392,6 +414,20 @@ async fn run_hotkey_supervisor(
                         Ok(exit) => {
                             active_paths.remove(&exit.path);
                             diagnostics.note_listener_exit(&exit.reason);
+                            let reset = {
+                                let mut state = shared_state
+                                    .lock()
+                                    .expect("hotkey shared state lock poisoned");
+                                state.reset()
+                            };
+                            if reset.had_pressed_keys() {
+                                warn!(
+                                    path = %exit.path.display(),
+                                    talk_down_count = reset.talk_down_count,
+                                    pre_modifier_down_count = reset.pre_modifier_down_count,
+                                    "reset hotkey shared state after listener exit to avoid stuck hotkeys"
+                                );
+                            }
                             match &exit.reason {
                                 ListenerExitReason::OpenError(err) => {
                                     warn!(path = %exit.path.display(), error = %err, "hotkey listener failed to open device; waiting for rescan");
@@ -663,7 +699,7 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, is_event_device_path, parse_key_name, parse_pre_modifier_key_names,
-        HotkeyEvent, HotkeyIntent, HotkeySharedState,
+        HotkeyEvent, HotkeyIntent, HotkeySharedState, HotkeySharedStateReset,
     };
     use evdev::Key;
     use std::path::Path;
@@ -707,6 +743,23 @@ mod tests {
         assert!(!state.note_talk_down());
         assert!(!state.note_talk_up());
         assert!(state.note_talk_up());
+    }
+
+    #[test]
+    fn shared_state_reset_clears_stuck_pressed_keys() {
+        let mut state = HotkeySharedState::default();
+        state.note_pre_modifier_down(Key::KEY_LEFTSHIFT);
+        assert!(state.note_talk_down());
+
+        assert_eq!(
+            state.reset(),
+            HotkeySharedStateReset {
+                talk_down_count: 1,
+                pre_modifier_down_count: 1
+            }
+        );
+        assert!(!state.pre_modifier_active());
+        assert!(state.note_talk_down());
     }
 
     #[test]
