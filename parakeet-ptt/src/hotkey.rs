@@ -31,8 +31,19 @@ pub enum HotkeyEvent {
 }
 
 pub struct HotkeyTasks {
+    #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
     listener_count: usize,
+    stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct HotkeyListenerContext {
+    tx: UnboundedSender<HotkeyEvent>,
+    talk_key: Key,
+    llm_pre_modifier_keys: Vec<Key>,
+    shared_state: Arc<Mutex<HotkeySharedState>>,
+    diagnostics: Arc<HotkeyDiagnostics>,
     stop: Arc<AtomicBool>,
 }
 
@@ -325,6 +336,7 @@ impl HotkeyTasks {
         self.listener_count
     }
 
+    #[allow(dead_code)]
     pub async fn stop(mut self) {
         request_hotkey_stop(&self.stop);
         let handles = std::mem::take(&mut self.handles);
@@ -460,16 +472,16 @@ pub fn spawn_hotkey_loop(
     let shared_state = Arc::new(Mutex::new(HotkeySharedState::default()));
     let diagnostics = Arc::new(HotkeyDiagnostics::default());
     let stop = Arc::new(AtomicBool::new(false));
-    diagnostics.note_scan(initial_paths.len());
-    let supervisor = tokio::spawn(run_hotkey_supervisor(
+    let listener_context = HotkeyListenerContext {
         tx,
         talk_key,
         llm_pre_modifier_keys,
-        initial_paths,
         shared_state,
         diagnostics,
-        Arc::clone(&stop),
-    ));
+        stop: Arc::clone(&stop),
+    };
+    listener_context.diagnostics.note_scan(initial_paths.len());
+    let supervisor = tokio::spawn(run_hotkey_supervisor(initial_paths, listener_context));
 
     Ok(HotkeyTasks {
         handles: vec![supervisor],
@@ -479,32 +491,18 @@ pub fn spawn_hotkey_loop(
 }
 
 async fn run_hotkey_supervisor(
-    tx: UnboundedSender<HotkeyEvent>,
-    talk_key: Key,
-    llm_pre_modifier_keys: Vec<Key>,
     initial_paths: Vec<PathBuf>,
-    shared_state: Arc<Mutex<HotkeySharedState>>,
-    diagnostics: Arc<HotkeyDiagnostics>,
-    stop: Arc<AtomicBool>,
+    listener_context: HotkeyListenerContext,
 ) {
     let mut listeners: JoinSet<ListenerExit> = JoinSet::new();
     let mut active_paths: HashSet<PathBuf> = HashSet::new();
 
     for path in initial_paths {
-        if hotkey_stop_requested(&stop) {
+        if hotkey_stop_requested(&listener_context.stop) {
             break;
         }
         let active_path = path.clone();
-        spawn_hotkey_listener(
-            &mut listeners,
-            path,
-            tx.clone(),
-            talk_key,
-            llm_pre_modifier_keys.clone(),
-            Arc::clone(&shared_state),
-            Arc::clone(&diagnostics),
-            Arc::clone(&stop),
-        );
+        spawn_hotkey_listener(&mut listeners, path, listener_context.clone());
         active_paths.insert(active_path);
     }
 
@@ -519,7 +517,7 @@ async fn run_hotkey_supervisor(
     shutdown_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        if hotkey_stop_requested(&stop) {
+        if hotkey_stop_requested(&listener_context.stop) {
             break;
         }
         tokio::select! {
@@ -528,9 +526,9 @@ async fn run_hotkey_supervisor(
                     match result {
                         Ok(exit) => {
                             active_paths.remove(&exit.path);
-                            diagnostics.note_listener_exit(&exit.reason);
+                            listener_context.diagnostics.note_listener_exit(&exit.reason);
                             let cleanup = {
-                                let mut state = shared_state
+                                let mut state = listener_context.shared_state
                                     .lock()
                                     .expect("hotkey shared state lock poisoned");
                                 state.release_listener_state(&exit.pressed)
@@ -545,9 +543,9 @@ async fn run_hotkey_supervisor(
                                 );
                             }
                             if cleanup.emit_talk_up {
-                                diagnostics.note_emitted_event(HotkeyEvent::Up);
-                                if tx.send(HotkeyEvent::Up).is_err() {
-                                    diagnostics.note_send_failure();
+                                listener_context.diagnostics.note_emitted_event(HotkeyEvent::Up);
+                                if listener_context.tx.send(HotkeyEvent::Up).is_err() {
+                                    listener_context.diagnostics.note_send_failure();
                                     warn!(path = %exit.path.display(), "hotkey supervisor channel closed while emitting synthetic key up");
                                     break;
                                 }
@@ -576,20 +574,18 @@ async fn run_hotkey_supervisor(
                 }
             }
             _ = rescan_tick.tick() => {
-                match find_hotkey_device_paths(talk_key, &llm_pre_modifier_keys) {
+                match find_hotkey_device_paths(
+                    listener_context.talk_key,
+                    &listener_context.llm_pre_modifier_keys,
+                ) {
                     Ok(paths) => {
-                        diagnostics.note_scan(paths.len());
+                        listener_context.diagnostics.note_scan(paths.len());
                         for path in paths {
                             if active_paths.insert(path.clone()) {
                                 spawn_hotkey_listener(
                                     &mut listeners,
                                     path,
-                                    tx.clone(),
-                                    talk_key,
-                                    llm_pre_modifier_keys.clone(),
-                                    Arc::clone(&shared_state),
-                                    Arc::clone(&diagnostics),
-                                    Arc::clone(&stop),
+                                    listener_context.clone(),
                                 );
                             }
                         }
@@ -603,7 +599,7 @@ async fn run_hotkey_supervisor(
                 }
             }
             _ = metrics_tick.tick() => {
-                diagnostics.log_summary(active_paths.len());
+                listener_context.diagnostics.log_summary(active_paths.len());
             }
             _ = shutdown_tick.tick() => {}
         }
@@ -613,7 +609,9 @@ async fn run_hotkey_supervisor(
         match result {
             Ok(exit) => {
                 active_paths.remove(&exit.path);
-                diagnostics.note_listener_exit(&exit.reason);
+                listener_context
+                    .diagnostics
+                    .note_listener_exit(&exit.reason);
             }
             Err(err) => {
                 warn!(error = %err, "hotkey listener join failed during shutdown");
@@ -625,28 +623,13 @@ async fn run_hotkey_supervisor(
 fn spawn_hotkey_listener(
     listeners: &mut JoinSet<ListenerExit>,
     path: PathBuf,
-    tx: UnboundedSender<HotkeyEvent>,
-    talk_key: Key,
-    llm_pre_modifier_keys: Vec<Key>,
-    shared_state: Arc<Mutex<HotkeySharedState>>,
-    diagnostics: Arc<HotkeyDiagnostics>,
-    stop: Arc<AtomicBool>,
+    listener_context: HotkeyListenerContext,
 ) {
-    diagnostics.note_listener_started();
+    listener_context.diagnostics.note_listener_started();
     listeners.spawn(async move {
         let join_path = path.clone();
-        match tokio::task::spawn_blocking(move || {
-            hotkey_listener_for_path(
-                path,
-                tx,
-                talk_key,
-                llm_pre_modifier_keys,
-                shared_state,
-                diagnostics,
-                stop,
-            )
-        })
-        .await
+        match tokio::task::spawn_blocking(move || hotkey_listener_for_path(path, listener_context))
+            .await
         {
             Ok(exit) => exit,
             Err(err) => ListenerExit {
@@ -660,12 +643,7 @@ fn spawn_hotkey_listener(
 
 fn hotkey_listener_for_path(
     path: PathBuf,
-    tx: UnboundedSender<HotkeyEvent>,
-    talk_key: Key,
-    llm_pre_modifier_keys: Vec<Key>,
-    shared_state: Arc<Mutex<HotkeySharedState>>,
-    diagnostics: Arc<HotkeyDiagnostics>,
-    stop: Arc<AtomicBool>,
+    listener_context: HotkeyListenerContext,
 ) -> ListenerExit {
     let mut pressed = ListenerPressedState::default();
     let mut device = match Device::open(&path) {
@@ -695,7 +673,7 @@ fn hotkey_listener_for_path(
     );
 
     loop {
-        if hotkey_stop_requested(&stop) {
+        if hotkey_stop_requested(&listener_context.stop) {
             return ListenerExit {
                 path,
                 reason: ListenerExitReason::Cancelled,
@@ -709,34 +687,40 @@ fn hotkey_listener_for_path(
                         continue;
                     };
                     if !record_raw_key_event(
-                        &diagnostics,
-                        talk_key,
-                        &llm_pre_modifier_keys,
+                        &listener_context.diagnostics,
+                        listener_context.talk_key,
+                        &listener_context.llm_pre_modifier_keys,
                         key,
                         ev.value(),
                     ) {
                         continue;
                     }
 
-                    pressed.note_key_event(talk_key, &llm_pre_modifier_keys, key, ev.value());
+                    pressed.note_key_event(
+                        listener_context.talk_key,
+                        &listener_context.llm_pre_modifier_keys,
+                        key,
+                        ev.value(),
+                    );
 
                     let event = {
-                        let mut state = shared_state
+                        let mut state = listener_context
+                            .shared_state
                             .lock()
                             .expect("hotkey shared state lock poisoned");
                         derive_hotkey_event(
                             &mut state,
-                            talk_key,
-                            &llm_pre_modifier_keys,
+                            listener_context.talk_key,
+                            &listener_context.llm_pre_modifier_keys,
                             key,
                             ev.value(),
                         )
                     };
 
                     if let Some(event) = event {
-                        diagnostics.note_emitted_event(event);
-                        if tx.send(event).is_err() {
-                            diagnostics.note_send_failure();
+                        listener_context.diagnostics.note_emitted_event(event);
+                        if listener_context.tx.send(event).is_err() {
+                            listener_context.diagnostics.note_send_failure();
                             return ListenerExit {
                                 path,
                                 reason: ListenerExitReason::ChannelClosed,
