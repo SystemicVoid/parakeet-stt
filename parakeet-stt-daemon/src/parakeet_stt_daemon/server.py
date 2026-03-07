@@ -110,6 +110,7 @@ class DaemonServer:
         self._websocket_send_locks: dict[int, asyncio.Lock] = {}
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
+        owner_token = self._owner_token_for_websocket(websocket)
         await websocket.accept()
         if self.settings.shared_secret:
             header_secret = websocket.headers.get("x-parakeet-secret")
@@ -136,12 +137,16 @@ class DaemonServer:
             await self._cleanup_active_session(
                 "websocket disconnected",
                 expected_session_id=expected_session_id,
+                expected_owner_token=owner_token,
                 require_session_match=True,
+                require_owner_match=True,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error in WebSocket handler: {}", exc)
             await self._cleanup_active_session(
-                f"websocket handler exception: {exc.__class__.__name__}"
+                f"websocket handler exception: {exc.__class__.__name__}",
+                expected_owner_token=owner_token,
+                require_owner_match=True,
             )
             try:
                 await self._send_error(websocket, None, "UNEXPECTED", str(exc))
@@ -167,8 +172,9 @@ class DaemonServer:
 
     async def _handle_start(self, websocket: WebSocket, message: StartSession) -> None:
         logger.debug("start_session received: {}", message)
+        owner_token = self._owner_token_for_websocket(websocket)
         try:
-            session = await self.sessions.start_session(message.session_id)
+            session = await self.sessions.start_session(message.session_id, owner_token=owner_token)
         except SessionBusyError:
             await self._send_error(
                 websocket, message.session_id, "SESSION_BUSY", "A session is already active"
@@ -202,6 +208,9 @@ class DaemonServer:
             await self._cleanup_active_session(
                 "start_session websocket disconnected",
                 expected_session_id=message.session_id,
+                expected_owner_token=owner_token,
+                require_session_match=True,
+                require_owner_match=True,
             )
             raise
         except Exception as exc:  # noqa: BLE001
@@ -209,6 +218,9 @@ class DaemonServer:
             await self._cleanup_active_session(
                 f"start_session rollback: {exc.__class__.__name__}",
                 expected_session_id=message.session_id,
+                expected_owner_token=owner_token,
+                require_session_match=True,
+                require_owner_match=True,
             )
             try:
                 await self._send_error(
@@ -224,10 +236,14 @@ class DaemonServer:
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
         logger.debug("stop_session received: {}", message)
+        owner_token = self._owner_token_for_websocket(websocket)
         await asyncio.sleep(0.25)  # brief post-roll to capture tail audio before stopping
         async with self._transcribe_lock:
             try:
-                session = await self.sessions.stop_session(message.session_id)
+                session = await self.sessions.stop_session(
+                    message.session_id,
+                    owner_token=owner_token,
+                )
             except SessionNotFoundError:
                 await self._send_error(
                     websocket, message.session_id, "SESSION_NOT_FOUND", "No matching active session"
@@ -254,7 +270,7 @@ class DaemonServer:
                     websocket, session.session_id, "AUDIO_DEVICE", "No audio captured for session"
                 )
                 await self._emit_session_ended(websocket, session.session_id, reason="error")
-                await self.sessions.clear(session.session_id)
+                await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 self._live_interim_audio = np.zeros((0,), dtype=np.float32)
                 self._live_interim_failed = False
@@ -291,7 +307,7 @@ class DaemonServer:
                     websocket, session.session_id, "MODEL", "Transcription failed"
                 )
                 await self._emit_session_ended(websocket, session.session_id, reason="error")
-                await self.sessions.clear(session.session_id)
+                await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 self._live_interim_audio = np.zeros((0,), dtype=np.float32)
                 self._live_interim_failed = False
@@ -311,7 +327,7 @@ class DaemonServer:
             await self._send_message(websocket, completion.model_dump(mode="json"))
             send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
             await self._emit_session_ended(websocket, session.session_id, reason="final")
-            await self.sessions.clear(session.session_id)
+            await self.sessions.clear(session.session_id, owner_token=owner_token)
             self._clear_overlay_session_runtime(session.session_id)
             self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
@@ -357,7 +373,9 @@ class DaemonServer:
         cleaned = await self._cleanup_active_session(
             f"abort_session requested ({message.reason})",
             expected_session_id=message.session_id,
+            expected_owner_token=self._owner_token_for_websocket(websocket),
             require_session_match=True,
+            require_owner_match=True,
         )
         if cleaned:
             await self._emit_session_ended(websocket, message.session_id, reason="abort")
@@ -372,8 +390,10 @@ class DaemonServer:
         self,
         reason: str,
         expected_session_id: UUID | None = None,
+        expected_owner_token: int | None = None,
         *,
         require_session_match: bool = False,
+        require_owner_match: bool = False,
     ) -> bool:
         """Reset all runtime state tied to an active session."""
         async with self._transcribe_lock:
@@ -394,6 +414,22 @@ class DaemonServer:
                         active.session_id if active else None,
                     )
                     return False
+            if require_owner_match:
+                if expected_owner_token is None and active is not None:
+                    logger.debug(
+                        "Skipping cleanup with no expected owner (active owner is {})",
+                        active.owner_token,
+                    )
+                    return False
+                if expected_owner_token is not None and (
+                    active is None or active.owner_token != expected_owner_token
+                ):
+                    logger.debug(
+                        "Skipping cleanup for owner {} (active owner is {})",
+                        expected_owner_token,
+                        active.owner_token if active else None,
+                    )
+                    return False
             if (
                 active is not None
                 and expected_session_id is not None
@@ -405,8 +441,20 @@ class DaemonServer:
                     active.session_id,
                 )
                 return False
+            if (
+                active is not None
+                and expected_owner_token is not None
+                and active.owner_token != expected_owner_token
+            ):
+                logger.debug(
+                    "Skipping cleanup for owner {} (active owner is {})",
+                    expected_owner_token,
+                    active.owner_token,
+                )
+                return False
 
             active_session_id = active.session_id if active else None
+            active_owner_token = active.owner_token if active else None
             if active_session_id is not None:
                 logger.warning("Cleaning up active session {} ({})", active_session_id, reason)
                 self._set_overlay_session_state(active_session_id, "terminal")
@@ -415,12 +463,15 @@ class DaemonServer:
             self.audio.abort_session()
             self._stop_stream_drain_loop()
             if active_session_id is not None:
-                await self.sessions.clear(active_session_id)
+                await self.sessions.clear(active_session_id, owner_token=active_owner_token)
                 self._clear_overlay_session_runtime(active_session_id)
             self._active_stream = None
             self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             return active_session_id is not None
+
+    def _owner_token_for_websocket(self, websocket: WebSocket) -> int:
+        return id(websocket)
 
     def _append_overlay_interim_context(
         self,

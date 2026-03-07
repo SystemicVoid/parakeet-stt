@@ -18,6 +18,7 @@ class SessionState(str, Enum):
 @dataclass
 class Session:
     session_id: UUID
+    owner_token: int
     started_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     state: SessionState = SessionState.LISTENING
     last_updated: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -54,24 +55,30 @@ class SessionManager:
     def active(self) -> Session | None:
         return self._active
 
-    async def start_session(self, session_id: UUID) -> Session:
+    async def start_session(self, session_id: UUID, *, owner_token: int) -> Session:
         async with self._lock:
             if self._active and self._active.state != SessionState.IDLE:
                 raise SessionBusyError("A session is already active")
-            self._active = Session(session_id=session_id)
+            self._active = Session(session_id=session_id, owner_token=owner_token)
             return self._active
 
-    async def stop_session(self, session_id: UUID) -> Session:
+    async def stop_session(self, session_id: UUID, *, owner_token: int | None = None) -> Session:
         async with self._lock:
             if not self._active or self._active.session_id != session_id:
+                raise SessionNotFoundError("No matching active session")
+            if owner_token is not None and self._active.owner_token != owner_token:
                 raise SessionNotFoundError("No matching active session")
             session = self._active
             session.mark_processing()
             return session
 
-    async def clear(self, session_id: UUID) -> None:
+    async def clear(self, session_id: UUID, *, owner_token: int | None = None) -> None:
         async with self._lock:
-            if self._active and self._active.session_id == session_id:
+            if (
+                self._active
+                and self._active.session_id == session_id
+                and (owner_token is None or self._active.owner_token == owner_token)
+            ):
                 self._active.mark_completed()
                 self._active = None
 
