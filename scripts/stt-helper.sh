@@ -79,7 +79,7 @@ stt() {
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
     local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
     local default_overlay_adaptive_width="${PARAKEET_OVERLAY_ADAPTIVE_WIDTH:-true}"
-    local default_query_modifier_key="${PARAKEET_QUERY_MODIFIER_KEY:-KEY_ALT}"
+    local default_llm_pre_modifier_key="${PARAKEET_LLM_PRE_MODIFIER_KEY:-KEY_SHIFT}"
     local default_llm_server_host="${PARAKEET_LLM_SERVER_HOST:-127.0.0.1}"
     local default_llm_server_port="${PARAKEET_LLM_SERVER_PORT:-8080}"
     local default_llm_server_bin="${PARAKEET_LLM_SERVER_BIN:-llama-server}"
@@ -119,7 +119,7 @@ stt() {
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
         "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
         "overlay-adaptive-width|overlay_adaptive_width|default_overlay_adaptive_width|PARAKEET_OVERLAY_ADAPTIVE_WIDTH|Stable controls|<v>|true|always|true"
-        "query-modifier-key|query_modifier_key|default_query_modifier_key|PARAKEET_QUERY_MODIFIER_KEY|Stable controls|<key>|KEY_ALT|always|KEY_ALT"
+        "llm-pre-modifier-key|llm_pre_modifier_key|default_llm_pre_modifier_key|PARAKEET_LLM_PRE_MODIFIER_KEY|Stable controls|<key>|KEY_SHIFT|always|KEY_SHIFT"
         "llm-base-url|llm_base_url|default_llm_base_url|PARAKEET_LLM_BASE_URL|Stable controls|<url>|http://127.0.0.1:8080/v1|always|http://127.0.0.1:8080/v1"
         "llm-model|llm_model|default_llm_model|PARAKEET_LLM_MODEL|Stable controls|<name>|local|always|local"
         "llm-timeout-seconds|llm_timeout_seconds|default_llm_timeout_seconds|PARAKEET_LLM_TIMEOUT_SECONDS|Stable controls|<n>|20|always|20"
@@ -853,7 +853,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local -a ptt_args
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
@@ -881,7 +881,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local launch_profile="stream-seal"
             if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
                 launch_profile="stream-seal"
@@ -934,7 +934,7 @@ CLIENTCMD
             echo "   - Completion sound volume: $completion_sound_volume"
             echo "   - Overlay enabled: $overlay_enabled"
             echo "   - Overlay adaptive width: $overlay_adaptive_width"
-            echo "   - Query modifier key: $query_modifier_key"
+            echo "   - LLM pre-modifier key: $llm_pre_modifier_key"
             echo "   - LLM base URL: $llm_base_url"
             echo "   - LLM model: $llm_model"
             echo "   - LLM timeout (s): $llm_timeout_seconds"
@@ -1279,7 +1279,7 @@ CLIENTCMD
             local injection_mode paste_key_backend paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
             _load_start_vars_from_defaults
@@ -1372,7 +1372,7 @@ CLIENTCMD
                     local injection_mode paste_key_backend paste_backend_failure_policy
                     local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
                     local completion_sound completion_sound_path completion_sound_volume
-                    local query_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+                    local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
 
                     _load_start_vars_from_defaults
