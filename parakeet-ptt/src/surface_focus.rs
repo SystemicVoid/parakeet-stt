@@ -6,13 +6,14 @@ use anyhow::{Context, Result};
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1,
 };
+use serde::{Deserialize, Serialize};
 use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FocusSnapshot {
     pub app_name: Option<String>,
     pub object_name: Option<String>,
@@ -21,7 +22,16 @@ pub struct FocusSnapshot {
     pub output_name: Option<String>,
     pub focused: bool,
     pub active: bool,
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "default_focus_snapshot_resolver"
+    )]
     pub resolver: &'static str,
+}
+
+fn default_focus_snapshot_resolver() -> &'static str {
+    "serde"
 }
 
 impl FocusSnapshot {
