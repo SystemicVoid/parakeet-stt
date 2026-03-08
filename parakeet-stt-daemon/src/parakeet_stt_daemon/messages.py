@@ -13,6 +13,7 @@ from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+from .session import SessionState
 
 Timestamp = datetime
 
@@ -116,7 +117,7 @@ class StatusMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[ServerMessageType.STATUS] = Field(default=ServerMessageType.STATUS)
-    state: Literal["idle", "listening", "processing"]
+    state: SessionState
     sessions_active: int
     gpu_mem_mb: int | None = None
     device: str | None = None
