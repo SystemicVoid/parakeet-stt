@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from fastapi import WebSocketDisconnect
+from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.audio import AudioInput
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import (
@@ -147,6 +148,23 @@ def _build_server() -> DaemonServer:
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     return cast(DaemonServer, server)
+
+
+def _pause_guard_sleep(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    guard_sleep_entered = asyncio.Event()
+    allow_guard_resume = asyncio.Event()
+
+    async def fake_guard_sleep(_seconds: float) -> None:
+        guard_sleep_entered.set()
+        await allow_guard_resume.wait()
+
+    monkeypatch.setattr(server_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
+    return guard_sleep_entered, allow_guard_resume
+
+
+async def _wait_for_session_to_clear(server: DaemonServer) -> None:
+    while server.sessions.active is not None:
+        await asyncio.sleep(0)
 
 
 def test_audio_input_enforces_session_sample_limit() -> None:
@@ -556,16 +574,19 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
     asyncio.run(scenario())
 
 
-def test_session_guard_aborts_when_audio_sample_limit_exceeded() -> None:
+def test_session_guard_aborts_when_audio_sample_limit_exceeded(monkeypatch) -> None:
     async def scenario() -> None:
+        guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
         websocket = FakeWebSocket([])
         session_id = uuid4()
 
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.wait_for(guard_sleep_entered.wait(), timeout=1.0)
         audio._session_limit_exceeded = True
-        await asyncio.sleep(0.15)
+        allow_guard_resume.set()
+        await asyncio.wait_for(_wait_for_session_to_clear(server), timeout=1.0)
 
         assert server.sessions.active is None
         assert audio.abort_calls == 1
