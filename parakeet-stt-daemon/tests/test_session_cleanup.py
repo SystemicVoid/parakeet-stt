@@ -48,12 +48,20 @@ class FakeAudio:
 class DummyDrainTask:
     def __init__(self) -> None:
         self.cancel_called = False
+        self.awaited = False
 
     def done(self) -> bool:
         return False
 
     def cancel(self) -> None:
         self.cancel_called = True
+
+    def __await__(self):
+        async def _wait() -> None:
+            self.awaited = True
+            return None
+
+        return _wait().__await__()
 
 
 class FakeStreamingTranscriber:
@@ -115,7 +123,8 @@ def _build_server() -> DaemonServer:
     server.audio = FakeAudio()
     server.model = object()
     server.transcriber = object()
-    server._transcribe_lock = asyncio.Lock()
+    server._session_lock = asyncio.Lock()
+    server._inference_lock = asyncio.Lock()
     server.streaming_transcriber = None
     server._active_stream = object()
     server._stream_drain_task = None
@@ -175,6 +184,7 @@ def test_disconnect_cleans_active_session_state() -> None:
         assert server._active_stream is None
         assert server._stream_drain_task is None
         assert drain_task.cancel_called is True
+        assert drain_task.awaited is True
 
     asyncio.run(scenario())
 

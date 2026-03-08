@@ -61,7 +61,8 @@ def _build_server(
     server.audio = FakeAudio()
     server.model = object()
     server.transcriber = object()
-    server._transcribe_lock = asyncio.Lock()
+    server._session_lock = asyncio.Lock()
+    server._inference_lock = asyncio.Lock()
     server.streaming_transcriber = streaming_transcriber
     server._active_stream = None
     server._stream_drain_task = None
