@@ -698,8 +698,40 @@ impl InjectorWorkerHandle {
     }
 }
 
-fn spawn_injector_worker_with_capacity(
+#[derive(Debug)]
+enum InjectionRunError {
+    BackendFailure(String),
+}
+
+trait InjectionJobRunner: Send + Sync {
+    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError>;
+}
+
+#[derive(Clone)]
+struct BlockingInjectorRunner {
     injector: Arc<dyn TextInjector>,
+}
+
+impl BlockingInjectorRunner {
+    fn new(injector: Arc<dyn TextInjector>) -> Self {
+        Self { injector }
+    }
+}
+
+impl InjectionJobRunner for BlockingInjectorRunner {
+    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        self.injector
+            .inject(text)
+            .map_err(|err| InjectionRunError::BackendFailure(format!("{err:#}")))
+    }
+}
+
+fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> {
+    Arc::new(BlockingInjectorRunner::new(build_injector(config)))
+}
+
+fn spawn_injector_worker_with_capacity(
+    runner: Arc<dyn InjectionJobRunner>,
     capacity: usize,
 ) -> (
     InjectorWorkerHandle,
@@ -708,7 +740,7 @@ fn spawn_injector_worker_with_capacity(
     let (job_tx, mut job_rx) = mpsc::channel::<InjectionJob>(capacity.max(1));
     let (report_tx, report_rx) = mpsc::unbounded_channel::<InjectionReport>();
     let metrics = Arc::new(InjectorQueueMetrics::default());
-    let worker_injector = Arc::clone(&injector);
+    let worker_runner = Arc::clone(&runner);
 
     tokio::spawn(async move {
         while let Some(job) = job_rx.recv().await {
@@ -722,9 +754,8 @@ fn spawn_injector_worker_with_capacity(
 
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
             let worker_started = TokioInstant::now();
-            let injector_for_job = Arc::clone(&worker_injector);
-            let injection_task =
-                tokio::task::spawn_blocking(move || injector_for_job.inject(&text));
+            let runner_for_job = Arc::clone(&worker_runner);
+            let injection_task = tokio::task::spawn_blocking(move || runner_for_job.run(&text));
             tokio::pin!(injection_task);
             let result = timeout(
                 TokioDuration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
@@ -736,10 +767,9 @@ fn spawn_injector_worker_with_capacity(
 
             let (error_kind, error) = match result {
                 Ok(Ok(Ok(()))) => (None, None),
-                Ok(Ok(Err(err))) => (
-                    Some(InjectionErrorKind::BackendFailure),
-                    Some(format!("{err:#}")),
-                ),
+                Ok(Ok(Err(InjectionRunError::BackendFailure(message)))) => {
+                    (Some(InjectionErrorKind::BackendFailure), Some(message))
+                }
                 Ok(Err(err)) => (
                     Some(InjectionErrorKind::WorkerTaskFailed),
                     Some(format!("injector worker task failed: {err}")),
@@ -781,12 +811,12 @@ fn spawn_injector_worker_with_capacity(
 }
 
 fn spawn_injector_worker(
-    injector: Arc<dyn TextInjector>,
+    runner: Arc<dyn InjectionJobRunner>,
 ) -> (
     InjectorWorkerHandle,
     mpsc::UnboundedReceiver<InjectionReport>,
 ) {
-    spawn_injector_worker_with_capacity(injector, INJECTION_QUEUE_CAPACITY)
+    spawn_injector_worker_with_capacity(runner, INJECTION_QUEUE_CAPACITY)
 }
 
 fn percentile_value(sorted_samples: &[u64], percentile: u64) -> u64 {
@@ -1403,8 +1433,8 @@ async fn run_demo(
 ) -> Result<()> {
     info!(endpoint = %config.endpoint, "Connecting to parakeet-stt-daemon");
     let mut client = WsClient::connect(&config).await?;
-    let injector = build_injector(&config);
-    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    let injector_runner = build_injection_runner(&config);
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(injector_runner);
 
     let mut state = PttState::new();
     let Some(session_id) = state.begin_listening() else {
@@ -1529,9 +1559,9 @@ async fn run_hotkey_mode(
         "Starting hotkey loop"
     );
     ensure_input_access()?;
-    let injector = build_injector(&config);
+    let injector_runner = build_injection_runner(&config);
     let focus_cache = Some(WaylandFocusCache::new());
-    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(injector_runner);
     let mut overlay_router = OverlayRouter::new(
         build_runtime_overlay_sink(
             overlay_capability.mode,
@@ -2174,7 +2204,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::anyhow;
     use clap::Parser;
     use tokio::sync::mpsc;
     use tokio::task::yield_now;
@@ -2186,7 +2216,6 @@ mod tests {
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
         PasteBackendFailurePolicy, PasteKeyBackend,
     };
-    use crate::injector::TextInjector;
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -2196,30 +2225,30 @@ mod tests {
     use super::{
         build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
         sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
-        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent,
-        OverlayRouter, OverlaySink, RuntimeOverlaySink, SessionIntent,
-        INJECTION_EXECUTION_TIMEOUT_MS,
+        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, InjectionJobRunner,
+        InjectionRunError, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
+        RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
-    struct SlowInjector {
+    struct SlowRunner {
         calls: Arc<AtomicU64>,
         sleep_ms: u64,
     }
 
-    impl TextInjector for SlowInjector {
-        fn inject(&self, _text: &str) -> Result<()> {
+    impl InjectionJobRunner for SlowRunner {
+        fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
             Ok(())
         }
     }
 
-    struct RecordingInjector {
+    struct RecordingRunner {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    impl TextInjector for RecordingInjector {
-        fn inject(&self, text: &str) -> Result<()> {
+    impl InjectionJobRunner for RecordingRunner {
+        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
             self.seen
                 .lock()
                 .expect("recording lock should be available")
@@ -2228,14 +2257,14 @@ mod tests {
         }
     }
 
-    struct TimeoutThenRecordingInjector {
+    struct TimeoutThenRecordingRunner {
         calls: Arc<AtomicU64>,
         seen: Arc<Mutex<Vec<String>>>,
         timeout_sleep_ms: u64,
     }
 
-    impl TextInjector for TimeoutThenRecordingInjector {
-        fn inject(&self, text: &str) -> Result<()> {
+    impl InjectionJobRunner for TimeoutThenRecordingRunner {
+        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
             let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
             if call_index == 0 {
                 std::thread::sleep(Duration::from_millis(self.timeout_sleep_ms));
@@ -2434,7 +2463,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
         let calls = Arc::new(AtomicU64::new(0));
-        let slow_injector = Arc::new(SlowInjector {
+        let slow_injector = Arc::new(SlowRunner {
             calls: Arc::clone(&calls),
             sleep_ms: 120,
         });
@@ -2477,7 +2506,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn injector_worker_preserves_fifo_order() {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2525,7 +2554,7 @@ mod tests {
             None,
         );
         let injector_seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&injector_seen),
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2621,7 +2650,7 @@ mod tests {
             None,
         );
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2725,7 +2754,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -2832,7 +2861,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -2941,7 +2970,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -3063,7 +3092,7 @@ mod tests {
             },
             None,
         );
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::new(Mutex::new(Vec::new())),
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -3129,7 +3158,7 @@ mod tests {
     async fn injector_worker_recovers_after_execution_timeout() {
         let calls = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(TimeoutThenRecordingInjector {
+        let injector = Arc::new(TimeoutThenRecordingRunner {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
             timeout_sleep_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
@@ -3207,7 +3236,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn enqueue_times_out_when_queue_remains_saturated() {
-        let slow = Arc::new(SlowInjector {
+        let slow = Arc::new(SlowRunner {
             calls: Arc::new(AtomicU64::new(0)),
             sleep_ms: 200,
         });
