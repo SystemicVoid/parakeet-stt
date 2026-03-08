@@ -100,6 +100,8 @@ Unit tests use short, controlled lifetimes and do not run long-duration soak sce
 Add server-side hard limits (`max_session_seconds` and/or `max_session_samples`) with automatic abort + explicit error message. For longer captures, spill to bounded ring/temporary file rather than unbounded in-memory vectors.
 9. Is this a real issue or just a preference?
 Real issue. This is a production robustness and resource-safety defect.
+10. Implementation status (2026-03-08)
+Mitigated in PR #20.
 
 ## Finding 5
 
