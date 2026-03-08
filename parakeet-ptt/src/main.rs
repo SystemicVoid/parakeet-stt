@@ -59,6 +59,7 @@ const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 #[cfg(test)]
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
+const INJECTION_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -803,11 +804,25 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
             )
         })?;
         let status_result = wait_for_child_exit(&mut child, self.timeout);
-        let stderr = join_pipe_reader(stderr_reader, "stderr");
+        let stderr = collect_pipe_reader(
+            stderr_reader,
+            "stderr",
+            Duration::from_millis(INJECTION_PIPE_DRAIN_TIMEOUT_MS),
+        );
 
         match status_result {
             Ok(status) => {
-                let stderr = stderr.map_err(InjectionRunError::WorkerTaskFailed)?;
+                let stderr = match stderr {
+                    Ok(Some(stderr)) => stderr,
+                    Ok(None) => {
+                        debug!(
+                            timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                            "injector subprocess stderr remained open after child exit; continuing without waiting for inherited handles"
+                        );
+                        Vec::new()
+                    }
+                    Err(err) => return Err(InjectionRunError::WorkerTaskFailed(err)),
+                };
                 if status.success() {
                     Ok(())
                 } else {
@@ -816,8 +831,15 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                 }
             }
             Err(err) => {
-                if let Ok(stderr) = stderr {
-                    return Err(enrich_run_error_with_stderr(err, &stderr));
+                match stderr {
+                    Ok(Some(stderr)) => return Err(enrich_run_error_with_stderr(err, &stderr)),
+                    Ok(None) => {
+                        debug!(
+                            timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                            "injector subprocess stderr remained open after failure; returning base error"
+                        );
+                    }
+                    Err(read_err) => return Err(InjectionRunError::WorkerTaskFailed(read_err)),
                 }
                 Err(err)
             }
@@ -896,26 +918,34 @@ fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
     args
 }
 
-fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+fn spawn_pipe_reader<R>(reader: R) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    })
+        let result = reader.read_to_end(&mut buffer).map(|_| buffer);
+        let _ = tx.send(result);
+    });
+    rx
 }
 
-fn join_pipe_reader(
-    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+fn collect_pipe_reader(
+    receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     label: &str,
-) -> std::result::Result<Vec<u8>, String> {
-    let read_result = handle
-        .join()
-        .map_err(|_| format!("{label} reader thread panicked"))?;
-    read_result.map_err(|err| format!("failed to read {label} pipe: {err}"))
+    timeout: Duration,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(read_result) => read_result
+            .map(Some)
+            .map_err(|err| format!("failed to read {label} pipe: {err}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "{label} reader thread disconnected before returning output"
+        )),
+    }
 }
 
 fn wait_for_child_exit(
@@ -3602,6 +3632,116 @@ mod tests {
 
         let written = fs::read_to_string(&log_path).expect("log file should be readable");
         assert_eq!(written, "second survives\n");
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[test]
+    fn injector_subprocess_runner_does_not_wait_for_background_grandchild_stderr_close() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-inherited-stderr-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\npayload=\"$(cat)\"\nprintf '%s %s\\n' \"$(date +%s%3N)\" \"$payload\" >>\"$log_path\"\n(sleep 0.4) &\nexit 0\n",
+        );
+        let runner = InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_secs(2),
+        );
+
+        let started = Instant::now();
+        runner
+            .run("clipboard helper should not pin the worker")
+            .expect("runner should treat the injector subprocess as successful");
+        let elapsed = started.elapsed();
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        assert!(
+            written.contains("clipboard helper should not pin the worker"),
+            "script should record the injected payload"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "runner should not wait for inherited stderr handles from background helpers, elapsed={elapsed:?}"
+        );
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_helper_lifetime_does_not_delay_following_injection_jobs() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-background-helper-queue-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\npayload=\"$(cat)\"\nprintf '%s %s\\n' \"$(date +%s%3N)\" \"$payload\" >>\"$log_path\"\n(sleep 0.4) &\nexit 0\n",
+        );
+        let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_secs(2),
+        ));
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
+
+        worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "first".to_string(), 1, 1))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "second".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        timeout(Duration::from_millis(250), reports.recv())
+            .await
+            .expect("first report should not wait for background helper exit")
+            .expect("report stream should remain open");
+        timeout(Duration::from_millis(250), reports.recv())
+            .await
+            .expect("second report should not be blocked behind the prior helper lifetime")
+            .expect("report stream should remain open");
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        let entries = written
+            .lines()
+            .map(|line| {
+                let (timestamp, payload) = line
+                    .split_once(' ')
+                    .expect("log line should contain timestamp and payload");
+                (
+                    timestamp
+                        .parse::<u128>()
+                        .expect("timestamp should parse as milliseconds"),
+                    payload.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 2, "both jobs should have executed");
+        assert_eq!(entries[0].1, "first");
+        assert_eq!(entries[1].1, "second");
+        assert!(
+            entries[1].0.saturating_sub(entries[0].0) < 200,
+            "second job should start promptly instead of waiting for prior clipboard helper teardown"
+        );
 
         fs::remove_file(&script).expect("test script should be removable");
         fs::remove_file(&log_path).expect("log file should be removable");
