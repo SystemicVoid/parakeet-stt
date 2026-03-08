@@ -28,7 +28,7 @@ class SettingsKwargs(TypedDict, total=False):
     left_context_secs: float
     batch_size: int
     max_session_seconds: float
-    max_session_samples: int
+    max_session_samples: int | None
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
