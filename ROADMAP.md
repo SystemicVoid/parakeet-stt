@@ -79,6 +79,8 @@ Session closeout notes (2026-02-22):
   - event-loop lag windows `p99=2ms` vs target `20ms`
 - Known minor issue: startup device scan can emit `failed to open "/dev/input/eventX": Permission denied` while still finding enough readable devices and starting hotkey listeners.
   - Follow-up candidate (low priority): suppress/downgrade per-device permission-denied noise unless no eligible hotkey devices are discovered.
+- Known minor issue: attach-time hotkey modifier seeding now covers the common path, but a listener still falls back to empty modifier state if `device.get_key_state()` fails during attach.
+  - Follow-up candidate (low priority): add a one-shot degraded-attach diagnostic or metric on the first talk-down after an unseeded attach so field debugging can tell "modifier truly inactive" from "attach state could not be reconstructed."
 
 Known cross-surface gap (2026-02-23):
 - Zed markdown editor can interpret current paste routing as a markdown preview toggle instead of text insertion.

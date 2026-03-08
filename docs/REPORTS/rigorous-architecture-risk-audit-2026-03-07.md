@@ -130,26 +130,28 @@ Mitigated in PR #20.
 ## Finding 5
 
 1. Title
-Hotkey listeners now self-heal after device churn, but intent capture does not reconstruct already-held modifier state on attach/recovery.
+Hotkey listeners now self-heal after device churn, and attach-time modifier seeding covers the common path; a narrow degraded-path blind spot remains when kernel key-state reads fail.
 2. Severity: Low
 3. Confidence: Medium
 4. Why this matters
-The merge closes the larger availability bug, but the new pre-modifier design still depends on seeing a modifier-down event after a listener attaches. If Shift is already held during startup, resume, or device re-enumeration, the first talk-down can still be classified as `Dictate` instead of `llm_query`.
+The larger availability bug is fixed, and normal attach/re-attach flow now reconstructs already-held pre-modifier state. The remaining risk is smaller: if a listener cannot read the device's current key bitmap during attach, it falls back to empty modifier state for that attach window.
 5. Evidence
    - `parakeet-ptt/src/hotkey.rs` (`run_hotkey_supervisor`, lines 555-645) now supervises listener exits, periodically rescans `/dev/input/event*`, and respawns listeners for recovered devices.
    - `parakeet-ptt/src/hotkey.rs` (`handle_listener_exit`, lines 371-424) releases dead listener state and can emit a synthetic `HotkeyEvent::Up`, so the original fail-closed/stuck-key defect is materially fixed.
-   - `parakeet-ptt/src/hotkey.rs` (`hotkey_listener_for_path`, lines 669-708) opens the device and immediately starts consuming future events; it does not seed state from the device's current pressed-key bitmap.
-   - `parakeet-ptt/src/hotkey.rs` (`derive_hotkey_event`, lines 800-828) snapshots intent from `state.pre_modifier_active()`, which is only updated from observed modifier transitions.
+   - `parakeet-ptt/src/hotkey.rs` (`seed_listener_pre_modifier_state`, lines 263-276) and `hotkey_listener_for_path` (`lines 710-733`) now read `device.get_key_state()` at attach time and seed already-held `llm_pre_modifier` keys into listener-local and shared state before processing new events.
+   - `parakeet-ptt/src/hotkey.rs` (`hotkey_listener_for_path`, lines 728-733) still warns and attaches unseeded if `device.get_key_state()` fails.
+   - `parakeet-ptt/src/hotkey.rs` tests (`lines 1120-1239`) now cover attach-time seeding, listener cleanup balance, and the "talk key already held on attach does not synthesize a session" guardrail.
+   - `parakeet-ptt/src/hotkey.rs` (`derive_hotkey_event`, lines 825-853) still snapshots intent from `state.pre_modifier_active()`, so an unseeded degraded attach can misclassify the first talk-down.
 6. Failure mode
-Concrete scenario: the keyboard re-enumerates after resume while the user is already holding Shift. The replacement listener attaches after the Shift-down event already happened, so shared state still says "modifier up." The next RightCtrl press starts a plain dictate session for that first utterance.
+Concrete scenario: the keyboard re-enumerates after resume while the user is already holding Shift, and `device.get_key_state()` fails on the replacement listener's attach path. That listener starts with empty modifier state, so the next RightCtrl press can still start a plain dictate session for that first utterance.
 7. Why tests/linters might miss it
-The new tests cover shared-state cleanup, supervised exits, and post-attach event handling, but they do not model "listener attaches while modifier is already held." Static checks cannot infer this temporal hardware-state edge.
+The new tests cover attach-time seeding and listener cleanup, but they do not prove behavior when attach-time `get_key_state()` fails while a modifier is already held. Static checks cannot infer this temporal hardware-state edge.
 8. Recommended fix
-On listener attach and reattach, read the device's current pressed-key state and seed `ListenerPressedState` / `HotkeySharedState` before processing new events. If evdev state cannot be trusted everywhere, add an explicit diagnostic when the first talk-down after attach occurs with no observed modifier history.
+No immediate behavior change is required. Keep the attach-time warning, and only add stronger degraded-path observability (for example, a one-shot diagnostic on the first talk-down after an unseeded attach) if field evidence shows this fallback still matters.
 9. Is this a real issue or just a preference?
-Real issue, but much narrower than the original finding. The availability hole was materially fixed; this is a residual intent-capture edge case.
+Real residual issue, but now limited to a degraded attach path rather than the common listener lifecycle.
 10. Implementation status (2026-03-08)
-Resolved locally pending PR review. Listeners now seed already-held LLM pre-modifier state from the kernel key bitmap at attach time, so the first post-attach utterance no longer depends on observing a fresh modifier-down event.
+Common-path resolved in PR #22. Listeners now seed already-held LLM pre-modifier state from the kernel key bitmap at attach time, though `hotkey_listener_for_path` still warns and attaches with empty modifier state if `device.get_key_state()` fails.
 
 ---
 
@@ -164,7 +166,7 @@ This isolates the failure boundary to **client-side modifier-intent capture/prom
 4. Connection to findings
 This mapped directly to the **original** Finding 5 and explains why commit `5c976fe` targeted the hotkey/input lifecycle path first.
 5. Priority update
-That original priority action has now been shipped. The remaining hotkey follow-up is narrower: seed already-held modifier state on listener attach/recovery so the first post-recovery utterance cannot be misclassified.
+That original priority action has now been shipped in the common path. The remaining hotkey follow-up is narrower: make degraded attaches more observable when kernel key-state seeding fails, rather than re-implementing attach-time seeding itself.
 
 ## Implementation Status Update (2026-03-07, Hotkey Reliability Pass)
 
@@ -179,7 +181,7 @@ The shipped change closes the original hotkey listener availability gap: listene
 5. Not an LLM availability fix
 This pass does **not** alter LLM model/server readiness semantics. If an utterance is captured with `Dictate` intent, the LLM path is intentionally bypassed regardless of LLM health.
 6. Residual edge still open
-The merged implementation does **not** reconstruct modifier state that was already held when a listener attached or re-attached. Operationally, a first utterance after startup/recovery can still be misrouted unless the modifier is re-pressed.
+The merged implementation **does** reconstruct modifier state that was already held when a listener attaches or re-attaches on the normal path. The residual edge is the fallback path where `device.get_key_state()` fails, because that listener still starts unseeded for that attach window.
 7. Operational interpretation change
 After this change, absence of LLM routing for a given utterance should be interpreted first as an intent-capture outcome (pre-modifier not active at talk-down), then as a possible attach-state blind spot if device recovery just occurred, before suspecting LLM runtime outages.
 8. Terminology migration completed
@@ -195,8 +197,8 @@ The audio callback path now clips/halts accumulation at the configured sample ca
 The daemon now runs a per-session guard task that monitors active session age/limit state and emits explicit session termination errors when limits trigger.
 4. Operational surfacing completed
 Session guardrail settings are now wired through CLI/env and startup diagnostics so operators can tune limits and verify effective values.
-5. Finding 1 tracking updated
-Finding 1 is now tracked as resolved in PR #19.
+5. Finding 4 tracking updated
+Finding 4 is now tracked as mitigated in PR #20.
 
 ## Implementation Status Update (2026-03-08, Daemon Inference Serialization)
 
@@ -213,7 +215,7 @@ Finding 2 is now tracked as resolved in PR #20.
 
 ## Implementation Status Update (2026-03-08, Injector Timeout Isolation)
 
-1. Finding 3 now resolved locally in client runtime
+1. Finding 3 now resolved in client runtime
 Injection work no longer relies on `spawn_blocking` cancellation semantics for timeout enforcement. Each queued injection job now executes in a one-shot subprocess boundary that the worker can kill and reap before proceeding.
 2. Timeout semantics now match the user-visible contract
 If the injector worker reports `execution_timeout`, the timed-out job process has already been terminated and reaped. The queue does not advance on the assumption that background clipboard/chord work probably stopped.
@@ -222,17 +224,27 @@ The next queued job only starts after the prior child process is confirmed gone,
 4. Regression coverage now proves the exact audit scenario
 Client tests now model a first injection job that exceeds the timeout and a second job that succeeds, then assert that only the second job's side effect is ever observed after the timeout window passes.
 5. Finding 3 tracking updated
-Finding 3 is now tracked as resolved locally pending PR review.
+Finding 3 is now tracked as resolved in PR #21.
 
 ## Open High-Risk Items (Post 2026-03-08)
 
-1. None currently open in this audit after the local Finding 5 fix.
+1. None currently open in this audit.
+2. Remaining lower-severity residual item
+   - Finding 5 is now a degraded-path observability gap when attach-time key-state reads fail, not a common-path correctness hole.
+
+## Remaining Work Worth Carrying Forward (Post-Verification 2026-03-08)
+
+1. Helpful roadmap candidate
+   - Low-priority hotkey degraded-attach observability: if attach-time `device.get_key_state()` fails, consider a one-shot diagnostic or metric on the first talk-down from that listener so field debugging can distinguish "modifier was not held" from "attach state could not be reconstructed."
+2. Items not promoted to roadmap
+   - Findings 1-4 are already implemented with code and test coverage, so keeping them on the active roadmap would only create stale bookkeeping.
+   - Re-adding attach-time modifier seeding itself is not useful, because the common-path implementation is already present in `parakeet-ptt/src/hotkey.rs`.
 
 ---
 
 ## Historical ROI-Prioritized Backlog (Pre-2026-03-08)
 
-This ordering is preserved for audit traceability from the pre-2026-03-08 mitigation state. Findings 1, 2, and 4 have since been resolved or mitigated as noted above.
+This ordering is preserved for audit traceability from the pre-2026-03-08 mitigation state. All four listed items have since shipped on `main`; only the lower-priority degraded-attach observability follow-up above remains potentially roadmap-worthy.
 
 1. Session audio hard limits (Finding 4).
 Why this ranks first: this is still the best resilience-per-line-item trade. A hard cap is a simple circuit breaker against daemon-wide OOM and does not require protocol redesign.
