@@ -148,6 +148,8 @@ The new tests cover shared-state cleanup, supervised exits, and post-attach even
 On listener attach and reattach, read the device's current pressed-key state and seed `ListenerPressedState` / `HotkeySharedState` before processing new events. If evdev state cannot be trusted everywhere, add an explicit diagnostic when the first talk-down after attach occurs with no observed modifier history.
 9. Is this a real issue or just a preference?
 Real issue, but much narrower than the original finding. The availability hole was materially fixed; this is a residual intent-capture edge case.
+10. Implementation status (2026-03-08)
+Resolved locally pending PR review. Listeners now seed already-held LLM pre-modifier state from the kernel key bitmap at attach time, so the first post-attach utterance no longer depends on observing a fresh modifier-down event.
 
 ---
 
@@ -224,9 +226,7 @@ Finding 3 is now tracked as resolved locally pending PR review.
 
 ## Open High-Risk Items (Post 2026-03-08)
 
-1. None currently open in this audit after the local Finding 3 fix.
-2. Remaining residual item
-   - Finding 5 remains open as a lower-severity intent-capture edge around attach-time modifier-state seeding.
+1. None currently open in this audit after the local Finding 5 fix.
 
 ---
 
@@ -261,6 +261,6 @@ Why this ranks fourth: the user-facing corruption risk is real, but the durable 
 
 1. Release-gate multi-client reconnect/disconnect runs that keep the new owner-binding invariant from regressing.
 2. Long-duration soak tests with intentional stuck sessions to validate the new daemon memory caps under saturation.
-3. Hotkey attach/recovery tests where Shift is already held before the listener comes online.
+3. Hotkey attach/recovery regression coverage in CI/release gates so attach-time modifier seeding stays fixed.
 4. NeMo/CUDA overlap stress runs with forced interim/final decode contention to validate the inference-gate fix.
 5. Short operator validation runs on real clipboard/paste backends to confirm the subprocess boundary adds no unacceptable latency in the common path.
