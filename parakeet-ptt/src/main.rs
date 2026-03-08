@@ -856,9 +856,9 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                                 "injector subprocess stderr drain hit deadline after failure; returning base error with partial stderr"
                             );
                     }
-                    return Err(enrich_run_error_with_stderr(err, &outcome.bytes));
+                    Err(enrich_run_error_with_stderr(err, &outcome.bytes))
                 }
-                Err(read_err) => return Err(InjectionRunError::WorkerTaskFailed(read_err)),
+                Err(read_err) => Err(InjectionRunError::WorkerTaskFailed(read_err)),
             },
         }
     }
