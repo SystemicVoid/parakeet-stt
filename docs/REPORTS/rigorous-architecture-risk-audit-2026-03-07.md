@@ -101,6 +101,8 @@ Existing tests validate that the queue “recovers” after timeout, but do not 
 Make serialization explicit even on timeout: do not dequeue the next job until the previous blocking task is known terminated. If hard timeout is required, move injection to killable subprocess boundaries per job (or a dedicated worker process) so timeout can enforce real termination.
 9. Is this a real issue or just a preference?
 Real issue. This is a lifecycle/cancellation semantic mismatch that can reorder user-visible side effects.
+10. Implementation status (2026-03-08)
+Resolved locally in commits `5a60dd0` and `55d9b51`. Injection jobs now run behind a killable subprocess boundary, and regression coverage asserts that a timed-out first job cannot leak late side effects after a later job completes.
 
 ## Finding 4
 
@@ -207,9 +209,24 @@ Daemon tests now force the interleaving where live interim inference is active d
 5. Finding 2 tracking updated
 Finding 2 is now tracked as resolved in PR #20.
 
+## Implementation Status Update (2026-03-08, Injector Timeout Isolation)
+
+1. Finding 3 now resolved locally in client runtime
+Injection work no longer relies on `spawn_blocking` cancellation semantics for timeout enforcement. Each queued injection job now executes in a one-shot subprocess boundary that the worker can kill and reap before proceeding.
+2. Timeout semantics now match the user-visible contract
+If the injector worker reports `execution_timeout`, the timed-out job process has already been terminated and reaped. The queue does not advance on the assumption that background clipboard/chord work probably stopped.
+3. FIFO side-effect isolation is preserved across timeout recovery
+The next queued job only starts after the prior child process is confirmed gone, so clipboard writes and paste shortcuts cannot arrive out of order due to late completion from a timed-out predecessor.
+4. Regression coverage now proves the exact audit scenario
+Client tests now model a first injection job that exceeds the timeout and a second job that succeeds, then assert that only the second job's side effect is ever observed after the timeout window passes.
+5. Finding 3 tracking updated
+Finding 3 is now tracked as resolved locally pending PR review.
+
 ## Open High-Risk Items (Post 2026-03-08)
 
-1. Injector timeout semantics can violate serialized side effects (Finding 3).
+1. None currently open in this audit after the local Finding 3 fix.
+2. Remaining residual item
+   - Finding 5 remains open as a lower-severity intent-capture edge around attach-time modifier-state seeding.
 
 ---
 
@@ -246,4 +263,4 @@ Why this ranks fourth: the user-facing corruption risk is real, but the durable 
 2. Long-duration soak tests with intentional stuck sessions to validate the new daemon memory caps under saturation.
 3. Hotkey attach/recovery tests where Shift is already held before the listener comes online.
 4. NeMo/CUDA overlap stress runs with forced interim/final decode contention to validate the inference-gate fix.
-5. Injection ordering tests around real timeout/retry behavior after moving the worker to a killable boundary.
+5. Short operator validation runs on real clipboard/paste backends to confirm the subprocess boundary adds no unacceptable latency in the common path.

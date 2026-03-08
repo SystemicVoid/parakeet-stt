@@ -10,7 +10,12 @@ mod state;
 mod surface_focus;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +58,7 @@ const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 #[cfg(test)]
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
+const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -698,8 +704,308 @@ impl InjectorWorkerHandle {
     }
 }
 
+#[derive(Debug)]
+enum InjectionRunError {
+    BackendFailure(String),
+    ExecutionTimeout(String),
+    WorkerTaskFailed(String),
+}
+
+trait InjectionJobRunner: Send + Sync {
+    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError>;
+}
+
+#[derive(Debug, Clone)]
+struct FailInjectionRunner {
+    kind: InjectionErrorKind,
+    message: Arc<str>,
+}
+
+impl FailInjectionRunner {
+    fn new(kind: InjectionErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: Arc::<str>::from(message.into()),
+        }
+    }
+}
+
+impl InjectionJobRunner for FailInjectionRunner {
+    fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
+        match self.kind {
+            InjectionErrorKind::BackendFailure => {
+                Err(InjectionRunError::BackendFailure(self.message.to_string()))
+            }
+            InjectionErrorKind::ExecutionTimeout => Err(InjectionRunError::ExecutionTimeout(
+                self.message.to_string(),
+            )),
+            InjectionErrorKind::WorkerTaskFailed => Err(InjectionRunError::WorkerTaskFailed(
+                self.message.to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InjectorSubprocessRunner {
+    executable: PathBuf,
+    base_args: Vec<OsString>,
+    timeout: Duration,
+}
+
+impl InjectorSubprocessRunner {
+    fn new(config: &ClientConfig) -> Result<Self> {
+        Ok(Self {
+            executable: std::env::current_exe().context("failed to resolve current executable")?,
+            base_args: internal_inject_args_from_config(config),
+            timeout: Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(executable: PathBuf, base_args: Vec<OsString>, timeout: Duration) -> Self {
+        Self {
+            executable,
+            base_args,
+            timeout,
+        }
+    }
+}
+
+impl InjectionJobRunner for InjectorSubprocessRunner {
+    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&self.base_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_injector_subprocess(&mut command);
+        let mut child = command.spawn().map_err(|err| {
+            InjectionRunError::WorkerTaskFailed(format!(
+                "failed to spawn injector subprocess '{}': {err}",
+                self.executable.display()
+            ))
+        })?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(text.as_bytes()).map_err(|err| {
+                InjectionRunError::WorkerTaskFailed(format!(
+                    "failed to write injector subprocess stdin: {err}"
+                ))
+            })?;
+        }
+        let _ = child.stdin.take();
+
+        let stderr_reader = child.stderr.take().map(spawn_pipe_reader).ok_or_else(|| {
+            InjectionRunError::WorkerTaskFailed(
+                "injector subprocess stderr pipe unavailable".to_string(),
+            )
+        })?;
+        let status_result = wait_for_child_exit(&mut child, self.timeout);
+        let stderr = join_pipe_reader(stderr_reader, "stderr");
+
+        match status_result {
+            Ok(status) => {
+                let stderr = stderr.map_err(InjectionRunError::WorkerTaskFailed)?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    let detail = format_child_failure(status, &stderr);
+                    Err(InjectionRunError::BackendFailure(detail))
+                }
+            }
+            Err(err) => {
+                if let Ok(stderr) = stderr {
+                    return Err(enrich_run_error_with_stderr(err, &stderr));
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> {
+    match InjectorSubprocessRunner::new(config) {
+        Ok(runner) => Arc::new(runner),
+        Err(err) => {
+            let message = format!("failed to initialize injector subprocess runner: {err:#}");
+            error!(error = %message, "injector subprocess runner unavailable");
+            Arc::new(FailInjectionRunner::new(
+                InjectionErrorKind::WorkerTaskFailed,
+                message,
+            ))
+        }
+    }
+}
+
+fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--internal-inject-once")];
+
+    match config.injection_mode {
+        crate::config::InjectionMode::Paste => {
+            args.push(OsString::from("--injection-mode"));
+            args.push(OsString::from("paste"));
+        }
+        crate::config::InjectionMode::CopyOnly => {
+            args.push(OsString::from("--injection-mode"));
+            args.push(OsString::from("copy-only"));
+        }
+    }
+
+    match config.clipboard.key_backend {
+        crate::config::PasteKeyBackend::Ydotool => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("ydotool"));
+        }
+        crate::config::PasteKeyBackend::Uinput => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("uinput"));
+        }
+        crate::config::PasteKeyBackend::Auto => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("auto"));
+        }
+    }
+
+    match config.clipboard.backend_failure_policy {
+        crate::config::PasteBackendFailurePolicy::CopyOnly => {
+            args.push(OsString::from("--paste-backend-failure-policy"));
+            args.push(OsString::from("copy-only"));
+        }
+        crate::config::PasteBackendFailurePolicy::Error => {
+            args.push(OsString::from("--paste-backend-failure-policy"));
+            args.push(OsString::from("error"));
+        }
+    }
+
+    args.push(OsString::from("--uinput-dwell-ms"));
+    args.push(OsString::from(config.uinput_dwell_ms.to_string()));
+    args.push(OsString::from("--paste-write-primary"));
+    args.push(OsString::from(config.clipboard.write_primary.to_string()));
+
+    if let Some(ydotool_path) = &config.ydotool_path {
+        args.push(OsString::from("--ydotool"));
+        args.push(ydotool_path.as_os_str().to_owned());
+    }
+    if let Some(seat) = &config.clipboard.seat {
+        args.push(OsString::from("--paste-seat"));
+        args.push(OsString::from(seat));
+    }
+
+    args
+}
+
+fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    label: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let read_result = handle
+        .join()
+        .map_err(|_| format!("{label} reader thread panicked"))?;
+    read_result.map_err(|err| format!("failed to read {label} pipe: {err}"))
+}
+
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::result::Result<ExitStatus, InjectionRunError> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                kill_injector_subprocess(child);
+                if let Err(err) = child.wait() {
+                    warn!(error = %err, "failed to reap timed-out injector subprocess");
+                }
+                return Err(InjectionRunError::ExecutionTimeout(format!(
+                    "injector execution timed out after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(INJECTION_SUBPROCESS_POLL_MS)),
+            Err(err) => {
+                return Err(InjectionRunError::WorkerTaskFailed(format!(
+                    "failed to query injector subprocess state: {err}"
+                )));
+            }
+        }
+    }
+}
+
+fn configure_injector_subprocess(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        // Give each injection job its own process group so timeout can kill the
+        // entire subprocess tree, not just the wrapper process.
+        command.process_group(0);
+    }
+}
+
+fn kill_injector_subprocess(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group_id = -(child.id() as i32);
+        let rc = unsafe { libc::kill(process_group_id, libc::SIGKILL) };
+        if rc == 0 {
+            return;
+        }
+
+        let err = std::io::Error::last_os_error();
+        warn!(
+            pid = child.id(),
+            error = %err,
+            "failed to kill timed-out injector subprocess tree; falling back to direct child kill"
+        );
+    }
+
+    if let Err(err) = child.kill() {
+        warn!(pid = child.id(), error = %err, "failed to kill timed-out injector subprocess");
+    }
+}
+
+fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
+    let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
+    if trimmed.is_empty() {
+        return format!("injector subprocess exited with status {status}");
+    }
+    format!("injector subprocess exited with status {status}: {trimmed}")
+}
+
+fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> InjectionRunError {
+    let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
+    if trimmed.is_empty() {
+        return error;
+    }
+
+    match error {
+        InjectionRunError::BackendFailure(message) => {
+            InjectionRunError::BackendFailure(format!("{message}; stderr: {trimmed}"))
+        }
+        InjectionRunError::ExecutionTimeout(message) => {
+            InjectionRunError::ExecutionTimeout(format!("{message}; stderr: {trimmed}"))
+        }
+        InjectionRunError::WorkerTaskFailed(message) => {
+            InjectionRunError::WorkerTaskFailed(format!("{message}; stderr: {trimmed}"))
+        }
+    }
+}
+
 fn spawn_injector_worker_with_capacity(
-    injector: Arc<dyn TextInjector>,
+    runner: Arc<dyn InjectionJobRunner>,
     capacity: usize,
 ) -> (
     InjectorWorkerHandle,
@@ -708,7 +1014,7 @@ fn spawn_injector_worker_with_capacity(
     let (job_tx, mut job_rx) = mpsc::channel::<InjectionJob>(capacity.max(1));
     let (report_tx, report_rx) = mpsc::unbounded_channel::<InjectionReport>();
     let metrics = Arc::new(InjectorQueueMetrics::default());
-    let worker_injector = Arc::clone(&injector);
+    let worker_runner = Arc::clone(&runner);
 
     tokio::spawn(async move {
         while let Some(job) = job_rx.recv().await {
@@ -722,37 +1028,26 @@ fn spawn_injector_worker_with_capacity(
 
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
             let worker_started = TokioInstant::now();
-            let injector_for_job = Arc::clone(&worker_injector);
-            let injection_task =
-                tokio::task::spawn_blocking(move || injector_for_job.inject(&text));
-            tokio::pin!(injection_task);
-            let result = timeout(
-                TokioDuration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
-                &mut injection_task,
-            )
-            .await;
+            let runner_for_job = Arc::clone(&worker_runner);
+            let result = tokio::task::spawn_blocking(move || runner_for_job.run(&text)).await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
             let (error_kind, error) = match result {
-                Ok(Ok(Ok(()))) => (None, None),
-                Ok(Ok(Err(err))) => (
-                    Some(InjectionErrorKind::BackendFailure),
-                    Some(format!("{err:#}")),
-                ),
-                Ok(Err(err)) => (
+                Ok(Ok(())) => (None, None),
+                Ok(Err(InjectionRunError::BackendFailure(message))) => {
+                    (Some(InjectionErrorKind::BackendFailure), Some(message))
+                }
+                Ok(Err(InjectionRunError::ExecutionTimeout(message))) => {
+                    (Some(InjectionErrorKind::ExecutionTimeout), Some(message))
+                }
+                Ok(Err(InjectionRunError::WorkerTaskFailed(message))) => {
+                    (Some(InjectionErrorKind::WorkerTaskFailed), Some(message))
+                }
+                Err(err) => (
                     Some(InjectionErrorKind::WorkerTaskFailed),
                     Some(format!("injector worker task failed: {err}")),
                 ),
-                Err(_) => {
-                    injection_task.as_ref().abort();
-                    (
-                        Some(InjectionErrorKind::ExecutionTimeout),
-                        Some(format!(
-                            "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
-                        )),
-                    )
-                }
             };
             let report = InjectionReport {
                 session_id,
@@ -781,12 +1076,12 @@ fn spawn_injector_worker_with_capacity(
 }
 
 fn spawn_injector_worker(
-    injector: Arc<dyn TextInjector>,
+    runner: Arc<dyn InjectionJobRunner>,
 ) -> (
     InjectorWorkerHandle,
     mpsc::UnboundedReceiver<InjectionReport>,
 ) {
-    spawn_injector_worker_with_capacity(injector, INJECTION_QUEUE_CAPACITY)
+    spawn_injector_worker_with_capacity(runner, INJECTION_QUEUE_CAPACITY)
 }
 
 fn percentile_value(sorted_samples: &[u64], percentile: u64) -> u64 {
@@ -873,6 +1168,10 @@ struct Cli {
     /// Test injector only (injects a fixed string then exits)
     #[arg(long)]
     test_injection: bool,
+
+    /// Internal subprocess mode: read transcript text from stdin, inject once, then exit.
+    #[arg(long, hide = true)]
+    internal_inject_once: bool,
 
     /// Run a single start/stop/demo sequence instead of the hotkey loop
     #[arg(long)]
@@ -1046,6 +1345,10 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
+    if cli.internal_inject_once {
+        return run_internal_inject_once(&config);
+    }
+
     let llm_base_url = url::Url::parse(&cli.llm_base_url)
         .with_context(|| format!("invalid LLM base URL: {}", cli.llm_base_url))?;
     let llm_config = LlmRuntimeConfig {
@@ -1091,6 +1394,16 @@ async fn main() -> Result<()> {
         cli.llm_pre_modifier_key.clone(),
     )
     .await
+}
+
+fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .context("failed to read injector subprocess stdin")?;
+    build_injector(config)
+        .inject(&text)
+        .context("internal injection failed")
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
@@ -1403,8 +1716,8 @@ async fn run_demo(
 ) -> Result<()> {
     info!(endpoint = %config.endpoint, "Connecting to parakeet-stt-daemon");
     let mut client = WsClient::connect(&config).await?;
-    let injector = build_injector(&config);
-    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    let injector_runner = build_injection_runner(&config);
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(injector_runner);
 
     let mut state = PttState::new();
     let Some(session_id) = state.begin_listening() else {
@@ -1529,9 +1842,9 @@ async fn run_hotkey_mode(
         "Starting hotkey loop"
     );
     ensure_input_access()?;
-    let injector = build_injector(&config);
+    let injector_runner = build_injection_runner(&config);
     let focus_cache = Some(WaylandFocusCache::new());
-    let (injector_worker, mut injection_reports) = spawn_injector_worker(Arc::clone(&injector));
+    let (injector_worker, mut injection_reports) = spawn_injector_worker(injector_runner);
     let mut overlay_router = OverlayRouter::new(
         build_runtime_overlay_sink(
             overlay_capability.mode,
@@ -2168,13 +2481,16 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::time::Instant;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::anyhow;
     use clap::Parser;
     use tokio::sync::mpsc;
     use tokio::task::yield_now;
@@ -2186,7 +2502,6 @@ mod tests {
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
         PasteBackendFailurePolicy, PasteKeyBackend,
     };
-    use crate::injector::TextInjector;
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -2196,30 +2511,30 @@ mod tests {
     use super::{
         build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
         sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
-        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, NoopOverlaySink, OverlayEvent,
-        OverlayRouter, OverlaySink, RuntimeOverlaySink, SessionIntent,
-        INJECTION_EXECUTION_TIMEOUT_MS,
+        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, InjectionJobRunner,
+        InjectionRunError, InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter,
+        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
-    struct SlowInjector {
+    struct SlowRunner {
         calls: Arc<AtomicU64>,
         sleep_ms: u64,
     }
 
-    impl TextInjector for SlowInjector {
-        fn inject(&self, _text: &str) -> Result<()> {
+    impl InjectionJobRunner for SlowRunner {
+        fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
             Ok(())
         }
     }
 
-    struct RecordingInjector {
+    struct RecordingRunner {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    impl TextInjector for RecordingInjector {
-        fn inject(&self, text: &str) -> Result<()> {
+    impl InjectionJobRunner for RecordingRunner {
+        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
             self.seen
                 .lock()
                 .expect("recording lock should be available")
@@ -2228,18 +2543,20 @@ mod tests {
         }
     }
 
-    struct TimeoutThenRecordingInjector {
+    struct TimeoutThenRecordingRunner {
         calls: Arc<AtomicU64>,
         seen: Arc<Mutex<Vec<String>>>,
-        timeout_sleep_ms: u64,
+        timeout_run_ms: u64,
     }
 
-    impl TextInjector for TimeoutThenRecordingInjector {
-        fn inject(&self, text: &str) -> Result<()> {
+    impl InjectionJobRunner for TimeoutThenRecordingRunner {
+        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
             let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
             if call_index == 0 {
-                std::thread::sleep(Duration::from_millis(self.timeout_sleep_ms));
-                return Ok(());
+                std::thread::sleep(Duration::from_millis(self.timeout_run_ms));
+                return Err(InjectionRunError::ExecutionTimeout(format!(
+                    "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                )));
             }
 
             self.seen
@@ -2248,6 +2565,24 @@ mod tests {
                 .push(text.to_string());
             Ok(())
         }
+    }
+
+    fn make_test_script(content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-worker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, content).expect("test script should be writable");
+        let mut perms = fs::metadata(&path)
+            .expect("test script should exist")
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).expect("test script should be executable");
+        path
     }
 
     struct RecordingOverlaySink {
@@ -2434,7 +2769,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_server_message_enqueues_without_waiting_for_injection_completion() {
         let calls = Arc::new(AtomicU64::new(0));
-        let slow_injector = Arc::new(SlowInjector {
+        let slow_injector = Arc::new(SlowRunner {
             calls: Arc::clone(&calls),
             sleep_ms: 120,
         });
@@ -2477,7 +2812,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn injector_worker_preserves_fifo_order() {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2525,7 +2860,7 @@ mod tests {
             None,
         );
         let injector_seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&injector_seen),
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2621,7 +2956,7 @@ mod tests {
             None,
         );
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
@@ -2725,7 +3060,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -2832,7 +3167,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -2941,7 +3276,7 @@ mod tests {
             OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -3063,7 +3398,7 @@ mod tests {
             },
             None,
         );
-        let injector = Arc::new(RecordingInjector {
+        let injector = Arc::new(RecordingRunner {
             seen: Arc::new(Mutex::new(Vec::new())),
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 2);
@@ -3129,10 +3464,10 @@ mod tests {
     async fn injector_worker_recovers_after_execution_timeout() {
         let calls = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(TimeoutThenRecordingInjector {
+        let injector = Arc::new(TimeoutThenRecordingRunner {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
-            timeout_sleep_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+            timeout_run_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
@@ -3206,8 +3541,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn injector_worker_timeout_kills_subprocess_tree_before_next_job_runs() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-injector-worker-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\ntext=\"$(cat)\"\nif [ \"$text\" = \"first wedges\" ]; then\n  (\n    sleep 0.35\n    printf '%s\\n' \"$text\" >>\"$log_path\"\n  ) &\n  sleep 0.35\n  wait\n  exit 0\nfi\nprintf '%s\\n' \"$text\" >>\"$log_path\"\n",
+        );
+        let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+        ));
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
+
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        worker
+            .enqueue(InjectionJob::new(
+                first_session,
+                "first wedges".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                second_session,
+                "second survives".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        let first_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("first report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(first_report.session_id, first_session);
+        assert_eq!(
+            first_report.error_kind,
+            Some(InjectionErrorKind::ExecutionTimeout)
+        );
+
+        let second_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("second report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(second_report.session_id, second_session);
+        assert_eq!(second_report.error_kind, None);
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        assert_eq!(written, "second survives\n");
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn enqueue_times_out_when_queue_remains_saturated() {
-        let slow = Arc::new(SlowInjector {
+        let slow = Arc::new(SlowRunner {
             calls: Arc::new(AtomicU64::new(0)),
             sleep_ms: 200,
         });
