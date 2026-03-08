@@ -45,8 +45,9 @@ use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent, HotkeyIntent,
 };
 use crate::injector::{
-    injector_metrics_snapshot, TextInjector, INJECTOR_JOB_TIMEOUT_MS,
-    INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS,
+    injector_metrics_snapshot, BackendAttemptReport, InjectorChildReport, InjectorContext,
+    ParentFocusCapture, TextInjector, INJECTOR_CONTEXT_ENV, INJECTOR_JOB_TIMEOUT_MS,
+    INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS, INJECTOR_REPORT_PREFIX,
     INJECTOR_SUBPROCESS_POLL_INTERVAL_MS,
 };
 use crate::overlay_process::OverlayProcessManager;
@@ -54,12 +55,13 @@ use crate::protocol::{
     decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
 };
 use crate::state::PttState;
-use crate::surface_focus::WaylandFocusCache;
+use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
+const INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT: usize = 120;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -107,6 +109,10 @@ struct InjectionJob {
     text: String,
     daemon_latency_ms: u64,
     daemon_audio_ms: u64,
+    origin: InjectionOrigin,
+    hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    parent_focus: Option<ParentFocusCapture>,
     enqueued_at: TokioInstant,
 }
 
@@ -117,8 +123,32 @@ impl InjectionJob {
             text,
             daemon_latency_ms,
             daemon_audio_ms,
+            origin: InjectionOrigin::Unspecified,
+            hotkey_up_elapsed_ms_at_enqueue: None,
+            stop_message_elapsed_ms_at_enqueue: None,
+            parent_focus: None,
             enqueued_at: TokioInstant::now(),
         }
+    }
+
+    fn with_origin(mut self, origin: InjectionOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    fn with_enqueue_timing(
+        mut self,
+        hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+        stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    ) -> Self {
+        self.hotkey_up_elapsed_ms_at_enqueue = hotkey_up_elapsed_ms_at_enqueue;
+        self.stop_message_elapsed_ms_at_enqueue = stop_message_elapsed_ms_at_enqueue;
+        self
+    }
+
+    fn with_parent_focus(mut self, parent_focus: Option<ParentFocusCapture>) -> Self {
+        self.parent_focus = parent_focus;
+        self
     }
 }
 
@@ -127,11 +157,41 @@ struct InjectionReport {
     session_id: Uuid,
     daemon_latency_ms: u64,
     daemon_audio_ms: u64,
+    origin: InjectionOrigin,
     queue_wait_ms: u64,
     run_ms: u64,
     total_worker_ms: u64,
+    hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    hotkey_up_elapsed_ms_at_worker_start: Option<u64>,
+    stop_message_elapsed_ms_at_worker_start: Option<u64>,
     error_kind: Option<InjectionErrorKind>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionOrigin {
+    RawFinalResult,
+    LlmAnswer,
+    Demo,
+    Unspecified,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedParentFocus {
+    focus: ParentFocusCapture,
+    captured_at: TokioInstant,
+}
+
+impl InjectionOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RawFinalResult => "raw_final_result",
+            Self::LlmAnswer => "llm_answer",
+            Self::Demo => "demo",
+            Self::Unspecified => "unspecified",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,8 +772,14 @@ enum InjectionRunError {
     WorkerTaskFailed(String),
 }
 
+#[derive(Debug, Default)]
+struct InjectionRunOutput {
+    stderr: Vec<u8>,
+}
+
 trait InjectionJobRunner: Send + Sync {
-    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError>;
+    fn run(&self, job: &InjectionJob)
+        -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
 #[derive(Debug, Clone)]
@@ -732,7 +798,10 @@ impl FailInjectionRunner {
 }
 
 impl InjectionJobRunner for FailInjectionRunner {
-    fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
+    fn run(
+        &self,
+        _job: &InjectionJob,
+    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
         match self.kind {
             InjectionErrorKind::BackendFailure => {
                 Err(InjectionRunError::BackendFailure(self.message.to_string()))
@@ -774,13 +843,29 @@ impl InjectorSubprocessRunner {
 }
 
 impl InjectionJobRunner for InjectorSubprocessRunner {
-    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+    fn run(
+        &self,
+        job: &InjectionJob,
+    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
         let mut command = Command::new(&self.executable);
         command
             .args(&self.base_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        let context = InjectorContext {
+            session_id: job.session_id,
+            origin: job.origin.as_str().to_string(),
+            hotkey_up_elapsed_ms_at_enqueue: job.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
+            parent_focus: job.parent_focus.clone(),
+        };
+        let context_json = serde_json::to_string(&context).map_err(|err| {
+            InjectionRunError::WorkerTaskFailed(format!(
+                "failed to serialize injector subprocess context: {err}"
+            ))
+        })?;
+        command.env(INJECTOR_CONTEXT_ENV, context_json);
         configure_injector_subprocess(&mut command);
         let mut child = command.spawn().map_err(|err| {
             InjectionRunError::WorkerTaskFailed(format!(
@@ -790,7 +875,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
         })?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes()).map_err(|err| {
+            stdin.write_all(job.text.as_bytes()).map_err(|err| {
                 InjectionRunError::WorkerTaskFailed(format!(
                     "failed to write injector subprocess stdin: {err}"
                 ))
@@ -839,7 +924,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                     Err(err) => return Err(InjectionRunError::WorkerTaskFailed(err)),
                 };
                 if status.success() {
-                    Ok(())
+                    Ok(InjectionRunOutput { stderr })
                 } else {
                     let detail = format_child_failure(status, &stderr);
                     Err(InjectionRunError::BackendFailure(detail))
@@ -1185,6 +1270,109 @@ fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> Inje
     }
 }
 
+fn summarize_backend_attempts(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| {
+            let mut summary = format!(
+                "{}:{}:{}",
+                attempt.route_attempt_name, attempt.backend, attempt.status
+            );
+            if let Some(error) = attempt.error.as_ref() {
+                summary.push(':');
+                summary.push_str(error);
+            }
+            summary
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn log_injector_subprocess_stderr(session_id: Uuid, origin: InjectionOrigin, stderr: &[u8]) {
+    if stderr.is_empty() {
+        return;
+    }
+
+    let stderr_text = String::from_utf8_lossy(stderr);
+    let mut logged_lines = 0usize;
+    let mut dropped_lines = 0usize;
+    for line in stderr_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if logged_lines >= INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT {
+            dropped_lines = dropped_lines.saturating_add(1);
+            continue;
+        }
+
+        logged_lines = logged_lines.saturating_add(1);
+        if let Some(payload) = trimmed.strip_prefix(INJECTOR_REPORT_PREFIX) {
+            match serde_json::from_str::<InjectorChildReport>(payload) {
+                Ok(report) => {
+                    info!(
+                        session = %session_id,
+                        origin = origin.as_str(),
+                        child_session = ?report.session_id,
+                        child_origin = ?report.origin,
+                        trace_id = report.trace_id,
+                        outcome = report.outcome,
+                        requested_len = report.requested_len,
+                        requested_fingerprint = report.requested_fingerprint,
+                        clipboard_ready = report.clipboard_ready,
+                        clipboard_probe_count = report.clipboard_probe_count,
+                        post_clipboard_matches = ?report.post_clipboard_matches,
+                        parent_focus_app = report.parent_focus.as_ref().and_then(|focus| focus.snapshot.as_ref()).and_then(|snapshot| snapshot.app_name.as_deref()),
+                        parent_focus_captured_elapsed_ms = report.parent_focus.as_ref().and_then(|focus| focus.captured_elapsed_ms),
+                        child_focus_before_app = report.child_focus_before.as_ref().and_then(|snapshot| snapshot.app_name.as_deref()),
+                        child_focus_after_app = report.child_focus_after.as_ref().and_then(|snapshot| snapshot.app_name.as_deref()),
+                        child_focus_source_selected = report.child_focus_source_selected,
+                        child_focus_wayland_cache_age_ms = ?report.child_focus_wayland_cache_age_ms,
+                        child_focus_wayland_fallback_reason = ?report.child_focus_wayland_fallback_reason,
+                        route_focus_source = report.route_focus_source,
+                        route_class = report.route_class,
+                        route_primary = report.route_primary,
+                        route_adaptive_fallback = ?report.route_adaptive_fallback,
+                        route_reason = report.route_reason,
+                        backend_attempts = summarize_backend_attempts(&report.backend_attempts),
+                        elapsed_ms_total = report.elapsed_ms_total,
+                        "injector subprocess report"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        session = %session_id,
+                        origin = origin.as_str(),
+                        line_index = logged_lines,
+                        error = %err,
+                        line = %trimmed,
+                        "failed to parse injector subprocess report line"
+                    );
+                }
+            }
+            continue;
+        }
+        info!(
+            session = %session_id,
+            origin = origin.as_str(),
+            line_index = logged_lines,
+            line = %trimmed,
+            "injector subprocess log line"
+        );
+    }
+
+    if dropped_lines > 0 {
+        warn!(
+            session = %session_id,
+            origin = origin.as_str(),
+            logged_lines,
+            dropped_lines,
+            line_limit = INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT,
+            "injector subprocess log lines were truncated"
+        );
+    }
+}
+
 fn spawn_injector_worker_with_capacity(
     runner: Arc<dyn InjectionJobRunner>,
     capacity: usize,
@@ -1204,18 +1392,54 @@ fn spawn_injector_worker_with_capacity(
                 text,
                 daemon_latency_ms,
                 daemon_audio_ms,
+                origin,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                parent_focus,
                 enqueued_at,
             } = job;
 
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+            let hotkey_up_elapsed_ms_at_worker_start = hotkey_up_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(queue_wait_ms));
+            let stop_message_elapsed_ms_at_worker_start = stop_message_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(queue_wait_ms));
+            info!(
+                session = %session_id,
+                origin = origin.as_str(),
+                daemon_latency_ms,
+                daemon_audio_ms,
+                queue_wait_ms,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start,
+                "injector worker starting job"
+            );
             let worker_started = TokioInstant::now();
             let runner_for_job = Arc::clone(&worker_runner);
-            let result = tokio::task::spawn_blocking(move || runner_for_job.run(&text)).await;
+            let job_for_runner = InjectionJob {
+                session_id,
+                text: text.clone(),
+                daemon_latency_ms,
+                daemon_audio_ms,
+                origin,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                parent_focus,
+                enqueued_at,
+            };
+            let result =
+                tokio::task::spawn_blocking(move || runner_for_job.run(&job_for_runner)).await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
+            let mut run_output: Option<InjectionRunOutput> = None;
             let (error_kind, error) = match result {
-                Ok(Ok(())) => (None, None),
+                Ok(Ok(output)) => {
+                    run_output = Some(output);
+                    (None, None)
+                }
                 Ok(Err(InjectionRunError::BackendFailure(message))) => {
                     (Some(InjectionErrorKind::BackendFailure), Some(message))
                 }
@@ -1230,13 +1454,21 @@ fn spawn_injector_worker_with_capacity(
                     Some(format!("injector worker task failed: {err}")),
                 ),
             };
+            if let Some(output) = run_output {
+                log_injector_subprocess_stderr(session_id, origin, &output.stderr);
+            }
             let report = InjectionReport {
                 session_id,
                 daemon_latency_ms,
                 daemon_audio_ms,
+                origin,
                 queue_wait_ms,
                 run_ms,
                 total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start,
                 error_kind,
                 error,
             };
@@ -1582,12 +1814,28 @@ fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
     std::io::stdin()
         .read_to_string(&mut text)
         .context("failed to read injector subprocess stdin")?;
-    build_injector(config)
+    let context = std::env::var(INJECTOR_CONTEXT_ENV)
+        .ok()
+        .and_then(|raw| match serde_json::from_str::<InjectorContext>(&raw) {
+            Ok(context) => Some(context),
+            Err(err) => {
+                warn!(error = %err, "failed to parse injector subprocess context env; continuing without parent focus context");
+                None
+            }
+        });
+    build_injector_with_context(config, context)
         .inject(&text)
         .context("internal injection failed")
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
+    build_injector_with_context(config, None)
+}
+
+fn build_injector_with_context(
+    config: &ClientConfig,
+    context: Option<InjectorContext>,
+) -> Arc<dyn TextInjector> {
     use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
     use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
 
@@ -1611,10 +1859,11 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
                     reason = %reason,
                     "paste backend unavailable; falling back to copy-only injection"
                 );
-                Arc::new(ClipboardInjector::new(
+                Arc::new(ClipboardInjector::new_with_context(
                     PasteKeySender::Disabled,
                     config.clipboard.clone(),
                     true,
+                    context.clone(),
                 ))
             }
             PasteBackendFailurePolicy::Error => {
@@ -1689,10 +1938,11 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
         "Using clipboard injector"
     );
 
-    Arc::new(ClipboardInjector::new(
+    Arc::new(ClipboardInjector::new_with_context(
         sender,
         config.clipboard.clone(),
         matches!(config.injection_mode, InjectionMode::CopyOnly),
+        context,
     ))
 }
 
@@ -1934,9 +2184,10 @@ async fn run_demo(
                     "final result received"
                 );
                 injector_worker
-                    .enqueue(InjectionJob::new(
-                        session_id, to_inject, latency_ms, audio_ms,
-                    ))
+                    .enqueue(
+                        InjectionJob::new(session_id, to_inject, latency_ms, audio_ms)
+                            .with_origin(InjectionOrigin::Demo),
+                    )
                     .await
                     .map_err(|failure| {
                         anyhow!("failed to enqueue demo injection job: {:?}", failure)
@@ -2069,6 +2320,9 @@ async fn run_hotkey_mode(
     let llm_busy_overlay_session = Uuid::nil();
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
     let mut hotkey_intent_diagnostics = HotkeyIntentDiagnostics::default();
+    let mut last_hotkey_up_at: Option<TokioInstant> = None;
+    let mut last_stop_message: Option<(Uuid, TokioInstant)> = None;
+    let mut parent_focus_by_session = HashMap::<Uuid, CapturedParentFocus>::new();
 
     loop {
         match WsClient::connect(&config).await {
@@ -2123,6 +2377,18 @@ async fn run_hotkey_mode(
                                         if let Some(session_id) = state.stop_listening() {
                                             let message = stop_message(session_id);
                                             send_message(&mut ws_write, &message).await?;
+                                            let now = TokioInstant::now();
+                                            last_hotkey_up_at = Some(now);
+                                            last_stop_message = Some((session_id, now));
+                                            if let Some(focus) = capture_parent_focus(overlay_router.focus_cache.as_ref()) {
+                                                parent_focus_by_session.insert(
+                                                    session_id,
+                                                    CapturedParentFocus {
+                                                        focus,
+                                                        captured_at: now,
+                                                    },
+                                                );
+                                            }
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         } else {
                                             hotkey_intent_diagnostics.note_hotkey_up_ignored();
@@ -2214,6 +2480,9 @@ async fn run_hotkey_mode(
                                                                     &mut state,
                                                                     &mut overlay_router,
                                                                     &injector_worker,
+                                                                    &mut parent_focus_by_session,
+                                                                    last_hotkey_up_at,
+                                                                    last_stop_message,
                                                                     &audio_feedback,
                                                                 ).await?;
                                                                 if clear_intent {
@@ -2290,6 +2559,7 @@ async fn run_hotkey_mode(
                                         llm_overlay_text.remove(&session_id);
                                         let session_end_reason =
                                             llm_deferred_session_end.remove(&session_id).flatten();
+                                        let session_end_was_deferred = session_end_reason.is_some();
                                         overlay_router.route_session_ended(
                                             None,
                                             session_id,
@@ -2322,9 +2592,42 @@ async fn run_hotkey_mode(
                                         } else {
                                             response_text
                                         };
+                                        let hotkey_up_elapsed_ms_at_enqueue =
+                                            elapsed_ms_since(last_hotkey_up_at);
+                                        let stop_message_elapsed_ms_at_enqueue =
+                                            last_stop_message.and_then(|(stopped_session_id, instant)| {
+                                                (stopped_session_id == session_id)
+                                                    .then(|| instant.elapsed().as_millis() as u64)
+                                            });
+                                        info!(
+                                            session = %session_id,
+                                            origin = InjectionOrigin::LlmAnswer.as_str(),
+                                            state_at_enqueue = state_label(&state),
+                                            session_end_was_deferred,
+                                            hotkey_up_elapsed_ms_at_enqueue,
+                                            stop_message_elapsed_ms_at_enqueue,
+                                            response_chars = to_inject.chars().count(),
+                                            "queueing llm answer injection job"
+                                        );
 
                                         match injector_worker
-                                            .enqueue(InjectionJob::new(session_id, to_inject, daemon_latency_ms, daemon_audio_ms))
+                                            .enqueue(
+                                                InjectionJob::new(
+                                                    session_id,
+                                                    to_inject,
+                                                    daemon_latency_ms,
+                                                    daemon_audio_ms,
+                                                )
+                                                .with_origin(InjectionOrigin::LlmAnswer)
+                                                .with_enqueue_timing(
+                                                    hotkey_up_elapsed_ms_at_enqueue,
+                                                    stop_message_elapsed_ms_at_enqueue,
+                                                )
+                                                .with_parent_focus(take_parent_focus_for_enqueue(
+                                                    &mut parent_focus_by_session,
+                                                    session_id,
+                                                )),
+                                            )
                                             .await
                                         {
                                             Ok(()) => debug!(session = %session_id, "llm final answer queued for injector worker"),
@@ -2393,12 +2696,17 @@ fn handle_injection_report(
         (Some(error_kind), Some(error)) => {
             warn!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 error_kind = error_kind.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 error = %error,
                 "injector worker reported failure"
             );
@@ -2406,11 +2714,16 @@ fn handle_injection_report(
         (None, None) => {
             info!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 "injector worker completed job"
             );
             audio_feedback.play_completion();
@@ -2418,12 +2731,17 @@ fn handle_injection_report(
         (error_kind, error) => {
             warn!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 error_kind = error_kind.map(InjectionErrorKind::as_str),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 error = ?error,
                 "injector worker reported inconsistent error classification"
             );
@@ -2460,11 +2778,62 @@ fn handle_injection_report(
     overlay_router.route_injection_complete(report.session_id, success);
 }
 
+fn capture_parent_focus(focus_cache: Option<&WaylandFocusCache>) -> Option<ParentFocusCapture> {
+    let cache = focus_cache?;
+    match cache.observe(30_000, 500) {
+        WaylandFocusObservation::Fresh {
+            snapshot,
+            cache_age_ms,
+        } => Some(ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: Some(0),
+        }),
+        WaylandFocusObservation::LowConfidence {
+            snapshot,
+            cache_age_ms,
+            reason,
+        } => Some(ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache_low_confidence".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        }),
+        WaylandFocusObservation::Unavailable {
+            reason,
+            cache_age_ms,
+        } => Some(ParentFocusCapture {
+            snapshot: None,
+            source_selected: "wayland_unavailable".to_string(),
+            wayland_cache_age_ms: cache_age_ms,
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        }),
+    }
+}
+
+fn take_parent_focus_for_enqueue(
+    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
+    session_id: Uuid,
+) -> Option<ParentFocusCapture> {
+    parent_focus_by_session.remove(&session_id).map(|captured| {
+        let mut focus = captured.focus;
+        focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
+        focus
+    })
+}
+
 async fn handle_server_message(
     message: ServerMessage,
     state: &mut PttState,
     overlay_router: &mut OverlayRouter<impl OverlaySink>,
     injector_worker: &InjectorWorkerHandle,
+    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
+    last_hotkey_up_at: Option<TokioInstant>,
+    last_stop_message: Option<(Uuid, TokioInstant)>,
     _audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
@@ -2479,14 +2848,34 @@ async fn handle_server_message(
             audio_ms,
             ..
         } => {
+            let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(last_hotkey_up_at);
+            let stop_message_elapsed_ms_at_enqueue =
+                last_stop_message.and_then(|(stopped_session_id, instant)| {
+                    (stopped_session_id == session_id).then(|| instant.elapsed().as_millis() as u64)
+                });
             info!(
                 session = %session_id,
+                origin = InjectionOrigin::RawFinalResult.as_str(),
                 latency_ms,
                 audio_ms,
+                state_at_enqueue = state_label(state),
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
                 "final result received"
             );
             match injector_worker
-                .enqueue(InjectionJob::new(session_id, text, latency_ms, audio_ms))
+                .enqueue(
+                    InjectionJob::new(session_id, text, latency_ms, audio_ms)
+                        .with_origin(InjectionOrigin::RawFinalResult)
+                        .with_enqueue_timing(
+                            hotkey_up_elapsed_ms_at_enqueue,
+                            stop_message_elapsed_ms_at_enqueue,
+                        )
+                        .with_parent_focus(take_parent_focus_for_enqueue(
+                            parent_focus_by_session,
+                            session_id,
+                        )),
+                )
                 .await
             {
                 Ok(()) => {
@@ -2522,6 +2911,9 @@ async fn handle_server_message(
                 "daemon error: {}",
                 message
             );
+            if let Some(session_id) = session_id {
+                parent_focus_by_session.remove(&session_id);
+            }
             state.reset();
         }
         ServerMessage::InterimState {
@@ -2550,6 +2942,7 @@ async fn handle_server_message(
             overlay_router.route_audio_level(session_id_from_state(state), session_id, level_db);
         }
         ServerMessage::SessionEnded { session_id, reason } => {
+            parent_focus_by_session.remove(&session_id);
             overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);
         }
         ServerMessage::Status { .. } => {}
@@ -2564,6 +2957,18 @@ fn session_id_from_state(state: &PttState) -> Option<Uuid> {
             Some(session_id)
         }
     }
+}
+
+fn state_label(state: &PttState) -> &'static str {
+    match state {
+        PttState::Idle => "idle",
+        PttState::Listening { .. } => "listening",
+        PttState::WaitingResult { .. } => "waiting_result",
+    }
+}
+
+fn elapsed_ms_since(instant: Option<TokioInstant>) -> Option<u64> {
+    instant.map(|value| value.elapsed().as_millis() as u64)
 }
 
 fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
@@ -2661,7 +3066,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
@@ -2695,10 +3100,31 @@ mod tests {
         build_injector, collect_pipe_reader, drain_sse_lines, handle_server_message,
         maybe_defer_llm_session_end, sanitize_model_answer, spawn_injector_worker_with_capacity,
         spawn_pipe_reader, EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind,
-        InjectionJob, InjectionJobRunner, InjectionRunError, InjectorSubprocessRunner,
-        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
-        SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
+        InjectionJob, InjectionJobRunner, InjectionRunError, InjectionRunOutput,
+        InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
+        RuntimeOverlaySink, SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
     };
+
+    async fn handle_server_message_for_tests<S: OverlaySink>(
+        message: ServerMessage,
+        state: &mut PttState,
+        overlay_router: &mut OverlayRouter<S>,
+        injector_worker: &super::InjectorWorkerHandle,
+        audio_feedback: &AudioFeedback,
+    ) -> anyhow::Result<()> {
+        let mut parent_focus_by_session = HashMap::new();
+        handle_server_message(
+            message,
+            state,
+            overlay_router,
+            injector_worker,
+            &mut parent_focus_by_session,
+            None,
+            None,
+            audio_feedback,
+        )
+        .await
+    }
 
     struct SlowRunner {
         calls: Arc<AtomicU64>,
@@ -2706,10 +3132,13 @@ mod tests {
     }
 
     impl InjectionJobRunner for SlowRunner {
-        fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            _job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
-            Ok(())
+            Ok(InjectionRunOutput::default())
         }
     }
 
@@ -2718,12 +3147,15 @@ mod tests {
     }
 
     impl InjectionJobRunner for RecordingRunner {
-        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             self.seen
                 .lock()
                 .expect("recording lock should be available")
-                .push(text.to_string());
-            Ok(())
+                .push(job.text.to_string());
+            Ok(InjectionRunOutput::default())
         }
     }
 
@@ -2734,7 +3166,10 @@ mod tests {
     }
 
     impl InjectionJobRunner for TimeoutThenRecordingRunner {
-        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
             if call_index == 0 {
                 std::thread::sleep(Duration::from_millis(self.timeout_run_ms));
@@ -2746,8 +3181,8 @@ mod tests {
             self.seen
                 .lock()
                 .expect("recording lock should be available")
-                .push(text.to_string());
-            Ok(())
+                .push(job.text.to_string());
+            Ok(InjectionRunOutput::default())
         }
     }
 
@@ -2974,9 +3409,15 @@ mod tests {
         };
 
         let started = Instant::now();
-        handle_server_message(message, &mut state, &mut overlay_router, &worker, &feedback)
-            .await
-            .expect("server message should enqueue successfully");
+        handle_server_message_for_tests(
+            message,
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &feedback,
+        )
+        .await
+        .expect("server message should enqueue successfully");
         let elapsed = started.elapsed();
 
         assert!(
@@ -3056,7 +3497,7 @@ mod tests {
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
@@ -3069,7 +3510,7 @@ mod tests {
         )
         .await
         .expect("interim state should route to overlay");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -3082,7 +3523,7 @@ mod tests {
         )
         .await
         .expect("interim text should route to overlay");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::SessionEnded {
                 session_id,
                 reason: Some("normal".to_string()),
@@ -3152,7 +3593,7 @@ mod tests {
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
@@ -3165,7 +3606,7 @@ mod tests {
         )
         .await
         .expect("interim state should route");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "only final injects".to_string(),
@@ -3181,7 +3622,7 @@ mod tests {
         )
         .await
         .expect("final result should enqueue exactly once");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -3256,7 +3697,7 @@ mod tests {
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
@@ -3276,7 +3717,7 @@ mod tests {
             1
         );
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final survives overlay disconnect".to_string(),
@@ -3364,7 +3805,7 @@ mod tests {
         let feedback = AudioFeedback::new(false, None, 100);
 
         for seq in 1..=4 {
-            handle_server_message(
+            handle_server_message_for_tests(
                 ServerMessage::InterimText {
                     session_id,
                     seq,
@@ -3379,7 +3820,7 @@ mod tests {
             .expect("overlay failures should remain non-fatal");
         }
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final survives repeated overlay failures".to_string(),
@@ -3472,7 +3913,7 @@ mod tests {
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
@@ -3500,7 +3941,7 @@ mod tests {
 
         drop(rx_first);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -3530,7 +3971,7 @@ mod tests {
             .await
             .is_err());
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final after overlay restart".to_string(),
@@ -3594,7 +4035,7 @@ mod tests {
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 10,
@@ -3607,7 +4048,7 @@ mod tests {
         )
         .await
         .expect("first interim text should route");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 9,
@@ -3812,7 +4253,12 @@ mod tests {
 
         let started = Instant::now();
         runner
-            .run("clipboard helper should not pin the worker")
+            .run(&InjectionJob::new(
+                Uuid::new_v4(),
+                "clipboard helper should not pin the worker".to_string(),
+                0,
+                0,
+            ))
             .expect("runner should treat the injector subprocess as successful");
         let elapsed = started.elapsed();
 
