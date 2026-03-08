@@ -759,6 +759,15 @@ impl InjectorSubprocessRunner {
             timeout: Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
         })
     }
+
+    #[cfg(test)]
+    fn new_for_tests(executable: PathBuf, base_args: Vec<OsString>, timeout: Duration) -> Self {
+        Self {
+            executable,
+            base_args,
+            timeout,
+        }
+    }
 }
 
 impl InjectionJobRunner for InjectorSubprocessRunner {
@@ -2440,6 +2449,9 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2468,8 +2480,8 @@ mod tests {
         build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
         sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
         HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, InjectionJobRunner,
-        InjectionRunError, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
-        RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
+        InjectionRunError, InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter,
+        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
     struct SlowRunner {
@@ -2521,6 +2533,24 @@ mod tests {
                 .push(text.to_string());
             Ok(())
         }
+    }
+
+    fn make_test_script(content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-worker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, content).expect("test script should be writable");
+        let mut perms = fs::metadata(&path)
+            .expect("test script should exist")
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).expect("test script should be executable");
+        path
     }
 
     struct RecordingOverlaySink {
@@ -3476,6 +3506,73 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injector_worker_timeout_kills_child_before_next_job_runs() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-injector-worker-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\ntext=\"$(cat)\"\nif [ \"$text\" = \"first wedges\" ]; then\n  sleep 0.35\nfi\nprintf '%s\\n' \"$text\" >>\"$log_path\"\n",
+        );
+        let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+        ));
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
+
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        worker
+            .enqueue(InjectionJob::new(
+                first_session,
+                "first wedges".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                second_session,
+                "second survives".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        let first_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("first report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(first_report.session_id, first_session);
+        assert_eq!(
+            first_report.error_kind,
+            Some(InjectionErrorKind::ExecutionTimeout)
+        );
+
+        let second_report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("second report should arrive")
+            .expect("report stream should remain open");
+        assert_eq!(second_report.session_id, second_session);
+        assert_eq!(second_report.error_kind, None);
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        assert_eq!(written, "second survives\n");
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
     }
 
     #[tokio::test(flavor = "current_thread")]
