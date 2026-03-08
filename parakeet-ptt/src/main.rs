@@ -10,7 +10,10 @@ mod state;
 mod surface_focus;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +56,7 @@ const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 #[cfg(test)]
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
+const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -701,33 +705,262 @@ impl InjectorWorkerHandle {
 #[derive(Debug)]
 enum InjectionRunError {
     BackendFailure(String),
+    ExecutionTimeout(String),
+    WorkerTaskFailed(String),
 }
 
 trait InjectionJobRunner: Send + Sync {
     fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError>;
 }
 
-#[derive(Clone)]
-struct BlockingInjectorRunner {
-    injector: Arc<dyn TextInjector>,
+#[derive(Debug, Clone)]
+struct FailInjectionRunner {
+    kind: InjectionErrorKind,
+    message: Arc<str>,
 }
 
-impl BlockingInjectorRunner {
-    fn new(injector: Arc<dyn TextInjector>) -> Self {
-        Self { injector }
+impl FailInjectionRunner {
+    fn new(kind: InjectionErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: Arc::<str>::from(message.into()),
+        }
     }
 }
 
-impl InjectionJobRunner for BlockingInjectorRunner {
+impl InjectionJobRunner for FailInjectionRunner {
+    fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
+        match self.kind {
+            InjectionErrorKind::BackendFailure => {
+                Err(InjectionRunError::BackendFailure(self.message.to_string()))
+            }
+            InjectionErrorKind::ExecutionTimeout => Err(InjectionRunError::ExecutionTimeout(
+                self.message.to_string(),
+            )),
+            InjectionErrorKind::WorkerTaskFailed => Err(InjectionRunError::WorkerTaskFailed(
+                self.message.to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InjectorSubprocessRunner {
+    executable: PathBuf,
+    base_args: Vec<OsString>,
+    timeout: Duration,
+}
+
+impl InjectorSubprocessRunner {
+    fn new(config: &ClientConfig) -> Result<Self> {
+        Ok(Self {
+            executable: std::env::current_exe().context("failed to resolve current executable")?,
+            base_args: internal_inject_args_from_config(config),
+            timeout: Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+        })
+    }
+}
+
+impl InjectionJobRunner for InjectorSubprocessRunner {
     fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
-        self.injector
-            .inject(text)
-            .map_err(|err| InjectionRunError::BackendFailure(format!("{err:#}")))
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&self.base_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|err| {
+            InjectionRunError::WorkerTaskFailed(format!(
+                "failed to spawn injector subprocess '{}': {err}",
+                self.executable.display()
+            ))
+        })?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(text.as_bytes()).map_err(|err| {
+                InjectionRunError::WorkerTaskFailed(format!(
+                    "failed to write injector subprocess stdin: {err}"
+                ))
+            })?;
+        }
+        let _ = child.stdin.take();
+
+        let stderr_reader = child.stderr.take().map(spawn_pipe_reader).ok_or_else(|| {
+            InjectionRunError::WorkerTaskFailed(
+                "injector subprocess stderr pipe unavailable".to_string(),
+            )
+        })?;
+        let status_result = wait_for_child_exit(&mut child, self.timeout);
+        let stderr = join_pipe_reader(stderr_reader, "stderr");
+
+        match status_result {
+            Ok(status) => {
+                let stderr = stderr.map_err(InjectionRunError::WorkerTaskFailed)?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    let detail = format_child_failure(status, &stderr);
+                    Err(InjectionRunError::BackendFailure(detail))
+                }
+            }
+            Err(err) => {
+                if let Ok(stderr) = stderr {
+                    return Err(enrich_run_error_with_stderr(err, &stderr));
+                }
+                Err(err)
+            }
+        }
     }
 }
 
 fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> {
-    Arc::new(BlockingInjectorRunner::new(build_injector(config)))
+    match InjectorSubprocessRunner::new(config) {
+        Ok(runner) => Arc::new(runner),
+        Err(err) => {
+            let message = format!("failed to initialize injector subprocess runner: {err:#}");
+            error!(error = %message, "injector subprocess runner unavailable");
+            Arc::new(FailInjectionRunner::new(
+                InjectionErrorKind::WorkerTaskFailed,
+                message,
+            ))
+        }
+    }
+}
+
+fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--internal-inject-once")];
+
+    match config.injection_mode {
+        crate::config::InjectionMode::Paste => {
+            args.push(OsString::from("--injection-mode"));
+            args.push(OsString::from("paste"));
+        }
+        crate::config::InjectionMode::CopyOnly => {
+            args.push(OsString::from("--injection-mode"));
+            args.push(OsString::from("copy-only"));
+        }
+    }
+
+    match config.clipboard.key_backend {
+        crate::config::PasteKeyBackend::Ydotool => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("ydotool"));
+        }
+        crate::config::PasteKeyBackend::Uinput => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("uinput"));
+        }
+        crate::config::PasteKeyBackend::Auto => {
+            args.push(OsString::from("--paste-key-backend"));
+            args.push(OsString::from("auto"));
+        }
+    }
+
+    match config.clipboard.backend_failure_policy {
+        crate::config::PasteBackendFailurePolicy::CopyOnly => {
+            args.push(OsString::from("--paste-backend-failure-policy"));
+            args.push(OsString::from("copy-only"));
+        }
+        crate::config::PasteBackendFailurePolicy::Error => {
+            args.push(OsString::from("--paste-backend-failure-policy"));
+            args.push(OsString::from("error"));
+        }
+    }
+
+    args.push(OsString::from("--uinput-dwell-ms"));
+    args.push(OsString::from(config.uinput_dwell_ms.to_string()));
+    args.push(OsString::from("--paste-write-primary"));
+    args.push(OsString::from(config.clipboard.write_primary.to_string()));
+
+    if let Some(ydotool_path) = &config.ydotool_path {
+        args.push(OsString::from("--ydotool"));
+        args.push(ydotool_path.as_os_str().to_owned());
+    }
+    if let Some(seat) = &config.clipboard.seat {
+        args.push(OsString::from("--paste-seat"));
+        args.push(OsString::from(seat));
+    }
+
+    args
+}
+
+fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    label: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let read_result = handle
+        .join()
+        .map_err(|_| format!("{label} reader thread panicked"))?;
+    read_result.map_err(|err| format!("failed to read {label} pipe: {err}"))
+}
+
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::result::Result<ExitStatus, InjectionRunError> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                if let Err(err) = child.kill() {
+                    warn!(error = %err, "failed to kill timed-out injector subprocess");
+                }
+                if let Err(err) = child.wait() {
+                    warn!(error = %err, "failed to reap timed-out injector subprocess");
+                }
+                return Err(InjectionRunError::ExecutionTimeout(format!(
+                    "injector execution timed out after {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(INJECTION_SUBPROCESS_POLL_MS)),
+            Err(err) => {
+                return Err(InjectionRunError::WorkerTaskFailed(format!(
+                    "failed to query injector subprocess state: {err}"
+                )));
+            }
+        }
+    }
+}
+
+fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
+    let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
+    if trimmed.is_empty() {
+        return format!("injector subprocess exited with status {status}");
+    }
+    format!("injector subprocess exited with status {status}: {trimmed}")
+}
+
+fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> InjectionRunError {
+    let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
+    if trimmed.is_empty() {
+        return error;
+    }
+
+    match error {
+        InjectionRunError::BackendFailure(message) => {
+            InjectionRunError::BackendFailure(format!("{message}; stderr: {trimmed}"))
+        }
+        InjectionRunError::ExecutionTimeout(message) => {
+            InjectionRunError::ExecutionTimeout(format!("{message}; stderr: {trimmed}"))
+        }
+        InjectionRunError::WorkerTaskFailed(message) => {
+            InjectionRunError::WorkerTaskFailed(format!("{message}; stderr: {trimmed}"))
+        }
+    }
 }
 
 fn spawn_injector_worker_with_capacity(
@@ -755,34 +988,25 @@ fn spawn_injector_worker_with_capacity(
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
             let worker_started = TokioInstant::now();
             let runner_for_job = Arc::clone(&worker_runner);
-            let injection_task = tokio::task::spawn_blocking(move || runner_for_job.run(&text));
-            tokio::pin!(injection_task);
-            let result = timeout(
-                TokioDuration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
-                &mut injection_task,
-            )
-            .await;
+            let result = tokio::task::spawn_blocking(move || runner_for_job.run(&text)).await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
             let (error_kind, error) = match result {
-                Ok(Ok(Ok(()))) => (None, None),
-                Ok(Ok(Err(InjectionRunError::BackendFailure(message)))) => {
+                Ok(Ok(())) => (None, None),
+                Ok(Err(InjectionRunError::BackendFailure(message))) => {
                     (Some(InjectionErrorKind::BackendFailure), Some(message))
                 }
-                Ok(Err(err)) => (
+                Ok(Err(InjectionRunError::ExecutionTimeout(message))) => {
+                    (Some(InjectionErrorKind::ExecutionTimeout), Some(message))
+                }
+                Ok(Err(InjectionRunError::WorkerTaskFailed(message))) => {
+                    (Some(InjectionErrorKind::WorkerTaskFailed), Some(message))
+                }
+                Err(err) => (
                     Some(InjectionErrorKind::WorkerTaskFailed),
                     Some(format!("injector worker task failed: {err}")),
                 ),
-                Err(_) => {
-                    injection_task.as_ref().abort();
-                    (
-                        Some(InjectionErrorKind::ExecutionTimeout),
-                        Some(format!(
-                            "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
-                        )),
-                    )
-                }
             };
             let report = InjectionReport {
                 session_id,
@@ -903,6 +1127,10 @@ struct Cli {
     /// Test injector only (injects a fixed string then exits)
     #[arg(long)]
     test_injection: bool,
+
+    /// Internal subprocess mode: read transcript text from stdin, inject once, then exit.
+    #[arg(long, hide = true)]
+    internal_inject_once: bool,
 
     /// Run a single start/stop/demo sequence instead of the hotkey loop
     #[arg(long)]
@@ -1076,6 +1304,10 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.timeout_seconds.max(1)),
     )?;
 
+    if cli.internal_inject_once {
+        return run_internal_inject_once(&config);
+    }
+
     let llm_base_url = url::Url::parse(&cli.llm_base_url)
         .with_context(|| format!("invalid LLM base URL: {}", cli.llm_base_url))?;
     let llm_config = LlmRuntimeConfig {
@@ -1121,6 +1353,16 @@ async fn main() -> Result<()> {
         cli.llm_pre_modifier_key.clone(),
     )
     .await
+}
+
+fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .context("failed to read injector subprocess stdin")?;
+    build_injector(config)
+        .inject(&text)
+        .context("internal injection failed")
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
@@ -2260,15 +2502,17 @@ mod tests {
     struct TimeoutThenRecordingRunner {
         calls: Arc<AtomicU64>,
         seen: Arc<Mutex<Vec<String>>>,
-        timeout_sleep_ms: u64,
+        timeout_run_ms: u64,
     }
 
     impl InjectionJobRunner for TimeoutThenRecordingRunner {
         fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
             let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
             if call_index == 0 {
-                std::thread::sleep(Duration::from_millis(self.timeout_sleep_ms));
-                return Ok(());
+                std::thread::sleep(Duration::from_millis(self.timeout_run_ms));
+                return Err(InjectionRunError::ExecutionTimeout(format!(
+                    "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                )));
             }
 
             self.seen
@@ -3161,7 +3405,7 @@ mod tests {
         let injector = Arc::new(TimeoutThenRecordingRunner {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
-            timeout_sleep_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+            timeout_run_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
