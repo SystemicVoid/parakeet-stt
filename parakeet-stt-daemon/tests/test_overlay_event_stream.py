@@ -26,19 +26,26 @@ class FakeAudio:
 
     def __init__(self, *, ready_chunks: list[np.ndarray] | None = None) -> None:
         self.ready_chunks = ready_chunks or []
+        self.abort_calls = 0
+        self.stop_calls = 0
+        self._session_limit_exceeded = False
 
     def start_session(self) -> None:
         return None
 
     def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+        self.stop_calls += 1
         samples = np.ones((1600,), dtype=np.float32)
         return samples, list(self.ready_chunks), np.zeros((0,), dtype=np.float32)
 
     def abort_session(self) -> None:
-        return None
+        self.abort_calls += 1
 
     def take_stream_chunks(self) -> list[np.ndarray]:
         return []
+
+    def session_limit_exceeded(self) -> bool:
+        return self._session_limit_exceeded
 
 
 class FakeWebSocket:
@@ -85,6 +92,37 @@ class BlockingIncrementalTranscriber:
         return self.output
 
 
+class SerializingTranscriber:
+    def __init__(self) -> None:
+        self.live_started = threading.Event()
+        self.final_started = threading.Event()
+        self.release_live = threading.Event()
+        self.calls = 0
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self._state_lock = threading.Lock()
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del samples, sample_rate
+        with self._state_lock:
+            self.calls += 1
+            call_number = self.calls
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            if call_number == 1:
+                self.live_started.set()
+                assert self.release_live.wait(timeout=1.0)
+                return "live interim"
+            if call_number == 2:
+                self.final_started.set()
+                return "final text"
+            raise AssertionError(f"unexpected transcribe call {call_number}")
+        finally:
+            with self._state_lock:
+                self.active_calls -= 1
+
+
 def _build_server(
     *,
     overlay_events_enabled: bool,
@@ -106,11 +144,16 @@ def _build_server(
         incremental_outputs,
         fail_at_call=incremental_fail_at_call,
     )
-    server._transcribe_lock = asyncio.Lock()
+    server._session_lock = asyncio.Lock()
+    server._inference_lock = asyncio.Lock()
     server.streaming_transcriber = None
     server._active_stream = None
     server._stream_drain_task = None
     server._stream_drain_running = False
+    server._session_guard_task = None
+    server._session_guard_running = False
+    server._session_sample_limit = 1_600
+    server._session_age_limit_ms = 90_000
     server._requested_device = "cpu"
     server._effective_device = "cpu"
     server._last_audio_ms = None
@@ -157,6 +200,18 @@ def _disable_server_sleep(monkeypatch) -> None:
     monkeypatch.setattr("parakeet_stt_daemon.server.asyncio.sleep", no_sleep)
 
 
+def _pause_guard_sleep(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    guard_sleep_entered = asyncio.Event()
+    allow_guard_resume = asyncio.Event()
+
+    async def fake_guard_sleep(_seconds: float) -> None:
+        guard_sleep_entered.set()
+        await allow_guard_resume.wait()
+
+    monkeypatch.setattr(server_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
+    return guard_sleep_entered, allow_guard_resume
+
+
 def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> None:
     async def scenario() -> None:
         _disable_server_sleep(monkeypatch)
@@ -171,6 +226,39 @@ def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> No
         sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
         assert sent_types == ["session_started", "final_result"]
         assert sent_types.count("final_result") == 1
+
+    asyncio.run(scenario())
+
+
+def test_stop_session_aborts_when_sample_limit_already_breached(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
+
+        server = _build_server(overlay_events_enabled=False)
+        audio = cast(FakeAudio, server.audio)
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.wait_for(guard_sleep_entered.wait(), timeout=1.0)
+
+        audio._session_limit_exceeded = True
+        await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+        allow_guard_resume.set()
+        await asyncio.sleep(0)
+
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert "final_result" not in sent_types
+        assert audio.abort_calls == 1
+        assert audio.stop_calls == 0
+        assert server.sessions.active is None
+        error_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        ]
+        assert error_payloads
+        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
+        assert "max buffered audio" in cast(str, error_payloads[-1]["message"])
 
     asyncio.run(scenario())
 
@@ -405,7 +493,7 @@ def test_live_interim_chunk_emission_dedupes_repeated_text(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_late_live_interim_is_dropped_once_final_send_begins(monkeypatch) -> None:
+def test_stop_waits_for_in_flight_live_interim_before_final_send(monkeypatch) -> None:
     async def scenario() -> None:
         _disable_server_sleep(monkeypatch)
 
@@ -433,18 +521,23 @@ def test_late_live_interim_is_dropped_once_final_send_begins(monkeypatch) -> Non
                 np.full((400,), 0.2, dtype=np.float32),
             )
         )
+        server._stream_drain_task = live_task
+        server._stream_drain_running = True
         await asyncio.to_thread(transcriber.started.wait)
 
         stop_task = asyncio.create_task(
             server._handle_stop(cast(Any, websocket), _stop_message(session_id))
         )
-        await final_started.wait()
+        await asyncio.sleep(0)
+
+        assert final_started.is_set() is False
 
         transcriber.release.set()
         allow_final_send.set()
 
         await stop_task
-        await live_task
+        assert final_started.is_set() is True
+        assert live_task.cancelled() is True
 
         sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
         assert sent_types == [
@@ -460,7 +553,62 @@ def test_late_live_interim_is_dropped_once_final_send_begins(monkeypatch) -> Non
 
         status = server.status()
         assert status.overlay_events_emitted == 4
-        assert status.overlay_events_dropped == 1
+        assert status.overlay_events_dropped == 0
+
+    asyncio.run(scenario())
+
+
+def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+
+        server = _build_server(overlay_events_enabled=True)
+        transcriber = SerializingTranscriber()
+        server.transcriber = transcriber
+        server._trim_tail_silence = (  # type: ignore[method-assign]
+            lambda samples, _sample_rate, _window_ms=50: samples
+        )
+        server._finalise_transcription = (  # type: ignore[method-assign]
+            DaemonServer._finalise_transcription.__get__(server, DaemonServer)
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        live_task = asyncio.create_task(
+            server._emit_live_interim_from_chunk(
+                cast(Any, websocket),
+                session_id,
+                np.full((400,), 0.2, dtype=np.float32),
+            )
+        )
+        server._stream_drain_task = live_task
+        server._stream_drain_running = True
+        await asyncio.to_thread(transcriber.live_started.wait)
+
+        stop_task = asyncio.create_task(
+            server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+        )
+        await asyncio.sleep(0)
+
+        assert transcriber.final_started.is_set() is False
+
+        transcriber.release_live.set()
+
+        await stop_task
+
+        assert live_task.cancelled() is True
+        assert transcriber.calls == 2
+        assert transcriber.max_active_calls == 1
+        sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
+        assert sent_types == [
+            "session_started",
+            "interim_state",
+            "interim_state",
+            "interim_state",
+            "final_result",
+            "session_ended",
+        ]
 
     asyncio.run(scenario())
 

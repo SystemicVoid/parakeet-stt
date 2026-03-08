@@ -27,6 +27,8 @@ class SettingsKwargs(TypedDict, total=False):
     right_context_secs: float
     left_context_secs: float
     batch_size: int
+    max_session_seconds: float
+    max_session_samples: int | None
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -67,6 +69,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--batch-size", type=int, help="Batch size for streaming chunked inference helper"
     )
     parser.add_argument(
+        "--max-session-seconds",
+        type=float,
+        help="Hard session duration limit in seconds before auto-abort",
+    )
+    parser.add_argument(
+        "--max-session-samples",
+        type=int,
+        help="Optional hard cap on buffered session samples before auto-abort",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Run startup checks (audio/model/streaming config) then exit",
@@ -100,6 +112,10 @@ def _build_settings(args: argparse.Namespace) -> ServerSettings:
         kwargs["left_context_secs"] = float(args.left_context_secs)
     if args.batch_size is not None:
         kwargs["batch_size"] = int(args.batch_size)
+    if args.max_session_seconds is not None:
+        kwargs["max_session_seconds"] = float(args.max_session_seconds)
+    if args.max_session_samples is not None:
+        kwargs["max_session_samples"] = int(args.max_session_samples)
     return ServerSettings(**kwargs)
 
 
@@ -109,7 +125,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     logger.info(
         (
             "Starting parakeet-stt-daemon on {}:{} "
-            "(device: {}, mic: {}, streaming: {}, vad: {}, overlay_events: {})"
+            "(device: {}, mic: {}, streaming: {}, vad: {}, overlay_events: {}, "
+            "max_session_seconds: {}, max_session_samples: {})"
         ),
         settings.host,
         settings.port,
@@ -118,6 +135,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         settings.streaming_enabled,
         settings.vad_enabled,
         settings.overlay_events_enabled,
+        settings.max_session_seconds,
+        settings.max_session_samples,
     )
     if settings.streaming_enabled:
         logger.info(
@@ -179,7 +198,8 @@ def run_checks(settings: ServerSettings) -> None:
 
     logger.info(
         "Streaming config: enabled={}, chunk_secs={}, right_context_secs={}, "
-        "left_context_secs={}, batch_size={}, vad_enabled={}, overlay_events_enabled={}",
+        "left_context_secs={}, batch_size={}, vad_enabled={}, overlay_events_enabled={}, "
+        "max_session_seconds={}, max_session_samples={}",
         settings.streaming_enabled,
         settings.chunk_secs,
         settings.right_context_secs,
@@ -187,6 +207,8 @@ def run_checks(settings: ServerSettings) -> None:
         settings.batch_size,
         settings.vad_enabled,
         settings.overlay_events_enabled,
+        settings.max_session_seconds,
+        settings.max_session_samples,
     )
     if settings.streaming_enabled:
         helper_active = server._stream_helper_active()
