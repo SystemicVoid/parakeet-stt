@@ -7,9 +7,16 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import numpy as np
 from fastapi import WebSocketDisconnect
+from parakeet_stt_daemon.audio import AudioInput
 from parakeet_stt_daemon.config import ServerSettings
-from parakeet_stt_daemon.messages import AbortSession, ClientMessageType, StartSession, StopSession
+from parakeet_stt_daemon.messages import (
+    AbortSession,
+    ClientMessageType,
+    StartSession,
+    StopSession,
+)
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
 
@@ -21,6 +28,7 @@ class FakeAudio:
         self.abort_calls = 0
         self.start_calls = 0
         self.raise_on_start = False
+        self._session_limit_exceeded = False
 
     def start_session(self) -> None:
         self.start_calls += 1
@@ -32,6 +40,9 @@ class FakeAudio:
 
     def take_stream_chunks(self) -> list[object]:
         return []
+
+    def session_limit_exceeded(self) -> bool:
+        return self._session_limit_exceeded
 
 
 class DummyDrainTask:
@@ -109,6 +120,10 @@ def _build_server() -> DaemonServer:
     server._active_stream = object()
     server._stream_drain_task = None
     server._stream_drain_running = False
+    server._session_guard_task = None
+    server._session_guard_running = False
+    server._session_sample_limit = 1_440_000
+    server._session_age_limit_ms = 90_000
     server._requested_device = "cpu"
     server._effective_device = "cpu"
     server._last_audio_ms = None
@@ -123,6 +138,22 @@ def _build_server() -> DaemonServer:
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     return cast(DaemonServer, server)
+
+
+def test_audio_input_enforces_session_sample_limit() -> None:
+    audio = AudioInput(sample_rate=16_000, channels=1, max_session_samples=5)
+    audio.start_session()
+
+    chunk = np.array([[0.1], [0.2], [0.3], [0.4]], dtype=np.float32)
+    audio._callback(chunk, frames=4, time=None, status=cast(Any, 0))
+    audio._callback(chunk, frames=4, time=None, status=cast(Any, 0))
+
+    assert audio.session_limit_exceeded() is True
+
+    captured = audio.stop_session()
+
+    assert captured.size == 5
+    assert np.allclose(captured, np.array([0.1, 0.2, 0.3, 0.4, 0.1], dtype=np.float32))
 
 
 def test_disconnect_cleans_active_session_state() -> None:
@@ -493,5 +524,51 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
         assert status.last_send_ms == 4
         assert status.active_session_age_ms is not None
         assert status.active_session_age_ms >= 0
+
+    asyncio.run(scenario())
+
+
+def test_session_guard_aborts_when_audio_sample_limit_exceeded() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        websocket = FakeWebSocket([])
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        audio._session_limit_exceeded = True
+        await asyncio.sleep(0.15)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        error_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        ]
+        assert error_payloads
+        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
+        assert "max buffered audio" in cast(str, error_payloads[-1]["message"])
+
+    asyncio.run(scenario())
+
+
+def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        server._session_age_limit_ms = 0
+        websocket = FakeWebSocket([])
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.sleep(0.15)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        error_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        ]
+        assert error_payloads
+        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
+        assert "max duration" in cast(str, error_payloads[-1]["message"])
 
     asyncio.run(scenario())
