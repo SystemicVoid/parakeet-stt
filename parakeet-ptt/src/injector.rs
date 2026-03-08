@@ -502,7 +502,14 @@ impl ClipboardInjector {
         command
             .arg("--type")
             .arg(CLIPBOARD_MIME_TYPE)
-            .stdin(Stdio::piped());
+            .stdin(Stdio::piped())
+            // Internal injector subprocesses pipe stderr back to the parent
+            // worker. If wl-copy helpers inherit that pipe, the worker can stay
+            // blocked until some unrelated clipboard change tears the helper
+            // down. Detach wl-copy stdio so clipboard ownership lifetime does
+            // not masquerade as injector job lifetime.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if let Some(seat) = options.seat.as_ref() {
             command.arg("--seat").arg(seat);
         }
