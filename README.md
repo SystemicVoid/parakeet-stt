@@ -145,12 +145,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-Local hardware-optimized release build (Zen 5):
+Local hardware-optimized release build (Zen 5 / local machine only):
 ```bash
-cd parakeet-ptt
-RUSTFLAGS="-C target-cpu=znver5" cargo build --release
+just build
 ```
-`target-cpu=znver5` already enables the relevant AVX-512 feature set on this host; no manual `target-feature=+avx512...` list is required.
+`just build` builds all Rust binaries in `parakeet-ptt` with `RUSTFLAGS="-C target-cpu=native"` by default. That keeps the build tuned for the current host without hardcoding a microarchitecture name in multiple places.
+
+If you need to override the flags for a one-off build:
+```bash
+PARAKEET_PTT_RUSTFLAGS="-C target-cpu=znver5" just build
+```
 
 Daemon checks:
 ```bash
