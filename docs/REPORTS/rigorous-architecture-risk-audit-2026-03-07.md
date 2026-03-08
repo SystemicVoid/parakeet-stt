@@ -56,6 +56,8 @@ The daemon still intentionally runs as a single-active-session service. A second
 Keep the new owner-binding regressions in the release gate. If multi-client operator UX becomes confusing later, consider an explicit protocol error that says "another controller owns the active session" instead of the current privacy-preserving `SESSION_NOT_FOUND`.
 9. Is this a real issue or just a preference?
 Real issue, now fixed locally.
+10. Implementation status (2026-03-08)
+Resolved in PR #19.
 
 ## Finding 2
 
@@ -77,6 +79,8 @@ This requires tight timing and scheduler overlap. Unit tests typically run deter
 Introduce a single inference gate (for example, an `asyncio.Lock` used by *all* transcribe calls, including live interim). On stop, await drain task completion after cancellation (`await task` with `CancelledError` handling) before starting final decode.
 9. Is this a real issue or just a preference?
 Real issue. This is a concurrency safety gap around a shared heavy runtime object.
+10. Implementation status (2026-03-08)
+Resolved in PR #20.
 
 ## Finding 3
 
@@ -118,6 +122,8 @@ Unit tests use short, controlled lifetimes and do not run long-duration soak sce
 Add server-side hard limits (`max_session_seconds` and/or `max_session_samples`) with automatic abort + explicit error message. For longer captures, spill to bounded ring/temporary file rather than unbounded in-memory vectors.
 9. Is this a real issue or just a preference?
 Real issue. This is a production robustness and resource-safety defect.
+10. Implementation status (2026-03-08)
+Mitigated in PR #20.
 
 ## Finding 5
 
@@ -175,11 +181,41 @@ After this change, absence of LLM routing for a given utterance should be interp
 8. Terminology migration completed
 Operator-facing surfaces use `llm_pre_modifier` naming (default `KEY_SHIFT`) instead of `query_modifier`, aligning CLI/helper UX with the canonical trigger model.
 
+## Implementation Status Update (2026-03-08, Daemon Session Guardrails)
+
+1. Finding 4 now mitigated in daemon runtime
+Session buffering now has hard server-side guardrails: `max_session_seconds` and `max_session_samples`, with auto-abort when either boundary is exceeded.
+2. Capture-layer memory boundary is enforced, not advisory
+The audio callback path now clips/halts accumulation at the configured sample cap, so memory cannot grow unbounded even if stop/abort control messages are lost.
+3. Server watchdog closes the loop for stuck control paths
+The daemon now runs a per-session guard task that monitors active session age/limit state and emits explicit session termination errors when limits trigger.
+4. Operational surfacing completed
+Session guardrail settings are now wired through CLI/env and startup diagnostics so operators can tune limits and verify effective values.
+5. Finding 1 tracking updated
+Finding 1 is now tracked as resolved in PR #19.
+
+## Implementation Status Update (2026-03-08, Daemon Inference Serialization)
+
+1. Finding 2 now mitigated in daemon runtime
+All transcriber/model entry points now share a single async inference gate, so live interim decode, stop-path interim recomputation, and authoritative final decode cannot overlap on the same runtime object.
+2. Cancellation semantics now preserve the safety boundary
+When stop cancels the drain task, daemon shutdown now awaits that task and keeps the inference gate held until any already-started executor inference has actually finished, preventing hidden overlap after coroutine cancellation.
+3. Finalization does not wait on a backlog of new live work
+Stop closes the drain loop first, so key-up can only wait for an already-running interim decode, not for additional streaming jobs queued after release. This bounds the latency tradeoff to the single in-flight decode window.
+4. Regression coverage now targets the race directly
+Daemon tests now force the interleaving where live interim inference is active during stop and assert both serialized model access and awaited drain shutdown before final send.
+5. Finding 2 tracking updated
+Finding 2 is now tracked as resolved in PR #20.
+
+## Open High-Risk Items (Post 2026-03-08)
+
+1. Injector timeout semantics can violate serialized side effects (Finding 3).
+
 ---
 
-## ROI-Prioritized Backlog
+## Historical ROI-Prioritized Backlog (Pre-2026-03-08)
 
-Finding 1 is closed in commit `efe286a`, so it drops out of the remaining backlog.
+This ordering is preserved for audit traceability from the pre-2026-03-08 mitigation state. Findings 1, 2, and 4 have since been resolved or mitigated as noted above.
 
 1. Session audio hard limits (Finding 4).
 Why this ranks first: this is still the best resilience-per-line-item trade. A hard cap is a simple circuit breaker against daemon-wide OOM and does not require protocol redesign.
@@ -207,7 +243,7 @@ Why this ranks fourth: the user-facing corruption risk is real, but the durable 
 ## What I Would Inspect Next
 
 1. Release-gate multi-client reconnect/disconnect runs that keep the new owner-binding invariant from regressing.
-2. Long-duration soak tests with intentional stuck sessions to validate daemon memory caps once implemented.
+2. Long-duration soak tests with intentional stuck sessions to validate the new daemon memory caps under saturation.
 3. Hotkey attach/recovery tests where Shift is already held before the listener comes online.
 4. NeMo/CUDA overlap stress runs with forced interim/final decode contention to validate the inference-gate fix.
 5. Injection ordering tests around real timeout/retry behavior after moving the worker to a killable boundary.

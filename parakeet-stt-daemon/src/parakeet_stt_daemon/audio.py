@@ -23,6 +23,7 @@ class AudioInput:
         pre_roll_seconds: float = 2.5,
         device: int | str | None = None,
         blocksize: int | None = None,
+        max_session_samples: int | None = None,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
@@ -35,6 +36,11 @@ class AudioInput:
         self._pre_roll_frames = 0
         self._session_chunks: list[np.ndarray] = []
         self._session_active = False
+        self._max_session_samples = (
+            max(1, int(max_session_samples)) if max_session_samples is not None else None
+        )
+        self._session_samples = 0
+        self._session_limit_exceeded = False
         self._stream_chunk_size: int | None = None
         self._stream_ready: list[np.ndarray] = []
         self._stream_buffer: np.ndarray = np.zeros((0,), dtype=np.float32)
@@ -71,8 +77,12 @@ class AudioInput:
     def start_session(self) -> None:
         """Begin accumulating audio for a new session (includes pre-roll)."""
         with self._lock:
-            pre_roll_chunks = [chunk.copy() for chunk in self._pre_roll]
+            pre_roll_chunks = self._bounded_pre_roll_chunks()
             self._session_chunks = pre_roll_chunks
+            # Pre-roll is clipped up front so low session caps still start cleanly.
+            # The live session budget applies to post-start capture.
+            self._session_samples = 0
+            self._session_limit_exceeded = False
             self._session_active = True
             self._stream_ready = []
             self._level_ready = []
@@ -86,16 +96,14 @@ class AudioInput:
                 )
             else:
                 self._stream_buffer = np.zeros((0,), dtype=np.float32)
+            self._enforce_session_sample_limit()
 
     def stop_session(self) -> np.ndarray:
         """Stop accumulation and return the captured samples."""
         with self._lock:
             self._session_active = False
             chunks = self._session_chunks
-            self._session_chunks = []
-            self._stream_ready = []
-            self._level_ready = []
-            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+            self._reset_session_runtime_state()
         if not chunks:
             return np.zeros((0,), dtype=self.dtype)
         return np.concatenate(chunks).astype(self.dtype, copy=False)
@@ -104,10 +112,7 @@ class AudioInput:
         """Stop accumulation and discard any captured session audio."""
         with self._lock:
             self._session_active = False
-            self._session_chunks = []
-            self._stream_ready = []
-            self._level_ready = []
-            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+            self._reset_session_runtime_state()
 
     def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
         """Stop accumulation and return captured samples plus streaming slices.
@@ -117,18 +122,22 @@ class AudioInput:
         with self._lock:
             self._session_active = False
             chunks = self._session_chunks
-            self._session_chunks = []
             ready = self._stream_ready
             tail = self._stream_buffer.copy()
-            self._stream_ready = []
-            self._level_ready = []
-            self._stream_buffer = np.zeros((0,), dtype=np.float32)
+            self._reset_session_runtime_state()
         audio = (
             np.concatenate(chunks).astype(self.dtype, copy=False)
             if chunks
             else np.zeros((0,), dtype=self.dtype)
         )
         return audio, ready, tail
+
+    def session_limit_exceeded(self) -> bool:
+        with self._lock:
+            return self._session_limit_exceeded
+
+    def session_sample_limit(self) -> int | None:
+        return self._max_session_samples
 
     def configure_stream_chunk_size(self, chunk_samples: int) -> None:
         """Set desired streaming chunk size in samples."""
@@ -165,9 +174,14 @@ class AudioInput:
             self._pre_roll_frames += len(chunk)
             self._trim_pre_roll()
             if self._session_active:
-                self._session_chunks.append(chunk)
-                self._collect_stream_chunks(chunk)
-                self._collect_audio_level(chunk)
+                accepted = self._clip_chunk_to_session_limit(chunk)
+                if accepted is None:
+                    return
+                self._session_chunks.append(accepted)
+                self._session_samples += int(accepted.size)
+                self._collect_stream_chunks(accepted)
+                self._collect_audio_level(accepted)
+                self._enforce_session_sample_limit()
 
     def _trim_pre_roll(self) -> None:
         while self._pre_roll_frames > self._pre_roll_capacity and self._pre_roll:
@@ -202,6 +216,55 @@ class AudioInput:
         rms = float(np.sqrt(np.mean(audio * audio)))
         if np.isfinite(rms):
             self._level_ready.append(rms)
+
+    def _bounded_pre_roll_chunks(self) -> list[np.ndarray]:
+        if self._max_session_samples is None:
+            return [chunk.copy() for chunk in self._pre_roll]
+
+        remaining = self._max_session_samples
+        if remaining <= 0:
+            return []
+
+        retained: list[np.ndarray] = []
+        for chunk in reversed(self._pre_roll):
+            if remaining <= 0:
+                break
+            if chunk.size <= remaining:
+                retained.append(chunk.copy())
+                remaining -= int(chunk.size)
+                continue
+            retained.append(np.array(chunk[-remaining:], copy=True))
+            remaining = 0
+        retained.reverse()
+        return retained
+
+    def _clip_chunk_to_session_limit(self, chunk: np.ndarray) -> np.ndarray | None:
+        if self._max_session_samples is None:
+            return chunk
+        remaining = self._max_session_samples - self._session_samples
+        if remaining <= 0:
+            self._session_limit_exceeded = True
+            self._session_active = False
+            return None
+        if chunk.size <= remaining:
+            return chunk
+        return np.array(chunk[:remaining], copy=True)
+
+    def _enforce_session_sample_limit(self) -> None:
+        if self._max_session_samples is None:
+            return
+        if self._session_samples < self._max_session_samples:
+            return
+        self._session_limit_exceeded = True
+        self._session_active = False
+
+    def _reset_session_runtime_state(self) -> None:
+        self._session_chunks = []
+        self._session_samples = 0
+        self._session_limit_exceeded = False
+        self._stream_ready = []
+        self._level_ready = []
+        self._stream_buffer = np.zeros((0,), dtype=np.float32)
 
 
 __all__ = ["AudioInput"]

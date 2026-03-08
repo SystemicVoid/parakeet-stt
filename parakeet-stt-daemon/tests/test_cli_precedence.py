@@ -56,3 +56,27 @@ def test_defaults_apply_without_env_or_cli(monkeypatch) -> None:
     assert settings.status_enabled is True
     assert settings.streaming_enabled is False
     assert settings.overlay_events_enabled is False
+    assert settings.max_session_seconds == 90.0
+    assert settings.max_session_samples is None
+
+
+def test_env_session_limits_apply_when_cli_absent(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_MAX_SESSION_SECONDS", "45")
+    monkeypatch.setenv("PARAKEET_MAX_SESSION_SAMPLES", "12345")
+
+    settings = _build_settings(_parse_args([]))
+
+    assert settings.max_session_seconds == 45.0
+    assert settings.max_session_samples == 12_345
+
+
+def test_cli_session_limits_override_env(monkeypatch) -> None:
+    monkeypatch.setenv("PARAKEET_MAX_SESSION_SECONDS", "30")
+    monkeypatch.setenv("PARAKEET_MAX_SESSION_SAMPLES", "1000")
+
+    settings = _build_settings(
+        _parse_args(["--max-session-seconds", "12", "--max-session-samples", "2048"])
+    )
+
+    assert settings.max_session_seconds == 12.0
+    assert settings.max_session_samples == 2_048

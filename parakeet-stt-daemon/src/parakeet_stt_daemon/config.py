@@ -58,6 +58,24 @@ class ServerSettings(BaseSettings):
     batch_size: int = Field(
         default=32, ge=1, le=128, description="Batch size used by streaming inference helper."
     )
+    max_session_seconds: float = Field(
+        default=90.0,
+        ge=1.0,
+        le=1800.0,
+        description=(
+            "Hard session duration limit (seconds). Active sessions exceeding this are aborted "
+            "to prevent runaway buffering."
+        ),
+    )
+    max_session_samples: int | None = Field(
+        default=None,
+        ge=1,
+        le=28_800_000,
+        description=(
+            "Optional hard cap on in-memory buffered session samples. "
+            "When unset, duration-based limit applies."
+        ),
+    )
     silence_floor_db: float = Field(
         default=-40.0,
         ge=-120.0,

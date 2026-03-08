@@ -7,9 +7,17 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import numpy as np
 from fastapi import WebSocketDisconnect
+from parakeet_stt_daemon import server as server_module
+from parakeet_stt_daemon.audio import AudioInput
 from parakeet_stt_daemon.config import ServerSettings
-from parakeet_stt_daemon.messages import AbortSession, ClientMessageType, StartSession, StopSession
+from parakeet_stt_daemon.messages import (
+    AbortSession,
+    ClientMessageType,
+    StartSession,
+    StopSession,
+)
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
 
@@ -21,6 +29,7 @@ class FakeAudio:
         self.abort_calls = 0
         self.start_calls = 0
         self.raise_on_start = False
+        self._session_limit_exceeded = False
 
     def start_session(self) -> None:
         self.start_calls += 1
@@ -33,16 +42,27 @@ class FakeAudio:
     def take_stream_chunks(self) -> list[object]:
         return []
 
+    def session_limit_exceeded(self) -> bool:
+        return self._session_limit_exceeded
+
 
 class DummyDrainTask:
     def __init__(self) -> None:
         self.cancel_called = False
+        self.awaited = False
 
     def done(self) -> bool:
         return False
 
     def cancel(self) -> None:
         self.cancel_called = True
+
+    def __await__(self):
+        async def _wait() -> None:
+            self.awaited = True
+            return None
+
+        return _wait().__await__()
 
 
 class FakeStreamingTranscriber:
@@ -104,11 +124,16 @@ def _build_server() -> DaemonServer:
     server.audio = FakeAudio()
     server.model = object()
     server.transcriber = object()
-    server._transcribe_lock = asyncio.Lock()
+    server._session_lock = asyncio.Lock()
+    server._inference_lock = asyncio.Lock()
     server.streaming_transcriber = None
     server._active_stream = object()
     server._stream_drain_task = None
     server._stream_drain_running = False
+    server._session_guard_task = None
+    server._session_guard_running = False
+    server._session_sample_limit = 1_440_000
+    server._session_age_limit_ms = 90_000
     server._requested_device = "cpu"
     server._effective_device = "cpu"
     server._last_audio_ms = None
@@ -123,6 +148,57 @@ def _build_server() -> DaemonServer:
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     return cast(DaemonServer, server)
+
+
+def _pause_guard_sleep(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    guard_sleep_entered = asyncio.Event()
+    allow_guard_resume = asyncio.Event()
+
+    async def fake_guard_sleep(_seconds: float) -> None:
+        guard_sleep_entered.set()
+        await allow_guard_resume.wait()
+
+    monkeypatch.setattr(server_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
+    return guard_sleep_entered, allow_guard_resume
+
+
+async def _wait_for_session_to_clear(server: DaemonServer) -> None:
+    while server.sessions.active is not None:
+        await asyncio.sleep(0)
+
+
+def test_audio_input_enforces_session_sample_limit() -> None:
+    audio = AudioInput(sample_rate=16_000, channels=1, max_session_samples=5)
+    audio.start_session()
+
+    chunk = np.array([[0.1], [0.2], [0.3], [0.4]], dtype=np.float32)
+    audio._callback(chunk, frames=4, time=None, status=cast(Any, 0))
+    audio._callback(chunk, frames=4, time=None, status=cast(Any, 0))
+
+    assert audio.session_limit_exceeded() is True
+
+    captured = audio.stop_session()
+
+    assert captured.size == 5
+    assert np.allclose(captured, np.array([0.1, 0.2, 0.3, 0.4, 0.1], dtype=np.float32))
+
+
+def test_audio_input_clips_pre_roll_to_session_sample_limit() -> None:
+    audio = AudioInput(sample_rate=16_000, channels=1, max_session_samples=3)
+
+    first = np.array([[0.1], [0.2]], dtype=np.float32)
+    second = np.array([[0.3], [0.4]], dtype=np.float32)
+    audio._callback(first, frames=2, time=None, status=cast(Any, 0))
+    audio._callback(second, frames=2, time=None, status=cast(Any, 0))
+
+    audio.start_session()
+
+    assert audio.session_limit_exceeded() is False
+
+    captured = audio.stop_session()
+
+    assert captured.size == 3
+    assert np.allclose(captured, np.array([0.2, 0.3, 0.4], dtype=np.float32))
 
 
 def test_disconnect_cleans_active_session_state() -> None:
@@ -144,6 +220,7 @@ def test_disconnect_cleans_active_session_state() -> None:
         assert server._active_stream is None
         assert server._stream_drain_task is None
         assert drain_task.cancel_called is True
+        assert drain_task.awaited is True
 
     asyncio.run(scenario())
 
@@ -501,6 +578,32 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
     asyncio.run(scenario())
 
 
+def test_session_guard_aborts_when_audio_sample_limit_exceeded(monkeypatch) -> None:
+    async def scenario() -> None:
+        guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        websocket = FakeWebSocket([])
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.wait_for(guard_sleep_entered.wait(), timeout=1.0)
+        audio._session_limit_exceeded = True
+        allow_guard_resume.set()
+        await asyncio.wait_for(_wait_for_session_to_clear(server), timeout=1.0)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        error_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        ]
+        assert error_payloads
+        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
+        assert "max buffered audio" in cast(str, error_payloads[-1]["message"])
+
+    asyncio.run(scenario())
+
+
 def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
@@ -525,6 +628,29 @@ def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> No
         assert server._active_stream is active_stream
         assert server._stream_drain_task is drain_task
         assert drain_task.cancel_called is False
+
+    asyncio.run(scenario())
+
+
+def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        server._session_age_limit_ms = 0
+        websocket = FakeWebSocket([])
+        session_id = uuid4()
+
+        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await asyncio.sleep(0.15)
+
+        assert server.sessions.active is None
+        assert audio.abort_calls == 1
+        error_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        ]
+        assert error_payloads
+        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
+        assert "max duration" in cast(str, error_payloads[-1]["message"])
 
     asyncio.run(scenario())
 
