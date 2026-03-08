@@ -85,7 +85,8 @@ class DaemonServer:
         self._effective_device = str(
             getattr(self.model, "_parakeet_effective_device", self._requested_device)
         )
-        self._transcribe_lock = asyncio.Lock()
+        self._session_lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()
         self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
             ParakeetStreamingTranscriber(
                 self.model,
@@ -240,7 +241,7 @@ class DaemonServer:
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
         logger.debug("stop_session received: {}", message)
         await asyncio.sleep(0.25)  # brief post-roll to capture tail audio before stopping
-        async with self._transcribe_lock:
+        async with self._session_lock_for_runtime():
             try:
                 session = await self.sessions.stop_session(message.session_id)
             except SessionNotFoundError:
@@ -256,7 +257,7 @@ class DaemonServer:
             )
             audio_stop_started = time.perf_counter()
             audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
-            self._stop_stream_drain_loop()
+            await self._stop_stream_drain_loop()
             # Final correctness must come from the capture layer's canonical buffer,
             # not whatever the drain task managed to mirror into `_active_stream`.
             self._active_stream = None
@@ -392,7 +393,7 @@ class DaemonServer:
         require_session_match: bool = False,
     ) -> bool:
         """Reset all runtime state tied to an active session."""
-        async with self._transcribe_lock:
+        async with self._session_lock_for_runtime():
             active = self.sessions.active
             if require_session_match:
                 if expected_session_id is None and active is not None:
@@ -429,7 +430,7 @@ class DaemonServer:
             else:
                 logger.debug("Cleaning residual runtime state with no active session ({})", reason)
             self.audio.abort_session()
-            self._stop_stream_drain_loop()
+            await self._stop_stream_drain_loop()
             self._stop_session_guard_loop()
             if active_session_id is not None:
                 await self.sessions.clear(active_session_id)
@@ -573,6 +574,43 @@ class DaemonServer:
         async with self._send_lock_for_websocket(websocket):
             await websocket.send_json(payload)
 
+    def _session_lock_for_runtime(self) -> asyncio.Lock:
+        lock = getattr(self, "_session_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_lock = lock
+        return lock
+
+    def _inference_lock_for_runtime(self) -> asyncio.Lock:
+        lock = getattr(self, "_inference_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inference_lock = lock
+        return lock
+
+    async def _transcribe_samples_serialized(self, samples: np.ndarray) -> str:
+        loop = asyncio.get_running_loop()
+        async with self._inference_lock_for_runtime():
+            inference = loop.run_in_executor(
+                None,
+                partial(
+                    self.transcriber.transcribe_samples,
+                    samples,
+                    sample_rate=self.audio.sample_rate,
+                ),
+            )
+            try:
+                return await asyncio.shield(inference)
+            except asyncio.CancelledError:
+                try:
+                    await inference
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Cancelled inference finished with {} before releasing gate",
+                        exc.__class__.__name__,
+                    )
+                raise
+
     def _set_overlay_session_state(self, session_id: UUID, state: str) -> None:
         overlay_states = getattr(self, "_overlay_state_by_session", None)
         if not isinstance(overlay_states, dict):
@@ -681,7 +719,6 @@ class DaemonServer:
         if not ready_chunks:
             return []
 
-        loop = asyncio.get_running_loop()
         rolling_audio = np.zeros((0,), dtype=np.float32)
         updates: list[str] = []
         last_text = ""
@@ -692,14 +729,7 @@ class DaemonServer:
                 continue
             rolling_audio = self._append_overlay_interim_context(rolling_audio, chunk_audio)
             try:
-                candidate = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self.transcriber.transcribe_samples,
-                        rolling_audio,
-                        sample_rate=self.audio.sample_rate,
-                    ),
-                )
+                candidate = await self._transcribe_samples_serialized(rolling_audio)
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "Incremental interim source unavailable for this session: {}",
@@ -777,16 +807,8 @@ class DaemonServer:
             self._live_interim_audio,
             chunk_audio,
         )
-        loop = asyncio.get_running_loop()
         try:
-            candidate = await loop.run_in_executor(
-                None,
-                partial(
-                    self.transcriber.transcribe_samples,
-                    self._live_interim_audio,
-                    sample_rate=self.audio.sample_rate,
-                ),
-            )
+            candidate = await self._transcribe_samples_serialized(self._live_interim_audio)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "Live incremental interim source unavailable for this session: {}",
@@ -976,14 +998,7 @@ class DaemonServer:
             logger.info("Skipping offline transcription: silence trimming removed all samples")
             return "", 0
         infer_started = time.perf_counter()
-        text = await loop.run_in_executor(
-            None,
-            partial(
-                self.transcriber.transcribe_samples,
-                trimmed,
-                sample_rate=self.audio.sample_rate,
-            ),
-        )
+        text = await self._transcribe_samples_serialized(trimmed)
         infer_ms = int((time.perf_counter() - infer_started) * 1000)
         return text, infer_ms
 
@@ -1006,14 +1021,25 @@ class DaemonServer:
 
         self._stream_drain_task = asyncio.create_task(_drain())
 
-    def _stop_stream_drain_loop(self) -> None:
+    async def _stop_stream_drain_loop(self) -> None:
         if self._stream_drain_task is None:
             return
         self._stream_drain_running = False
         task = self._stream_drain_task
         self._stream_drain_task = None
+        if task is asyncio.current_task():
+            return
         if not task.done():
             task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Stream drain loop stopped with {} during shutdown",
+                exc.__class__.__name__,
+            )
 
     def _trim_tail_silence(
         self, samples: np.ndarray, sample_rate: int, window_ms: int = 50
