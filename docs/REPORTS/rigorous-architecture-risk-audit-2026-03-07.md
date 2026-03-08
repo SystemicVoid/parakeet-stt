@@ -57,6 +57,8 @@ This requires tight timing and scheduler overlap. Unit tests typically run deter
 Introduce a single inference gate (for example, an `asyncio.Lock` used by *all* transcribe calls, including live interim). On stop, await drain task completion after cancellation (`await task` with `CancelledError` handling) before starting final decode.
 9. Is this a real issue or just a preference?
 Real issue. This is a concurrency safety gap around a shared heavy runtime object.
+10. Implementation status (2026-03-08)
+Resolved in PR #20.
 
 ## Finding 3
 
@@ -164,10 +166,22 @@ Session guardrail settings are now wired through CLI/env and startup diagnostics
 5. Finding 1 tracking updated
 Finding 1 is now tracked as resolved in PR #19.
 
+## Implementation Status Update (2026-03-08, Daemon Inference Serialization)
+
+1. Finding 2 now mitigated in daemon runtime
+All transcriber/model entry points now share a single async inference gate, so live interim decode, stop-path interim recomputation, and authoritative final decode cannot overlap on the same runtime object.
+2. Cancellation semantics now preserve the safety boundary
+When stop cancels the drain task, daemon shutdown now awaits that task and keeps the inference gate held until any already-started executor inference has actually finished, preventing hidden overlap after coroutine cancellation.
+3. Finalization does not wait on a backlog of new live work
+Stop closes the drain loop first, so key-up can only wait for an already-running interim decode, not for additional streaming jobs queued after release. This bounds the latency tradeoff to the single in-flight decode window.
+4. Regression coverage now targets the race directly
+Daemon tests now force the interleaving where live interim inference is active during stop and assert both serialized model access and awaited drain shutdown before final send.
+5. Finding 2 tracking updated
+Finding 2 is now tracked as resolved in PR #20.
+
 ## Open High-Risk Items (Post 2026-03-08)
 
-1. Concurrent transcriber/model use across executor paths can yield non-deterministic failures (Finding 2).
-2. Injector timeout semantics can violate serialized side effects (Finding 3).
+1. Injector timeout semantics can violate serialized side effects (Finding 3).
 
 ---
 
