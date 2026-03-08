@@ -12,6 +12,8 @@ mod surface_focus;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -778,6 +780,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        configure_injector_subprocess(&mut command);
         let mut child = command.spawn().map_err(|err| {
             InjectionRunError::WorkerTaskFailed(format!(
                 "failed to spawn injector subprocess '{}': {err}",
@@ -924,9 +927,7 @@ fn wait_for_child_exit(
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() >= timeout => {
-                if let Err(err) = child.kill() {
-                    warn!(error = %err, "failed to kill timed-out injector subprocess");
-                }
+                kill_injector_subprocess(child);
                 if let Err(err) = child.wait() {
                     warn!(error = %err, "failed to reap timed-out injector subprocess");
                 }
@@ -942,6 +943,37 @@ fn wait_for_child_exit(
                 )));
             }
         }
+    }
+}
+
+fn configure_injector_subprocess(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        // Give each injection job its own process group so timeout can kill the
+        // entire subprocess tree, not just the wrapper process.
+        command.process_group(0);
+    }
+}
+
+fn kill_injector_subprocess(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group_id = -(child.id() as i32);
+        let rc = unsafe { libc::kill(process_group_id, libc::SIGKILL) };
+        if rc == 0 {
+            return;
+        }
+
+        let err = std::io::Error::last_os_error();
+        warn!(
+            pid = child.id(),
+            error = %err,
+            "failed to kill timed-out injector subprocess tree; falling back to direct child kill"
+        );
+    }
+
+    if let Err(err) = child.kill() {
+        warn!(pid = child.id(), error = %err, "failed to kill timed-out injector subprocess");
     }
 }
 
@@ -3509,7 +3541,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn injector_worker_timeout_kills_child_before_next_job_runs() {
+    async fn injector_worker_timeout_kills_subprocess_tree_before_next_job_runs() {
         let log_path = std::env::temp_dir().join(format!(
             "parakeet-ptt-injector-worker-log-{}-{}",
             std::process::id(),
@@ -3519,7 +3551,7 @@ mod tests {
                 .as_nanos()
         ));
         let script = make_test_script(
-            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\ntext=\"$(cat)\"\nif [ \"$text\" = \"first wedges\" ]; then\n  sleep 0.35\nfi\nprintf '%s\\n' \"$text\" >>\"$log_path\"\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\ntext=\"$(cat)\"\nif [ \"$text\" = \"first wedges\" ]; then\n  (\n    sleep 0.35\n    printf '%s\\n' \"$text\" >>\"$log_path\"\n  ) &\n  sleep 0.35\n  wait\n  exit 0\nfi\nprintf '%s\\n' \"$text\" >>\"$log_path\"\n",
         );
         let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
             script.clone(),
