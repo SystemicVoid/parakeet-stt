@@ -22,11 +22,21 @@ const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
 const STAGE_CLIPBOARD_READY: &str = "clipboard_ready";
 const STAGE_ROUTE_SHORTCUT: &str = "route_shortcut";
 const STAGE_BACKEND: &str = "backend";
+// The parent worker waits slightly longer than individual helper commands so it
+// can reap the subprocess tree and drain stderr without timing out first.
 #[cfg(not(test))]
-const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 1_000;
+pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 1_000;
 #[cfg(test)]
-const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 150;
-const INJECTOR_SUBPROCESS_POLL_MS: u64 = 5;
+pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 150;
+#[cfg(not(test))]
+pub(crate) const INJECTOR_JOB_TIMEOUT_SLACK_MS: u64 = 500;
+#[cfg(test)]
+pub(crate) const INJECTOR_JOB_TIMEOUT_SLACK_MS: u64 = 0;
+pub(crate) const INJECTOR_JOB_TIMEOUT_MS: u64 =
+    INJECTOR_CHILD_COMMAND_TIMEOUT_MS + INJECTOR_JOB_TIMEOUT_SLACK_MS;
+pub(crate) const INJECTOR_SUBPROCESS_POLL_INTERVAL_MS: u64 = 5;
+pub(crate) const INJECTOR_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
+pub(crate) const INJECTOR_PIPE_READER_JOIN_SLACK_MS: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
 enum InjectionStage {
@@ -221,7 +231,7 @@ fn wait_for_child_exit(
                 }
                 anyhow::bail!("{command_name} timed out after {} ms", timeout.as_millis());
             }
-            None => std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_MS)),
+            None => std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_INTERVAL_MS)),
         }
     }
 }
@@ -468,7 +478,7 @@ impl ClipboardInjector {
 
         let output = command_output_with_timeout(
             command,
-            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
             0,
             "wl-paste",
         )?;
@@ -538,7 +548,7 @@ impl ClipboardInjector {
         // with wait_with_output can hang because the helper keeps the pipe open.
         let status = wait_for_child_exit(
             &mut child,
-            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
             0,
             "wl-copy",
         )
@@ -717,7 +727,7 @@ impl ClipboardInjector {
                     .args(Self::ydotool_shortcut_args(shortcut));
                 let status = command_status_with_timeout(
                     command,
-                    Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+                    Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
                     trace_id,
                     "ydotool",
                 )

@@ -44,7 +44,11 @@ use crate::config::{
 use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent, HotkeyIntent,
 };
-use crate::injector::{injector_metrics_snapshot, TextInjector};
+use crate::injector::{
+    injector_metrics_snapshot, TextInjector, INJECTOR_JOB_TIMEOUT_MS,
+    INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS,
+    INJECTOR_SUBPROCESS_POLL_INTERVAL_MS,
+};
 use crate::overlay_process::OverlayProcessManager;
 use crate::protocol::{
     decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
@@ -56,13 +60,6 @@ use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
-#[cfg(not(test))]
-const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
-#[cfg(test)]
-const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
-const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
-const INJECTION_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
-const INJECTION_PIPE_READER_JOIN_SLACK_MS: u64 = 10;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -762,7 +759,7 @@ impl InjectorSubprocessRunner {
         Ok(Self {
             executable: std::env::current_exe().context("failed to resolve current executable")?,
             base_args: internal_inject_args_from_config(config),
-            timeout: Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+            timeout: Duration::from_millis(INJECTOR_JOB_TIMEOUT_MS),
         })
     }
 
@@ -808,7 +805,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
             .map(|stderr| {
                 spawn_pipe_reader(
                     stderr,
-                    Duration::from_millis(INJECTION_PIPE_DRAIN_TIMEOUT_MS),
+                    Duration::from_millis(INJECTOR_PIPE_DRAIN_TIMEOUT_MS),
                 )
             })
             .ok_or_else(|| {
@@ -821,7 +818,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
             stderr_reader,
             "stderr",
             Duration::from_millis(
-                INJECTION_PIPE_DRAIN_TIMEOUT_MS + INJECTION_PIPE_READER_JOIN_SLACK_MS,
+                INJECTOR_PIPE_DRAIN_TIMEOUT_MS + INJECTOR_PIPE_READER_JOIN_SLACK_MS,
             ),
         );
 
@@ -831,7 +828,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                     Ok(outcome) => {
                         if outcome.timed_out {
                             debug!(
-                                timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                                timeout_ms = INJECTOR_PIPE_DRAIN_TIMEOUT_MS,
                                 drained_bytes = outcome.bytes.len(),
                                 "injector subprocess stderr drain hit deadline; continuing with partial output"
                             );
@@ -851,7 +848,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                 Ok(outcome) => {
                     if outcome.timed_out {
                         debug!(
-                                timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                                timeout_ms = INJECTOR_PIPE_DRAIN_TIMEOUT_MS,
                                 drained_bytes = outcome.bytes.len(),
                                 "injector subprocess stderr drain hit deadline after failure; returning base error with partial stderr"
                             );
@@ -1089,7 +1086,9 @@ fn wait_for_child_exit(
                     timeout.as_millis()
                 )));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(INJECTION_SUBPROCESS_POLL_MS)),
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_INTERVAL_MS))
+            }
             Err(err) => {
                 return Err(InjectionRunError::WorkerTaskFailed(format!(
                     "failed to query injector subprocess state: {err}"
@@ -2669,7 +2668,7 @@ mod tests {
         spawn_pipe_reader, EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind,
         InjectionJob, InjectionJobRunner, InjectionRunError, InjectorSubprocessRunner,
         NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
-        SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
+        SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
     };
 
     struct SlowRunner {
@@ -2711,7 +2710,7 @@ mod tests {
             if call_index == 0 {
                 std::thread::sleep(Duration::from_millis(self.timeout_run_ms));
                 return Err(InjectionRunError::ExecutionTimeout(format!(
-                    "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                    "injector execution timed out after {INJECTOR_JOB_TIMEOUT_MS} ms"
                 )));
             }
 
@@ -3623,7 +3622,7 @@ mod tests {
         let injector = Arc::new(TimeoutThenRecordingRunner {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
-            timeout_run_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+            timeout_run_ms: INJECTOR_JOB_TIMEOUT_MS + 75,
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
@@ -3712,7 +3711,7 @@ mod tests {
         let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
             script.clone(),
             vec![OsString::from(log_path.as_os_str())],
-            Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_JOB_TIMEOUT_MS),
         ));
         let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
 
