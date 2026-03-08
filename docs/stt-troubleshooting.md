@@ -34,6 +34,7 @@ Canonical-source policy:
 - Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
 - Queue and stage metric summaries are emitted periodically from the client loop (`injector worker queue metrics summary`, `injector stage metrics summary`).
 - Event-loop lag summaries are emitted every 30 seconds (`event loop lag window summary`) with p50/p95/p99 fields, measured against the interval schedule so windows recover after transient stalls.
+- Hotkey listeners now seed already-held `llm_pre_modifier` state from the kernel when they attach or re-attach, so the first utterance after startup/resume/device recovery still routes to LLM mode if Shift was already held.
 - `stt diag-injector` reports backend capability prerequisites (`ydotool`, `/dev/uinput` write access) before running matrix cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.

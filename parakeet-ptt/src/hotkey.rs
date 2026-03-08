@@ -260,6 +260,22 @@ impl ListenerPressedState {
     }
 }
 
+fn seed_listener_pre_modifier_state(
+    state: &mut HotkeySharedState,
+    pressed: &mut ListenerPressedState,
+    llm_pre_modifier_keys: &[Key],
+    key_state: &evdev::AttributeSetRef<Key>,
+) -> usize {
+    let mut seeded = 0;
+    for key in llm_pre_modifier_keys {
+        if key_state.contains(*key) && pressed.pre_modifier_down_keys.insert(*key) {
+            state.note_pre_modifier_down(*key);
+            seeded += 1;
+        }
+    }
+    seeded
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListenerExitCleanup {
     released_talk_down: bool,
@@ -691,9 +707,40 @@ fn hotkey_listener_for_path(
         };
     }
 
+    let (seeded_pre_modifier_count, talk_key_held_on_attach) = match device.get_key_state() {
+        Ok(key_state) => {
+            let seeded_pre_modifier_count = {
+                let mut state = listener_context
+                    .shared_state
+                    .lock()
+                    .expect("hotkey shared state lock poisoned");
+                seed_listener_pre_modifier_state(
+                    &mut state,
+                    &mut pressed,
+                    &listener_context.llm_pre_modifier_keys,
+                    &key_state,
+                )
+            };
+            (
+                seeded_pre_modifier_count,
+                key_state.contains(listener_context.talk_key),
+            )
+        }
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to read initial hotkey device state; listener will attach without seeded modifier state"
+            );
+            (0, false)
+        }
+    };
+
     debug!(
         path = %path.display(),
         name = ?device.name(),
+        seeded_pre_modifier_count,
+        talk_key_held_on_attach,
         "hotkey listener attached"
     );
 
@@ -876,12 +923,12 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, handle_listener_exit, is_event_device_path, parse_key_name,
-        parse_pre_modifier_key_names, validate_hotkey_binding_config, HotkeyDiagnostics,
-        HotkeyEvent, HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks,
-        ListenerExit, ListenerExitAction, ListenerExitCleanup, ListenerExitReason,
-        ListenerPressedState,
+        parse_pre_modifier_key_names, seed_listener_pre_modifier_state,
+        validate_hotkey_binding_config, HotkeyDiagnostics, HotkeyEvent, HotkeyIntent,
+        HotkeyListenerContext, HotkeySharedState, HotkeyTasks, ListenerExit, ListenerExitAction,
+        ListenerExitCleanup, ListenerExitReason, ListenerPressedState,
     };
-    use evdev::Key;
+    use evdev::{AttributeSet, Key};
     use std::collections::HashSet;
     use std::path::Path;
     use std::path::PathBuf;
@@ -1066,6 +1113,136 @@ mod tests {
             Some(HotkeyEvent::Down {
                 intent: HotkeyIntent::LlmQuery
             })
+        );
+    }
+
+    #[test]
+    fn seed_listener_pre_modifier_state_marks_listener_and_shared_state() {
+        let mut state = HotkeySharedState::default();
+        let mut pressed = ListenerPressedState::default();
+        let mut key_state = AttributeSet::new();
+        key_state.insert(Key::KEY_LEFTSHIFT);
+        key_state.insert(Key::KEY_RIGHTCTRL);
+
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut pressed,
+                &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+        assert_eq!(
+            pressed.pre_modifier_down_keys,
+            HashSet::from([Key::KEY_LEFTSHIFT])
+        );
+        assert!(state.pre_modifier_active());
+    }
+
+    #[test]
+    fn seeded_pre_modifier_routes_first_talk_press_to_llm() {
+        let mut state = HotkeySharedState::default();
+        let mut pressed = ListenerPressedState::default();
+        let mut key_state = AttributeSet::new();
+        key_state.insert(Key::KEY_LEFTSHIFT);
+
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut pressed,
+                &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+                Key::KEY_RIGHTCTRL,
+                1
+            ),
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::LlmQuery
+            })
+        );
+    }
+
+    #[test]
+    fn seeded_pre_modifier_cleanup_only_releases_exiting_listener_share() {
+        let mut state = HotkeySharedState::default();
+        let mut first_pressed = ListenerPressedState::default();
+        let mut second_pressed = ListenerPressedState::default();
+        let mut key_state = AttributeSet::new();
+        key_state.insert(Key::KEY_LEFTSHIFT);
+
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut first_pressed,
+                &[Key::KEY_LEFTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut second_pressed,
+                &[Key::KEY_LEFTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+
+        assert_eq!(
+            state.release_listener_state(&first_pressed),
+            ListenerExitCleanup {
+                released_talk_down: false,
+                released_pre_modifier_count: 1,
+                emit_talk_up: false,
+            }
+        );
+        assert!(state.pre_modifier_active());
+
+        assert_eq!(
+            state.release_listener_state(&second_pressed),
+            ListenerExitCleanup {
+                released_talk_down: false,
+                released_pre_modifier_count: 1,
+                emit_talk_up: false,
+            }
+        );
+        assert!(!state.pre_modifier_active());
+    }
+
+    #[test]
+    fn attach_time_talk_key_state_does_not_start_or_release_session_state() {
+        let mut state = HotkeySharedState::default();
+        let mut pressed = ListenerPressedState::default();
+        let mut key_state = AttributeSet::new();
+        key_state.insert(Key::KEY_LEFTSHIFT);
+        key_state.insert(Key::KEY_RIGHTCTRL);
+
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut pressed,
+                &[Key::KEY_LEFTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+        assert!(!pressed.talk_down);
+        assert_eq!(
+            state.release_listener_state(&pressed),
+            ListenerExitCleanup {
+                released_talk_down: false,
+                released_pre_modifier_count: 1,
+                emit_talk_up: false,
+            }
         );
     }
 
