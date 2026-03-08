@@ -34,6 +34,8 @@ Current tests focus heavily on single-client cleanup invariants and interleaving
 Track `session_owner` (for example, `id(websocket)` or a per-connection UUID) alongside active session metadata. Only allow disconnect-triggered cleanup when the disconnecting socket matches the owner. If multi-client is intentionally unsupported, enforce that explicitly by rejecting second active control connections with a protocol-level error.
 9. Is this a real issue or just a preference?
 Real issue. This is a correctness boundary violation under plausible runtime topology, not a style preference.
+10. Implementation status (2026-03-08)
+Resolved in PR #19.
 
 ## Finding 2
 
@@ -149,9 +151,27 @@ After this change, absence of LLM routing for a given utterance should be interp
 7. Terminology migration completed
 Operator-facing surfaces use `llm_pre_modifier` naming (default `KEY_SHIFT`) instead of `query_modifier`, aligning CLI/helper UX with the canonical trigger model.
 
+## Implementation Status Update (2026-03-08, Daemon Session Guardrails)
+
+1. Finding 4 now mitigated in daemon runtime
+Session buffering now has hard server-side guardrails: `max_session_seconds` and `max_session_samples`, with auto-abort when either boundary is exceeded.
+2. Capture-layer memory boundary is enforced, not advisory
+The audio callback path now clips/halts accumulation at the configured sample cap, so memory cannot grow unbounded even if stop/abort control messages are lost.
+3. Server watchdog closes the loop for stuck control paths
+The daemon now runs a per-session guard task that monitors active session age/limit state and emits explicit session termination errors when limits trigger.
+4. Operational surfacing completed
+Session guardrail settings are now wired through CLI/env and startup diagnostics so operators can tune limits and verify effective values.
+5. Finding 1 tracking updated
+Finding 1 is now tracked as resolved in PR #19.
+
+## Open High-Risk Items (Post 2026-03-08)
+
+1. Concurrent transcriber/model use across executor paths can yield non-deterministic failures (Finding 2).
+2. Injector timeout semantics can violate serialized side effects (Finding 3).
+
 ---
 
-## Ranked Top-5 Risk List
+## Historical Ranked Top-5 Risk List (Pre-2026-03-08)
 
 1. Unbounded session audio accumulation can OOM the daemon (Finding 4).
 2. Concurrent transcriber/model use across executor paths can yield non-deterministic failures (Finding 2).
