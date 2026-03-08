@@ -14,6 +14,10 @@ status_url := "http://127.0.0.1:8765/status"
 default:
     @just --list
 
+# Build local Rust binaries for the current host CPU.
+build:
+    @bash -lc 'cd "{{repo_root}}/parakeet-ptt" && rustflags="${PARAKEET_PTT_RUSTFLAGS:--C target-cpu=native}" && echo ">>> building parakeet-ptt release binaries with RUSTFLAGS=${rustflags}" && RUSTFLAGS="${rustflags}" cargo build --release --bins'
+
 # Overlay helper shortcuts.
 start mode="auto" adaptive_width="false":
     @bash -lc 'cd "{{repo_root}}" && mode="{{mode}}" && adaptive_width="{{adaptive_width}}" && case "$mode" in auto|layer-shell|fallback-window|disabled) ;; *) echo "mode must be one of: auto|layer-shell|fallback-window|disabled" >&2; exit 2 ;; esac && case "${adaptive_width,,}" in true|false) ;; *) echo "adaptive_width must be true or false" >&2; exit 2 ;; esac && export PARAKEET_ROOT="{{repo_root}}" && export PARAKEET_OVERLAY_MODE="$mode" && source scripts/stt-helper.sh && stt restart --overlay-enabled true --overlay-adaptive-width "$adaptive_width"'
