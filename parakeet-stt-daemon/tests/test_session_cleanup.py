@@ -165,6 +165,24 @@ def test_audio_input_enforces_session_sample_limit() -> None:
     assert np.allclose(captured, np.array([0.1, 0.2, 0.3, 0.4, 0.1], dtype=np.float32))
 
 
+def test_audio_input_clips_pre_roll_to_session_sample_limit() -> None:
+    audio = AudioInput(sample_rate=16_000, channels=1, max_session_samples=3)
+
+    first = np.array([[0.1], [0.2]], dtype=np.float32)
+    second = np.array([[0.3], [0.4]], dtype=np.float32)
+    audio._callback(first, frames=2, time=None, status=cast(Any, 0))
+    audio._callback(second, frames=2, time=None, status=cast(Any, 0))
+
+    audio.start_session()
+
+    assert audio.session_limit_exceeded() is False
+
+    captured = audio.stop_session()
+
+    assert captured.size == 3
+    assert np.allclose(captured, np.array([0.2, 0.3, 0.4], dtype=np.float32))
+
+
 def test_disconnect_cleans_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
