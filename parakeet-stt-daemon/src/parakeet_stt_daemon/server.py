@@ -53,6 +53,8 @@ ErrorCode = Literal[
 ]
 OVERLAY_INTERIM_CONTEXT_WINDOW_SECS = 2.0
 OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
+SESSION_GUARD_POLL_SECS = 0.1
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 class DaemonServer:
@@ -61,11 +63,21 @@ class DaemonServer:
     def __init__(self, settings: ServerSettings) -> None:
         self.settings = settings
         self.sessions = SessionManager()
+        sample_rate = 16_000
+        duration_limit_samples = max(1, int(settings.max_session_seconds * sample_rate))
+        explicit_sample_limit = (
+            int(settings.max_session_samples)
+            if settings.max_session_samples is not None
+            else duration_limit_samples
+        )
+        self._session_sample_limit = max(1, min(duration_limit_samples, explicit_sample_limit))
+        self._session_age_limit_ms = max(1, int(settings.max_session_seconds * 1000))
         self.audio = AudioInput(
-            sample_rate=16_000,
+            sample_rate=sample_rate,
             channels=1,
             dtype="float32",
             device=settings.mic_device,
+            max_session_samples=self._session_sample_limit,
         )
         self.model = load_parakeet_model(device=settings.device)
         self.transcriber = ParakeetTranscriber(self.model)
@@ -88,6 +100,8 @@ class DaemonServer:
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
+        self._session_guard_task: asyncio.Task | None = None
+        self._session_guard_running = False
         self._last_audio_ms: int | None = None
         self._last_audio_stop_ms: int | None = None
         self._last_finalize_ms: int | None = None
@@ -185,6 +199,7 @@ class DaemonServer:
                     self.audio.sample_rate
                 )
                 self._start_stream_drain_loop(websocket, message.session_id)
+            self._start_session_guard_loop(websocket, message.session_id)
 
             response = SessionStarted(
                 session_id=message.session_id,
@@ -233,6 +248,7 @@ class DaemonServer:
                     websocket, message.session_id, "SESSION_NOT_FOUND", "No matching active session"
                 )
                 return
+            self._stop_session_guard_loop()
             await self._emit_interim_state(
                 websocket,
                 session.session_id,
@@ -414,6 +430,7 @@ class DaemonServer:
                 logger.debug("Cleaning residual runtime state with no active session ({})", reason)
             self.audio.abort_session()
             self._stop_stream_drain_loop()
+            self._stop_session_guard_loop()
             if active_session_id is not None:
                 await self.sessions.clear(active_session_id)
                 self._clear_overlay_session_runtime(active_session_id)
@@ -421,6 +438,105 @@ class DaemonServer:
             self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             return active_session_id is not None
+
+    async def _abort_session_due_to_limit(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        trigger: Literal["duration", "samples"],
+    ) -> None:
+        cleaned = await self._cleanup_active_session(
+            f"session {trigger} limit exceeded",
+            expected_session_id=session_id,
+            require_session_match=True,
+        )
+        if not cleaned:
+            return
+
+        if trigger == "duration":
+            limit_seconds = float(getattr(self.settings, "max_session_seconds", 0.0))
+            message = (
+                "Session exceeded max duration "
+                f"({limit_seconds:.1f}s); capture aborted to protect daemon memory"
+            )
+        else:
+            limit_samples = int(getattr(self, "_session_sample_limit", 0))
+            message = (
+                "Session exceeded max buffered audio "
+                f"({limit_samples} samples); capture aborted to protect daemon memory"
+            )
+
+        logger.warning(
+            "Session {} aborted by session guard (trigger={}, limit_seconds={}, limit_samples={})",
+            session_id,
+            trigger,
+            getattr(self.settings, "max_session_seconds", None),
+            getattr(self, "_session_sample_limit", None),
+        )
+        try:
+            await self._send_error(websocket, session_id, "AUDIO_DEVICE", message)
+            await self._emit_session_ended(websocket, session_id, reason="error")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to report session guard abort for {}: {}", session_id, exc)
+
+    def _audio_session_limit_exceeded(self) -> bool:
+        checker = getattr(self.audio, "session_limit_exceeded", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed checking audio session limit state: {}", exc)
+            return False
+
+    def _start_session_guard_loop(self, websocket: WebSocket, session_id: UUID) -> None:
+        if getattr(self, "_session_guard_task", None) is not None:
+            return
+        self._session_guard_running = True
+
+        async def _guard() -> None:
+            try:
+                while bool(getattr(self, "_session_guard_running", False)):
+                    active = self.sessions.active
+                    if active is None or active.session_id != session_id:
+                        break
+                    if self._audio_session_limit_exceeded():
+                        await self._abort_session_due_to_limit(
+                            websocket,
+                            session_id,
+                            trigger="samples",
+                        )
+                        break
+
+                    session_age_limit_ms = getattr(self, "_session_age_limit_ms", None)
+                    if session_age_limit_ms is not None and active.audio_duration_ms >= int(
+                        session_age_limit_ms
+                    ):
+                        await self._abort_session_due_to_limit(
+                            websocket,
+                            session_id,
+                            trigger="duration",
+                        )
+                        break
+                    await _REAL_ASYNCIO_SLEEP(SESSION_GUARD_POLL_SECS)
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if getattr(self, "_session_guard_task", None) is asyncio.current_task():
+                    self._session_guard_task = None
+                self._session_guard_running = False
+
+        self._session_guard_task = asyncio.create_task(_guard())
+
+    def _stop_session_guard_loop(self) -> None:
+        task = getattr(self, "_session_guard_task", None)
+        if task is None:
+            return
+        self._session_guard_running = False
+        self._session_guard_task = None
+        if not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     def _append_overlay_interim_context(
         self,
