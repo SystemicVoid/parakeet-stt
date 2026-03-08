@@ -593,8 +593,8 @@ PY
     }
 
     _ensure_llm_server() {
-        local llm_health_url owner llm_cmd_shell
-        local -a llm_cmd
+        local llm_health_url owner
+        local -a llm_cmd llm_tmux_cmd
 
         if ! _llm_validate_server_config; then
             return 1
@@ -624,13 +624,23 @@ PY
         rm -f "$LLM_PID_FILE"
 
         _build_llm_server_args llm_cmd
-        llm_cmd_shell="$(_args_to_shell_words llm_cmd)"
+        if [ "${#llm_cmd[@]}" -eq 0 ] || [ -z "${llm_cmd[0]}" ]; then
+            echo "   - Internal error: managed llama command is empty."
+            return 1
+        fi
+
+        llm_tmux_cmd=(
+            env "LOG_LLM=$LOG_LLM" bash -lc
+            'echo "[helper] exec $*" >> "$LOG_LLM"; exec "$@" >> "$LOG_LLM" 2>&1'
+            _
+            "${llm_cmd[@]}"
+        )
 
         echo "--- LLM session start: $(date -Is) ---" >> "$LOG_LLM"
         echo "[$(date -Is)] [helper] managed llama-server start" >> "$LOG_LLM"
 
         tmux new-session -d -s "$LLM_TMUX_SESSION" -n "$LLM_TMUX_WINDOW" -c "$REPO_ROOT" \
-            "LOG_LLM=\"$LOG_LLM\" LLM_CMD_SHELL=\"$llm_cmd_shell\" bash -lc 'echo \"[helper] exec $LLM_CMD_SHELL\" >> \"$LOG_LLM\"; eval \"set -- $LLM_CMD_SHELL\"; exec \"$@\" >> \"$LOG_LLM\" 2>&1'"
+            "$(_args_to_shell_words llm_tmux_cmd)"
 
         echo -n "   - Waiting for llama-server health..."
         if _wait_for_http "$llm_health_url" "$LLM_PID_FILE" 120; then

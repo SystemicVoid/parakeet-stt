@@ -205,14 +205,14 @@ def test_disconnect_cleans_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
+        websocket = FakeWebSocket([WebSocketDisconnect()])
         session_id = uuid4()
-        await server.sessions.start_session(session_id)
+        await server.sessions.start_session(session_id, owner_token=id(websocket))
 
         drain_task = DummyDrainTask()
         server._stream_drain_task = cast(Any, drain_task)
         server._stream_drain_running = True
 
-        websocket = FakeWebSocket([WebSocketDisconnect()])
         await server.handle_websocket(cast(Any, websocket))
 
         assert server.sessions.active is None
@@ -229,13 +229,6 @@ def test_handler_exception_cleans_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
-        session_id = uuid4()
-        await server.sessions.start_session(session_id)
-
-        async def explode_dispatch(*_args, **_kwargs) -> None:
-            raise RuntimeError("boom")
-
-        server._dispatch = explode_dispatch  # type: ignore[method-assign]
         websocket = FakeWebSocket(
             [
                 {
@@ -245,6 +238,13 @@ def test_handler_exception_cleans_active_session_state() -> None:
                 }
             ]
         )
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=id(websocket))
+
+        async def explode_dispatch(*_args, **_kwargs) -> None:
+            raise RuntimeError("boom")
+
+        server._dispatch = explode_dispatch  # type: ignore[method-assign]
         await server.handle_websocket(cast(Any, websocket))
 
         assert server.sessions.active is None
@@ -262,7 +262,8 @@ def test_abort_only_cleans_matching_session() -> None:
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
         active_session_id = uuid4()
-        await server.sessions.start_session(active_session_id)
+        websocket = FakeWebSocket([])
+        await server.sessions.start_session(active_session_id, owner_token=id(websocket))
 
         message = AbortSession(
             type=ClientMessageType.ABORT_SESSION,
@@ -270,7 +271,6 @@ def test_abort_only_cleans_matching_session() -> None:
             reason="user",
             timestamp=datetime.now(tz=UTC),
         )
-        websocket = FakeWebSocket([])
         await server._handle_abort(cast(Any, websocket), message)
 
         assert server.sessions.active is not None
@@ -308,7 +308,8 @@ def test_abort_session_returns_aborted_on_match() -> None:
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
         session_id = uuid4()
-        await server.sessions.start_session(session_id)
+        websocket = FakeWebSocket([])
+        await server.sessions.start_session(session_id, owner_token=id(websocket))
 
         message = AbortSession(
             type=ClientMessageType.ABORT_SESSION,
@@ -316,7 +317,6 @@ def test_abort_session_returns_aborted_on_match() -> None:
             reason="user",
             timestamp=datetime.now(tz=UTC),
         )
-        websocket = FakeWebSocket([])
         await server._handle_abort(cast(Any, websocket), message)
 
         assert server.sessions.active is None
@@ -515,17 +515,21 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
         async def cleanup_with_interleaving(
             reason: str,
             expected_session_id: UUID | None = None,
+            expected_owner_token: int | None = None,
             *,
             require_session_match: bool = False,
+            require_owner_match: bool = False,
         ) -> bool:
             nonlocal cleanup_calls
             cleanup_calls += 1
             if cleanup_calls == 2:
-                await server.sessions.start_session(replacement_session_id)
+                await server.sessions.start_session(replacement_session_id, owner_token=-1)
             return await original_cleanup(
                 reason,
                 expected_session_id=expected_session_id,
+                expected_owner_token=expected_owner_token,
                 require_session_match=require_session_match,
+                require_owner_match=require_owner_match,
             )
 
         server._cleanup_active_session = cleanup_with_interleaving  # type: ignore[method-assign]
@@ -552,7 +556,7 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
         server._last_infer_ms = 85
         server._last_send_ms = 4
         session_id = uuid4()
-        await server.sessions.start_session(session_id)
+        await server.sessions.start_session(session_id, owner_token=1)
 
         status = server.status()
 
@@ -600,6 +604,34 @@ def test_session_guard_aborts_when_audio_sample_limit_exceeded(monkeypatch) -> N
     asyncio.run(scenario())
 
 
+def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        owner_websocket = FakeWebSocket([])
+        other_websocket = FakeWebSocket([WebSocketDisconnect()])
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+
+        active_stream = cast(Any, object())
+        drain_task = DummyDrainTask()
+        server._active_stream = active_stream
+        server._stream_drain_task = cast(Any, drain_task)
+        server._stream_drain_running = True
+
+        await server.handle_websocket(cast(Any, other_websocket))
+
+        assert server.sessions.active is not None
+        assert server.sessions.active.session_id == session_id
+        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert audio.abort_calls == 0
+        assert server._active_stream is active_stream
+        assert server._stream_drain_task is drain_task
+        assert drain_task.cancel_called is False
+
+    asyncio.run(scenario())
+
+
 def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
     async def scenario() -> None:
         server = _build_server()
@@ -619,5 +651,58 @@ def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
         assert error_payloads
         assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
         assert "max duration" in cast(str, error_payloads[-1]["message"])
+
+    asyncio.run(scenario())
+
+
+def test_stop_session_from_non_owner_returns_not_found() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        owner_websocket = FakeWebSocket([])
+        other_websocket = FakeWebSocket([])
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+
+        message = StopSession(
+            type=ClientMessageType.STOP_SESSION,
+            session_id=session_id,
+            timestamp=datetime.now(tz=UTC),
+        )
+        await server._handle_stop(cast(Any, other_websocket), message)
+
+        assert server.sessions.active is not None
+        assert server.sessions.active.session_id == session_id
+        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert other_websocket.sent_json
+        assert other_websocket.sent_json[-1]["type"] == "error"
+        assert other_websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
+
+    asyncio.run(scenario())
+
+
+def test_abort_session_from_non_owner_returns_not_found() -> None:
+    async def scenario() -> None:
+        server = _build_server()
+        audio = cast(FakeAudio, server.audio)
+        owner_websocket = FakeWebSocket([])
+        other_websocket = FakeWebSocket([])
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+
+        message = AbortSession(
+            type=ClientMessageType.ABORT_SESSION,
+            session_id=session_id,
+            reason="user",
+            timestamp=datetime.now(tz=UTC),
+        )
+        await server._handle_abort(cast(Any, other_websocket), message)
+
+        assert server.sessions.active is not None
+        assert server.sessions.active.session_id == session_id
+        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert audio.abort_calls == 0
+        assert other_websocket.sent_json
+        assert other_websocket.sent_json[-1]["type"] == "error"
+        assert other_websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
 
     asyncio.run(scenario())

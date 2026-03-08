@@ -230,7 +230,7 @@ def test_status_includes_active_session_age_when_session_active() -> None:
     async def scenario() -> None:
         server = _build_server(streaming_enabled=False)
         session_id = uuid4()
-        await server.sessions.start_session(session_id)
+        await server.sessions.start_session(session_id, owner_token=1)
 
         status = server.status()
         assert status.active_session_age_ms is not None
