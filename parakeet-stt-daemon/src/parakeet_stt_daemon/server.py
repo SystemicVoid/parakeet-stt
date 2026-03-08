@@ -897,7 +897,7 @@ class DaemonServer:
         requested_device = getattr(self, "_requested_device", str(self.settings.device))
         effective_device = getattr(self, "_effective_device", requested_device)
         return StatusMessage(
-            state=state.value,
+            state=state,
             sessions_active=int(active is not None),
             gpu_mem_mb=self._gpu_mem_mb(),
             device=requested_device,
