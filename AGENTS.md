@@ -1,34 +1,41 @@
 # Repository Guidelines
 
-The role of this file is to describe common mistakes and confusion points that agents might encounter as they work in this project. If you ever encounter something in the project that surprises you, please alert the developer working with you and indicate that this is the case in the AGENTS.md file to help prevent future agents from having the same issue.
+This file is a repo map, not a surprise log.
+
+Keep it short, stable, and biased toward source-of-truth locations. If something in the repo surprises an agent, prefer fixing the code, tests, CLI help, or canonical docs so the behavior becomes predictable. Only keep workflow rules here that an agent needs before acting.
+
+## Repo Map
+- `README.md`: quickstart and top-level workflow.
+- `docs/SPEC.md`: product/runtime intent and behavior.
+- `docs/stt-troubleshooting.md`: operator-facing runtime behavior and troubleshooting.
+- `docs/engineering/harness-engineering-playbook.md`: tooling policy, repo hygiene, and maintenance cadence.
+- `scripts/stt-helper.sh` `start_option_rows`: canonical source for helper start flags, defaults, and env wiring.
+
+## Predictability Rules
+- Do not turn `AGENTS.md` into an accumulating list of caveats. Move stable operational detail into the canonical doc or encode it in the tool itself.
+- Keep one source of truth per surface. Do not hardcode `stt start` flags/defaults in parser/help/client args/diagnostics/docs when they can be derived from helper metadata.
+- Prefer mechanical checks over memory. If a rule matters, back it with validation, tests, or generated help text.
+- Keep machine-local behavior in ignored repo-local files `.parakeet-stt.local.env` and `.parakeet-stt.local.sh`, not tracked config.
 
 ## Build, Test, and Development Commands
 - Unified quality gate (repo root): `prek install -t pre-commit -t pre-push`, then `prek run --all-files` and `prek run --stage pre-push --all-files`.
-- main protected, must push through merge on integration branch.
+- main branch requires pull requests; force pushes blocked, admin protections enabled.
 - Overlay reliability gate: `just phase6-contract` (single pass), `just phase6-promotion 3` (promotion gate with repeated clean runs + eval compare).
 - Eval shortcuts (existing dataset): `just eval compare` (default), `just eval offline`, `just eval stream`, `just eval calibrate-offline`, `just eval calibrate-stream`.
+- Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` so the package environment and imports resolve correctly.
+- Commit-hook behavior: if pre-commit rewrites staged files, re-stage them and retry the commit.
 
 ## Runtime Operator Defaults (2026-03)
-- `stt` / `stt start`: online stream+seal profile with overlay enabled and adaptive width disabled by default.
+- `stt` / `stt start`: online stream+seal profile with overlay enabled by default. Exact helper defaults belong in `scripts/stt-helper.sh` and `docs/stt-troubleshooting.md`, not here.
 - `stt off`: offline profile defaults (no streaming, overlay disabled).
-
-- Maintain lazy imports in `model.py` to avoid GPU dependencies for protocol work. Use structured logging (`loguru`) and environment variables prefixed `PARAKEET_` for overrides.
-- Naming: binaries remain `parakeet-stt-daemon` and `parakeet-ptt`; config flags match protocol and injector surfaces (`shared_secret`, `endpoint`, `hotkey`, `paste_*`).
 
 ## Harness Engineering
 - Canonical playbook: `docs/engineering/harness-engineering-playbook.md`.
-- Keep `AGENTS.md` short and map-style; operational depth belongs in canonical docs and scripts.
 - Python static quality is consolidated on Ruff + ty. Prefer adding Ruff rules before adding overlapping one-off tools.
-- Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` (for example `uv run pytest ...`, `uv run ty check ...`); running them from repo root can miss that package environment/import path and give false failures.
-- Commit-hook caveat: pre-commit may rewrite staged Python files (typically Ruff import/order fixes), so after a failed `git commit` caused by hook-applied fixes, re-stage the touched files and retry the same commit.
 - Clarification: Ruff `BLE001` is blind exception handling; unreachable duplicate handler checks are `B014` / `B025`.
 
 ## STT Helper Flag Policy
-- Single source of truth: `scripts/stt-helper.sh` `start_option_rows`.
 - Do not hardcode `stt start` flag lists in parser/help/client args/diagnostics; derive behavior from metadata helpers.
 - Validation: run `bash -n scripts/stt-helper.sh`, `source scripts/stt-helper.sh && stt help start`, and `source scripts/stt-helper.sh && stt help llm` after helper flag/default/env changes.
-- Daemon lifecycle caveat: `uv run parakeet-stt-daemon` can expose a launcher PID that differs from the long-lived listener PID; helper lifecycle checks should refresh `/tmp/parakeet-daemon.pid` from the bound port after startup/status probes instead of trusting the initial `$!`.
-- Multi-binary caveat: this repo has both `parakeet-ptt` and `parakeet-overlay`; any helper fallback using `cargo run` must pass `--bin parakeet-ptt`.
-- Local-config caveat: `stt` auto-loads ignored repo-local `.parakeet-stt.local.env` and `.parakeet-stt.local.sh`; use them for machine-specific `PARAKEET_LLM_*` and `PARAKEET_LLM_SERVER_*` overrides instead of tracked files.
-- Runtime override: `PARAKEET_OVERLAY_MODE` supports `auto|layer-shell|fallback-window|disabled` for compositor-specific overlay bring-up.
-- Note: `scripts/check-stt-helper-flags.sh` is referenced in older docs/history but is currently not present in this repository.
+- Process-model contract: helper lifecycle checks must refresh `/tmp/parakeet-daemon.pid` from the bound port after startup/status probes instead of trusting the initial `uv run` launcher PID.
+- Multi-binary contract: any helper fallback using `cargo run` must pass `--bin parakeet-ptt`.
