@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -60,6 +62,7 @@ const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
 const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
 const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
 const INJECTION_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
+const INJECTION_PIPE_READER_JOIN_SLACK_MS: u64 = 10;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
@@ -798,28 +801,42 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
         }
         let _ = child.stdin.take();
 
-        let stderr_reader = child.stderr.take().map(spawn_pipe_reader).ok_or_else(|| {
-            InjectionRunError::WorkerTaskFailed(
-                "injector subprocess stderr pipe unavailable".to_string(),
-            )
-        })?;
+        // Drain stderr concurrently so the child cannot block on a full pipe before exit.
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|stderr| {
+                spawn_pipe_reader(
+                    stderr,
+                    Duration::from_millis(INJECTION_PIPE_DRAIN_TIMEOUT_MS),
+                )
+            })
+            .ok_or_else(|| {
+                InjectionRunError::WorkerTaskFailed(
+                    "injector subprocess stderr pipe unavailable".to_string(),
+                )
+            })?;
         let status_result = wait_for_child_exit(&mut child, self.timeout);
         let stderr = collect_pipe_reader(
             stderr_reader,
             "stderr",
-            Duration::from_millis(INJECTION_PIPE_DRAIN_TIMEOUT_MS),
+            Duration::from_millis(
+                INJECTION_PIPE_DRAIN_TIMEOUT_MS + INJECTION_PIPE_READER_JOIN_SLACK_MS,
+            ),
         );
 
         match status_result {
             Ok(status) => {
                 let stderr = match stderr {
-                    Ok(Some(stderr)) => stderr,
-                    Ok(None) => {
-                        debug!(
-                            timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
-                            "injector subprocess stderr remained open after child exit; continuing without waiting for inherited handles"
-                        );
-                        Vec::new()
+                    Ok(outcome) => {
+                        if outcome.timed_out {
+                            debug!(
+                                timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                                drained_bytes = outcome.bytes.len(),
+                                "injector subprocess stderr drain hit deadline; continuing with partial output"
+                            );
+                        }
+                        outcome.bytes
                     }
                     Err(err) => return Err(InjectionRunError::WorkerTaskFailed(err)),
                 };
@@ -830,19 +847,19 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
                     Err(InjectionRunError::BackendFailure(detail))
                 }
             }
-            Err(err) => {
-                match stderr {
-                    Ok(Some(stderr)) => return Err(enrich_run_error_with_stderr(err, &stderr)),
-                    Ok(None) => {
+            Err(err) => match stderr {
+                Ok(outcome) => {
+                    if outcome.timed_out {
                         debug!(
-                            timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
-                            "injector subprocess stderr remained open after failure; returning base error"
-                        );
+                                timeout_ms = INJECTION_PIPE_DRAIN_TIMEOUT_MS,
+                                drained_bytes = outcome.bytes.len(),
+                                "injector subprocess stderr drain hit deadline after failure; returning base error with partial stderr"
+                            );
                     }
-                    Err(read_err) => return Err(InjectionRunError::WorkerTaskFailed(read_err)),
+                    return Err(enrich_run_error_with_stderr(err, &outcome.bytes));
                 }
-                Err(err)
-            }
+                Err(read_err) => return Err(InjectionRunError::WorkerTaskFailed(read_err)),
+            },
         }
     }
 }
@@ -918,30 +935,136 @@ fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
     args
 }
 
-fn spawn_pipe_reader<R>(reader: R) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>
+#[derive(Debug)]
+struct PipeReadOutcome {
+    bytes: Vec<u8>,
+    timed_out: bool,
+}
+
+fn spawn_pipe_reader<R>(
+    reader: R,
+    timeout: Duration,
+) -> std::sync::mpsc::Receiver<std::io::Result<PipeReadOutcome>>
 where
-    R: Read + Send + 'static,
+    R: Read + Send + AsRawFd + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut buffer = Vec::new();
-        let result = reader.read_to_end(&mut buffer).map(|_| buffer);
+        let result = read_pipe_until_deadline(reader, timeout);
         let _ = tx.send(result);
     });
     rx
 }
 
+fn read_pipe_until_deadline<R>(mut reader: R, timeout: Duration) -> std::io::Result<PipeReadOutcome>
+where
+    R: Read + AsRawFd,
+{
+    set_pipe_nonblocking(reader.as_raw_fd())?;
+    let started = std::time::Instant::now();
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        if started.elapsed() >= timeout {
+            return Ok(PipeReadOutcome {
+                bytes: buffer,
+                timed_out: true,
+            });
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                return Ok(PipeReadOutcome {
+                    bytes: buffer,
+                    timed_out: false,
+                });
+            }
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                    return Ok(PipeReadOutcome {
+                        bytes: buffer,
+                        timed_out: true,
+                    });
+                };
+                if !wait_for_pipe_read_ready(reader.as_raw_fd(), remaining)? {
+                    return Ok(PipeReadOutcome {
+                        bytes: buffer,
+                        timed_out: true,
+                    });
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn wait_for_pipe_read_ready(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<bool> {
+    let timeout_ms = timeout
+        .as_millis()
+        .min(i32::MAX as u128)
+        .try_into()
+        .unwrap_or(i32::MAX);
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+
+    loop {
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready > 0 {
+            if poll_fd.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe fd became invalid while draining output",
+                ));
+            }
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+fn set_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let current_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if current_flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+
+    let updated_flags = unsafe { libc::fcntl(fd, libc::F_SETFL, current_flags | libc::O_NONBLOCK) };
+    if updated_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn collect_pipe_reader(
-    receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    receiver: std::sync::mpsc::Receiver<std::io::Result<PipeReadOutcome>>,
     label: &str,
     timeout: Duration,
-) -> std::result::Result<Option<Vec<u8>>, String> {
+) -> std::result::Result<PipeReadOutcome, String> {
+    // The read thread owns the real drain deadline. This outer wait only tolerates
+    // scheduler jitter while proving that the thread actually returned.
     match receiver.recv_timeout(timeout) {
-        Ok(read_result) => read_result
-            .map(Some)
-            .map_err(|err| format!("failed to read {label} pipe: {err}")),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Ok(read_result) => read_result.map_err(|err| format!("failed to read {label} pipe: {err}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{label} reader thread exceeded the drain deadline without returning"
+        )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
             "{label} reader thread disconnected before returning output"
         )),
@@ -2513,7 +2636,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2539,11 +2664,12 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
-        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
-        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, InjectionJobRunner,
-        InjectionRunError, InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter,
-        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
+        build_injector, collect_pipe_reader, drain_sse_lines, handle_server_message,
+        maybe_defer_llm_session_end, sanitize_model_answer, spawn_injector_worker_with_capacity,
+        spawn_pipe_reader, EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind,
+        InjectionJob, InjectionJobRunner, InjectionRunError, InjectorSubprocessRunner,
+        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
     };
 
     struct SlowRunner {
@@ -3674,6 +3800,35 @@ mod tests {
 
         fs::remove_file(&script).expect("test script should be removable");
         fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[test]
+    fn pipe_reader_returns_partial_output_by_deadline_without_waiting_for_eof() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should open");
+        writer
+            .write_all(b"partial stderr")
+            .expect("writer should accept bytes");
+
+        let started = Instant::now();
+        let outcome = collect_pipe_reader(
+            spawn_pipe_reader(reader, Duration::from_millis(40)),
+            "stderr",
+            Duration::from_millis(200),
+        )
+        .expect("reader should return once the drain deadline elapses");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.bytes, b"partial stderr");
+        assert!(
+            outcome.timed_out,
+            "open writers should force a timed drain result instead of blocking for EOF"
+        );
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "pipe reader should stop itself near the drain deadline, elapsed={elapsed:?}"
+        );
+
+        drop(writer);
     }
 
     #[tokio::test(flavor = "current_thread")]
