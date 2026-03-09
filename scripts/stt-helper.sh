@@ -734,7 +734,7 @@ Commands:
   show | attach          Attach to tmux session.
   tmux [attach|kill]     Attach/kill helper tmux session.
   check                  Run daemon health check.
-  diag-injector          Run clipboard injector diagnostics.
+  diag-injector [opts]   Run clipboard injector diagnostics.
   help [start|llm]       Show this help or command-specific help.
 EOF
     }
@@ -1374,6 +1374,87 @@ CLIENTCMD
             (
                 cd "$CLIENT_DIR" || exit 1
                 set -e
+                local backend_filter="all"
+                local attempts="1"
+                local shortcut="auto"
+                local text_prefix="Parakeet Test"
+                local interval_ms="150"
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --backend)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --backend" >&2
+                                exit 2
+                            }
+                            backend_filter="$2"
+                            shift 2
+                            ;;
+                        --attempts)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --attempts" >&2
+                                exit 2
+                            }
+                            attempts="$2"
+                            shift 2
+                            ;;
+                        --shortcut)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --shortcut" >&2
+                                exit 2
+                            }
+                            shortcut="$2"
+                            shift 2
+                            ;;
+                        --prefix)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --prefix" >&2
+                                exit 2
+                            }
+                            text_prefix="$2"
+                            shift 2
+                            ;;
+                        --interval-ms)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --interval-ms" >&2
+                                exit 2
+                            }
+                            interval_ms="$2"
+                            shift 2
+                            ;;
+                        *)
+                            echo "Unknown diag-injector argument: $1" >&2
+                            exit 2
+                            ;;
+                    esac
+                done
+
+                case "$backend_filter" in
+                    all|auto|uinput|ydotool) ;;
+                    *)
+                        echo "diag-injector backend must be one of: all|auto|uinput|ydotool" >&2
+                        exit 2
+                        ;;
+                esac
+                case "$shortcut" in
+                    auto|ctrl-v|ctrl-shift-v) ;;
+                    *)
+                        echo "diag-injector shortcut must be one of: auto|ctrl-v|ctrl-shift-v" >&2
+                        exit 2
+                        ;;
+                esac
+                [[ "$attempts" =~ ^[0-9]+$ ]] || {
+                    echo "diag-injector attempts must be an integer" >&2
+                    exit 2
+                }
+                [ "$attempts" -ge 1 ] || {
+                    echo "diag-injector attempts must be >= 1" >&2
+                    exit 2
+                }
+                [[ "$interval_ms" =~ ^[0-9]+$ ]] || {
+                    echo "diag-injector interval-ms must be an integer" >&2
+                    exit 2
+                }
+
                 local runner_mode runner_bin
                 local ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:-}"
                 local ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
@@ -1390,6 +1471,11 @@ CLIENTCMD
                     echo "   - release binary missing expected start flags; using cargo run --release --bin parakeet-ptt"
                 fi
 
+                echo "   - diag backend filter: $backend_filter"
+                echo "   - diag attempts per backend: $attempts"
+                echo "   - diag forced shortcut: $shortcut"
+                echo "   - diag text prefix: $text_prefix"
+                echo "   - diag interval ms: $interval_ms"
                 echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
                 if [ -e /dev/uinput ]; then
                     if [ -w /dev/uinput ]; then
@@ -1408,25 +1494,40 @@ CLIENTCMD
                     local completion_sound completion_sound_path completion_sound_volume
                     local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
+                    local -a diag_args
 
                     _load_start_vars_from_defaults
                     injection_mode="paste"
                     paste_key_backend="$backend"
                     _build_ptt_args ptt_args no
 
+                    diag_args=(
+                        --test-injection
+                        --test-injection-count "$attempts"
+                        --test-injection-text-prefix "$text_prefix"
+                        --test-injection-interval-ms "$interval_ms"
+                    )
+                    if [ "$shortcut" != "auto" ]; then
+                        diag_args+=(--test-injection-shortcut "$shortcut")
+                    fi
+
                     echo "   - case backend=$backend"
                     if [ -n "$runner_bin" ]; then
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            "$runner_bin" --test-injection "${ptt_args[@]}"
+                            "$runner_bin" "${diag_args[@]}" "${ptt_args[@]}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- --test-injection "${ptt_args[@]}"
+                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- "${diag_args[@]}" "${ptt_args[@]}"
                     fi
                 }
 
-                run_case "auto"
-                run_case "uinput"
-                run_case "ydotool"
+                if [ "$backend_filter" = "all" ]; then
+                    run_case "auto"
+                    run_case "uinput"
+                    run_case "ydotool"
+                else
+                    run_case "$backend_filter"
+                fi
             )
             ;;
         *)
