@@ -673,3 +673,200 @@ This is now the best next option because:
 
 - focus/routing evidence is materially better than before
 - the remaining contradiction is between "command says it sent the chord" and "target visibly did nothing"
+
+## Status Update (2026-03-09, matrix harness added)
+
+To reduce operator error in the next backend-semantics pass, the repo now contains a dedicated local harness:
+
+- `scripts/paste-gap-matrix.sh`
+- `just paste-gap-start`
+- `just paste-gap-stop`
+- `just paste-gap-diag`
+- `just paste-gap-summary`
+- `just paste-gap-current`
+
+What it does:
+
+- records baseline commit SHA and worktree status before each backend run
+- clears `/tmp/parakeet-ptt.log`, `/tmp/parakeet-daemon.log`, and `/tmp/parakeet-ghostty-sink.txt`
+- starts `stt` with one explicit backend and `--paste-backend-failure-policy error`
+- archives the runtime artifacts after the manual Ghostty run
+- mechanically extracts `injector subprocess report` rows into TSV files
+- seeds operator-observation templates so visible-paste results can be recorded next to the parsed reports
+
+What it does **not** do:
+
+- it does not change injector routing or backend behavior
+- it does not remove the need for a live Ghostty operator repro
+- it does not yet answer the backend question by itself
+
+Practical effect:
+
+- the next Ghostty matrix run can now be repeated with less manual bookkeeping
+- evidence capture is standardized before any behavioral change is attempted
+
+## Status Update (2026-03-09, Ghostty backend matrix completed)
+
+The Ghostty raw-path backend matrix has now been run with the local harness.
+
+Run directories:
+
+- `uinput`: `/tmp/parakeet-paste-gap/20260309T195817Z-uinput-ghostty`
+- `ydotool`: `/tmp/parakeet-paste-gap/20260309T200916Z-ydotool-ghostty`
+- `auto`: `/tmp/parakeet-paste-gap/20260309T201528Z-auto-ghostty`
+
+### What was held constant
+
+- target surface: Ghostty sink
+- utterance set: 10 fixed raw dictation phrases
+- path under test: plain raw PTT only
+- route chosen in all inspected runs: Ghostty paste route `CtrlShiftV`
+- runtime policy: explicit backend selection for `uinput` and `ydotool`, helper default `auto` for the third run
+
+### `uinput` run
+
+What the archived summary proves:
+
+- 10 raw injections reached `injector subprocess report`
+- all 10 reported:
+  - `origin=raw_final_result`
+  - `backend_attempts=primary:uinput:ok`
+  - `clipboard_ready=true`
+  - `post_clipboard_matches=Some(true)`
+  - `route_primary=CtrlShiftV`
+  - `route_class=Unknown`
+- Ghostty sink artifact captured only 3 non-empty lines
+
+Operator-visible result recorded for this run:
+
+- attempts reported visibly pasted: `1`, `2`, `8`
+- Ghostty sink artifact contained:
+  - `Gravel Raw Three Charlie.`
+  - `Raw for Delta.`
+  - `Raw hate hotel.`
+
+Important contradiction preserved:
+
+- parent + child reports still look syntactically healthy on every attempt
+- target-side visible/sink results are still intermittent and do not line up cleanly with the "all good" child reports
+
+### `ydotool` run
+
+What the archived summary proves:
+
+- 10 raw injections reached `injector subprocess report`
+- all 10 reported:
+  - `origin=raw_final_result`
+  - `backend_attempts=primary:ydotool:ok`
+  - `clipboard_ready=true`
+  - `post_clipboard_matches=Some(true)`
+  - `route_primary=CtrlShiftV`
+  - `route_class=Unknown`
+- Ghostty sink artifact captured 10 non-empty lines
+
+What the target actually received:
+
+- every captured Ghostty sink line was the same value:
+  - `244442`
+
+Additional child-side signal present on every inspected `ydotool` injection:
+
+- child stderr emitted:
+  - `ydotool: notice: ydotoold backend unavailable (may have latency+delay issues)`
+
+Practical interpretation from this run alone:
+
+- `ydotool` does cause a consistent target-side effect in this environment
+- but the effect captured here is not the dictated transcript text
+
+### `auto` run
+
+What the archived summary proves:
+
+- 10 raw injections reached `injector subprocess report`
+- all 10 reported:
+  - `clipboard_ready=true`
+  - `post_clipboard_matches=Some(true)`
+  - `route_primary=CtrlShiftV`
+- route classification was:
+  - `Unknown` on 9 attempts
+  - `Terminal` on 1 attempt
+
+Most important backend fact from this run:
+
+- all 10 `auto` attempts still reported:
+  - `backend_attempts=primary:uinput:ok`
+
+So for the archived `auto` run:
+
+- no successful fallback to `ydotool` is evidenced
+- `auto` behaved like `uinput-only` from the child report’s point of view
+
+Ghostty sink artifact for `auto` contained 5 non-empty lines:
+
+- `Raw to Bravo.Raw through a Charlie.`
+- `Raw four delta`
+- `Ролсикс фор фокт.`
+- `Ро Эйт Хотел.`
+- `Row ten Juliet`
+
+This means:
+
+- the `auto` run produced intermittent target-side transcript-like output
+- but current evidence does **not** show the alternate backend being used on those successful-looking sink captures
+
+### `diag-injector` limitation in this matrix
+
+The control run is not clean evidence in this capture set.
+
+Why:
+
+- the operator reported focus-follow-mouse constraints during `stt diag-injector`
+- Ghostty could not stay reliably focused while launching the control from another terminal
+- the resulting `Parakeet Test...` target artifact cannot be attributed with confidence to a specific backend case inside the combined `diag-injector` sequence
+
+Therefore:
+
+- do **not** use the current `diag-injector` results as a per-backend proof point from this pass
+
+### Strongest new facts established by the matrix
+
+1. Backend choice materially changes target-side behavior in Ghostty.
+2. `uinput` remains intermittent even though child reports look healthy on every attempt.
+3. `ydotool` produces a consistent target-side effect in this environment, but the captured effect in this run was the repeated value `244442`, not the dictated transcript text.
+4. `auto` did not show evidence of falling back away from `uinput`; every archived child report still said `primary:uinput:ok`.
+
+### What this does and does not prove
+
+What it proves:
+
+- a simple "if `uinput` looks successful, retry with `ydotool`" change is not yet justified as a safe fix
+- because the current `ydotool` path is not demonstrated as transcript-correct in this Ghostty environment
+
+What it does not prove:
+
+- it does not prove whether `ydotool` has **ever** been correct historically in prior environments or earlier builds
+- it does not prove the exact origin of the repeated `244442` value
+
+### Operator note to preserve, but not elevate to proven fact
+
+The operator stated that `ydotool` may never have been a meaningfully used or needed fallback in normal practice and may only be adding complexity now.
+
+Treat that as a useful product/maintenance concern, not yet as a proven historical fact from repo artifacts.
+
+### Current best interpretation after this matrix
+
+The matrix weakens the previous "just add alternate-backend retry in `auto`" idea.
+
+Why:
+
+- `auto` currently never showed evidence of leaving `uinput`
+- the only directly observed `ydotool` behavior in Ghostty from this pass was consistent but wrong target-side output
+
+So the next debugging question is no longer just:
+
+- "should `auto` retry another backend after an apparent `uinput` success?"
+
+It is now first:
+
+- "is `ydotool` a valid transcript-correct backend at all in the current Ghostty/COSMIC environment, especially when `ydotoold` is unavailable?"
