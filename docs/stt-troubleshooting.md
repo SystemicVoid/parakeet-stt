@@ -137,3 +137,42 @@ stt diag-injector
 ```
 
 It prints backend capability checks and then runs three `--test-injection` backend cases (`auto`, `uinput`, `ydotool`) with injector debug logging.
+
+### Paste-gap matrix harness
+
+For the raw-paste Ghostty investigation, use the repo-local harness instead of manually juggling `/tmp` artifacts:
+
+```bash
+just paste-gap-start backend=uinput
+```
+
+That command:
+
+- records the current commit SHA and worktree status
+- clears `/tmp/parakeet-ptt.log`, `/tmp/parakeet-daemon.log`, and `/tmp/parakeet-ghostty-sink.txt`
+- starts `stt` with `--paste-key-backend <backend>` and `--paste-backend-failure-policy error`
+- seeds operator observation templates under `/tmp/parakeet-paste-gap/...`
+
+After the manual Ghostty utterance run, archive and summarize with:
+
+```bash
+just paste-gap-stop
+just paste-gap-diag
+just paste-gap-summary
+```
+
+Useful follow-ups:
+
+```bash
+just paste-gap-current
+just paste-gap-summary run_dir=/tmp/parakeet-paste-gap/<run-dir>
+```
+
+The harness writes:
+
+- `summary.txt`: counts by origin, route, backend-attempt string, focus app, and clipboard fields
+- `injector-subprocess-report.tsv`: mechanically extracted `injector subprocess report` rows
+- `injector-subprocess-report.raw.tsv`: raw-only subset for the failing path
+- `raw-observation-joined.tsv`: created only when raw report count matches the operator observation row count
+
+This keeps the experiment honest: same stack, same `/tmp` artifacts, different backend.
