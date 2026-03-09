@@ -9,7 +9,7 @@ mod routing;
 mod state;
 mod surface_focus;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -1275,14 +1275,67 @@ fn summarize_backend_attempts(attempts: &[BackendAttemptReport]) -> String {
         .iter()
         .map(|attempt| {
             let mut summary = format!(
-                "{}:{}:{}",
-                attempt.route_attempt_name, attempt.backend, attempt.status
+                "{}:{}:{}:{}ms",
+                attempt.route_attempt_name, attempt.backend, attempt.status, attempt.duration_ms
             );
+            if let Some(exit_status) = attempt.exit_status.as_ref() {
+                summary.push_str(":exit=");
+                summary.push_str(exit_status);
+            }
+            if !attempt.warning_tags.is_empty() {
+                summary.push_str(":warn=");
+                summary.push_str(&attempt.warning_tags.join(","));
+            }
+            if let Some(config) = attempt.backend_config.as_ref() {
+                summary.push_str(":cfg=");
+                summary.push_str(config);
+            }
+            if let Some(stderr_excerpt) = attempt.stderr_excerpt.as_ref() {
+                summary.push_str(":stderr=");
+                summary.push_str(stderr_excerpt);
+            }
             if let Some(error) = attempt.error.as_ref() {
                 summary.push(':');
                 summary.push_str(error);
             }
             summary
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_backend_warning_tags(attempts: &[BackendAttemptReport]) -> String {
+    let tags = attempts
+        .iter()
+        .flat_map(|attempt| attempt.warning_tags.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if tags.is_empty() {
+        return "none".to_string();
+    }
+    tags.into_iter().collect::<Vec<_>>().join(",")
+}
+
+fn summarize_backend_exit_statuses(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .filter_map(|attempt| {
+            attempt
+                .exit_status
+                .as_ref()
+                .map(|status| format!("{}:{}", attempt.backend, status))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_backend_stderr_excerpts(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .filter_map(|attempt| {
+            attempt
+                .stderr_excerpt
+                .as_ref()
+                .map(|stderr| format!("{}:{}", attempt.backend, stderr))
         })
         .collect::<Vec<_>>()
         .join(" | ")
@@ -1334,6 +1387,10 @@ fn log_injector_subprocess_stderr(session_id: Uuid, origin: InjectionOrigin, std
                         route_primary = report.route_primary,
                         route_adaptive_fallback = ?report.route_adaptive_fallback,
                         route_reason = report.route_reason,
+                        backend_attempt_count = report.backend_attempts.len(),
+                        backend_warning_tags = summarize_backend_warning_tags(&report.backend_attempts),
+                        backend_exit_statuses = summarize_backend_exit_statuses(&report.backend_attempts),
+                        backend_stderr_excerpts = summarize_backend_stderr_excerpts(&report.backend_attempts),
                         backend_attempts = summarize_backend_attempts(&report.backend_attempts),
                         elapsed_ms_total = report.elapsed_ms_total,
                         "injector subprocess report"
@@ -1582,6 +1639,22 @@ struct Cli {
     #[arg(long)]
     test_injection: bool,
 
+    /// Number of test-injection attempts to emit before exiting.
+    #[arg(long, default_value_t = 1, requires = "test_injection")]
+    test_injection_count: u32,
+
+    /// Prefix text used for test-injection payload(s).
+    #[arg(long, default_value = "Parakeet Test", requires = "test_injection")]
+    test_injection_text_prefix: String,
+
+    /// Delay between repeated test-injection attempts.
+    #[arg(long, default_value_t = 150, requires = "test_injection")]
+    test_injection_interval_ms: u64,
+
+    /// Optional forced route shortcut for test-injection runs.
+    #[arg(long, value_enum, requires = "test_injection")]
+    test_injection_shortcut: Option<CliTestInjectionShortcut>,
+
     /// Internal subprocess mode: read transcript text from stdin, inject once, then exit.
     #[arg(long, hide = true)]
     internal_inject_once: bool,
@@ -1705,6 +1778,21 @@ enum CliPasteBackendFailurePolicy {
     Error,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum CliTestInjectionShortcut {
+    CtrlV,
+    CtrlShiftV,
+}
+
+impl From<CliTestInjectionShortcut> for crate::config::PasteShortcut {
+    fn from(shortcut: CliTestInjectionShortcut) -> Self {
+        match shortcut {
+            CliTestInjectionShortcut::CtrlV => crate::config::PasteShortcut::CtrlV,
+            CliTestInjectionShortcut::CtrlShiftV => crate::config::PasteShortcut::CtrlShiftV,
+        }
+    }
+}
+
 impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePolicy {
     fn from(policy: CliPasteBackendFailurePolicy) -> Self {
         match policy {
@@ -1775,11 +1863,38 @@ async fn main() -> Result<()> {
     };
 
     if cli.test_injection {
-        let injector = build_injector(&config);
-        injector
-            .inject("Parakeet Test")
-            .context("injector test failed")?;
-        info!("Injector test sent 'Parakeet Test'");
+        let forced_shortcut = cli.test_injection_shortcut.clone().map(Into::into);
+        let injector = build_injector_with_shortcut_override(&config, None, forced_shortcut);
+        let attempt_total = cli.test_injection_count.max(1);
+        for attempt_index in 0..attempt_total {
+            let payload = if attempt_total == 1 {
+                cli.test_injection_text_prefix.clone()
+            } else {
+                format!(
+                    "{} {:02}",
+                    cli.test_injection_text_prefix,
+                    attempt_index + 1
+                )
+            };
+            injector.inject(&payload).with_context(|| {
+                format!("injector test failed at attempt {}", attempt_index + 1)
+            })?;
+            info!(
+                test_attempt_index = attempt_index + 1,
+                test_attempt_total = attempt_total,
+                forced_shortcut = ?forced_shortcut,
+                payload_len = payload.len(),
+                "injector test attempt completed"
+            );
+            if attempt_index + 1 < attempt_total && cli.test_injection_interval_ms > 0 {
+                std::thread::sleep(Duration::from_millis(cli.test_injection_interval_ms));
+            }
+        }
+        info!(
+            test_attempt_total = attempt_total,
+            forced_shortcut = ?forced_shortcut,
+            "injector test run completed"
+        );
         return Ok(());
     }
 
@@ -1823,18 +1938,19 @@ fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
                 None
             }
         });
-    build_injector_with_context(config, context)
+    build_injector_with_shortcut_override(config, context, None)
         .inject(&text)
         .context("internal injection failed")
 }
 
 fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
-    build_injector_with_context(config, None)
+    build_injector_with_shortcut_override(config, None, None)
 }
 
-fn build_injector_with_context(
+fn build_injector_with_shortcut_override(
     config: &ClientConfig,
     context: Option<InjectorContext>,
+    forced_shortcut: Option<crate::config::PasteShortcut>,
 ) -> Arc<dyn TextInjector> {
     use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
     use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
@@ -1859,11 +1975,13 @@ fn build_injector_with_context(
                     reason = %reason,
                     "paste backend unavailable; falling back to copy-only injection"
                 );
-                Arc::new(ClipboardInjector::new_with_context(
+                Arc::new(ClipboardInjector::new_with_overrides(
                     PasteKeySender::Disabled,
                     config.clipboard.clone(),
                     true,
                     context.clone(),
+                    // Copy-only fallback never sends chords; forced shortcut is irrelevant.
+                    None,
                 ))
             }
             PasteBackendFailurePolicy::Error => {
@@ -1938,11 +2056,12 @@ fn build_injector_with_context(
         "Using clipboard injector"
     );
 
-    Arc::new(ClipboardInjector::new_with_context(
+    Arc::new(ClipboardInjector::new_with_overrides(
         sender,
         config.clipboard.clone(),
         matches!(config.injection_mode, InjectionMode::CopyOnly),
         context,
+        forced_shortcut,
     ))
 }
 
@@ -3254,6 +3373,30 @@ mod tests {
         assert!(matches!(
             cli.paste_key_backend,
             super::CliPasteKeyBackend::Auto
+        ));
+    }
+
+    #[test]
+    fn cli_test_injection_defaults_are_stable() {
+        let cli = super::Cli::parse_from(["parakeet-ptt", "--test-injection"]);
+        assert!(cli.test_injection);
+        assert_eq!(cli.test_injection_count, 1);
+        assert_eq!(cli.test_injection_text_prefix, "Parakeet Test");
+        assert_eq!(cli.test_injection_interval_ms, 150);
+        assert_eq!(cli.test_injection_shortcut, None);
+    }
+
+    #[test]
+    fn cli_test_injection_accepts_forced_shortcut() {
+        let cli = super::Cli::parse_from([
+            "parakeet-ptt",
+            "--test-injection",
+            "--test-injection-shortcut",
+            "ctrl-shift-v",
+        ]);
+        assert!(matches!(
+            cli.test_injection_shortcut,
+            Some(super::CliTestInjectionShortcut::CtrlShiftV)
         ));
     }
 
