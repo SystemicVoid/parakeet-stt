@@ -38,6 +38,24 @@ status:
 logs:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'
 
+paste-gap-start backend="auto" label="ghostty" attempts="10":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh start --backend "{{backend}}" --label "{{label}}" --attempts "{{attempts}}"'
+
+paste-gap-inject-only backend="uinput" shortcut="ctrl-shift-v" label="ghostty-inject-only" attempts="20" prefix="PG" interval_ms="150":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh inject-only --backend "{{backend}}" --shortcut "{{shortcut}}" --label "{{label}}" --attempts "{{attempts}}" --prefix "{{prefix}}" --interval-ms "{{interval_ms}}"'
+
+paste-gap-stop run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh stop --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh stop; fi'
+
+paste-gap-diag run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh diag --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh diag; fi'
+
+paste-gap-summary run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh summarize --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh summarize; fi'
+
+paste-gap-current:
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh current'
+
 logs-overlay:
     @cd "{{repo_root}}"
     tail -f /tmp/parakeet-ptt.log /tmp/parakeet-daemon.log | rg -i "overlay|interim|session_ended|final_result|spawn|replay|disconnect"
