@@ -79,6 +79,14 @@ pub(crate) struct BackendAttemptReport {
     pub warning_tags: Vec<String>,
     pub backend_config: Option<String>,
     pub error: Option<String>,
+    pub uinput_sender_generation: Option<u64>,
+    pub uinput_fresh_device: Option<bool>,
+    pub uinput_device_age_ms_at_attempt: Option<u64>,
+    pub uinput_use_count_before_attempt: Option<u64>,
+    pub uinput_created_this_job: Option<bool>,
+    pub uinput_create_elapsed_ms: Option<u64>,
+    pub uinput_last_create_error: Option<String>,
+    pub uinput_reused_after_failure: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,9 +412,42 @@ impl TextInjector for FailInjector {
 }
 
 #[derive(Debug, Clone)]
+pub struct UinputAttemptMetadata {
+    pub generation: u64,
+    pub fresh_device: bool,
+    pub device_age_ms_at_attempt: u64,
+    pub use_count_before_attempt: u64,
+    pub created_this_job: bool,
+    pub create_elapsed_ms: Option<u64>,
+    pub last_create_error: Option<String>,
+    pub reused_after_failure: bool,
+}
+
+pub trait PasteChordSender: std::fmt::Debug + Send + Sync {
+    fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()>;
+    fn backend_config(&self) -> Option<String>;
+}
+
+#[derive(Clone)]
 pub enum PasteKeySender {
-    Uinput(Arc<UinputChordSender>),
+    Uinput {
+        sender: Arc<dyn PasteChordSender>,
+        metadata: Option<UinputAttemptMetadata>,
+    },
     Disabled,
+}
+
+impl std::fmt::Debug for PasteKeySender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uinput { sender, metadata } => f
+                .debug_struct("Uinput")
+                .field("sender", sender)
+                .field("metadata", metadata)
+                .finish(),
+            Self::Disabled => f.write_str("Disabled"),
+        }
+    }
 }
 
 pub struct UinputChordSender {
@@ -492,6 +533,16 @@ impl UinputChordSender {
     }
 }
 
+impl PasteChordSender for UinputChordSender {
+    fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
+        UinputChordSender::send_shortcut(self, shortcut)
+    }
+
+    fn backend_config(&self) -> Option<String> {
+        Some(format!("dwell_ms={}", self.dwell_ms()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClipboardInjector {
     sender: PasteKeySender,
@@ -528,6 +579,7 @@ struct BackendAttemptOutcome {
     warning_tags: Vec<String>,
     backend_config: Option<String>,
     error: Option<String>,
+    uinput_metadata: Option<UinputAttemptMetadata>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -620,6 +672,35 @@ impl ClipboardInjector {
             warning_tags: outcome.warning_tags,
             backend_config: outcome.backend_config,
             error: outcome.error,
+            uinput_sender_generation: outcome.uinput_metadata.as_ref().map(|meta| meta.generation),
+            uinput_fresh_device: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.fresh_device),
+            uinput_device_age_ms_at_attempt: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.device_age_ms_at_attempt),
+            uinput_use_count_before_attempt: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.use_count_before_attempt),
+            uinput_created_this_job: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.created_this_job),
+            uinput_create_elapsed_ms: outcome
+                .uinput_metadata
+                .as_ref()
+                .and_then(|meta| meta.create_elapsed_ms),
+            uinput_last_create_error: outcome
+                .uinput_metadata
+                .as_ref()
+                .and_then(|meta| meta.last_create_error.clone()),
+            uinput_reused_after_failure: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.reused_after_failure),
         }
     }
 
@@ -819,7 +900,7 @@ impl ClipboardInjector {
 
     fn sender_name(sender: &PasteKeySender) -> &'static str {
         match sender {
-            PasteKeySender::Uinput(_) => "uinput",
+            PasteKeySender::Uinput { .. } => "uinput",
             PasteKeySender::Disabled => "disabled",
         }
     }
@@ -881,7 +962,7 @@ impl ClipboardInjector {
         );
         let backend_attempt_started = Instant::now();
         match sender {
-            PasteKeySender::Uinput(sender) => {
+            PasteKeySender::Uinput { sender, metadata } => {
                 debug!(
                     trace_id,
                     stage = STAGE_BACKEND,
@@ -892,7 +973,15 @@ impl ClipboardInjector {
                     backend_attempt_total = attempt.backend_attempt_total,
                     shortcut = ?shortcut,
                     backend = "uinput",
-                    dwell_ms = sender.dwell_ms(),
+                    backend_config = sender.backend_config().as_deref().unwrap_or("unknown"),
+                    uinput_sender_generation = metadata.as_ref().map(|value| value.generation),
+                    uinput_fresh_device = metadata.as_ref().map(|value| value.fresh_device),
+                    uinput_device_age_ms_at_attempt = metadata
+                        .as_ref()
+                        .map(|value| value.device_age_ms_at_attempt),
+                    uinput_use_count_before_attempt = metadata
+                        .as_ref()
+                        .map(|value| value.use_count_before_attempt),
                     "sending paste chord"
                 );
                 if let Err(err) = sender.send_shortcut(shortcut).with_context(|| {
@@ -912,8 +1001,9 @@ impl ClipboardInjector {
                             exit_status: None,
                             stderr_excerpt: None,
                             warning_tags: Vec::new(),
-                            backend_config: Some(format!("dwell_ms={}", sender.dwell_ms())),
+                            backend_config: sender.backend_config(),
                             error: Some(message.clone()),
+                            uinput_metadata: metadata.clone(),
                         },
                     ));
                     Self::stage_failure(
@@ -947,8 +1037,9 @@ impl ClipboardInjector {
                         exit_status: None,
                         stderr_excerpt: None,
                         warning_tags: Vec::new(),
-                        backend_config: Some(format!("dwell_ms={}", sender.dwell_ms())),
+                        backend_config: sender.backend_config(),
                         error: None,
+                        uinput_metadata: metadata.clone(),
                     },
                 ));
                 Result::<()>::Ok(())
@@ -967,6 +1058,7 @@ impl ClipboardInjector {
                         warning_tags: Vec::new(),
                         backend_config: None,
                         error: Some(message.clone()),
+                        uinput_metadata: None,
                     },
                 ));
                 Self::stage_failure(
@@ -1726,7 +1818,10 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
+    use super::{
+        BackendAttemptOutcome, ClipboardInjector, PasteKeySender, ShortcutAttemptContext,
+        UinputAttemptMetadata, UinputChordSender,
+    };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
@@ -1825,5 +1920,48 @@ mod tests {
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(8), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(9), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(128), 70);
+    }
+
+    #[test]
+    fn backend_attempt_report_includes_uinput_lifecycle_metadata() {
+        let report = ClipboardInjector::backend_attempt_report(
+            ShortcutAttemptContext {
+                route_attempt_name: "primary",
+                route_attempt_index: 1,
+                route_attempt_total: 1,
+                backend_attempt_index: 1,
+                backend_attempt_total: 1,
+            },
+            "uinput",
+            "CtrlShiftV",
+            BackendAttemptOutcome {
+                status: "ok",
+                duration_ms: 12,
+                exit_status: None,
+                stderr_excerpt: None,
+                warning_tags: Vec::new(),
+                backend_config: Some("dwell_ms=18".to_string()),
+                error: None,
+                uinput_metadata: Some(UinputAttemptMetadata {
+                    generation: 4,
+                    fresh_device: true,
+                    device_age_ms_at_attempt: 203,
+                    use_count_before_attempt: 0,
+                    created_this_job: true,
+                    create_elapsed_ms: Some(7),
+                    last_create_error: None,
+                    reused_after_failure: true,
+                }),
+            },
+        );
+
+        assert_eq!(report.uinput_sender_generation, Some(4));
+        assert_eq!(report.uinput_fresh_device, Some(true));
+        assert_eq!(report.uinput_device_age_ms_at_attempt, Some(203));
+        assert_eq!(report.uinput_use_count_before_attempt, Some(0));
+        assert_eq!(report.uinput_created_this_job, Some(true));
+        assert_eq!(report.uinput_create_elapsed_ms, Some(7));
+        assert_eq!(report.uinput_last_create_error, None);
+        assert_eq!(report.uinput_reused_after_failure, Some(true));
     }
 }
