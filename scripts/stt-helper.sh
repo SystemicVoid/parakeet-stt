@@ -182,6 +182,27 @@ stt() {
         return 1
     }
 
+    _normalize_paste_key_backend() {
+        local value="$1"
+        local source="$2"
+        case "$value" in
+            ""|uinput)
+                printf "%s" "${value:-uinput}"
+                ;;
+            auto|ydotool|wtype)
+                echo "stt helper: $source='$value' was removed; falling back to 'uinput'." >&2
+                printf "uinput"
+                ;;
+            *)
+                printf "%s" "$value"
+                ;;
+        esac
+    }
+
+    if [ -n "${PARAKEET_PASTE_KEY_BACKEND+x}" ]; then
+        default_paste_key_backend="$(_normalize_paste_key_backend "$default_paste_key_backend" "PARAKEET_PASTE_KEY_BACKEND")"
+    fi
+
     _set_start_option_value() {
         local target="$1"
         local value="$2"
@@ -189,6 +210,9 @@ stt() {
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ <<<"$row"
             if [ "$opt_name" = "$target" ]; then
+                if [ "$opt_name" = "paste-key-backend" ]; then
+                    value="$(_normalize_paste_key_backend "$value" "--paste-key-backend")"
+                fi
                 printf -v "$var_name" "%s" "$value"
                 return 0
             fi
