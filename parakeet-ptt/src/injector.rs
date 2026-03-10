@@ -25,20 +25,22 @@ const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
 const STAGE_CLIPBOARD_READY: &str = "clipboard_ready";
 const STAGE_ROUTE_SHORTCUT: &str = "route_shortcut";
 const STAGE_BACKEND: &str = "backend";
-// The parent worker waits slightly longer than individual helper commands so it
-// can reap the subprocess tree and drain stderr without timing out first.
+// The command timeout still drives runtime helper subprocesses such as wl-copy.
 #[cfg(not(test))]
 pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 1_000;
 #[cfg(test)]
 pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 150;
-#[cfg(not(test))]
-pub(crate) const INJECTOR_JOB_TIMEOUT_SLACK_MS: u64 = 500;
+// The worker-level timeout constants are only used by the test-only subprocess
+// harness in main.rs.
 #[cfg(test)]
 pub(crate) const INJECTOR_JOB_TIMEOUT_SLACK_MS: u64 = 0;
+#[cfg(test)]
 pub(crate) const INJECTOR_JOB_TIMEOUT_MS: u64 =
     INJECTOR_CHILD_COMMAND_TIMEOUT_MS + INJECTOR_JOB_TIMEOUT_SLACK_MS;
 pub(crate) const INJECTOR_SUBPROCESS_POLL_INTERVAL_MS: u64 = 5;
+#[cfg(test)]
 pub(crate) const INJECTOR_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
+#[cfg(test)]
 pub(crate) const INJECTOR_PIPE_READER_JOIN_SLACK_MS: u64 = 10;
 pub(crate) const INJECTOR_CONTEXT_ENV: &str = "PARAKEET_INJECT_CONTEXT_JSON";
 pub(crate) const INJECTOR_REPORT_PREFIX: &str = "PARAKEET_INJECT_REPORT ";
@@ -236,7 +238,6 @@ pub fn injector_metrics_snapshot() -> InjectorMetricsSnapshot {
 struct TimedCommandOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
 }
 
 fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -372,11 +373,7 @@ fn command_output_with_timeout(
         );
     }
 
-    Ok(TimedCommandOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(TimedCommandOutput { status, stdout })
 }
 
 pub trait TextInjector: Send + Sync {
@@ -522,6 +519,17 @@ struct ShortcutAttemptContext {
     backend_attempt_total: usize,
 }
 
+#[derive(Debug)]
+struct BackendAttemptOutcome {
+    status: &'static str,
+    duration_ms: u64,
+    exit_status: Option<String>,
+    stderr_excerpt: Option<String>,
+    warning_tags: Vec<String>,
+    backend_config: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InjectionOutcome {
     SuccessAssumed,
@@ -595,13 +603,7 @@ impl ClipboardInjector {
         attempt: ShortcutAttemptContext,
         backend_name: &str,
         shortcut_name: &str,
-        status: &str,
-        duration_ms: u64,
-        exit_status: Option<String>,
-        stderr_excerpt: Option<String>,
-        warning_tags: Vec<String>,
-        backend_config: Option<String>,
-        error: Option<String>,
+        outcome: BackendAttemptOutcome,
     ) -> BackendAttemptReport {
         BackendAttemptReport {
             route_attempt_name: attempt.route_attempt_name.to_string(),
@@ -611,13 +613,13 @@ impl ClipboardInjector {
             backend_attempt_index: attempt.backend_attempt_index,
             backend_attempt_total: attempt.backend_attempt_total,
             shortcut: shortcut_name.to_string(),
-            status: status.to_string(),
-            duration_ms,
-            exit_status,
-            stderr_excerpt,
-            warning_tags,
-            backend_config,
-            error,
+            status: outcome.status.to_string(),
+            duration_ms: outcome.duration_ms,
+            exit_status: outcome.exit_status,
+            stderr_excerpt: outcome.stderr_excerpt,
+            warning_tags: outcome.warning_tags,
+            backend_config: outcome.backend_config,
+            error: outcome.error,
         }
     }
 
@@ -904,13 +906,15 @@ impl ClipboardInjector {
                         attempt,
                         backend_name,
                         &shortcut_name,
-                        "error",
-                        backend_attempt_started.elapsed().as_millis() as u64,
-                        None,
-                        None,
-                        Vec::new(),
-                        Some(format!("dwell_ms={}", sender.dwell_ms())),
-                        Some(message.clone()),
+                        BackendAttemptOutcome {
+                            status: "error",
+                            duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                            exit_status: None,
+                            stderr_excerpt: None,
+                            warning_tags: Vec::new(),
+                            backend_config: Some(format!("dwell_ms={}", sender.dwell_ms())),
+                            error: Some(message.clone()),
+                        },
                     ));
                     Self::stage_failure(
                         trace_id,
@@ -937,13 +941,15 @@ impl ClipboardInjector {
                     attempt,
                     backend_name,
                     &shortcut_name,
-                    "ok",
-                    backend_attempt_started.elapsed().as_millis() as u64,
-                    None,
-                    None,
-                    Vec::new(),
-                    Some(format!("dwell_ms={}", sender.dwell_ms())),
-                    None,
+                    BackendAttemptOutcome {
+                        status: "ok",
+                        duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                        exit_status: None,
+                        stderr_excerpt: None,
+                        warning_tags: Vec::new(),
+                        backend_config: Some(format!("dwell_ms={}", sender.dwell_ms())),
+                        error: None,
+                    },
                 ));
                 Result::<()>::Ok(())
             }
@@ -953,13 +959,15 @@ impl ClipboardInjector {
                     attempt,
                     backend_name,
                     &shortcut_name,
-                    "error",
-                    backend_attempt_started.elapsed().as_millis() as u64,
-                    None,
-                    None,
-                    Vec::new(),
-                    None,
-                    Some(message.clone()),
+                    BackendAttemptOutcome {
+                        status: "error",
+                        duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                        exit_status: None,
+                        stderr_excerpt: None,
+                        warning_tags: Vec::new(),
+                        backend_config: None,
+                        error: Some(message.clone()),
+                    },
                 ));
                 Self::stage_failure(
                     trace_id,
@@ -1243,7 +1251,6 @@ impl TextInjector for ClipboardInjector {
             .as_ref()
             .and_then(|context| context.parent_focus.clone());
         let mut backend_attempts = Vec::new();
-        let child_focus_before;
         let mut child_focus_after = None;
         let mut child_focus_source_selected = "not_resolved".to_string();
         let mut child_focus_wayland_cache_age_ms = None;
@@ -1465,7 +1472,7 @@ impl TextInjector for ClipboardInjector {
         }
 
         let child_focus = self.resolve_focus_metadata(trace_id);
-        child_focus_before = child_focus.snapshot.clone();
+        let child_focus_before = child_focus.snapshot.clone();
         child_focus_source_selected = child_focus.source_selected.to_string();
         child_focus_wayland_cache_age_ms = child_focus.wayland_cache_age_ms;
         child_focus_wayland_fallback_reason =
