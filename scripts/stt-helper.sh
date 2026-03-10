@@ -234,7 +234,6 @@ stt() {
         if [ "$include_endpoint" = "yes" ]; then
             out_ref+=(--endpoint "$DEFAULT_ENDPOINT")
         fi
-        out_ref+=(--paste-key-backend uinput)
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
