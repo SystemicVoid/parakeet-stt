@@ -22,16 +22,12 @@ pub struct FocusSnapshot {
     pub output_name: Option<String>,
     pub focused: bool,
     pub active: bool,
-    #[serde(
-        skip_serializing,
-        skip_deserializing,
-        default = "default_focus_snapshot_resolver"
-    )]
-    pub resolver: &'static str,
+    #[serde(default = "default_focus_snapshot_resolver")]
+    pub resolver: String,
 }
 
-fn default_focus_snapshot_resolver() -> &'static str {
-    "serde"
+fn default_focus_snapshot_resolver() -> String {
+    "serde".to_string()
 }
 
 impl FocusSnapshot {
@@ -321,7 +317,7 @@ impl CachedToplevel {
             output_name: self.output_names.first().cloned(),
             focused,
             active: true,
-            resolver: "wayland",
+            resolver: "wayland".to_string(),
         }
     }
 }
@@ -692,6 +688,23 @@ mod tests {
 
         let snapshot = entry.to_focus_snapshot(true);
         assert_eq!(snapshot.output_name.as_deref(), Some("DP-1"));
+    }
+
+    #[test]
+    fn focus_snapshot_round_trips_resolver_through_serde() {
+        let snapshot = CachedToplevel {
+            identifier: Some("ghi".to_string()),
+            app_id: Some("Terminal".to_string()),
+            title: Some("shell".to_string()),
+            output_names: vec!["DP-1".to_string()],
+        }
+        .to_focus_snapshot(true);
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        let decoded: super::FocusSnapshot =
+            serde_json::from_str(&encoded).expect("snapshot should deserialize");
+
+        assert_eq!(decoded.resolver, "wayland");
     }
 
     #[test]

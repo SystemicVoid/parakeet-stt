@@ -175,7 +175,7 @@ mod tests {
             output_name: None,
             focused,
             active: true,
-            resolver: "test",
+            resolver: "test".to_string(),
         }
     }
 
