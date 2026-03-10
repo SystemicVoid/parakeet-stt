@@ -870,3 +870,134 @@ So the next debugging question is no longer just:
 It is now first:
 
 - "is `ydotool` a valid transcript-correct backend at all in the current Ghostty/COSMIC environment, especially when `ydotoold` is unavailable?"
+
+## Status Update (2026-03-10, full evidence gathering pass and root cause identification)
+
+### Evidence gathering session
+
+A full structured evidence-gathering session was completed following the `PASTE-GAP-EVIDENCE-GATHERING-USER-MANUAL.md` playbook.
+
+Both inject-only (no ASR, no hotkey, just clipboard + synthetic paste) and full PTT flow runs were executed against Ghostty with all three backends.
+
+Run directories (2026-03-10):
+
+- inject-only uinput: `/tmp/parakeet-paste-gap/20260310T073955Z-uinput-ghostty-inject-only`
+- inject-only ydotool: `/tmp/parakeet-paste-gap/20260310T074428Z-ydotool-ghostty-inject-only`
+- inject-only auto: `/tmp/parakeet-paste-gap/20260310T074650Z-auto-ghostty-inject-only`
+- PTT uinput: `/tmp/parakeet-paste-gap/20260310T074952Z-uinput-ghostty`
+- PTT ydotool: `/tmp/parakeet-paste-gap/20260310T075259Z-ydotool-ghostty`
+- PTT auto: `/tmp/parakeet-paste-gap/20260310T075527Z-auto-ghostty`
+
+### Results matrix
+
+| Run | Backend | Mode | Attempts | Visible Pastes | Rate | Key Finding |
+|-----|---------|------|----------|---------------|------|-------------|
+| 1 | uinput | inject-only | 20 | 19/20 | 95% | First/last chars truncated, no newlines |
+| 2 | ydotool | inject-only | 20 | 20/20 | 100% | All paste = `244442` (wrong content) |
+| 3 | auto | inject-only | 20 | 19/20 | 95% | Same as uinput (auto=uinput here) |
+| 4 | uinput | PTT flow | 10 | 2/10 | 20% | child_focus MISSING on 7/10 |
+| 5 | ydotool | PTT flow | 10 | 10/10 | 100% | All paste = `244442` (wrong content) |
+| 6 | auto | PTT flow | 10 | 7/10 | 70% | Some Cyrillic output; 11 injections for 10 attempts |
+
+### Smoking gun finding
+
+Inject-only uinput achieves a 95% success rate. PTT-flow uinput achieves only 20%.
+
+Same backend, same Ghostty target, same shortcut (`CtrlShiftV`). The only difference is the PTT lifecycle path.
+
+This definitively separates the uinput backend's intrinsic reliability from the PTT flow's injection delivery mechanism.
+
+### Root cause analysis
+
+Three root causes were identified, ranked by probability.
+
+#### RC1: Fresh uinput virtual keyboard per injection (45% probability)
+
+The PTT flow spawns a new subprocess (`--internal-inject-once`) for every injection. Each subprocess creates a brand new `UinputChordSender`, which creates a brand new `/dev/uinput` virtual keyboard device, emits the chord almost immediately, then exits — destroying the device.
+
+In inject-only mode, one `ClipboardInjector` and one `UinputChordSender` are built once (at `main.rs:1867`) and reused for all 20 attempts. The virtual keyboard stays warm.
+
+Why this explains the evidence:
+
+- Compositors and applications commonly drop or partially interpret the first events from a newly-enumerated virtual input device
+- This fits the 20% PTT success rate vs 95% inject-only success rate
+- This fits truncated first/last characters (partial chord interpretation during device warm-up)
+- This explains why the 250ms settle delay after hotkey release did not fix it — the delay was before the subprocess spawn, not after the virtual device creation
+- This explains Cyrillic output (chord partially interpreted = wrong keymap state assumed by compositor)
+
+Code path difference:
+
+- inject-only: `build_injector_with_shortcut_override()` once → `injector.inject()` × N (main.rs:1867-1881)
+- PTT flow: `InjectorSubprocessRunner.run()` → spawn new process → `run_internal_inject_once()` → `build_injector_with_shortcut_override()` → `inject()` once → exit (main.rs:845-875, 1927-1944)
+
+#### RC2: Hotkey listener self-observing the Parakeet virtual keyboard (25% probability)
+
+`is_hotkey_capable_device()` in `hotkey.rs:907-913` attaches to any `/dev/input/event*` device that supports the talk key OR any LLM pre-modifier key. The Parakeet virtual keyboard declares `KEY_LEFTCTRL` and `KEY_LEFTSHIFT` in its capability set (injector.rs:429-432). The default LLM pre-modifier is `KEY_SHIFT`.
+
+Result: every PTT injection creates a transient virtual keyboard → hotkey supervisor (rescanning every 750ms) attaches to it → subprocess exits → device disappears → `No such device (os error 19)` warning. This is self-inflicted device churn.
+
+The `/dev/input/event18` churn warnings seen throughout the investigation are almost certainly the hotkey supervisor attaching to and losing its own transient virtual keyboards.
+
+#### RC3: Hotkey release / input-state race at compositor boundary (15% probability)
+
+The operator's PTT key is right Ctrl (a modifier key). Raw path enqueues injection about 300ms after hotkey-up; LLM path 700-1900ms later. Physical modifier key release may leave compositor aggregate key state unsettled when the synthetic chord lands.
+
+Evidence for: historically, later injections (LLM path) were somewhat healthier. Evidence against: the 250ms settle delay did not fix it alone.
+
+This is likely a contributing factor rather than the primary cause.
+
+### Disproven hypotheses (cumulative)
+
+| Hypothesis | Status | Evidence |
+|------------|--------|---------|
+| Focus/routing is primary cause | Disproven | Parent-guided focus override tried and removed; correct routing proven on every attempt |
+| ydotool is a valid fallback backend | Disproven | Without ydotoold, it types keycode numbers as literal text (`244442` = keycodes 29,42,47) |
+| Fixed settle delay after hotkey release | Disproven | 250ms delay did not change outcomes |
+| auto mode tries ydotool fallback | Disproven | auto only falls back on hard errors; uinput never hard-errors |
+| Empty Ghostty sink = paste did not happen | Disproven for inject-only | `cat \| tee` is line-buffered; no-newline pastes are visible but not flushed to pipe |
+| success_assumed = paste worked | Disproven | Means "no error thrown", not "target received it" |
+
+### Confirmed environmental facts
+
+- Talk key: right Ctrl (modifier key)
+- LLM pre-modifier: Shift
+- Compositor: COSMIC (Wayland)
+- ydotoold: not running; ydotool falls back to direct evdev which types keycode numbers as text
+- Parakeet virtual keyboard name: `"Parakeet STT Virtual Keyboard"`
+- Virtual keyboard capabilities: `KEY_LEFTCTRL`, `KEY_LEFTSHIFT`, `KEY_V`
+
+### Fix plan
+
+#### Phase 1: Make uinput persistent (addresses RC1 — highest confidence)
+
+Change the PTT injection path from subprocess-per-injection to in-process injection with a persistent `UinputChordSender`:
+
+1. Create `UinputChordSender` once at startup in the injector worker
+2. Reuse it for every `InjectionJob` (matching the pattern that inject-only already uses)
+3. This eliminates virtual keyboard churn, cold-device event drops, and the self-observation feedback loop
+
+This is the single change most directly aligned with the evidence gap between inject-only (95%) and PTT flow (20%).
+
+#### Phase 2: Exclude Parakeet virtual keyboard from hotkey scanner (addresses RC2)
+
+Add a name check to `is_hotkey_capable_device()` in `hotkey.rs`:
+
+- Skip devices whose name starts with `"Parakeet"` (or matches the exact virtual keyboard name)
+- This eliminates self-inflicted device churn and the `/dev/input/event18` warnings
+
+#### Phase 3: Fully disable ydotool backend (addresses proven-broken backend)
+
+ydotool without ydotoold is not a paste backend — it is a keycode-to-text printer. Disable it entirely and simplify the backend selection to uinput-only.
+
+This reduces complexity and removes a broken fallback path that has never been proven to work correctly in the current environment.
+
+### Acceptance criteria
+
+The fix is validated when:
+
+- PTT-flow uinput paste rate into Ghostty matches or exceeds the inject-only rate (~95%)
+- `/dev/input/event18` churn warnings no longer appear
+- No ydotool code paths remain
+- `cargo test` passes
+- `cargo fmt` passes
+- Manual Ghostty PTT repro confirms reliable paste
