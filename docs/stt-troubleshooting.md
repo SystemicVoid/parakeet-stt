@@ -26,10 +26,23 @@ Canonical-source policy:
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
+- The in-process paste path now keeps one `uinput` virtual keyboard alive while healthy instead of creating a fresh device for every job.
+- If `/dev/uinput` is unavailable, the client no longer poisons the whole session:
+  - failed create attempts fall back per policy (`copy-only` or `error`)
+  - the worker retries sender creation on later jobs after a short internal backoff
+- Freshly created or recovered `uinput` devices now pay a one-time warm-up delay before the first real paste chord so COSMIC/libinput can discover and route the device before the shortcut is emitted.
 - Final-result injection is now enqueued to a dedicated bounded worker queue (`capacity=32`) so hotkey/websocket handling paths do not await blocking clipboard/chord execution inline.
 - Worker enqueue backpressure is timeout-limited (`20ms`) with explicit dropped-job warnings when the queue stays saturated.
 - Injector logs now tag stage outcomes and durations with `stage=<clipboard_ready|route_shortcut|backend>` and `status=<start|ok|fail>`.
 - Backend stage failure accounting reflects initialization and command failures from the uinput-only injector path.
+- Backend-attempt summaries for `uinput` now include sender lifecycle fields so paste-gap runs can distinguish fresh vs reused devices:
+  - `ugen=<n>` sender generation
+  - `ufresh=1|0` whether this was the first routed use after create/recovery
+  - `uage_ms=<ms>` device age when the chord was attempted
+  - `uuse=<n>` prior successful uses on the current sender
+  - `ucreated_this_job=1|0` whether the sender was created for the current job
+  - `ucreate_ms=<ms>` sender creation latency for fresh jobs
+  - `urecovered=1|0` whether the current sender generation came from recovery after a prior create failure
 - Queue and stage metric summaries are emitted periodically from the client loop (`injector worker queue metrics summary`, `injector stage metrics summary`).
 - Event-loop lag summaries are emitted every 30 seconds (`event loop lag window summary`) with p50/p95/p99 fields, measured against the interval schedule so windows recover after transient stalls.
 - Hotkey listeners now seed already-held `llm_pre_modifier` state from the kernel when they attach or re-attach, so the first utterance after startup/resume/device recovery still routes to LLM mode if Shift was already held.
