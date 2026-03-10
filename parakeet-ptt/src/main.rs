@@ -792,15 +792,30 @@ trait InjectionJobRunner: Send + Sync {
         -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
+type InProcessInjectorBuilder = dyn Fn(&ClientConfig) -> Arc<dyn TextInjector> + Send + Sync;
+
 #[derive(Clone)]
 struct InProcessInjectorRunner {
-    injector: Arc<dyn TextInjector>,
+    config: ClientConfig,
+    injector_builder: Arc<InProcessInjectorBuilder>,
 }
 
 impl InProcessInjectorRunner {
     fn new(config: &ClientConfig) -> Self {
         Self {
-            injector: build_injector(config),
+            config: config.clone(),
+            injector_builder: Arc::new(build_injector),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_builder(
+        config: &ClientConfig,
+        injector_builder: Arc<InProcessInjectorBuilder>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            injector_builder,
         }
     }
 }
@@ -817,7 +832,9 @@ impl InjectionJobRunner for InProcessInjectorRunner {
             stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
             parent_focus: job.parent_focus.clone(),
         };
-        self.injector
+        // Rebuild the backend for each job so late-available /dev/uinput can recover
+        // without forcing a full client restart.
+        (self.injector_builder)(&self.config)
             .inject_with_context(&job.text, Some(context))
             .map_err(|err| InjectionRunError::BackendFailure(format!("{err:#}")))?;
         Ok(InjectionRunOutput::default())
@@ -3099,7 +3116,11 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crate::config::OverlayMode;
+    use crate::config::{
+        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
+        PasteBackendFailurePolicy, PasteKeyBackend,
+    };
+    use crate::injector::TextInjector;
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -3110,9 +3131,9 @@ mod tests {
         collect_pipe_reader, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
         sanitize_model_answer, spawn_injector_worker_with_capacity, spawn_pipe_reader,
         EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob,
-        InjectionJobRunner, InjectionRunError, InjectionRunOutput, InjectorSubprocessRunner,
-        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
-        SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
+        InjectionJobRunner, InjectionRunError, InjectionRunOutput, InjectorContext,
+        InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
+        RuntimeOverlaySink, SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
     };
 
     async fn handle_server_message_for_tests<S: OverlaySink>(
@@ -3192,6 +3213,54 @@ mod tests {
                 .push(job.text.to_string());
             Ok(InjectionRunOutput::default())
         }
+    }
+
+    #[derive(Clone)]
+    struct RecordingTextInjector {
+        seen: Arc<Mutex<Vec<(String, Uuid)>>>,
+    }
+
+    impl TextInjector for RecordingTextInjector {
+        fn inject(&self, _text: &str) -> anyhow::Result<()> {
+            panic!("recording injector expects inject_with_context");
+        }
+
+        fn inject_with_context(
+            &self,
+            text: &str,
+            context: Option<InjectorContext>,
+        ) -> anyhow::Result<()> {
+            let session_id = context
+                .as_ref()
+                .map(|value| value.session_id)
+                .expect("in-process runner should pass injector context");
+            self.seen
+                .lock()
+                .expect("recording injector lock should be available")
+                .push((text.to_string(), session_id));
+            Ok(())
+        }
+    }
+
+    fn test_client_config() -> ClientConfig {
+        ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: ClipboardOptions {
+                    key_backend: PasteKeyBackend::Uinput,
+                    backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
+                    post_chord_hold_ms: 700,
+                    seat: None,
+                    write_primary: false,
+                },
+            },
+            Duration::from_secs(1),
+        )
+        .expect("test client config should be valid")
     }
 
     fn make_test_script(content: &str) -> PathBuf {
@@ -3300,6 +3369,46 @@ mod tests {
         assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
         assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
         assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn in_process_runner_rebuilds_injector_for_each_job() {
+        let build_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_with_builder(
+            &config,
+            Arc::new({
+                let build_count = Arc::clone(&build_count);
+                let seen = Arc::clone(&seen);
+                move |_config| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+        );
+
+        let session_one = Uuid::new_v4();
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_one, "first".to_string(), 0, 0))
+            .expect("first run should succeed");
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should succeed");
+
+        assert_eq!(build_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[
+                ("first".to_string(), session_one),
+                ("second".to_string(), session_two)
+            ]
+        );
     }
 
     #[test]
