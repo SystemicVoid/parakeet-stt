@@ -12,8 +12,8 @@ GHOSTTY_SINK="/tmp/parakeet-ghostty-sink.txt"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/paste-gap-matrix.sh start --backend <auto|uinput|ydotool> [--label LABEL] [--attempts N]
-  scripts/paste-gap-matrix.sh inject-only --backend <auto|uinput|ydotool> [--shortcut <auto|ctrl-v|ctrl-shift-v>] [--label LABEL] [--attempts N] [--prefix TEXT] [--interval-ms N]
+  scripts/paste-gap-matrix.sh start --backend <uinput> [--label LABEL] [--attempts N]
+  scripts/paste-gap-matrix.sh inject-only --backend <uinput> [--shortcut <auto|ctrl-v|ctrl-shift-v>] [--label LABEL] [--attempts N] [--prefix TEXT] [--interval-ms N]
   scripts/paste-gap-matrix.sh stop [--run-dir DIR]
   scripts/paste-gap-matrix.sh diag [--run-dir DIR]
   scripts/paste-gap-matrix.sh summarize [--run-dir DIR]
@@ -29,7 +29,7 @@ Commands:
 
 Notes:
   - Artifacts are stored under /tmp/parakeet-paste-gap by default.
-  - start seeds operator-observation TSV templates; fill them in during the manual Ghostty run.
+  - start seeds both operator-observations.tsv and a simpler operator-observations.txt template.
   - stop/summarize extract fields from 'injector subprocess report' lines in the archived ptt log.
 EOF
 }
@@ -58,9 +58,9 @@ normalize_named_value() {
 
 validate_backend() {
     case "${1}" in
-        auto | uinput | ydotool) ;;
+        uinput) ;;
         *)
-            die "backend must be one of: auto|uinput|ydotool"
+            die "backend must be: uinput"
             ;;
     esac
 }
@@ -121,13 +121,26 @@ seed_operator_observations() {
     } >"${path}"
 }
 
+seed_operator_compact_observations() {
+    local path="$1"
+    local attempts="$2"
+    cat >"${path}" <<EOF
+# Optional compact operator input.
+# Fill this file instead of editing operator-observations.tsv if you want a simpler loop.
+# Use comma-separated attempt numbers or ranges. Example: 1,2,5-7
+visible_paste:
+sink_captured:
+notes:
+# 1: first thing that looked wrong
+# 2: pasted duplicate text
+EOF
+}
+
 seed_diag_observations() {
     local path="$1"
     {
         printf 'backend,visible_paste,notes\n'
-        printf 'auto,,\n'
         printf 'uinput,,\n'
-        printf 'ydotool,,\n'
     } >"${path}"
 }
 
@@ -216,6 +229,7 @@ start_run() {
 
     write_run_metadata "${run_dir}" "${backend}" "${label}" "${attempts}" "${started_at}"
     seed_operator_observations "${run_dir}/operator-observations.tsv" "${attempts}"
+    seed_operator_compact_observations "${run_dir}/operator-observations.txt" "${attempts}"
     seed_diag_observations "${run_dir}/diag-observations.tsv"
 
     run_stt stop >/dev/null 2>&1 || true
@@ -235,8 +249,10 @@ git_dirty=$(sed -n 's/^git_dirty=//p' "${run_dir}/run-meta.env")
 Next:
 1. Focus the Ghostty sink target.
 2. Perform ${attempts} raw PTT utterances.
-3. Mark visible results in:
+3. Record results in either:
    ${run_dir}/operator-observations.tsv
+   or
+   ${run_dir}/operator-observations.txt
 4. Finish with:
    scripts/paste-gap-matrix.sh stop
 5. Run the control:
@@ -309,6 +325,7 @@ inject_only_run() {
         printf 'interval_ms=%s\n' "${interval_ms}"
     } >>"${run_dir}/run-meta.env"
     seed_operator_observations "${run_dir}/operator-observations.tsv" "${attempts}" "${text_prefix}"
+    seed_operator_compact_observations "${run_dir}/operator-observations.txt" "${attempts}"
     seed_diag_observations "${run_dir}/diag-observations.tsv"
 
     run_stt stop >/dev/null 2>&1 || true
@@ -337,8 +354,10 @@ text_prefix=${text_prefix}
 interval_ms=${interval_ms}
 
 Next:
-1. Mark visible/sink observations in:
+1. Mark visible/sink observations in either:
    ${run_dir}/operator-observations.tsv
+   or
+   ${run_dir}/operator-observations.txt
 2. Rebuild joined summaries after edits:
    scripts/paste-gap-matrix.sh summarize --run-dir "${run_dir}"
 EOF
@@ -429,6 +448,7 @@ diag_log = artifacts / "diag-injector.log"
 sink_file = artifacts / "parakeet-ghostty-sink.txt"
 meta_path = run_dir / "run-meta.env"
 operator_path = run_dir / "operator-observations.tsv"
+operator_compact_path = run_dir / "operator-observations.txt"
 diag_path = run_dir / "diag-observations.tsv"
 
 meta = {}
@@ -645,16 +665,139 @@ def count_values(key: str) -> Counter[str]:
     return counter
 
 
-def read_tabular(path: Path) -> list[dict[str, str]]:
+def clean_cell(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def read_tabular(
+    path: Path,
+    *,
+    require_attempt_index: bool = False,
+) -> tuple[list[dict[str, str]], int]:
     if not path.exists():
-        return []
+        return [], 0
+    cleaned_rows: list[dict[str, str]] = []
+    malformed_rows = 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        return list(reader)
+        for raw_row in reader:
+            extras = raw_row.pop(None, None)
+            row = {str(key): clean_cell(value) for key, value in raw_row.items() if key is not None}
+            if extras:
+                malformed_rows += 1
+            if require_attempt_index:
+                attempt_index = row.get("attempt_index", "")
+                if not attempt_index:
+                    if any(value for value in row.values()) or extras:
+                        malformed_rows += 1
+                    continue
+                if not attempt_index.isdigit():
+                    malformed_rows += 1
+                    continue
+            if not any(value for value in row.values()):
+                continue
+            cleaned_rows.append(row)
+    return cleaned_rows, malformed_rows
 
 
-operator_rows = read_tabular(operator_path)
-diag_rows = read_tabular(diag_path)
+def parse_attempt_set(raw_value: str) -> set[int]:
+    attempts: set[int] = set()
+    normalized = raw_value.replace(",", " ")
+    for token in normalized.split():
+        part = token.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            if start_s.isdigit() and end_s.isdigit():
+                start_i = int(start_s)
+                end_i = int(end_s)
+                lo, hi = sorted((start_i, end_i))
+                attempts.update(range(lo, hi + 1))
+            continue
+        if part.isdigit():
+            attempts.add(int(part))
+    return attempts
+
+
+def parse_compact_observations(path: Path) -> tuple[dict[int, dict[str, str]], int]:
+    if not path.exists():
+        return {}, 0
+    parsed: dict[int, dict[str, str]] = {}
+    malformed_lines = 0
+    section = ""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lowered = line.lower()
+        if lowered.startswith("visible_paste:"):
+            section = "visible_paste"
+            for attempt in parse_attempt_set(line.split(":", 1)[1]):
+                parsed.setdefault(attempt, {})["visible_paste"] = "yes"
+            continue
+        if lowered.startswith("sink_captured:"):
+            section = "sink_captured"
+            for attempt in parse_attempt_set(line.split(":", 1)[1]):
+                parsed.setdefault(attempt, {})["sink_captured"] = "yes"
+            continue
+        if lowered == "notes:":
+            section = "notes"
+            continue
+
+        if section in {"visible_paste", "sink_captured"}:
+            values = parse_attempt_set(line)
+            if values:
+                for attempt in values:
+                    parsed.setdefault(attempt, {})[section] = "yes"
+            else:
+                malformed_lines += 1
+            continue
+
+        if ":" in line:
+            attempt_s, note = line.split(":", 1)
+            attempt_s = attempt_s.strip()
+            if attempt_s.isdigit():
+                parsed.setdefault(int(attempt_s), {})["notes"] = note.strip()
+                continue
+
+        malformed_lines += 1
+    return parsed, malformed_lines
+
+
+def overlay_compact_observations(
+    base_rows: list[dict[str, str]],
+    compact_path: Path,
+) -> tuple[list[dict[str, str]], int]:
+    compact_rows, malformed_lines = parse_compact_observations(compact_path)
+    if not compact_rows:
+        return base_rows, malformed_lines
+    row_map = {int(row["attempt_index"]): dict(row) for row in base_rows if row.get("attempt_index", "").isdigit()}
+    for attempt_index, updates in compact_rows.items():
+        row = row_map.setdefault(
+            attempt_index,
+            {
+                "attempt_index": str(attempt_index),
+                "utterance": "",
+                "visible_paste": "",
+                "sink_captured": "",
+                "notes": "",
+            },
+        )
+        for key, value in updates.items():
+            row[key] = value
+    ordered_rows = [row_map[key] for key in sorted(row_map)]
+    return ordered_rows, malformed_lines
+
+
+operator_rows, operator_invalid_rows = read_tabular(operator_path, require_attempt_index=True)
+operator_rows, operator_compact_invalid_lines = overlay_compact_observations(
+    operator_rows,
+    operator_compact_path,
+)
+diag_rows, diag_invalid_rows = read_tabular(diag_path)
 
 joined_path = run_dir / "raw-observation-joined.tsv"
 joined_written = False
@@ -695,8 +838,11 @@ summary_lines = [
     f"injector_reports_test_injection={sum(1 for row in rows if row.get('origin') == 'test_injection')}",
     f"ghostty_sink_nonempty_lines={len(sink_lines)}",
     f"operator_observation_rows={len(operator_rows)}",
+    f"operator_observation_invalid_rows={operator_invalid_rows}",
+    f"operator_compact_invalid_lines={operator_compact_invalid_lines}",
     f"operator_visible_rows_filled={sum(1 for row in operator_rows if row.get('visible_paste', '').strip())}",
     f"diag_observation_rows={len(diag_rows)}",
+    f"diag_observation_invalid_rows={diag_invalid_rows}",
     f"diag_visible_rows_filled={sum(1 for row in diag_rows if row.get('visible_paste', '').strip())}",
     f"joined_raw_observations={'yes' if joined_written else 'no'}",
 ]

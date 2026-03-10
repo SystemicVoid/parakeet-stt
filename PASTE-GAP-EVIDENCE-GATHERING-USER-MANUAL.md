@@ -8,7 +8,7 @@ Use this manual exactly as written for consistency across runs.
 
 Build clean evidence that separates:
 
-1. synthetic key backend behavior (`uinput` vs `ydotool` vs `auto`), and
+1. synthetic `uinput` paste behavior in isolation, and
 2. full push-to-talk lifecycle behavior (raw final result path under normal `stt start`).
 
 ## Scope
@@ -27,13 +27,11 @@ This guide covers both evidence modes:
 
 ## Focus And Mouse Discipline
 
-This bug is focus-sensitive. Treat focus like lab contamination control.
+This bug is focus-sensitive. 
 
 1. If your desktop uses focus-follows-mouse, temporarily disable it before starting the session.
-2. If you cannot disable it, park the mouse pointer inside the Ghostty sink window and do not move it during attempts.
-3. Do not hover over other windows while attempts run.
-4. Do not click notifications, docks, or panel widgets mid-run.
-5. If you think focus drifted, stop and restart that run instead of trusting partial data.
+2. Do not hover over other windows while attempts run.
+3. If you think focus drifted, stop and restart that run instead of trusting partial data.
 
 ## Terminal Layout
 
@@ -67,7 +65,7 @@ just --list | rg paste-gap
 
 Expected: you see `paste-gap-start`, `paste-gap-stop`, `paste-gap-summary`, `paste-gap-current`, and `paste-gap-inject-only`.
 
-## Step 3: Inject-Only Backend Isolation (Do This First)
+## Step 3: Inject-Only Backend Isolation
 
 This mode removes ASR/hotkey/session confounders and tests backend paste semantics directly.
 
@@ -99,17 +97,29 @@ cat "$run_dir/summary.txt"
 
 ### 3C) Record Operator Observations
 
-Edit the template:
+Use either the TSV template or the simpler compact text file:
 
 ```bash
 nano "$run_dir/operator-observations.tsv"
+nano "$run_dir/operator-observations.txt"
 ```
 
-For each attempt row:
+If you use `operator-observations.tsv`, fill one row per attempt:
 
 1. set `visible_paste` to `yes` or `no`,
 2. set `sink_captured` to `yes` or `no`,
 3. add anything odd in `notes` (for example `244442`, duplicate paste, wrong text).
+
+If you use `operator-observations.txt`, fill the compact block instead:
+
+```text
+visible_paste: 1,2,8
+sink_captured: 4,6
+notes:
+1: first numbers only
+2: duplicate paste
+8: pasted wrong payload
+```
 
 Rebuild summary after edits:
 
@@ -118,16 +128,9 @@ just paste-gap-summary run_dir="$run_dir"
 cat "$run_dir/summary.txt"
 ```
 
-### 3D) Repeat For `ydotool` And `auto`
+### 3D) Optional Repeat Pass
 
-Run one backend at a time, same focus discipline:
-
-```bash
-( sleep 5; just paste-gap-inject-only backend=ydotool shortcut=ctrl-shift-v label=ghostty-inject-only attempts=20 prefix=PG interval_ms=150 )
-( sleep 5; just paste-gap-inject-only backend=auto shortcut=ctrl-shift-v label=ghostty-inject-only attempts=20 prefix=PG interval_ms=150 )
-```
-
-After each run, repeat Step 3B and 3C.
+If you need a second control sample, rerun the same `uinput` inject-only pass and record it as a new run directory.
 
 ## Step 4: Full Raw PTT Path Matrix
 
@@ -180,18 +183,21 @@ echo "$run_dir"
 
 ```bash
 nano "$run_dir/operator-observations.tsv"
+# or
+nano "$run_dir/operator-observations.txt"
 just paste-gap-summary run_dir="$run_dir"
 cat "$run_dir/summary.txt"
 ```
 
-### 4E) Repeat Backend Runs
+### 4E) Optional Repeat PTT Run
 
-Repeat Steps 4A-4D for:
+If you need another sample after a code change or workstation change, repeat Steps 4A-4D with:
 
 ```bash
-just paste-gap-start backend=ydotool label=ghostty attempts=10
-just paste-gap-start backend=auto label=ghostty attempts=10
+just paste-gap-start backend=uinput label=ghostty attempts=10
 ```
+
+Historical multi-backend evidence from before the backend retirement is recorded in `HANDOFF-raw-ptt-paste-gap-2026-03-08.md`.
 
 ## Step 5: Optional Direct Diagnostic Control
 
