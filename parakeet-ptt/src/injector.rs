@@ -1839,16 +1839,19 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{
         configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
-        PasteKeySender, ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender,
+        InjectorChildReport, ParentFocusCapture, PasteKeySender, ShortcutAttemptContext,
+        UinputAttemptMetadata, UinputChordSender,
     };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
+    use crate::surface_focus::FocusSnapshot;
     use evdev::Key;
     #[cfg(unix)]
     use std::io::Read;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
+    use uuid::Uuid;
 
     fn test_options() -> ClipboardOptions {
         ClipboardOptions {
@@ -1978,6 +1981,107 @@ mod tests {
         assert_eq!(
             pid, pgid,
             "child should become leader of its own process group"
+        );
+    }
+
+    fn test_focus_snapshot(resolver: &str) -> FocusSnapshot {
+        FocusSnapshot {
+            app_name: Some("Ghostty".to_string()),
+            object_name: Some("terminal".to_string()),
+            object_path: Some("/com/example/terminal".to_string()),
+            service_name: Some("wayland".to_string()),
+            output_name: Some("DP-1".to_string()),
+            focused: true,
+            active: true,
+            resolver: resolver.to_string(),
+        }
+    }
+
+    #[test]
+    fn parent_focus_capture_round_trips_resolver_through_serde() {
+        let parent_focus = ParentFocusCapture {
+            snapshot: Some(test_focus_snapshot("wayland")),
+            source_selected: "wayland".to_string(),
+            wayland_cache_age_ms: Some(42),
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: Some(7),
+        };
+
+        let encoded = serde_json::to_string(&parent_focus).expect("parent focus should serialize");
+        let decoded: ParentFocusCapture =
+            serde_json::from_str(&encoded).expect("parent focus should deserialize");
+
+        assert_eq!(
+            decoded
+                .snapshot
+                .as_ref()
+                .expect("snapshot should round-trip")
+                .resolver,
+            "wayland"
+        );
+    }
+
+    #[test]
+    fn injector_child_report_round_trips_resolver_through_serde() {
+        let report = InjectorChildReport {
+            session_id: Some(Uuid::nil()),
+            origin: Some("test".to_string()),
+            trace_id: 9,
+            outcome: "success".to_string(),
+            requested_len: 12,
+            requested_fingerprint: "abc123".to_string(),
+            clipboard_ready: true,
+            clipboard_probe_count: 2,
+            post_clipboard_matches: Some(true),
+            parent_focus: Some(ParentFocusCapture {
+                snapshot: Some(test_focus_snapshot("parent")),
+                source_selected: "wayland".to_string(),
+                wayland_cache_age_ms: Some(3),
+                wayland_fallback_reason: None,
+                captured_elapsed_ms: Some(4),
+            }),
+            child_focus_before: Some(test_focus_snapshot("before")),
+            child_focus_after: Some(test_focus_snapshot("after")),
+            child_focus_source_selected: "wayland".to_string(),
+            child_focus_wayland_cache_age_ms: Some(5),
+            child_focus_wayland_fallback_reason: None,
+            route_focus_source: "wayland".to_string(),
+            route_class: "Terminal".to_string(),
+            route_primary: "CtrlShiftV".to_string(),
+            route_adaptive_fallback: Some("CtrlV".to_string()),
+            route_reason: "focused terminal".to_string(),
+            backend_attempts: Vec::new(),
+            elapsed_ms_total: 25,
+        };
+
+        let encoded = serde_json::to_string(&report).expect("report should serialize");
+        let decoded: InjectorChildReport =
+            serde_json::from_str(&encoded).expect("report should deserialize");
+
+        assert_eq!(
+            decoded
+                .parent_focus
+                .as_ref()
+                .and_then(|focus| focus.snapshot.as_ref())
+                .expect("parent snapshot should round-trip")
+                .resolver,
+            "parent"
+        );
+        assert_eq!(
+            decoded
+                .child_focus_before
+                .as_ref()
+                .expect("child focus before should round-trip")
+                .resolver,
+            "before"
+        );
+        assert_eq!(
+            decoded
+                .child_focus_after
+                .as_ref()
+                .expect("child focus after should round-trip")
+                .resolver,
+            "after"
         );
     }
 
