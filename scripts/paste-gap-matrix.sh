@@ -65,6 +65,23 @@ validate_backend() {
     esac
 }
 
+canonicalize_backend() {
+    local backend="$1"
+    local source="$2"
+    case "${backend}" in
+        "" | uinput)
+            printf '%s\n' "${backend:-uinput}"
+            ;;
+        auto | ydotool | wtype)
+            echo "paste-gap-matrix: ${source}='${backend}' was removed; falling back to 'uinput'." >&2
+            printf 'uinput\n'
+            ;;
+        *)
+            printf '%s\n' "${backend}"
+            ;;
+    esac
+}
+
 validate_shortcut() {
     case "${1}" in
         auto | ctrl-v | ctrl-shift-v) ;;
@@ -218,6 +235,7 @@ start_run() {
     done
 
     [[ -n "${backend}" ]] || die "start requires --backend"
+    backend="$(canonicalize_backend "${backend}" "--backend")"
     validate_backend "${backend}"
     validate_attempts "${attempts}"
     ensure_run_root
