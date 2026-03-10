@@ -484,6 +484,10 @@ def scalar(value: object) -> str:
     return str(value)
 
 
+def dict_or_empty(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
 def summarize_backend_attempts_from_json(
     attempts: list[dict[str, object]],
 ) -> tuple[str, str, str, str]:
@@ -615,17 +619,11 @@ def parse_child_reports_from_text(text: str, default_origin: str) -> list[dict[s
             summarize_backend_attempts_from_json(attempts)
         )
         parent_focus = report.get("parent_focus")
-        parent_focus_snapshot = parent_focus.get("snapshot") if isinstance(parent_focus, dict) else {}
-        child_focus_before = (
-            report.get("child_focus_before")
-            if isinstance(report.get("child_focus_before"), dict)
-            else {}
+        parent_focus_snapshot = dict_or_empty(
+            dict_or_empty(parent_focus).get("snapshot")
         )
-        child_focus_after = (
-            report.get("child_focus_after")
-            if isinstance(report.get("child_focus_after"), dict)
-            else {}
-        )
+        child_focus_before = dict_or_empty(report.get("child_focus_before"))
+        child_focus_after = dict_or_empty(report.get("child_focus_after"))
         parsed_rows.append(
             {
                 "session": scalar(report.get("session_id")),
