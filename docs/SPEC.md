@@ -114,7 +114,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Crates**
   - `tokio`, `tokio-tungstenite`, `serde`/`serde_json`, `evdev`, `anyhow`, `uuid`.
-  - `evdev`/`uinput` stack plus `ydotool` subprocess fallback for paste chord emission.
+  - `evdev`/`uinput` stack for paste chord emission.
 
 - **Hotkey handling**
   - Identify Right Ctrl (`KEY_RIGHTCTRL`, code 97). Use non-blocking event loop to avoid missed releases.
@@ -124,7 +124,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 - **Injection pipeline**
   - Default runtime path is clipboard choreography (`wl-copy` + readiness probe) and paste chord emission.
   - Injection execution is serialized through a dedicated bounded worker queue (`capacity=32`) so websocket/hotkey async paths do not run blocking clipboard/chord calls inline.
-  - Paste backend ladder (helper default): `auto` => `uinput -> ydotool`.
+  - Paste backend contract is `uinput` only.
   - Adaptive routing chooses shortcut by focused-surface class (`terminal`, `general`, `unknown`).
   - Focus metadata source is Wayland toplevel cache observations (with low-confidence handling on transition/staleness paths).
   - Low-confidence focus snapshots (`focus_focused=false`) are treated as `unknown` for routing.
@@ -275,7 +275,7 @@ durations. `last_*` fields are retained for compatibility and will be deprecated
 
 3. **M2 – Text Injection**
    - Harden clipboard + adaptive routing path across target app classes.
-   - Keep `uinput -> ydotool` fallback behavior observable and deterministic.
+   - Keep the `uinput` injection path observable and deterministic across target surfaces.
 
 4. **M3 – Hardening**
    - Daemon hardening gate: session cleanup invariants, start rollback semantics, config precedence tests, runtime truth status fields.
