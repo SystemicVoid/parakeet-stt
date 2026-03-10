@@ -17,7 +17,7 @@ Canonical-source policy:
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
 - Default startup profile is now online stream+seal (`stt` / `stt start`) with paste-mode and adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
-  - `--paste-key-backend auto` (ladder: uinput → ydotool)
+  - `--paste-key-backend uinput`
   - `--paste-backend-failure-policy copy-only`
   - daemon launch default: `PARAKEET_STREAMING_ENABLED=true` for the default profile
   - overlay launch default: `PARAKEET_OVERLAY_ENABLED=true` with `--overlay-adaptive-width=false`
@@ -27,15 +27,14 @@ Canonical-source policy:
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
-- `auto` backend now performs runtime fallback attempts (uinput → ydotool) per shortcut execution.
 - Final-result injection is now enqueued to a dedicated bounded worker queue (`capacity=32`) so hotkey/websocket handling paths do not await blocking clipboard/chord execution inline.
 - Worker enqueue backpressure is timeout-limited (`20ms`) with explicit dropped-job warnings when the queue stays saturated.
 - Injector logs now tag stage outcomes and durations with `stage=<clipboard_ready|route_shortcut|backend>` and `status=<start|ok|fail>`.
-- Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
+- Backend stage failure accounting reflects initialization and command failures from the uinput-only injector path.
 - Queue and stage metric summaries are emitted periodically from the client loop (`injector worker queue metrics summary`, `injector stage metrics summary`).
 - Event-loop lag summaries are emitted every 30 seconds (`event loop lag window summary`) with p50/p95/p99 fields, measured against the interval schedule so windows recover after transient stalls.
 - Hotkey listeners now seed already-held `llm_pre_modifier` state from the kernel when they attach or re-attach, so the first utterance after startup/resume/device recovery still routes to LLM mode if Shift was already held.
-- `stt diag-injector` reports backend capability prerequisites (`ydotool`, `/dev/uinput` write access) before running matrix cases.
+- `stt diag-injector` reports `/dev/uinput` capability before running reproducible uinput-only cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
@@ -97,12 +96,11 @@ Paste/copy injection now exposes a stable operator surface through `stt start` a
 
 Client knobs:
 - `--injection-mode paste|copy-only`
-- `--paste-key-backend ydotool|uinput|auto` (default: `auto`, ladder: uinput→ydotool)
+- `--paste-key-backend uinput` (default: `uinput`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
 - `--paste-write-primary true|false` (default: `false`)
-- `--ydotool <path>` (optional explicit path override)
 - `--completion-sound true|false` (default: `true`)
 - `--completion-sound-path <path>` (optional)
 - `--completion-sound-volume <0-100>` (default: `100`)
@@ -112,7 +110,7 @@ Recommended baseline for Ghostty/COSMIC:
 
 ```bash
 stt start --paste \
-  --paste-key-backend auto \
+  --paste-key-backend uinput \
   --paste-backend-failure-policy copy-only
 ```
 
@@ -136,7 +134,7 @@ Use the new helper matrix command:
 stt diag-injector
 ```
 
-It prints backend capability checks and then runs three `--test-injection` backend cases (`auto`, `uinput`, `ydotool`) with injector debug logging.
+It prints `/dev/uinput` capability checks and then runs reproducible `uinput` test-injection cases with injector debug logging.
 
 ### Paste-gap matrix harness
 
