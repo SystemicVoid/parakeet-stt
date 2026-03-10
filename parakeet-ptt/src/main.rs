@@ -25,8 +25,8 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -51,8 +51,10 @@ use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent, HotkeyIntent,
 };
 use crate::injector::{
-    injector_metrics_snapshot, BackendAttemptReport, InjectorChildReport, InjectorContext,
-    ParentFocusCapture, TextInjector, INJECTOR_CONTEXT_ENV, INJECTOR_REPORT_PREFIX,
+    injector_metrics_snapshot, BackendAttemptReport, ClipboardInjector, FailInjector,
+    InjectorChildReport, InjectorContext, ParentFocusCapture, PasteChordSender, PasteKeySender,
+    TextInjector, UinputAttemptMetadata, UinputChordSender, INJECTOR_CONTEXT_ENV,
+    INJECTOR_REPORT_PREFIX,
 };
 #[cfg(test)]
 use crate::injector::{
@@ -74,6 +76,8 @@ const INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT: usize = 120;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
+const IN_PROCESS_UINPUT_WARMUP_MS: u64 = 200;
+const IN_PROCESS_UINPUT_RETRY_BACKOFF_MS: u64 = 500;
 const DEFAULT_LLM_PRE_MODIFIER_KEY: &str = "KEY_SHIFT";
 const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_LLM_MODEL: &str = "local";
@@ -792,30 +796,203 @@ trait InjectionJobRunner: Send + Sync {
         -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
-type InProcessInjectorBuilder = dyn Fn(&ClientConfig) -> Arc<dyn TextInjector> + Send + Sync;
+type InProcessInjectorBuilder =
+    dyn Fn(&ClientConfig, PasteKeySender) -> Arc<dyn TextInjector> + Send + Sync;
+type InProcessPasteSenderFactory =
+    dyn Fn(&ClientConfig) -> Result<Arc<dyn PasteChordSender>> + Send + Sync;
+type InProcessSleepFn = dyn Fn(Duration) + Send + Sync;
+
+#[derive(Debug)]
+struct HealthyUinputSender {
+    sender: Arc<dyn PasteChordSender>,
+    generation: u64,
+    created_at: Instant,
+    use_count: u64,
+    fresh_pending: bool,
+    recovered_after_failure: bool,
+}
+
+#[derive(Debug)]
+struct FailedUinputSender {
+    last_error: String,
+    retry_after: Instant,
+}
+
+#[derive(Debug)]
+enum UinputSenderState {
+    Uninitialized,
+    Healthy(HealthyUinputSender),
+    CreateFailed(FailedUinputSender),
+}
+
+#[derive(Debug)]
+struct UinputSenderManager {
+    state: UinputSenderState,
+    next_generation: u64,
+}
+
+impl Default for UinputSenderManager {
+    fn default() -> Self {
+        Self {
+            state: UinputSenderState::Uninitialized,
+            next_generation: 1,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct InProcessInjectorRunner {
     config: ClientConfig,
+    sender_manager: Arc<Mutex<UinputSenderManager>>,
     injector_builder: Arc<InProcessInjectorBuilder>,
+    sender_factory: Arc<InProcessPasteSenderFactory>,
+    sleep_fn: Arc<InProcessSleepFn>,
+    uinput_warmup: Duration,
+    uinput_retry_backoff: Duration,
 }
 
 impl InProcessInjectorRunner {
     fn new(config: &ClientConfig) -> Self {
         Self {
             config: config.clone(),
-            injector_builder: Arc::new(build_injector),
+            sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
+            injector_builder: Arc::new(|config, sender| {
+                build_clipboard_injector_with_sender(
+                    config,
+                    sender,
+                    matches!(
+                        config.injection_mode,
+                        crate::config::InjectionMode::CopyOnly
+                    ),
+                    None,
+                    None,
+                )
+            }),
+            sender_factory: Arc::new(build_uinput_chord_sender),
+            sleep_fn: Arc::new(std::thread::sleep),
+            uinput_warmup: Duration::from_millis(IN_PROCESS_UINPUT_WARMUP_MS),
+            uinput_retry_backoff: Duration::from_millis(IN_PROCESS_UINPUT_RETRY_BACKOFF_MS),
         }
     }
 
     #[cfg(test)]
-    fn new_with_builder(
+    fn new_for_tests(
         config: &ClientConfig,
         injector_builder: Arc<InProcessInjectorBuilder>,
+        sender_factory: Arc<InProcessPasteSenderFactory>,
+        sleep_fn: Arc<InProcessSleepFn>,
+        uinput_warmup: Duration,
+        uinput_retry_backoff: Duration,
     ) -> Self {
         Self {
             config: config.clone(),
+            sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
             injector_builder,
+            sender_factory,
+            sleep_fn,
+            uinput_warmup,
+            uinput_retry_backoff,
+        }
+    }
+
+    fn prepare_paste_key_sender(&self) -> std::result::Result<PasteKeySender, String> {
+        use crate::config::InjectionMode;
+
+        if matches!(self.config.injection_mode, InjectionMode::CopyOnly) {
+            return Ok(PasteKeySender::Disabled);
+        }
+
+        let mut created_this_job = false;
+        let mut create_elapsed_ms = None;
+        let mut recovered_after_failure = false;
+
+        loop {
+            enum Action {
+                Sleep(Duration),
+                Create,
+            }
+
+            let action = {
+                let mut manager = self
+                    .sender_manager
+                    .lock()
+                    .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                match &mut manager.state {
+                    UinputSenderState::Healthy(healthy) => {
+                        let age = healthy.created_at.elapsed();
+                        if healthy.fresh_pending && age < self.uinput_warmup {
+                            Action::Sleep(self.uinput_warmup - age)
+                        } else {
+                            let metadata = UinputAttemptMetadata {
+                                generation: healthy.generation,
+                                fresh_device: healthy.fresh_pending,
+                                device_age_ms_at_attempt: age.as_millis() as u64,
+                                use_count_before_attempt: healthy.use_count,
+                                created_this_job,
+                                create_elapsed_ms,
+                                last_create_error: None,
+                                reused_after_failure: healthy.recovered_after_failure,
+                            };
+                            healthy.fresh_pending = false;
+                            healthy.use_count = healthy.use_count.saturating_add(1);
+                            return Ok(PasteKeySender::Uinput {
+                                sender: Arc::clone(&healthy.sender),
+                                metadata: Some(metadata),
+                            });
+                        }
+                    }
+                    UinputSenderState::Uninitialized => Action::Create,
+                    UinputSenderState::CreateFailed(failed) => {
+                        if Instant::now() < failed.retry_after {
+                            return Err(failed.last_error.clone());
+                        }
+                        recovered_after_failure = true;
+                        Action::Create
+                    }
+                }
+            };
+
+            match action {
+                Action::Sleep(duration) => (self.sleep_fn)(duration),
+                Action::Create => {
+                    let started = Instant::now();
+                    match (self.sender_factory)(&self.config) {
+                        Ok(sender) => {
+                            let mut manager = self
+                                .sender_manager
+                                .lock()
+                                .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                            let generation = manager.next_generation;
+                            manager.next_generation = manager.next_generation.saturating_add(1);
+                            manager.state = UinputSenderState::Healthy(HealthyUinputSender {
+                                sender,
+                                generation,
+                                created_at: Instant::now(),
+                                use_count: 0,
+                                fresh_pending: true,
+                                recovered_after_failure,
+                            });
+                            created_this_job = true;
+                            create_elapsed_ms = Some(started.elapsed().as_millis() as u64);
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                                err
+                            );
+                            let mut manager = self
+                                .sender_manager
+                                .lock()
+                                .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                            manager.state = UinputSenderState::CreateFailed(FailedUinputSender {
+                                last_error: message.clone(),
+                                retry_after: Instant::now() + self.uinput_retry_backoff,
+                            });
+                            return Err(message);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -832,11 +1009,26 @@ impl InjectionJobRunner for InProcessInjectorRunner {
             stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
             parent_focus: job.parent_focus.clone(),
         };
-        // Rebuild the backend for each job so late-available /dev/uinput can recover
-        // without forcing a full client restart.
-        (self.injector_builder)(&self.config)
-            .inject_with_context(&job.text, Some(context))
-            .map_err(|err| InjectionRunError::BackendFailure(format!("{err:#}")))?;
+        let injector = match self.prepare_paste_key_sender() {
+            Ok(sender) => (self.injector_builder)(&self.config, sender),
+            Err(reason) => build_backend_failure_fallback_injector(&self.config, reason, None),
+        };
+        if let Err(err) = injector.inject_with_context(&job.text, Some(context)) {
+            let err_text = format!("{err:#}");
+            if err_text.contains("stage=backend")
+                && matches!(
+                    self.config.injection_mode,
+                    crate::config::InjectionMode::Paste
+                )
+            {
+                if let Ok(mut manager) = self.sender_manager.lock() {
+                    if matches!(manager.state, UinputSenderState::Healthy(_)) {
+                        manager.state = UinputSenderState::Uninitialized;
+                    }
+                }
+            }
+            return Err(InjectionRunError::BackendFailure(err_text));
+        }
         Ok(InjectionRunOutput::default())
     }
 }
@@ -1258,6 +1450,38 @@ fn summarize_backend_attempts(attempts: &[BackendAttemptReport]) -> String {
             if let Some(config) = attempt.backend_config.as_ref() {
                 summary.push_str(":cfg=");
                 summary.push_str(config);
+            }
+            if let Some(generation) = attempt.uinput_sender_generation {
+                summary.push_str(":ugen=");
+                summary.push_str(&generation.to_string());
+            }
+            if let Some(fresh) = attempt.uinput_fresh_device {
+                summary.push_str(":ufresh=");
+                summary.push_str(if fresh { "1" } else { "0" });
+            }
+            if let Some(age_ms) = attempt.uinput_device_age_ms_at_attempt {
+                summary.push_str(":uage_ms=");
+                summary.push_str(&age_ms.to_string());
+            }
+            if let Some(use_count) = attempt.uinput_use_count_before_attempt {
+                summary.push_str(":uuse=");
+                summary.push_str(&use_count.to_string());
+            }
+            if let Some(created_this_job) = attempt.uinput_created_this_job {
+                summary.push_str(":ucreated_this_job=");
+                summary.push_str(if created_this_job { "1" } else { "0" });
+            }
+            if let Some(create_elapsed_ms) = attempt.uinput_create_elapsed_ms {
+                summary.push_str(":ucreate_ms=");
+                summary.push_str(&create_elapsed_ms.to_string());
+            }
+            if let Some(reused_after_failure) = attempt.uinput_reused_after_failure {
+                summary.push_str(":urecovered=");
+                summary.push_str(if reused_after_failure { "1" } else { "0" });
+            }
+            if let Some(last_create_error) = attempt.uinput_last_create_error.as_ref() {
+                summary.push_str(":uerr=");
+                summary.push_str(last_create_error);
             }
             if let Some(stderr_excerpt) = attempt.stderr_excerpt.as_ref() {
                 summary.push_str(":stderr=");
@@ -1903,57 +2127,50 @@ fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
         .context("internal injection failed")
 }
 
-fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
-    build_injector_with_shortcut_override(config, None, None)
+fn build_uinput_chord_sender(config: &ClientConfig) -> Result<Arc<dyn PasteChordSender>> {
+    Ok(Arc::new(UinputChordSender::new(config.uinput_dwell_ms)?))
 }
 
-fn build_injector_with_shortcut_override(
+fn build_backend_failure_fallback_injector(
     config: &ClientConfig,
+    reason: String,
+    context: Option<InjectorContext>,
+) -> Arc<dyn TextInjector> {
+    use crate::config::PasteBackendFailurePolicy;
+
+    match config.clipboard.backend_failure_policy {
+        PasteBackendFailurePolicy::CopyOnly => {
+            warn!(
+                reason = %reason,
+                "paste backend unavailable; falling back to copy-only injection"
+            );
+            build_clipboard_injector_with_sender(
+                config,
+                PasteKeySender::Disabled,
+                true,
+                context,
+                // Copy-only fallback never sends chords; forced shortcut is irrelevant.
+                None,
+            )
+        }
+        PasteBackendFailurePolicy::Error => {
+            error!(
+                reason = %reason,
+                "paste backend unavailable and policy=error; returning explicit injector error"
+            );
+            Arc::new(FailInjector::new(reason))
+        }
+    }
+}
+
+fn build_clipboard_injector_with_sender(
+    config: &ClientConfig,
+    sender: PasteKeySender,
+    copy_only: bool,
     context: Option<InjectorContext>,
     forced_shortcut: Option<crate::config::PasteShortcut>,
 ) -> Arc<dyn TextInjector> {
-    use crate::config::{InjectionMode, PasteBackendFailurePolicy};
-    use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
-
-    let backend_failure_fallback = |reason: String| -> Arc<dyn TextInjector> {
-        match config.clipboard.backend_failure_policy {
-            PasteBackendFailurePolicy::CopyOnly => {
-                warn!(
-                    reason = %reason,
-                    "paste backend unavailable; falling back to copy-only injection"
-                );
-                Arc::new(ClipboardInjector::new_with_overrides(
-                    PasteKeySender::Disabled,
-                    config.clipboard.clone(),
-                    true,
-                    context.clone(),
-                    // Copy-only fallback never sends chords; forced shortcut is irrelevant.
-                    None,
-                ))
-            }
-            PasteBackendFailurePolicy::Error => {
-                error!(
-                    reason = %reason,
-                    "paste backend unavailable and policy=error; returning explicit injector error"
-                );
-                Arc::new(FailInjector::new(reason))
-            }
-        }
-    };
-
-    let sender = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
-        PasteKeySender::Disabled
-    } else {
-        match UinputChordSender::new(config.uinput_dwell_ms) {
-            Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
-            Err(err) => {
-                return backend_failure_fallback(format!(
-                    "paste_key_backend=uinput could not initialize /dev/uinput: {}",
-                    err
-                ));
-            }
-        }
-    };
+    use crate::config::InjectionMode;
 
     info!(
         mode = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
@@ -1973,10 +2190,50 @@ fn build_injector_with_shortcut_override(
     Arc::new(ClipboardInjector::new_with_overrides(
         sender,
         config.clipboard.clone(),
-        matches!(config.injection_mode, InjectionMode::CopyOnly),
+        copy_only,
         context,
         forced_shortcut,
     ))
+}
+
+fn build_fresh_paste_key_sender(config: &ClientConfig) -> Result<PasteKeySender> {
+    use crate::config::InjectionMode;
+
+    if matches!(config.injection_mode, InjectionMode::CopyOnly) {
+        return Ok(PasteKeySender::Disabled);
+    }
+
+    Ok(PasteKeySender::Uinput {
+        sender: build_uinput_chord_sender(config)?,
+        metadata: None,
+    })
+}
+
+fn build_injector_with_shortcut_override(
+    config: &ClientConfig,
+    context: Option<InjectorContext>,
+    forced_shortcut: Option<crate::config::PasteShortcut>,
+) -> Arc<dyn TextInjector> {
+    match build_fresh_paste_key_sender(config) {
+        Ok(sender) => build_clipboard_injector_with_sender(
+            config,
+            sender,
+            matches!(
+                config.injection_mode,
+                crate::config::InjectionMode::CopyOnly
+            ),
+            context,
+            forced_shortcut,
+        ),
+        Err(err) => build_backend_failure_fallback_injector(
+            config,
+            format!(
+                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                err
+            ),
+            context,
+        ),
+    }
 }
 
 fn llm_chat_completions_url(base: &url::Url) -> Result<url::Url> {
@@ -3118,9 +3375,9 @@ mod tests {
 
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
-        PasteBackendFailurePolicy, PasteKeyBackend,
+        PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
-    use crate::injector::TextInjector;
+    use crate::injector::{PasteChordSender, PasteKeySender, TextInjector};
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -3238,6 +3495,57 @@ mod tests {
                 .lock()
                 .expect("recording injector lock should be available")
                 .push((text.to_string(), session_id));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingPasteChordSender {
+        sends: Arc<AtomicU64>,
+        fail: bool,
+    }
+
+    impl PasteChordSender for RecordingPasteChordSender {
+        fn send_shortcut(&self, _shortcut: PasteShortcut) -> anyhow::Result<()> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                anyhow::bail!("stage=backend synthetic sender failure");
+            }
+            Ok(())
+        }
+
+        fn backend_config(&self) -> Option<String> {
+            Some("test_sender".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SenderDrivenInjector {
+        seen: Arc<Mutex<Vec<(String, Uuid)>>>,
+        sender: PasteKeySender,
+    }
+
+    impl TextInjector for SenderDrivenInjector {
+        fn inject(&self, _text: &str) -> anyhow::Result<()> {
+            panic!("sender-driven injector expects inject_with_context");
+        }
+
+        fn inject_with_context(
+            &self,
+            text: &str,
+            context: Option<InjectorContext>,
+        ) -> anyhow::Result<()> {
+            let session_id = context
+                .as_ref()
+                .map(|value| value.session_id)
+                .expect("sender-driven injector expects session context");
+            self.seen
+                .lock()
+                .expect("sender-driven injector lock should be available")
+                .push((text.to_string(), session_id));
+            if let PasteKeySender::Uinput { sender, .. } = &self.sender {
+                sender.send_shortcut(PasteShortcut::CtrlV)?;
+            }
             Ok(())
         }
     }
@@ -3372,22 +3680,36 @@ mod tests {
     }
 
     #[test]
-    fn in_process_runner_rebuilds_injector_for_each_job() {
+    fn in_process_runner_reuses_sender_across_jobs_when_healthy() {
         let build_count = Arc::new(AtomicU64::new(0));
+        let sender_create_count = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let config = test_client_config();
-        let runner = super::InProcessInjectorRunner::new_with_builder(
+        let runner = super::InProcessInjectorRunner::new_for_tests(
             &config,
             Arc::new({
                 let build_count = Arc::clone(&build_count);
                 let seen = Arc::clone(&seen);
-                move |_config| {
+                move |_config, _sender| {
                     build_count.fetch_add(1, Ordering::Relaxed);
                     Arc::new(RecordingTextInjector {
                         seen: Arc::clone(&seen),
                     })
                 }
             }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
         );
 
         let session_one = Uuid::new_v4();
@@ -3400,6 +3722,7 @@ mod tests {
             .expect("second run should succeed");
 
         assert_eq!(build_count.load(Ordering::Relaxed), 2);
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             seen.lock()
                 .expect("recording injector lock should be available")
@@ -3408,6 +3731,120 @@ mod tests {
                 ("first".to_string(), session_one),
                 ("second".to_string(), session_two)
             ]
+        );
+    }
+
+    #[test]
+    fn in_process_runner_retries_after_create_failure_without_restart() {
+        let build_count = Arc::new(AtomicU64::new(0));
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let build_count = Arc::clone(&build_count);
+                let seen = Arc::clone(&seen);
+                move |_config, _sender| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    let attempt = sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        anyhow::bail!("synthetic /dev/uinput unavailable");
+                    }
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+        );
+
+        let _session_one = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(_session_one, "first".to_string(), 0, 0))
+            .expect("copy-only fallback should keep first run alive");
+        std::thread::sleep(Duration::from_millis(6));
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should recover after retry backoff");
+
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 2);
+        assert_eq!(build_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[("second".to_string(), session_two)]
+        );
+    }
+
+    #[test]
+    fn in_process_runner_drops_sender_after_explicit_send_error() {
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let send_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let seen = Arc::clone(&seen);
+                move |_config, sender| {
+                    Arc::new(SenderDrivenInjector {
+                        seen: Arc::clone(&seen),
+                        sender,
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                let send_count = Arc::clone(&send_count);
+                move |_config| {
+                    let generation = sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::clone(&send_count),
+                        fail: generation == 0,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+        );
+
+        let first = runner.run(&InjectionJob::new(
+            Uuid::new_v4(),
+            "first".to_string(),
+            0,
+            0,
+        ));
+        assert!(matches!(first, Err(InjectionRunError::BackendFailure(_))));
+
+        let second = runner.run(&InjectionJob::new(
+            Uuid::new_v4(),
+            "second".to_string(),
+            0,
+            0,
+        ));
+        assert!(second.is_ok());
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 2);
+        assert_eq!(send_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            seen.lock()
+                .expect("sender-driven injector lock should be available")
+                .len(),
+            2
         );
     }
 
