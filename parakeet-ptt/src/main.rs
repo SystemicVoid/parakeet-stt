@@ -933,8 +933,6 @@ impl InProcessInjectorRunner {
                                 last_create_error: None,
                                 reused_after_failure: healthy.recovered_after_failure,
                             };
-                            healthy.fresh_pending = false;
-                            healthy.use_count = healthy.use_count.saturating_add(1);
                             return Ok(PasteKeySender::Uinput {
                                 sender: Arc::clone(&healthy.sender),
                                 metadata: Some(metadata),
@@ -995,6 +993,27 @@ impl InProcessInjectorRunner {
             }
         }
     }
+
+    fn commit_successful_paste_key_sender(&self, sender: &PasteKeySender) {
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = sender
+        else {
+            return;
+        };
+
+        if let Ok(mut manager) = self.sender_manager.lock() {
+            if let UinputSenderState::Healthy(healthy) = &mut manager.state {
+                if healthy.generation == metadata.generation
+                    && healthy.use_count == metadata.use_count_before_attempt
+                {
+                    healthy.fresh_pending = false;
+                    healthy.use_count = healthy.use_count.saturating_add(1);
+                }
+            }
+        }
+    }
 }
 
 impl InjectionJobRunner for InProcessInjectorRunner {
@@ -1009,9 +1028,15 @@ impl InjectionJobRunner for InProcessInjectorRunner {
             stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
             parent_focus: job.parent_focus.clone(),
         };
-        let injector = match self.prepare_paste_key_sender() {
-            Ok(sender) => (self.injector_builder)(&self.config, sender),
-            Err(reason) => build_backend_failure_fallback_injector(&self.config, reason, None),
+        let (injector, prepared_sender) = match self.prepare_paste_key_sender() {
+            Ok(sender) => {
+                let injector = (self.injector_builder)(&self.config, sender.clone());
+                (injector, Some(sender))
+            }
+            Err(reason) => (
+                build_backend_failure_fallback_injector(&self.config, reason, None),
+                None,
+            ),
         };
         if let Err(err) = injector.inject_with_context(&job.text, Some(context)) {
             let err_text = format!("{err:#}");
@@ -1028,6 +1053,9 @@ impl InjectionJobRunner for InProcessInjectorRunner {
                 }
             }
             return Err(InjectionRunError::BackendFailure(err_text));
+        }
+        if let Some(sender) = prepared_sender.as_ref() {
+            self.commit_successful_paste_key_sender(sender);
         }
         Ok(InjectionRunOutput::default())
     }
@@ -3377,7 +3405,7 @@ mod tests {
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
         PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
-    use crate::injector::{PasteChordSender, PasteKeySender, TextInjector};
+    use crate::injector::{FailInjector, PasteChordSender, PasteKeySender, TextInjector};
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -3732,6 +3760,77 @@ mod tests {
                 ("second".to_string(), session_two)
             ]
         );
+    }
+
+    #[test]
+    fn in_process_runner_commits_sender_usage_only_after_success() {
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new(|_config, _sender| Arc::new(FailInjector::new("unused test injector"))),
+            Arc::new(|_config| {
+                Ok(Arc::new(RecordingPasteChordSender {
+                    sends: Arc::new(AtomicU64::new(0)),
+                    fail: false,
+                }) as Arc<dyn PasteChordSender>)
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+        );
+
+        let sender = runner
+            .prepare_paste_key_sender()
+            .expect("preparing sender should succeed");
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = &sender
+        else {
+            panic!("paste mode should prepare a uinput sender");
+        };
+        assert!(metadata.fresh_device);
+        assert_eq!(metadata.use_count_before_attempt, 0);
+
+        {
+            let manager = runner
+                .sender_manager
+                .lock()
+                .expect("sender manager lock should be available");
+            let super::UinputSenderState::Healthy(healthy) = &manager.state else {
+                panic!("prepared sender should leave manager healthy");
+            };
+            assert!(healthy.fresh_pending);
+            assert_eq!(healthy.use_count, 0);
+        }
+
+        runner.commit_successful_paste_key_sender(&sender);
+        runner.commit_successful_paste_key_sender(&sender);
+
+        {
+            let manager = runner
+                .sender_manager
+                .lock()
+                .expect("sender manager lock should be available");
+            let super::UinputSenderState::Healthy(healthy) = &manager.state else {
+                panic!("committed sender should keep manager healthy");
+            };
+            assert!(!healthy.fresh_pending);
+            assert_eq!(healthy.use_count, 1);
+        }
+
+        let sender = runner
+            .prepare_paste_key_sender()
+            .expect("preparing reused sender should succeed");
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = &sender
+        else {
+            panic!("paste mode should keep using a uinput sender");
+        };
+        assert!(!metadata.fresh_device);
+        assert_eq!(metadata.use_count_before_attempt, 1);
     }
 
     #[test]
