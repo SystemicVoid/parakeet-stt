@@ -38,7 +38,7 @@ status:
 logs:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'
 
-paste-gap-start backend="auto" label="ghostty" attempts="10":
+paste-gap-start backend="uinput" label="ghostty" attempts="10":
     @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh start --backend "{{backend}}" --label "{{label}}" --attempts "{{attempts}}"'
 
 paste-gap-inject-only backend="uinput" shortcut="ctrl-shift-v" label="ghostty-inject-only" attempts="20" prefix="PG" interval_ms="150":
