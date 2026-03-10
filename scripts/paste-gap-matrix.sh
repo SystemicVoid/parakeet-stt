@@ -487,6 +487,20 @@ def scalar(value: object) -> str:
 def summarize_backend_attempts_from_json(
     attempts: list[dict[str, object]],
 ) -> tuple[str, str, str, str]:
+    def append_scalar_suffix(summary: str, suffix: str, value: object) -> str:
+        rendered = scalar(value)
+        if rendered:
+            return f"{summary}:{suffix}={rendered}"
+        return summary
+
+    def append_bool_suffix(summary: str, suffix: str, value: object) -> str:
+        if isinstance(value, bool):
+            return f"{summary}:{suffix}={'1' if value else '0'}"
+        rendered = scalar(value)
+        if rendered:
+            return f"{summary}:{suffix}={rendered}"
+        return summary
+
     summaries: list[str] = []
     warning_tags: set[str] = set()
     exit_statuses: list[str] = []
@@ -507,9 +521,42 @@ def summarize_backend_attempts_from_json(
             tag_s = scalar(tag)
             if tag_s:
                 warning_tags.add(tag_s)
+        attempt_warning_tags = sorted(
+            {
+                scalar(tag)
+                for tag in (attempt.get("warning_tags") or [])
+                if scalar(tag)
+            }
+        )
+        if attempt_warning_tags:
+            summary += f":warn={','.join(attempt_warning_tags)}"
         backend_config = scalar(attempt.get("backend_config"))
         if backend_config:
             summary += f":cfg={backend_config}"
+        summary = append_scalar_suffix(
+            summary, "ugen", attempt.get("uinput_sender_generation")
+        )
+        summary = append_bool_suffix(
+            summary, "ufresh", attempt.get("uinput_fresh_device")
+        )
+        summary = append_scalar_suffix(
+            summary, "uage_ms", attempt.get("uinput_device_age_ms_at_attempt")
+        )
+        summary = append_scalar_suffix(
+            summary, "uuse", attempt.get("uinput_use_count_before_attempt")
+        )
+        summary = append_bool_suffix(
+            summary, "ucreated_this_job", attempt.get("uinput_created_this_job")
+        )
+        summary = append_scalar_suffix(
+            summary, "ucreate_ms", attempt.get("uinput_create_elapsed_ms")
+        )
+        summary = append_bool_suffix(
+            summary, "urecovered", attempt.get("uinput_reused_after_failure")
+        )
+        summary = append_scalar_suffix(
+            summary, "uerr", attempt.get("uinput_last_create_error")
+        )
         stderr_excerpt = scalar(attempt.get("stderr_excerpt"))
         if stderr_excerpt:
             summary += f":stderr={stderr_excerpt}"
