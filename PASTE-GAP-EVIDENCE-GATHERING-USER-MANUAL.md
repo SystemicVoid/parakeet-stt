@@ -74,7 +74,7 @@ This mode removes ASR/hotkey/session confounders and tests backend paste semanti
 Run from Terminal A:
 
 ```bash
-( sleep 5; just paste-gap-inject-only backend=uinput shortcut=ctrl-shift-v label=ghostty-inject-only attempts=20 prefix=PG interval_ms=150 )
+( sleep 5; just paste-gap-inject-only shortcut=ctrl-shift-v label=ghostty-inject-only attempts=20 prefix=PG interval_ms=150 )
 ```
 
 Immediately after pressing Enter:
@@ -141,7 +141,7 @@ This mode tests real behavior with daemon + hotkey lifecycle.
 From Terminal A:
 
 ```bash
-just paste-gap-start backend=uinput label=ghostty attempts=10
+just paste-gap-start label=ghostty attempts=10
 ```
 
 Important: this may attach to tmux. If it does, detach with `Ctrl+b` then `d` to return to your shell.
@@ -194,7 +194,7 @@ cat "$run_dir/summary.txt"
 If you need another sample after a code change or workstation change, repeat Steps 4A-4D with:
 
 ```bash
-just paste-gap-start backend=uinput label=ghostty attempts=10
+just paste-gap-start label=ghostty attempts=10
 ```
 
 Historical multi-backend evidence from before the backend retirement is recorded in `HANDOFF-raw-ptt-paste-gap-2026-03-08.md`.
@@ -205,7 +205,7 @@ If you need a quick non-archived spot check:
 
 ```bash
 source scripts/stt-helper.sh
-stt diag-injector --backend uinput --attempts 10 --shortcut ctrl-shift-v --prefix QUICK --interval-ms 150
+stt diag-injector --attempts 10 --shortcut ctrl-shift-v --prefix QUICK --interval-ms 150
 ```
 
 Run this only from repo root.

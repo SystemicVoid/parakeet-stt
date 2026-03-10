@@ -85,7 +85,6 @@ Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror 
 Default `stt` / `stt start` profile:
 
 - `--injection-mode paste`
-- `--paste-key-backend uinput`
 - `--paste-backend-failure-policy copy-only`
 - `--uinput-dwell-ms 18`
 - `PARAKEET_STREAMING_ENABLED=true`

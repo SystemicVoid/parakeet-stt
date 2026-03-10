@@ -38,11 +38,11 @@ status:
 logs:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'
 
-paste-gap-start backend="uinput" label="ghostty" attempts="10":
-    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh start --backend "{{backend}}" --label "{{label}}" --attempts "{{attempts}}"'
+paste-gap-start label="ghostty" attempts="10":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh start --label "{{label}}" --attempts "{{attempts}}"'
 
-paste-gap-inject-only backend="uinput" shortcut="ctrl-shift-v" label="ghostty-inject-only" attempts="20" prefix="PG" interval_ms="150":
-    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh inject-only --backend "{{backend}}" --shortcut "{{shortcut}}" --label "{{label}}" --attempts "{{attempts}}" --prefix "{{prefix}}" --interval-ms "{{interval_ms}}"'
+paste-gap-inject-only shortcut="ctrl-shift-v" label="ghostty-inject-only" attempts="20" prefix="PG" interval_ms="150":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh inject-only --shortcut "{{shortcut}}" --label "{{label}}" --attempts "{{attempts}}" --prefix "{{prefix}}" --interval-ms "{{interval_ms}}"'
 
 paste-gap-stop run_dir="":
     @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh stop --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh stop; fi'
