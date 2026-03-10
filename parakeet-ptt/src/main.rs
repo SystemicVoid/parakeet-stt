@@ -1002,20 +1002,8 @@ fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
         }
     }
 
-    match config.clipboard.key_backend {
-        crate::config::PasteKeyBackend::Ydotool => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("ydotool"));
-        }
-        crate::config::PasteKeyBackend::Uinput => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("uinput"));
-        }
-        crate::config::PasteKeyBackend::Auto => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("auto"));
-        }
-    }
+    args.push(OsString::from("--paste-key-backend"));
+    args.push(OsString::from("uinput"));
 
     match config.clipboard.backend_failure_policy {
         crate::config::PasteBackendFailurePolicy::CopyOnly => {
@@ -1033,10 +1021,6 @@ fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
     args.push(OsString::from("--paste-write-primary"));
     args.push(OsString::from(config.clipboard.write_primary.to_string()));
 
-    if let Some(ydotool_path) = &config.ydotool_path {
-        args.push(OsString::from("--ydotool"));
-        args.push(ydotool_path.as_os_str().to_owned());
-    }
     if let Some(seat) = &config.clipboard.seat {
         args.push(OsString::from("--paste-seat"));
         args.push(OsString::from(seat));
@@ -1650,10 +1634,6 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_LLM_PRE_MODIFIER_KEY)]
     llm_pre_modifier_key: String,
 
-    /// Path to ydotool binary (used when paste key backend is ydotool/auto)
-    #[arg(long)]
-    ydotool: Option<PathBuf>,
-
     /// Key dwell time in milliseconds for direct uinput paste chords
     #[arg(long, default_value_t = 18)]
     uinput_dwell_ms: u64,
@@ -1699,7 +1679,7 @@ struct Cli {
     injection_mode: CliInjectionMode,
 
     /// Keyboard injection backend for paste shortcut(s).
-    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Auto)]
+    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Uinput)]
     paste_key_backend: CliPasteKeyBackend,
 
     /// Behavior when selected paste backend cannot be initialized or used.
@@ -1784,17 +1764,13 @@ impl From<CliInjectionMode> for crate::config::InjectionMode {
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteKeyBackend {
-    Ydotool,
     Uinput,
-    Auto,
 }
 
 impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
     fn from(backend: CliPasteKeyBackend) -> Self {
         match backend {
-            CliPasteKeyBackend::Ydotool => crate::config::PasteKeyBackend::Ydotool,
             CliPasteKeyBackend::Uinput => crate::config::PasteKeyBackend::Uinput,
-            CliPasteKeyBackend::Auto => crate::config::PasteKeyBackend::Auto,
         }
     }
 }
@@ -1859,7 +1835,6 @@ async fn main() -> Result<()> {
         cli.shared_secret.clone(),
         cli.hotkey.clone(),
         InjectionConfig {
-            ydotool_path: cli.ydotool.clone(),
             uinput_dwell_ms: cli.uinput_dwell_ms,
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
@@ -1979,21 +1954,8 @@ fn build_injector_with_shortcut_override(
     context: Option<InjectorContext>,
     forced_shortcut: Option<crate::config::PasteShortcut>,
 ) -> Arc<dyn TextInjector> {
-    use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
+    use crate::config::{InjectionMode, PasteBackendFailurePolicy};
     use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
-
-    let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
-        if let Some(path) = configured {
-            if path.exists() {
-                return Some(path.clone());
-            }
-            error!(?path, binary, "Configured binary path does not exist");
-            return None;
-        }
-        which::which(binary).ok()
-    };
-
-    let ydotool_binary = resolve_binary(config.ydotool_path.as_ref(), "ydotool");
 
     let backend_failure_fallback = |reason: String| -> Arc<dyn TextInjector> {
         match config.clipboard.backend_failure_policy {
@@ -2024,47 +1986,14 @@ fn build_injector_with_shortcut_override(
     let sender = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
         PasteKeySender::Disabled
     } else {
-        match config.clipboard.key_backend {
-            PasteKeyBackend::Ydotool => {
-                let Some(path) = ydotool_binary.clone() else {
-                    return backend_failure_fallback(
-                        "paste_key_backend=ydotool but ydotool was not found".to_string(),
-                    );
-                };
-                PasteKeySender::Ydotool(path)
+        match UinputChordSender::new(config.uinput_dwell_ms) {
+            Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
+            Err(err) => {
+                return backend_failure_fallback(format!(
+                    "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                    err
+                ));
             }
-            PasteKeyBackend::Uinput => match UinputChordSender::new(config.uinput_dwell_ms) {
-                Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
-                Err(err) => {
-                    return backend_failure_fallback(format!(
-                        "paste_key_backend=uinput could not initialize /dev/uinput: {}",
-                        err
-                    ));
-                }
-            },
-            PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
-                Ok(sender) => {
-                    let mut senders = Vec::new();
-                    senders.push(PasteKeySender::Uinput(std::sync::Arc::new(sender)));
-                    if let Some(path) = ydotool_binary.clone() {
-                        senders.push(PasteKeySender::Ydotool(path));
-                    }
-                    PasteKeySender::Chain(senders)
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        dwell_ms = config.uinput_dwell_ms,
-                        "paste_key_backend=auto could not initialize uinput; trying ydotool backend"
-                    );
-                    let Some(path) = ydotool_binary.clone() else {
-                        return backend_failure_fallback(
-                            "paste_key_backend=auto could not initialize uinput and could not find ydotool".to_string(),
-                        );
-                    };
-                    PasteKeySender::Ydotool(path)
-                }
-            },
         }
     };
 
@@ -3232,10 +3161,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::audio_feedback::AudioFeedback;
-    use crate::config::{
-        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
-        PasteBackendFailurePolicy, PasteKeyBackend,
-    };
+    use crate::config::OverlayMode;
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -3243,12 +3169,12 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, collect_pipe_reader, drain_sse_lines, handle_server_message,
-        maybe_defer_llm_session_end, sanitize_model_answer, spawn_injector_worker_with_capacity,
-        spawn_pipe_reader, EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind,
-        InjectionJob, InjectionJobRunner, InjectionRunError, InjectionRunOutput,
-        InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
-        RuntimeOverlaySink, SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
+        collect_pipe_reader, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, spawn_pipe_reader,
+        EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob,
+        InjectionJobRunner, InjectionRunError, InjectionRunOutput, InjectorSubprocessRunner,
+        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
     };
 
     async fn handle_server_message_for_tests<S: OverlaySink>(
@@ -3364,42 +3290,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_failure_policy_error_returns_injector_error() {
-        let config = ClientConfig::new(
-            "ws://127.0.0.1:8765/ws",
-            None,
-            "KEY_RIGHTCTRL".to_string(),
-            InjectionConfig {
-                ydotool_path: Some(PathBuf::from("/definitely/missing/ydotool")),
-                uinput_dwell_ms: 18,
-                injection_mode: InjectionMode::Paste,
-                clipboard: ClipboardOptions {
-                    key_backend: PasteKeyBackend::Ydotool,
-                    backend_failure_policy: PasteBackendFailurePolicy::Error,
-                    post_chord_hold_ms: 700,
-                    seat: None,
-                    write_primary: false,
-                },
-            },
-            Duration::from_secs(5),
-        )
-        .expect("config should parse");
-
-        let injector = build_injector(&config);
-        let err = injector
-            .inject("test")
-            .expect_err("policy=error should fail injection");
-        let message = format!("{err:#}");
-        assert!(message.contains("ydotool"));
-        assert!(message.contains("not found"));
-    }
-
-    #[test]
-    fn cli_default_paste_key_backend_is_auto() {
+    fn cli_default_paste_key_backend_is_uinput() {
         let cli = super::Cli::parse_from(["parakeet-ptt"]);
         assert!(matches!(
             cli.paste_key_backend,
-            super::CliPasteKeyBackend::Auto
+            super::CliPasteKeyBackend::Uinput
         ));
     }
 

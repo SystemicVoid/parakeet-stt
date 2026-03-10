@@ -71,12 +71,11 @@ stt() {
     local PORT="${PARAKEET_PORT:-8765}"
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
-    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
+    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-uinput}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
-    local default_ydotool_path="${PARAKEET_YDOTOOL_PATH:-}"
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
@@ -111,12 +110,11 @@ stt() {
     local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
-        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|auto|always|auto"
+        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|uinput|always|uinput"
         "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"
         "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Stable controls|<n>|18|always|18"
         "paste-seat|paste_seat|default_paste_seat|PARAKEET_PASTE_SEAT|Stable controls|<v>|<unset>|nonempty|"
         "paste-write-primary|paste_write_primary|default_paste_write_primary|PARAKEET_PASTE_WRITE_PRIMARY|Stable controls|<v>|false|always|false"
-        "ydotool|ydotool_path|default_ydotool_path|PARAKEET_YDOTOOL_PATH|Stable controls|<path>|<auto>|nonempty|"
         "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Stable controls|<v>|true|always|true"
         "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Stable controls|<path>|<system default>|nonempty|"
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
@@ -865,7 +863,7 @@ CLIENTCMD
             ;;
         __start-args)
             local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local -a ptt_args
@@ -893,7 +891,7 @@ CLIENTCMD
             ;;
         start)
             local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local launch_profile="stream-seal"
@@ -1311,7 +1309,7 @@ CLIENTCMD
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local ptt_rustflags="$default_ptt_rustflags"
@@ -1429,9 +1427,9 @@ CLIENTCMD
                 done
 
                 case "$backend_filter" in
-                    all|auto|uinput|ydotool) ;;
+                    all|uinput) ;;
                     *)
-                        echo "diag-injector backend must be one of: all|auto|uinput|ydotool" >&2
+                        echo "diag-injector backend must be one of: all|uinput" >&2
                         exit 2
                         ;;
                 esac
@@ -1476,7 +1474,6 @@ CLIENTCMD
                 echo "   - diag forced shortcut: $shortcut"
                 echo "   - diag text prefix: $text_prefix"
                 echo "   - diag interval ms: $interval_ms"
-                echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
                 if [ -e /dev/uinput ]; then
                     if [ -w /dev/uinput ]; then
                         echo "   - capability: /dev/uinput writable=yes"
@@ -1490,7 +1487,7 @@ CLIENTCMD
                 run_case() {
                     local backend="$1"
                     local injection_mode paste_key_backend paste_backend_failure_policy
-                    local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+                    local uinput_dwell_ms paste_seat paste_write_primary
                     local completion_sound completion_sound_path completion_sound_volume
                     local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
@@ -1522,9 +1519,7 @@ CLIENTCMD
                 }
 
                 if [ "$backend_filter" = "all" ]; then
-                    run_case "auto"
                     run_case "uinput"
-                    run_case "ydotool"
                 else
                     run_case "$backend_filter"
                 fi

@@ -2,7 +2,6 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -409,9 +408,7 @@ impl TextInjector for FailInjector {
 
 #[derive(Debug, Clone)]
 pub enum PasteKeySender {
-    Ydotool(PathBuf),
     Uinput(Arc<UinputChordSender>),
-    Chain(Vec<PasteKeySender>),
     Disabled,
 }
 
@@ -549,7 +546,6 @@ impl InjectionOutcome {
 impl ClipboardInjector {
     const CLIPBOARD_READY_TIMEOUT_MS: u64 = 250;
     const CLIPBOARD_READY_SCHEDULE_MS: [u64; 8] = [5, 10, 15, 20, 30, 40, 50, 70];
-    const BACKEND_STDERR_EXCERPT_MAX_CHARS: usize = 240;
     const WAYLAND_STALE_MS: u64 = 30_000;
     const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
 
@@ -593,36 +589,6 @@ impl ClipboardInjector {
 
     fn route_class_name(route: &crate::routing::RouteDecision) -> String {
         format!("{:?}", route.class)
-    }
-
-    fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
-        let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let mut excerpt = String::new();
-        for ch in trimmed.chars().take(Self::BACKEND_STDERR_EXCERPT_MAX_CHARS) {
-            excerpt.push(ch);
-        }
-        if trimmed.chars().count() > Self::BACKEND_STDERR_EXCERPT_MAX_CHARS {
-            excerpt.push_str("...");
-        }
-        Some(excerpt)
-    }
-
-    fn classify_warning_tags(stderr_excerpt: Option<&str>) -> Vec<String> {
-        let Some(stderr) = stderr_excerpt else {
-            return Vec::new();
-        };
-        let mut tags = Vec::new();
-        let lower = stderr.to_ascii_lowercase();
-        if lower.contains("ydotoold backend unavailable") {
-            tags.push("ydotool_backend_unavailable".to_string());
-        }
-        if lower.contains("latency+delay") {
-            tags.push("ydotool_latency_delay_warning".to_string());
-        }
-        tags
     }
 
     fn backend_attempt_report(
@@ -849,18 +815,9 @@ impl ClipboardInjector {
             .unwrap_or_else(|| *Self::CLIPBOARD_READY_SCHEDULE_MS.last().unwrap_or(&70))
     }
 
-    fn ydotool_shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
-        match shortcut {
-            PasteShortcut::CtrlV => &["29:1", "47:1", "47:0", "29:0"],
-            PasteShortcut::CtrlShiftV => &["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
-        }
-    }
-
     fn sender_name(sender: &PasteKeySender) -> &'static str {
         match sender {
-            PasteKeySender::Ydotool(_) => "ydotool",
             PasteKeySender::Uinput(_) => "uinput",
-            PasteKeySender::Chain(_) => "chain",
             PasteKeySender::Disabled => "disabled",
         }
     }
@@ -922,134 +879,6 @@ impl ClipboardInjector {
         );
         let backend_attempt_started = Instant::now();
         match sender {
-            PasteKeySender::Ydotool(binary) => {
-                debug!(
-                    trace_id,
-                    stage = STAGE_BACKEND,
-                    route_attempt_name = attempt.route_attempt_name,
-                    route_attempt_index = attempt.route_attempt_index,
-                    route_attempt_total = attempt.route_attempt_total,
-                    backend_attempt_index = attempt.backend_attempt_index,
-                    backend_attempt_total = attempt.backend_attempt_total,
-                    shortcut = ?shortcut,
-                    backend = "ydotool",
-                    binary = %binary.display(),
-                    args = ?Self::ydotool_shortcut_args(shortcut),
-                    "sending paste chord"
-                );
-                let mut command = Command::new(binary);
-                command
-                    .arg("key")
-                    .args(Self::ydotool_shortcut_args(shortcut));
-                let output = command_output_with_timeout(
-                    command,
-                    Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
-                    trace_id,
-                    "ydotool",
-                )
-                .context("stage=backend failed to run ydotool for paste chord");
-                let output = match output {
-                    Ok(output) => output,
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        backend_attempts.push(Self::backend_attempt_report(
-                            attempt,
-                            backend_name,
-                            &shortcut_name,
-                            "error",
-                            backend_attempt_started.elapsed().as_millis() as u64,
-                            None,
-                            None,
-                            Vec::new(),
-                            Some(format!("binary={}", binary.display())),
-                            Some(message.clone()),
-                        ));
-                        Self::stage_failure(
-                            trace_id,
-                            InjectionStage::Backend,
-                            stage_started,
-                            &message,
-                            "backend shortcut emission failed",
-                        );
-                        return Err(err);
-                    }
-                };
-
-                let stderr_excerpt = Self::stderr_excerpt(&output.stderr);
-                let warning_tags = Self::classify_warning_tags(stderr_excerpt.as_deref());
-                if !warning_tags.is_empty() {
-                    warn!(
-                        trace_id,
-                        stage = STAGE_BACKEND,
-                        backend = "ydotool",
-                        warning_tags = ?warning_tags,
-                        stderr_excerpt = ?stderr_excerpt,
-                        "ydotool backend emitted warning stderr"
-                    );
-                }
-
-                debug!(
-                    trace_id,
-                    stage = STAGE_BACKEND,
-                    route_attempt_name = attempt.route_attempt_name,
-                    route_attempt_index = attempt.route_attempt_index,
-                    route_attempt_total = attempt.route_attempt_total,
-                    backend_attempt_index = attempt.backend_attempt_index,
-                    backend_attempt_total = attempt.backend_attempt_total,
-                    status = ?output.status,
-                    backend = "ydotool",
-                    stderr_excerpt = ?stderr_excerpt,
-                    "paste chord command finished"
-                );
-                if !output.status.success() {
-                    let mut message = format!(
-                        "stage=backend paste key chord {:?} via ydotool exited with status {}",
-                        shortcut, output.status
-                    );
-                    if let Some(stderr_excerpt) = stderr_excerpt.as_ref() {
-                        message.push_str(&format!(": stderr={stderr_excerpt}"));
-                    }
-                    backend_attempts.push(Self::backend_attempt_report(
-                        attempt,
-                        backend_name,
-                        &shortcut_name,
-                        "nonzero_exit",
-                        backend_attempt_started.elapsed().as_millis() as u64,
-                        Some(output.status.to_string()),
-                        stderr_excerpt,
-                        warning_tags,
-                        Some(format!("binary={}", binary.display())),
-                        Some(message.clone()),
-                    ));
-                    Self::stage_failure(
-                        trace_id,
-                        InjectionStage::Backend,
-                        stage_started,
-                        &message,
-                        "backend shortcut emission failed",
-                    );
-                    anyhow::bail!("{message}");
-                }
-                Self::stage_success(
-                    trace_id,
-                    InjectionStage::Backend,
-                    stage_started,
-                    "backend shortcut emission succeeded",
-                );
-                backend_attempts.push(Self::backend_attempt_report(
-                    attempt,
-                    backend_name,
-                    &shortcut_name,
-                    "ok",
-                    backend_attempt_started.elapsed().as_millis() as u64,
-                    Some(output.status.to_string()),
-                    stderr_excerpt,
-                    warning_tags,
-                    Some(format!("binary={}", binary.display())),
-                    None,
-                ));
-                Result::<()>::Ok(())
-            }
             PasteKeySender::Uinput(sender) => {
                 debug!(
                     trace_id,
@@ -1118,29 +947,6 @@ impl ClipboardInjector {
                 ));
                 Result::<()>::Ok(())
             }
-            PasteKeySender::Chain(_) => {
-                let message = "stage=backend nested sender chain is not supported".to_string();
-                backend_attempts.push(Self::backend_attempt_report(
-                    attempt,
-                    backend_name,
-                    &shortcut_name,
-                    "error",
-                    backend_attempt_started.elapsed().as_millis() as u64,
-                    None,
-                    None,
-                    Vec::new(),
-                    None,
-                    Some(message.clone()),
-                ));
-                Self::stage_failure(
-                    trace_id,
-                    InjectionStage::Backend,
-                    stage_started,
-                    &message,
-                    "backend shortcut emission failed",
-                );
-                anyhow::bail!("{message}")
-            }
             PasteKeySender::Disabled => {
                 let message = "stage=backend paste key sender is disabled".to_string();
                 backend_attempts.push(Self::backend_attempt_report(
@@ -1187,81 +993,19 @@ impl ClipboardInjector {
         shortcut: PasteShortcut,
         backend_attempts: &mut Vec<BackendAttemptReport>,
     ) -> Result<()> {
-        match &self.sender {
-            PasteKeySender::Chain(backends) => {
-                let mut errors = Vec::new();
-                for (idx, backend) in backends.iter().enumerate() {
-                    let backend_attempt_index = idx + 1;
-                    let backend_attempt_total = backends.len();
-                    let attempt = ShortcutAttemptContext {
-                        route_attempt_name,
-                        route_attempt_index,
-                        route_attempt_total,
-                        backend_attempt_index,
-                        backend_attempt_total,
-                    };
-                    if backend_attempt_index > 1 {
-                        info!(
-                            trace_id,
-                            stage = STAGE_BACKEND,
-                            route_attempt_name,
-                            route_attempt_index,
-                            route_attempt_total,
-                            route_shortcut = ?shortcut,
-                            backend = Self::sender_name(backend),
-                            backend_attempt_index,
-                            backend_attempt_total,
-                            "attempting paste backend fallback"
-                        );
-                    }
-                    match Self::run_shortcut_with_sender(
-                        trace_id,
-                        shortcut,
-                        backend,
-                        attempt,
-                        backend_attempts,
-                    ) {
-                        Ok(()) => return Ok(()),
-                        Err(err) => {
-                            let err_text = format!("{err:#}");
-                            warn!(
-                                trace_id,
-                                stage = STAGE_BACKEND,
-                                route_attempt_name,
-                                route_attempt_index,
-                                route_attempt_total,
-                                route_shortcut = ?shortcut,
-                                backend = Self::sender_name(backend),
-                                backend_attempt_index,
-                                backend_attempt_total,
-                                error = %err_text,
-                                "paste backend attempt failed"
-                            );
-                            errors.push(format!("{}: {}", Self::sender_name(backend), err_text));
-                        }
-                    }
-                }
-
-                anyhow::bail!(
-                    "stage=backend all paste backend attempts failed for shortcut {:?}: {}",
-                    shortcut,
-                    errors.join(" | ")
-                )
-            }
-            sender => Self::run_shortcut_with_sender(
-                trace_id,
-                shortcut,
-                sender,
-                ShortcutAttemptContext {
-                    route_attempt_name,
-                    route_attempt_index,
-                    route_attempt_total,
-                    backend_attempt_index: 1,
-                    backend_attempt_total: 1,
-                },
-                backend_attempts,
-            ),
-        }
+        Self::run_shortcut_with_sender(
+            trace_id,
+            shortcut,
+            &self.sender,
+            ShortcutAttemptContext {
+                route_attempt_name,
+                route_attempt_index,
+                route_attempt_total,
+                backend_attempt_index: 1,
+                backend_attempt_total: 1,
+            },
+            backend_attempts,
+        )
     }
 
     #[cfg(test)]
@@ -1975,19 +1719,15 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{injector_metrics_snapshot, ClipboardInjector, PasteKeySender, UinputChordSender};
+    use super::{ClipboardInjector, PasteKeySender, UinputChordSender};
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use evdev::Key;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
 
     fn test_options() -> ClipboardOptions {
         ClipboardOptions {
-            key_backend: PasteKeyBackend::Auto,
+            key_backend: PasteKeyBackend::Uinput,
             backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
             post_chord_hold_ms: 700,
             seat: None,
@@ -2000,90 +1740,6 @@ mod tests {
         let (modifiers, key) = UinputChordSender::shortcut_plan(PasteShortcut::CtrlShiftV);
         assert_eq!(modifiers, [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT]);
         assert_eq!(key, Key::KEY_V);
-    }
-
-    #[test]
-    fn chain_sender_falls_through_to_next_backend() {
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
-                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-            context: None,
-            forced_shortcut: None,
-        };
-
-        // ydotool /bin/true with "key" arg should succeed (it's just /bin/true ignoring args)
-        assert!(injector.run_shortcut(1, PasteShortcut::CtrlV).is_ok());
-    }
-
-    #[test]
-    fn chain_sender_reports_all_backend_failures() {
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Disabled,
-                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-            context: None,
-            forced_shortcut: None,
-        };
-
-        let err = injector
-            .run_shortcut(1, PasteShortcut::CtrlV)
-            .expect_err("expected chain failure");
-        let message = format!("{err:#}");
-        assert!(message.contains("all paste backend attempts failed"));
-        assert!(message.contains("disabled"));
-        assert!(message.contains("ydotool"));
-    }
-
-    fn make_test_ydotool(content: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "parakeet-ptt-injector-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("current time should be after epoch")
-                .as_nanos()
-        ));
-        fs::write(&path, content).expect("test helper script should be writable");
-        let mut perms = fs::metadata(&path)
-            .expect("test helper script should exist")
-            .permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&path, perms).expect("test helper script should be executable");
-        path
-    }
-
-    #[test]
-    fn route_fallback_attempt_uses_adaptive_shortcut_after_primary_failure() {
-        let script = make_test_ydotool(
-            "#!/usr/bin/env bash\nif [ \"$#\" -eq 7 ]; then exit 1; fi\nexit 0\n",
-        );
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Ydotool(script.clone()),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-            context: None,
-            forced_shortcut: None,
-        };
-
-        let result = injector.run_route_shortcuts(
-            1,
-            PasteShortcut::CtrlShiftV,
-            Some(PasteShortcut::CtrlV),
-            &mut Vec::new(),
-        );
-        fs::remove_file(&script).expect("test helper script should be removable");
-
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -2127,71 +1783,6 @@ mod tests {
             .expect_err("disabled backend should fail");
         let message = format!("{err:#}");
         assert!(message.contains("stage=backend"));
-    }
-
-    #[test]
-    fn ydotool_spawn_failures_are_counted_as_backend_stage_failures() {
-        let missing_binary = std::env::temp_dir().join(format!(
-            "parakeet-ptt-missing-ydotool-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("current time should be after epoch")
-                .as_nanos()
-        ));
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Ydotool(missing_binary),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-            context: None,
-            forced_shortcut: None,
-        };
-        let attempts = 12;
-        let baseline = injector_metrics_snapshot().backend_failure_total;
-
-        for trace_id in 1..=attempts {
-            let err = injector
-                .run_shortcut(trace_id, PasteShortcut::CtrlV)
-                .expect_err("missing ydotool binary should fail to spawn");
-            let message = format!("{err:#}");
-            assert!(message.contains("failed to spawn ydotool"));
-            assert!(message.contains("stage=backend"));
-        }
-
-        let observed_delta = injector_metrics_snapshot()
-            .backend_failure_total
-            .saturating_sub(baseline);
-        assert!(
-            observed_delta >= attempts,
-            "expected at least {attempts} backend failures recorded, observed {observed_delta}",
-        );
-    }
-
-    #[test]
-    fn timed_out_ydotool_backend_fails_fast_and_chain_recovers() {
-        let hanging_script = make_test_ydotool("#!/usr/bin/env bash\nsleep 5\n");
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Ydotool(hanging_script.clone()),
-                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-            context: None,
-            forced_shortcut: None,
-        };
-
-        let started = Instant::now();
-        let result = injector.run_shortcut(1, PasteShortcut::CtrlV);
-        fs::remove_file(&hanging_script).expect("test helper script should be removable");
-
-        assert!(result.is_ok(), "chain backend should recover after timeout");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timed out backend should be killed promptly"
-        );
     }
 
     #[test]
