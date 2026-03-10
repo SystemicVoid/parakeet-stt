@@ -71,7 +71,6 @@ stt() {
     local PORT="${PARAKEET_PORT:-8765}"
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
-    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-uinput}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
@@ -110,7 +109,6 @@ stt() {
     local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
-        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|uinput|always|uinput"
         "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"
         "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Stable controls|<n>|18|always|18"
         "paste-seat|paste_seat|default_paste_seat|PARAKEET_PASTE_SEAT|Stable controls|<v>|<unset>|nonempty|"
@@ -182,27 +180,6 @@ stt() {
         return 1
     }
 
-    _normalize_paste_key_backend() {
-        local value="$1"
-        local source="$2"
-        case "$value" in
-            ""|uinput)
-                printf "%s" "${value:-uinput}"
-                ;;
-            auto|ydotool|wtype)
-                echo "stt helper: $source='$value' was removed; falling back to 'uinput'." >&2
-                printf "uinput"
-                ;;
-            *)
-                printf "%s" "$value"
-                ;;
-        esac
-    }
-
-    if [ -n "${PARAKEET_PASTE_KEY_BACKEND+x}" ]; then
-        default_paste_key_backend="$(_normalize_paste_key_backend "$default_paste_key_backend" "PARAKEET_PASTE_KEY_BACKEND")"
-    fi
-
     _set_start_option_value() {
         local target="$1"
         local value="$2"
@@ -210,9 +187,6 @@ stt() {
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ <<<"$row"
             if [ "$opt_name" = "$target" ]; then
-                if [ "$opt_name" = "paste-key-backend" ]; then
-                    value="$(_normalize_paste_key_backend "$value" "--paste-key-backend")"
-                fi
                 printf -v "$var_name" "%s" "$value"
                 return 0
             fi
@@ -260,6 +234,7 @@ stt() {
         if [ "$include_endpoint" = "yes" ]; then
             out_ref+=(--endpoint "$DEFAULT_ENDPOINT")
         fi
+        out_ref+=(--paste-key-backend uinput)
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
@@ -886,7 +861,7 @@ CLIENTCMD
             _print_start_option_names
             ;;
         __start-args)
-            local injection_mode paste_key_backend paste_backend_failure_policy
+            local injection_mode paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
@@ -914,7 +889,7 @@ CLIENTCMD
             printf "%s\n" "${ptt_args[@]}"
             ;;
         start)
-            local injection_mode paste_key_backend paste_backend_failure_policy
+            local injection_mode paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
@@ -960,7 +935,6 @@ CLIENTCMD
 
             echo ">>> Starting Parakeet STT (detached tmux)..."
             echo "   - Injection mode: $injection_mode"
-            echo "   - Paste key backend: $paste_key_backend"
             echo "   - Paste backend failure policy: $paste_backend_failure_policy"
             echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
@@ -1332,7 +1306,7 @@ CLIENTCMD
             echo "${HOST}:${PORT}" >| "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local injection_mode paste_key_backend paste_backend_failure_policy
+            local injection_mode paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
@@ -1396,21 +1370,12 @@ CLIENTCMD
             (
                 cd "$CLIENT_DIR" || exit 1
                 set -e
-                local backend_filter="all"
                 local attempts="1"
                 local shortcut="auto"
                 local text_prefix="Parakeet Test"
                 local interval_ms="150"
                 while [ "$#" -gt 0 ]; do
                     case "$1" in
-                        --backend)
-                            [ "$#" -ge 2 ] || {
-                                echo "diag-injector requires a value after --backend" >&2
-                                exit 2
-                            }
-                            backend_filter="$2"
-                            shift 2
-                            ;;
                         --attempts)
                             [ "$#" -ge 2 ] || {
                                 echo "diag-injector requires a value after --attempts" >&2
@@ -1450,13 +1415,6 @@ CLIENTCMD
                     esac
                 done
 
-                case "$backend_filter" in
-                    all|uinput) ;;
-                    *)
-                        echo "diag-injector backend must be one of: all|uinput" >&2
-                        exit 2
-                        ;;
-                esac
                 case "$shortcut" in
                     auto|ctrl-v|ctrl-shift-v) ;;
                     *)
@@ -1493,7 +1451,7 @@ CLIENTCMD
                     echo "   - release binary missing expected start flags; using cargo run --release --bin parakeet-ptt"
                 fi
 
-                echo "   - diag backend filter: $backend_filter"
+                echo "   - diag backend: uinput"
                 echo "   - diag attempts per backend: $attempts"
                 echo "   - diag forced shortcut: $shortcut"
                 echo "   - diag text prefix: $text_prefix"
@@ -1509,8 +1467,7 @@ CLIENTCMD
                 fi
 
                 run_case() {
-                    local backend="$1"
-                    local injection_mode paste_key_backend paste_backend_failure_policy
+                    local injection_mode paste_backend_failure_policy
                     local uinput_dwell_ms paste_seat paste_write_primary
                     local completion_sound completion_sound_path completion_sound_volume
                     local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
@@ -1519,7 +1476,6 @@ CLIENTCMD
 
                     _load_start_vars_from_defaults
                     injection_mode="paste"
-                    paste_key_backend="$backend"
                     _build_ptt_args ptt_args no
 
                     diag_args=(
@@ -1532,7 +1488,7 @@ CLIENTCMD
                         diag_args+=(--test-injection-shortcut "$shortcut")
                     fi
 
-                    echo "   - case backend=$backend"
+                    echo "   - case backend=uinput"
                     if [ -n "$runner_bin" ]; then
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
                             "$runner_bin" "${diag_args[@]}" "${ptt_args[@]}"
@@ -1542,11 +1498,7 @@ CLIENTCMD
                     fi
                 }
 
-                if [ "$backend_filter" = "all" ]; then
-                    run_case "uinput"
-                else
-                    run_case "$backend_filter"
-                fi
+                run_case
             )
             ;;
         *)

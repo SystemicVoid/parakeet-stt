@@ -17,7 +17,6 @@ Canonical-source policy:
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
 - Default startup profile is now online stream+seal (`stt` / `stt start`) with paste-mode and adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
-  - `--paste-key-backend uinput`
   - `--paste-backend-failure-policy copy-only`
   - daemon launch default: `PARAKEET_STREAMING_ENABLED=true` for the default profile
   - overlay launch default: `PARAKEET_OVERLAY_ENABLED=true` with `--overlay-adaptive-width=false`
@@ -96,7 +95,6 @@ Paste/copy injection now exposes a stable operator surface through `stt start` a
 
 Client knobs:
 - `--injection-mode paste|copy-only`
-- `--paste-key-backend uinput` (default: `uinput`)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
@@ -110,7 +108,6 @@ Recommended baseline for Ghostty/COSMIC:
 
 ```bash
 stt start --paste \
-  --paste-key-backend uinput \
   --paste-backend-failure-policy copy-only
 ```
 
@@ -141,14 +138,14 @@ It prints `/dev/uinput` capability checks and then runs reproducible `uinput` te
 For the raw-paste Ghostty investigation, use the repo-local harness instead of manually juggling `/tmp` artifacts:
 
 ```bash
-just paste-gap-start backend=uinput
+just paste-gap-start
 ```
 
 That command:
 
 - records the current commit SHA and worktree status
 - clears `/tmp/parakeet-ptt.log`, `/tmp/parakeet-daemon.log`, and `/tmp/parakeet-ghostty-sink.txt`
-- starts `stt` with `--paste-key-backend <backend>` and `--paste-backend-failure-policy error`
+- starts `stt` with the fixed `uinput` path and `--paste-backend-failure-policy error`
 - seeds operator observation templates under `/tmp/parakeet-paste-gap/...`
 
 After the manual Ghostty utterance run, archive and summarize with:

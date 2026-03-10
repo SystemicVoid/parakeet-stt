@@ -12,16 +12,16 @@ GHOSTTY_SINK="/tmp/parakeet-ghostty-sink.txt"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/paste-gap-matrix.sh start --backend <uinput> [--label LABEL] [--attempts N]
-  scripts/paste-gap-matrix.sh inject-only --backend <uinput> [--shortcut <auto|ctrl-v|ctrl-shift-v>] [--label LABEL] [--attempts N] [--prefix TEXT] [--interval-ms N]
+  scripts/paste-gap-matrix.sh start [--label LABEL] [--attempts N]
+  scripts/paste-gap-matrix.sh inject-only [--shortcut <auto|ctrl-v|ctrl-shift-v>] [--label LABEL] [--attempts N] [--prefix TEXT] [--interval-ms N]
   scripts/paste-gap-matrix.sh stop [--run-dir DIR]
   scripts/paste-gap-matrix.sh diag [--run-dir DIR]
   scripts/paste-gap-matrix.sh summarize [--run-dir DIR]
   scripts/paste-gap-matrix.sh current
 
 Commands:
-  start      Freeze baseline metadata, clear runtime artifacts, and start STT with one backend.
-  inject-only Run repeated test-injection diagnostics for one backend without ASR/hotkey flow.
+  start      Freeze baseline metadata, clear runtime artifacts, and start STT with the fixed uinput path.
+  inject-only Run repeated test-injection diagnostics without ASR/hotkey flow.
   stop       Stop STT, archive runtime artifacts, and summarize injector report evidence.
   diag       Run stt diag-injector and capture the control log in the run directory.
   summarize  Rebuild parsed TSV/summary outputs from archived artifacts.
@@ -52,32 +52,6 @@ normalize_named_value() {
             ;;
         *)
             printf '%s\n' "${raw}"
-            ;;
-    esac
-}
-
-validate_backend() {
-    case "${1}" in
-        uinput) ;;
-        *)
-            die "backend must be: uinput"
-            ;;
-    esac
-}
-
-canonicalize_backend() {
-    local backend="$1"
-    local source="$2"
-    case "${backend}" in
-        "" | uinput)
-            printf '%s\n' "${backend:-uinput}"
-            ;;
-        auto | ydotool | wtype)
-            echo "paste-gap-matrix: ${source}='${backend}' was removed; falling back to 'uinput'." >&2
-            printf 'uinput\n'
-            ;;
-        *)
-            printf '%s\n' "${backend}"
             ;;
     esac
 }
@@ -208,16 +182,11 @@ write_run_metadata() {
 }
 
 start_run() {
-    local backend=""
+    local backend="uinput"
     local label="ghostty"
     local attempts="10"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --backend)
-                [[ $# -ge 2 ]] || die "missing value for --backend"
-                backend="$(normalize_named_value "$2" "backend")"
-                shift 2
-                ;;
             --label)
                 [[ $# -ge 2 ]] || die "missing value for --label"
                 label="$(normalize_named_value "$2" "label")"
@@ -234,9 +203,6 @@ start_run() {
         esac
     done
 
-    [[ -n "${backend}" ]] || die "start requires --backend"
-    backend="$(canonicalize_backend "${backend}" "--backend")"
-    validate_backend "${backend}"
     validate_attempts "${attempts}"
     ensure_run_root
 
@@ -252,7 +218,7 @@ start_run() {
 
     run_stt stop >/dev/null 2>&1 || true
     clear_runtime_artifacts
-    run_stt start --paste --paste-key-backend "${backend}" --paste-backend-failure-policy error
+    run_stt start --paste --paste-backend-failure-policy error
     write_current_run "${run_dir}"
 
     cat <<EOF
@@ -279,7 +245,7 @@ EOF
 }
 
 inject_only_run() {
-    local backend=""
+    local backend="uinput"
     local shortcut="ctrl-shift-v"
     local label="ghostty-inject-only"
     local attempts="20"
@@ -287,11 +253,6 @@ inject_only_run() {
     local interval_ms="150"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --backend)
-                [[ $# -ge 2 ]] || die "missing value for --backend"
-                backend="$(normalize_named_value "$2" "backend")"
-                shift 2
-                ;;
             --shortcut)
                 [[ $# -ge 2 ]] || die "missing value for --shortcut"
                 shortcut="$(normalize_named_value "$2" "shortcut")"
@@ -323,9 +284,6 @@ inject_only_run() {
         esac
     done
 
-    [[ -n "${backend}" ]] || die "inject-only requires --backend"
-    backend="$(canonicalize_backend "${backend}" "--backend")"
-    validate_backend "${backend}"
     validate_shortcut "${shortcut}"
     validate_attempts "${attempts}"
     [[ "${interval_ms}" =~ ^[0-9]+$ ]] || die "interval-ms must be an integer"
@@ -350,7 +308,6 @@ inject_only_run() {
     run_stt stop >/dev/null 2>&1 || true
     clear_runtime_artifacts
     run_stt diag-injector \
-        --backend "${backend}" \
         --attempts "${attempts}" \
         --shortcut "${shortcut}" \
         --prefix "${text_prefix}" \
