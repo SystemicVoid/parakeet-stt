@@ -324,6 +324,7 @@ inject_only_run() {
     done
 
     [[ -n "${backend}" ]] || die "inject-only requires --backend"
+    backend="$(canonicalize_backend "${backend}" "--backend")"
     validate_backend "${backend}"
     validate_shortcut "${shortcut}"
     validate_attempts "${attempts}"
