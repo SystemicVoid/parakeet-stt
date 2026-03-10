@@ -382,6 +382,10 @@ fn command_output_with_timeout(
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
+
+    fn inject_with_context(&self, text: &str, _context: Option<InjectorContext>) -> Result<()> {
+        self.inject(text)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -652,6 +656,17 @@ impl ClipboardInjector {
     }
 
     fn emit_report(report: &InjectorChildReport) {
+        info!(
+            session = ?report.session_id,
+            origin = ?report.origin,
+            trace_id = report.trace_id,
+            outcome = report.outcome,
+            route_class = report.route_class,
+            route_primary = report.route_primary,
+            backend_attempt_count = report.backend_attempts.len(),
+            elapsed_ms_total = report.elapsed_ms_total,
+            "injector report"
+        );
         match serde_json::to_string(report) {
             Ok(encoded) => eprintln!("{INJECTOR_REPORT_PREFIX}{encoded}"),
             Err(err) => eprintln!(
@@ -1926,6 +1941,12 @@ impl TextInjector for ClipboardInjector {
         );
 
         Ok(())
+    }
+
+    fn inject_with_context(&self, text: &str, context: Option<InjectorContext>) -> Result<()> {
+        let mut scoped = self.clone();
+        scoped.context = context;
+        scoped.inject(text)
     }
 }
 

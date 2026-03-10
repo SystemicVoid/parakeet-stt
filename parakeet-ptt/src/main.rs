@@ -816,6 +816,43 @@ impl InjectionJobRunner for FailInjectionRunner {
     }
 }
 
+#[derive(Clone)]
+struct InProcessInjectorRunner {
+    injector: Arc<dyn TextInjector>,
+}
+
+impl InProcessInjectorRunner {
+    fn new(config: &ClientConfig) -> Self {
+        Self {
+            injector: build_injector(config),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(injector: Arc<dyn TextInjector>) -> Self {
+        Self { injector }
+    }
+}
+
+impl InjectionJobRunner for InProcessInjectorRunner {
+    fn run(
+        &self,
+        job: &InjectionJob,
+    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
+        let context = InjectorContext {
+            session_id: job.session_id,
+            origin: job.origin.as_str().to_string(),
+            hotkey_up_elapsed_ms_at_enqueue: job.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
+            parent_focus: job.parent_focus.clone(),
+        };
+        self.injector
+            .inject_with_context(&job.text, Some(context))
+            .map_err(|err| InjectionRunError::BackendFailure(format!("{err:#}")))?;
+        Ok(InjectionRunOutput::default())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InjectorSubprocessRunner {
     executable: PathBuf,
@@ -948,17 +985,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
 }
 
 fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> {
-    match InjectorSubprocessRunner::new(config) {
-        Ok(runner) => Arc::new(runner),
-        Err(err) => {
-            let message = format!("failed to initialize injector subprocess runner: {err:#}");
-            error!(error = %message, "injector subprocess runner unavailable");
-            Arc::new(FailInjectionRunner::new(
-                InjectionErrorKind::WorkerTaskFailed,
-                message,
-            ))
-        }
-    }
+    Arc::new(InProcessInjectorRunner::new(config))
 }
 
 fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
