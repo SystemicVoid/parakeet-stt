@@ -2499,7 +2499,6 @@ async fn run_hotkey_mode(
                                                                     &mut parent_focus_by_session,
                                                                     last_hotkey_up_at,
                                                                     last_stop_message,
-                                                                    &audio_feedback,
                                                                 ).await?;
                                                                 if clear_intent {
                                                                     active_intent = None;
@@ -2850,7 +2849,6 @@ async fn handle_server_message(
     parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
     last_hotkey_up_at: Option<TokioInstant>,
     last_stop_message: Option<(Uuid, TokioInstant)>,
-    _audio_feedback: &AudioFeedback,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -3101,7 +3099,6 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crate::audio_feedback::AudioFeedback;
     use crate::config::OverlayMode;
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
@@ -3123,7 +3120,6 @@ mod tests {
         state: &mut PttState,
         overlay_router: &mut OverlayRouter<S>,
         injector_worker: &super::InjectorWorkerHandle,
-        audio_feedback: &AudioFeedback,
     ) -> anyhow::Result<()> {
         let mut parent_focus_by_session = HashMap::new();
         handle_server_message(
@@ -3134,7 +3130,6 @@ mod tests {
             &mut parent_focus_by_session,
             None,
             None,
-            audio_feedback,
         )
         .await
     }
@@ -3404,7 +3399,6 @@ mod tests {
         let session_id = state.begin_listening().expect("state should start");
         state.stop_listening();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
-        let feedback = AudioFeedback::new(false, None, 100);
         let message = ServerMessage::FinalResult {
             session_id,
             text: "hello from daemon".to_string(),
@@ -3415,15 +3409,9 @@ mod tests {
         };
 
         let started = Instant::now();
-        handle_server_message_for_tests(
-            message,
-            &mut state,
-            &mut overlay_router,
-            &worker,
-            &feedback,
-        )
-        .await
-        .expect("server message should enqueue successfully");
+        handle_server_message_for_tests(message, &mut state, &mut overlay_router, &worker)
+            .await
+            .expect("server message should enqueue successfully");
         let elapsed = started.elapsed();
 
         assert!(
@@ -3501,7 +3489,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
@@ -3511,7 +3498,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim state should route to overlay");
@@ -3524,7 +3510,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text should route to overlay");
@@ -3536,7 +3521,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("session ended should route to overlay");
@@ -3596,7 +3580,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
@@ -3606,7 +3589,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim state should route");
@@ -3622,7 +3604,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should enqueue exactly once");
@@ -3635,7 +3616,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text should stay in overlay route");
@@ -3699,7 +3679,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -3709,7 +3688,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("overlay disconnect should be non-fatal");
@@ -3732,7 +3710,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -3805,7 +3782,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         for seq in 1..=4 {
             handle_server_message_for_tests(
                 ServerMessage::InterimText {
@@ -3816,7 +3792,6 @@ mod tests {
                 &mut state,
                 &mut overlay_router,
                 &worker,
-                &feedback,
             )
             .await
             .expect("overlay failures should remain non-fatal");
@@ -3834,7 +3809,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -3913,7 +3887,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -3923,7 +3896,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("first interim text should route");
@@ -3951,7 +3923,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text after crash should remain non-fatal");
@@ -3984,7 +3955,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -4034,7 +4004,6 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -4044,7 +4013,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("first interim text should route");
@@ -4057,7 +4025,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("stale interim text should be dropped without failure");
