@@ -10,15 +10,21 @@ mod state;
 mod surface_focus;
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsString;
-use std::io::{Read, Write};
-#[cfg(unix)]
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
+#[cfg(all(test, unix))]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::process::{Child, ExitStatus};
+#[cfg(test)]
+use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,8 +52,11 @@ use crate::hotkey::{
 };
 use crate::injector::{
     injector_metrics_snapshot, BackendAttemptReport, InjectorChildReport, InjectorContext,
-    ParentFocusCapture, TextInjector, INJECTOR_CONTEXT_ENV, INJECTOR_JOB_TIMEOUT_MS,
-    INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS, INJECTOR_REPORT_PREFIX,
+    ParentFocusCapture, TextInjector, INJECTOR_CONTEXT_ENV, INJECTOR_REPORT_PREFIX,
+};
+#[cfg(test)]
+use crate::injector::{
+    INJECTOR_JOB_TIMEOUT_MS, INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS,
     INJECTOR_SUBPROCESS_POLL_INTERVAL_MS,
 };
 use crate::overlay_process::OverlayProcessManager;
@@ -765,6 +774,7 @@ impl InjectorWorkerHandle {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 enum InjectionRunError {
     BackendFailure(String),
@@ -782,40 +792,6 @@ trait InjectionJobRunner: Send + Sync {
         -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
-#[derive(Debug, Clone)]
-struct FailInjectionRunner {
-    kind: InjectionErrorKind,
-    message: Arc<str>,
-}
-
-impl FailInjectionRunner {
-    fn new(kind: InjectionErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: Arc::<str>::from(message.into()),
-        }
-    }
-}
-
-impl InjectionJobRunner for FailInjectionRunner {
-    fn run(
-        &self,
-        _job: &InjectionJob,
-    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
-        match self.kind {
-            InjectionErrorKind::BackendFailure => {
-                Err(InjectionRunError::BackendFailure(self.message.to_string()))
-            }
-            InjectionErrorKind::ExecutionTimeout => Err(InjectionRunError::ExecutionTimeout(
-                self.message.to_string(),
-            )),
-            InjectionErrorKind::WorkerTaskFailed => Err(InjectionRunError::WorkerTaskFailed(
-                self.message.to_string(),
-            )),
-        }
-    }
-}
-
 #[derive(Clone)]
 struct InProcessInjectorRunner {
     injector: Arc<dyn TextInjector>,
@@ -826,11 +802,6 @@ impl InProcessInjectorRunner {
         Self {
             injector: build_injector(config),
         }
-    }
-
-    #[cfg(test)]
-    fn new_for_tests(injector: Arc<dyn TextInjector>) -> Self {
-        Self { injector }
     }
 }
 
@@ -853,24 +824,21 @@ impl InjectionJobRunner for InProcessInjectorRunner {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct InjectorSubprocessRunner {
     executable: PathBuf,
-    base_args: Vec<OsString>,
+    base_args: Vec<std::ffi::OsString>,
     timeout: Duration,
 }
 
+#[cfg(test)]
 impl InjectorSubprocessRunner {
-    fn new(config: &ClientConfig) -> Result<Self> {
-        Ok(Self {
-            executable: std::env::current_exe().context("failed to resolve current executable")?,
-            base_args: internal_inject_args_from_config(config),
-            timeout: Duration::from_millis(INJECTOR_JOB_TIMEOUT_MS),
-        })
-    }
-
-    #[cfg(test)]
-    fn new_for_tests(executable: PathBuf, base_args: Vec<OsString>, timeout: Duration) -> Self {
+    fn new_for_tests(
+        executable: PathBuf,
+        base_args: Vec<std::ffi::OsString>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             executable,
             base_args,
@@ -879,6 +847,7 @@ impl InjectorSubprocessRunner {
     }
 }
 
+#[cfg(test)]
 impl InjectionJobRunner for InjectorSubprocessRunner {
     fn run(
         &self,
@@ -988,64 +957,27 @@ fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> 
     Arc::new(InProcessInjectorRunner::new(config))
 }
 
-fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
-    let mut args = vec![OsString::from("--internal-inject-once")];
-
-    match config.injection_mode {
-        crate::config::InjectionMode::Paste => {
-            args.push(OsString::from("--injection-mode"));
-            args.push(OsString::from("paste"));
-        }
-        crate::config::InjectionMode::CopyOnly => {
-            args.push(OsString::from("--injection-mode"));
-            args.push(OsString::from("copy-only"));
-        }
-    }
-
-    args.push(OsString::from("--paste-key-backend"));
-    args.push(OsString::from("uinput"));
-
-    match config.clipboard.backend_failure_policy {
-        crate::config::PasteBackendFailurePolicy::CopyOnly => {
-            args.push(OsString::from("--paste-backend-failure-policy"));
-            args.push(OsString::from("copy-only"));
-        }
-        crate::config::PasteBackendFailurePolicy::Error => {
-            args.push(OsString::from("--paste-backend-failure-policy"));
-            args.push(OsString::from("error"));
-        }
-    }
-
-    args.push(OsString::from("--uinput-dwell-ms"));
-    args.push(OsString::from(config.uinput_dwell_ms.to_string()));
-    args.push(OsString::from("--paste-write-primary"));
-    args.push(OsString::from(config.clipboard.write_primary.to_string()));
-
-    if let Some(seat) = &config.clipboard.seat {
-        args.push(OsString::from("--paste-seat"));
-        args.push(OsString::from(seat));
-    }
-
-    args
-}
-
+#[cfg(test)]
 #[derive(Debug)]
 struct PipeReadOutcome {
     bytes: Vec<u8>,
     timed_out: bool,
 }
 
+#[cfg(test)]
 struct PipeReaderHandle {
     receiver: std::sync::mpsc::Receiver<std::io::Result<PipeReadOutcome>>,
     deadline_started: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl PipeReaderHandle {
     fn start_deadline(&self) {
         self.deadline_started.store(true, Ordering::Release);
     }
 }
 
+#[cfg(test)]
 fn spawn_pipe_reader<R>(reader: R, timeout: Duration) -> PipeReaderHandle
 where
     R: Read + Send + AsRawFd + 'static,
@@ -1063,6 +995,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn read_pipe_until_deadline<R>(
     mut reader: R,
     timeout: Duration,
@@ -1124,6 +1057,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn wait_for_pipe_read_ready(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<bool> {
     let timeout_ms = timeout
         .as_millis()
@@ -1159,6 +1093,7 @@ fn wait_for_pipe_read_ready(fd: std::os::fd::RawFd, timeout: Duration) -> std::i
     }
 }
 
+#[cfg(test)]
 fn set_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     let current_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if current_flags < 0 {
@@ -1175,6 +1110,7 @@ fn set_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_pipe_reader(
     handle: PipeReaderHandle,
     label: &str,
@@ -1193,6 +1129,7 @@ fn collect_pipe_reader(
     }
 }
 
+#[cfg(test)]
 fn wait_for_child_exit(
     child: &mut Child,
     timeout: Duration,
@@ -1223,6 +1160,7 @@ fn wait_for_child_exit(
     }
 }
 
+#[cfg(test)]
 fn configure_injector_subprocess(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -1232,6 +1170,7 @@ fn configure_injector_subprocess(command: &mut Command) {
     }
 }
 
+#[cfg(test)]
 fn kill_injector_subprocess(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -1254,6 +1193,7 @@ fn kill_injector_subprocess(child: &mut Child) {
     }
 }
 
+#[cfg(test)]
 fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
     let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
     if trimmed.is_empty() {
@@ -1262,6 +1202,7 @@ fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
     format!("injector subprocess exited with status {status}: {trimmed}")
 }
 
+#[cfg(test)]
 fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> InjectionRunError {
     let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
     if trimmed.is_empty() {
@@ -3561,7 +3502,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
@@ -3657,7 +3597,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
@@ -3761,7 +3700,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -3868,7 +3806,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         for seq in 1..=4 {
             handle_server_message_for_tests(
                 ServerMessage::InterimText {
@@ -3977,7 +3914,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -4099,7 +4035,6 @@ mod tests {
             .expect("state should begin listening");
         state.stop_listening();
         let feedback = AudioFeedback::new(false, None, 100);
-
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
