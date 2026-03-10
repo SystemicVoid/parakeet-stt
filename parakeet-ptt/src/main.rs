@@ -796,8 +796,9 @@ trait InjectionJobRunner: Send + Sync {
         -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
-type InProcessInjectorBuilder =
-    dyn Fn(&ClientConfig, PasteKeySender) -> Arc<dyn TextInjector> + Send + Sync;
+type InProcessInjectorBuilder = dyn Fn(&ClientConfig, PasteKeySender, Option<WaylandFocusCache>) -> Arc<dyn TextInjector>
+    + Send
+    + Sync;
 type InProcessPasteSenderFactory =
     dyn Fn(&ClientConfig) -> Result<Arc<dyn PasteChordSender>> + Send + Sync;
 type InProcessSleepFn = dyn Fn(Duration) + Send + Sync;
@@ -844,6 +845,7 @@ impl Default for UinputSenderManager {
 struct InProcessInjectorRunner {
     config: ClientConfig,
     sender_manager: Arc<Mutex<UinputSenderManager>>,
+    focus_cache: Option<WaylandFocusCache>,
     injector_builder: Arc<InProcessInjectorBuilder>,
     sender_factory: Arc<InProcessPasteSenderFactory>,
     sleep_fn: Arc<InProcessSleepFn>,
@@ -853,10 +855,12 @@ struct InProcessInjectorRunner {
 
 impl InProcessInjectorRunner {
     fn new(config: &ClientConfig) -> Self {
+        let focus_cache = Some(WaylandFocusCache::new());
         Self {
             config: config.clone(),
             sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
-            injector_builder: Arc::new(|config, sender| {
+            focus_cache,
+            injector_builder: Arc::new(|config, sender, focus_cache| {
                 build_clipboard_injector_with_sender(
                     config,
                     sender,
@@ -866,6 +870,7 @@ impl InProcessInjectorRunner {
                     ),
                     None,
                     None,
+                    focus_cache,
                 )
             }),
             sender_factory: Arc::new(build_uinput_chord_sender),
@@ -883,10 +888,12 @@ impl InProcessInjectorRunner {
         sleep_fn: Arc<InProcessSleepFn>,
         uinput_warmup: Duration,
         uinput_retry_backoff: Duration,
+        focus_cache: Option<WaylandFocusCache>,
     ) -> Self {
         Self {
             config: config.clone(),
             sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
+            focus_cache,
             injector_builder,
             sender_factory,
             sleep_fn,
@@ -1030,11 +1037,17 @@ impl InjectionJobRunner for InProcessInjectorRunner {
         };
         let (injector, prepared_sender) = match self.prepare_paste_key_sender() {
             Ok(sender) => {
-                let injector = (self.injector_builder)(&self.config, sender.clone());
+                let injector =
+                    (self.injector_builder)(&self.config, sender.clone(), self.focus_cache.clone());
                 (injector, Some(sender))
             }
             Err(reason) => (
-                build_backend_failure_fallback_injector(&self.config, reason, None),
+                build_backend_failure_fallback_injector(
+                    &self.config,
+                    reason,
+                    None,
+                    self.focus_cache.clone(),
+                ),
                 None,
             ),
         };
@@ -2163,6 +2176,7 @@ fn build_backend_failure_fallback_injector(
     config: &ClientConfig,
     reason: String,
     context: Option<InjectorContext>,
+    focus_cache: Option<WaylandFocusCache>,
 ) -> Arc<dyn TextInjector> {
     use crate::config::PasteBackendFailurePolicy;
 
@@ -2179,6 +2193,7 @@ fn build_backend_failure_fallback_injector(
                 context,
                 // Copy-only fallback never sends chords; forced shortcut is irrelevant.
                 None,
+                focus_cache,
             )
         }
         PasteBackendFailurePolicy::Error => {
@@ -2197,6 +2212,7 @@ fn build_clipboard_injector_with_sender(
     copy_only: bool,
     context: Option<InjectorContext>,
     forced_shortcut: Option<crate::config::PasteShortcut>,
+    focus_cache: Option<WaylandFocusCache>,
 ) -> Arc<dyn TextInjector> {
     use crate::config::InjectionMode;
 
@@ -2215,12 +2231,13 @@ fn build_clipboard_injector_with_sender(
         "Using clipboard injector"
     );
 
-    Arc::new(ClipboardInjector::new_with_overrides(
+    Arc::new(ClipboardInjector::new_with_shared_focus_cache(
         sender,
         config.clipboard.clone(),
         copy_only,
         context,
         forced_shortcut,
+        focus_cache,
     ))
 }
 
@@ -2252,6 +2269,7 @@ fn build_injector_with_shortcut_override(
             ),
             context,
             forced_shortcut,
+            None,
         ),
         Err(err) => build_backend_failure_fallback_injector(
             config,
@@ -2260,6 +2278,7 @@ fn build_injector_with_shortcut_override(
                 err
             ),
             context,
+            None,
         ),
     }
 }
@@ -3718,7 +3737,7 @@ mod tests {
             Arc::new({
                 let build_count = Arc::clone(&build_count);
                 let seen = Arc::clone(&seen);
-                move |_config, _sender| {
+                move |_config, _sender, _focus_cache| {
                     build_count.fetch_add(1, Ordering::Relaxed);
                     Arc::new(RecordingTextInjector {
                         seen: Arc::clone(&seen),
@@ -3738,6 +3757,7 @@ mod tests {
             Arc::new(|_| {}),
             Duration::from_millis(0),
             Duration::from_millis(5),
+            None,
         );
 
         let session_one = Uuid::new_v4();
@@ -3763,11 +3783,78 @@ mod tests {
     }
 
     #[test]
+    fn in_process_runner_reuses_focus_cache_across_jobs() {
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_focus_caches = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let shared_focus_cache = crate::surface_focus::WaylandFocusCache::new();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let seen = Arc::clone(&seen);
+                let observed_focus_caches = Arc::clone(&observed_focus_caches);
+                move |_config, _sender, focus_cache| {
+                    observed_focus_caches
+                        .lock()
+                        .expect("observed focus cache lock should be available")
+                        .push(focus_cache.expect("runner should reuse a shared focus cache"));
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            Some(shared_focus_cache.clone()),
+        );
+
+        let session_one = Uuid::new_v4();
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_one, "first".to_string(), 0, 0))
+            .expect("first run should succeed");
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should succeed");
+
+        let observed_focus_caches = observed_focus_caches
+            .lock()
+            .expect("observed focus cache lock should be available");
+        assert_eq!(observed_focus_caches.len(), 2);
+        assert!(observed_focus_caches[0].shares_worker_with(&observed_focus_caches[1]));
+        assert!(observed_focus_caches[0].shares_worker_with(&shared_focus_cache));
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[
+                ("first".to_string(), session_one),
+                ("second".to_string(), session_two)
+            ]
+        );
+    }
+
+    #[test]
     fn in_process_runner_commits_sender_usage_only_after_success() {
         let config = test_client_config();
         let runner = super::InProcessInjectorRunner::new_for_tests(
             &config,
-            Arc::new(|_config, _sender| Arc::new(FailInjector::new("unused test injector"))),
+            Arc::new(|_config, _sender, _focus_cache| {
+                Arc::new(FailInjector::new("unused test injector"))
+            }),
             Arc::new(|_config| {
                 Ok(Arc::new(RecordingPasteChordSender {
                     sends: Arc::new(AtomicU64::new(0)),
@@ -3777,6 +3864,7 @@ mod tests {
             Arc::new(|_| {}),
             Duration::from_millis(0),
             Duration::from_millis(5),
+            None,
         );
 
         let sender = runner
@@ -3844,7 +3932,7 @@ mod tests {
             Arc::new({
                 let build_count = Arc::clone(&build_count);
                 let seen = Arc::clone(&seen);
-                move |_config, _sender| {
+                move |_config, _sender, _focus_cache| {
                     build_count.fetch_add(1, Ordering::Relaxed);
                     Arc::new(RecordingTextInjector {
                         seen: Arc::clone(&seen),
@@ -3867,6 +3955,7 @@ mod tests {
             Arc::new(|_| {}),
             Duration::from_millis(0),
             Duration::from_millis(5),
+            None,
         );
 
         let _session_one = Uuid::new_v4();
@@ -3899,7 +3988,7 @@ mod tests {
             &config,
             Arc::new({
                 let seen = Arc::clone(&seen);
-                move |_config, sender| {
+                move |_config, sender, _focus_cache| {
                     Arc::new(SenderDrivenInjector {
                         seen: Arc::clone(&seen),
                         sender,
@@ -3920,6 +4009,7 @@ mod tests {
             Arc::new(|_| {}),
             Duration::from_millis(0),
             Duration::from_millis(5),
+            None,
         );
 
         let first = runner.run(&InjectionJob::new(
