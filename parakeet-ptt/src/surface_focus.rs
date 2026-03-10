@@ -86,6 +86,11 @@ impl WaylandFocusCache {
         Self { shared }
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_worker_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     pub fn observe(&self, stale_ms: u64, transition_grace_ms: u64) -> WaylandFocusObservation {
         let snapshot = self
             .shared

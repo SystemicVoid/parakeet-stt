@@ -630,11 +630,29 @@ impl ClipboardInjector {
         context: Option<InjectorContext>,
         forced_shortcut: Option<PasteShortcut>,
     ) -> Self {
+        Self::new_with_shared_focus_cache(
+            sender,
+            options,
+            copy_only,
+            context,
+            forced_shortcut,
+            Some(WaylandFocusCache::new()),
+        )
+    }
+
+    pub(crate) fn new_with_shared_focus_cache(
+        sender: PasteKeySender,
+        options: ClipboardOptions,
+        copy_only: bool,
+        context: Option<InjectorContext>,
+        forced_shortcut: Option<PasteShortcut>,
+        wayland_focus_cache: Option<WaylandFocusCache>,
+    ) -> Self {
         Self {
             sender,
             options,
             copy_only,
-            wayland_focus_cache: Some(WaylandFocusCache::new()),
+            wayland_focus_cache,
             context,
             forced_shortcut,
         }
