@@ -810,6 +810,7 @@ impl ClipboardInjector {
             command.arg("--foreground");
         }
 
+        configure_subprocess_process_group(&mut command);
         let mut child = command.spawn().context("failed to spawn wl-copy")?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -1837,13 +1838,17 @@ fn preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendAttemptOutcome, ClipboardInjector, PasteKeySender, ShortcutAttemptContext,
-        UinputAttemptMetadata, UinputChordSender,
+        configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
+        PasteKeySender, ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender,
     };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use evdev::Key;
+    #[cfg(unix)]
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
 
     fn test_options() -> ClipboardOptions {
         ClipboardOptions {
@@ -1938,6 +1943,42 @@ mod tests {
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(8), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(9), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(128), 70);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_subprocess_process_group_moves_child_into_own_group() {
+        let mut command = Command::new("bash");
+        command.arg("-lc").arg(
+            r#"pid=$$; pgid=$(ps -o pgid= -p "$pid" | tr -d ' '); printf '%s %s\n' "$pid" "$pgid""#,
+        );
+        configure_subprocess_process_group(&mut command);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("test helper should spawn");
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout pipe should exist")
+            .read_to_string(&mut stdout)
+            .expect("stdout should be readable");
+        let status = child.wait().expect("child should exit");
+        assert!(status.success(), "helper should exit successfully");
+
+        let mut parts = stdout.split_whitespace();
+        let pid = parts.next().expect("helper should report pid");
+        let pgid = parts.next().expect("helper should report pgid");
+        assert_eq!(
+            parts.next(),
+            None,
+            "helper output should contain two fields"
+        );
+        assert_eq!(
+            pid, pgid,
+            "child should become leader of its own process group"
+        );
     }
 
     #[test]
