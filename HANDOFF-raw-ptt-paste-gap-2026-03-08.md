@@ -18,7 +18,113 @@ Goal:
 
 This issue is **not solved**.
 
-The latest attempted fix was based on the wrong root-cause hypothesis and has been reverted. The codebase should be treated as back to the pre-experiment runtime behavior.
+Current branch state as of **2026-03-10**:
+
+- the paste-gap harness has been corrected so archived runs no longer mislabel removed backend names
+- runtime injection still uses the in-process worker path introduced on this branch
+- however, the most recent review-safe runtime fix changed that in-process path from **one cached injector for the whole client session** to **rebuilding the injector per job**
+
+That last point is the important subtlety.
+
+The original branch intent was not just "silence review comments" or "avoid subprocesses on principle". The real UX goal is:
+
+- final transcript / LLM-answer paste must work reliably enough that the user can trust it every time
+
+Historical operator experience matters here:
+
+- before the child-process injection change, paste behavior was reported as working **basically every time**
+- after moving to the child-process injection model, the branch began chasing intermittent visible-paste failures even though clipboard writes and daemon finalization still looked correct
+
+So the current branch should be read this way:
+
+- `a90b9ef fix(injector): run PTT injections through persistent in-process injector`
+  - likely moved in the right direction for reliability because it removed per-injection subprocess lifetime behavior from the hot path
+  - it also kept one in-process injector instance alive for the client session, which may have unintentionally provided a "warm" persistent `uinput` device
+- `8564084 fix(injector): rebuild in-process backend per job`
+  - fixed a real review regression: if `/dev/uinput` was unavailable when the client started, the cached injector permanently baked in fallback/error behavior for the whole session
+  - but it also gave up whole-session injector reuse, which may cut against the original reliability goal if a persistent virtual keyboard was part of why paste became more stable
+
+Therefore:
+
+- the current runtime state should be treated as a **review-safe stopgap**, not as the final design
+- it preserves the in-process worker architecture
+- it does **not** preserve the stronger "warm persistent injector/device" behavior from `a90b9ef`
+
+## Status Update (2026-03-10, branch intent versus review-safe runtime fix)
+
+The current branch now has two truths that must be kept in view at the same time.
+
+### Truth 1: the review comment was correct
+
+Caching `build_injector(config)` once at client startup froze the `/dev/uinput` availability decision for the entire session.
+
+That was a real behavioral regression relative to the older subprocess path:
+
+- old subprocess path: each injection effectively retried backend construction
+- cached in-process injector path: startup-time failure could not recover until client restart
+
+So the review fix was not bikeshedding; it corrected a real recovery bug.
+
+### Truth 2: the review-safe fix may not match the branch's real UX intent
+
+Rebuilding the injector for every job keeps late `/dev/uinput` recovery, but it may also discard the exact property that was helping paste reliability:
+
+- one stable in-process `uinput` virtual keyboard surviving across utterances
+- no repeated "fresh virtual device appears immediately before first chord" timing boundary
+
+This distinction matters because the Linux `uinput` documentation explicitly notes that after `UI_DEV_CREATE`, userspace may need time to detect and initialize the new device before it will notice the first emitted event.
+
+That does **not** prove our bug is a fresh-device race.
+
+But it does mean the following hypothesis is grounded and worth taking seriously:
+
+- a persistent `uinput` device may be more reliable not because of superstition, but because it avoids compositor/client detection races around newly created virtual keyboards
+
+### Current best design direction
+
+The likely end state is **not** one of these extremes:
+
+- not "always rebuild everything every job forever"
+- not "cache startup success/failure forever and never retry"
+
+The more promising design is:
+
+- persistent in-process worker
+- persistent `uinput` sender/device while healthy
+- lazy initialization or retryable re-initialization on demand
+- recovery if `/dev/uinput` permissions or availability are fixed after startup
+
+In other words:
+
+- keep the warm device when it is healthy
+- but do not let one startup-time failure poison the whole session
+
+### What should not be assumed yet
+
+Do not assume a priming hack such as "send space, then backspace, then paste" is the answer.
+
+Why:
+
+- it could help if the real issue is "first event from a newly created virtual device is not observed"
+- but it is not a semantic no-op and can corrupt the target buffer if either half lands without the other
+- it does not explain clipboard readiness or routing mistakes
+
+Treat priming as a diagnostic hypothesis, not as a product fix.
+
+### What we now need from ground truth, not guesses
+
+We need code-level answers from the underlying stack:
+
+- COSMIC compositor / Smithay:
+  - how keyboard focus is assigned at the seat level
+  - whether newly appeared keyboards or shortcut inhibition change event delivery timing/eligibility
+  - whether terminals like Ghostty receive synthetic `Ctrl+Shift+V` on the exact same path as a physical keyboard
+- Linux `uinput` / evdev:
+  - whether our current `evdev::uinput::VirtualDeviceBuilder::build()` path creates a new virtual keyboard for every injection attempt in the rebuilt-per-job model
+  - whether keeping one `VirtualDevice` open materially avoids first-event detection races
+  - what observable signal, if any, exists to tell us the compositor has actually noticed the device
+
+Until those answers are gathered, do not confuse "review-safe" with "reliability-maximizing".
 
 ## Status Update (2026-03-08, later debugging pass)
 
