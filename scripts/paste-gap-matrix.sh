@@ -104,10 +104,10 @@ seed_operator_observations() {
     local attempts="$2"
     local utterance_prefix="${3:-raw}"
     {
-        printf 'attempt_index,utterance,visible_paste,sink_captured,notes\n'
+        printf 'attempt_index\tutterance\tvisible_paste\tsink_captured\tnotes\n'
         local index
         for index in $(seq 1 "${attempts}"); do
-            printf '%s,%s %s,,,\n' "${index}" "${utterance_prefix}" "${index}"
+            printf '%s\t%s %s\t\t\t\n' "${index}" "${utterance_prefix}" "${index}"
         done
     } >"${path}"
 }
@@ -130,8 +130,8 @@ EOF
 seed_diag_observations() {
     local path="$1"
     {
-        printf 'backend,visible_paste,notes\n'
-        printf 'uinput,,\n'
+        printf 'backend\tvisible_paste\tnotes\n'
+        printf 'uinput\t\t\n'
     } >"${path}"
 }
 
@@ -218,7 +218,11 @@ start_run() {
 
     run_stt stop >/dev/null 2>&1 || true
     clear_runtime_artifacts
-    run_stt start --paste --paste-backend-failure-policy error
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/scripts/stt-helper.sh"
+    local -a start_args
+    get_stt_start_args start_args --injection-mode paste --paste-backend-failure-policy error
+    run_stt start "${start_args[@]}"
     write_current_run "${run_dir}"
 
     cat <<EOF
@@ -411,6 +415,7 @@ summarize_run() {
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 import sys
@@ -442,6 +447,7 @@ fields = [
     "child_origin",
     "trace_id",
     "outcome",
+    "error",
     "clipboard_ready",
     "post_clipboard_matches",
     "parent_focus_app",
@@ -632,6 +638,7 @@ def parse_child_reports_from_text(text: str, default_origin: str) -> list[dict[s
                 "child_origin": scalar(report.get("origin")) or default_origin,
                 "trace_id": scalar(report.get("trace_id")),
                 "outcome": scalar(report.get("outcome")),
+                "error": scalar(report.get("error")),
                 "clipboard_ready": scalar(report.get("clipboard_ready")),
                 "post_clipboard_matches": scalar(report.get("post_clipboard_matches")),
                 "parent_focus_app": scalar(parent_focus_snapshot.get("app_name")),
@@ -692,6 +699,16 @@ def clean_cell(value: object) -> str:
     return str(value).strip()
 
 
+def detect_tabular_delimiter(text: str) -> str:
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if "\t" in line:
+            return "\t"
+        return ","
+    return ","
+
+
 def read_tabular(
     path: Path,
     *,
@@ -701,8 +718,10 @@ def read_tabular(
         return [], 0
     cleaned_rows: list[dict[str, str]] = []
     malformed_rows = 0
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
+    text = path.read_text(encoding="utf-8")
+    delimiter = detect_tabular_delimiter(text)
+    with io.StringIO(text) as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
         for raw_row in reader:
             extras = raw_row.pop(None, None)
             row = {str(key): clean_cell(value) for key, value in raw_row.items() if key is not None}
