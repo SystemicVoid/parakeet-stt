@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "parakeet-stt-daemon"
-version = "0.2.0"
+version = "0.2.2"
 description = "Local Parakeet push-to-talk daemon (WebSocket API + NeMo streaming)."
 readme = "README.md"
 license = { text = "MIT" }
