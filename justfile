@@ -3,6 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 repo_root := justfile_directory()
 daemon_dir := justfile_directory() + "/parakeet-stt-daemon"
 personal_dir := "bench_audio/personal"
+history_dir := personal_dir + "/history"
 manifest_path := personal_dir + "/manifest.jsonl"
 offline_baseline := personal_dir + "/baseline.json"
 stream_baseline := personal_dir + "/baseline-stream-seal.json"
@@ -37,6 +38,24 @@ status:
 
 logs:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'
+
+paste-gap-start label="ghostty" attempts="10":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh start --label "{{label}}" --attempts "{{attempts}}"'
+
+paste-gap-inject-only shortcut="ctrl-shift-v" label="ghostty-inject-only" attempts="20" prefix="PG" interval_ms="150":
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh inject-only --shortcut "{{shortcut}}" --label "{{label}}" --attempts "{{attempts}}" --prefix "{{prefix}}" --interval-ms "{{interval_ms}}"'
+
+paste-gap-stop run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh stop --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh stop; fi'
+
+paste-gap-diag run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh diag --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh diag; fi'
+
+paste-gap-summary run_dir="":
+    @bash -lc 'cd "{{repo_root}}" && if [[ -n "{{run_dir}}" ]]; then scripts/paste-gap-matrix.sh summarize --run-dir "{{run_dir}}"; else scripts/paste-gap-matrix.sh summarize; fi'
+
+paste-gap-current:
+    @bash -lc 'cd "{{repo_root}}" && scripts/paste-gap-matrix.sh current'
 
 logs-overlay:
     @cd "{{repo_root}}"
@@ -78,6 +97,7 @@ overlay-doctor:
 #   just eval offline                  # run offline gate
 #   just eval stream                   # run stream-seal gate
 #   just eval compare                  # run both and print side-by-side metrics
+#   latest JSON outputs are also copied to bench_audio/personal/history/
 #   just eval calibrate-offline        # refresh offline baseline
 #   just eval calibrate-stream         # refresh stream baseline
 #   just eval calibrate-both           # refresh both baselines
@@ -101,6 +121,9 @@ eval action="compare":
           "  just eval calibrate-offline" \
           "  just eval calibrate-stream" \
           "  just eval calibrate-both" \
+          "" \
+          "Each run archives a timestamped JSON copy under:" \
+          "  parakeet-stt-daemon/bench_audio/personal/history/" \
           "" \
           "Dataset setup (rare): just eval-dataset help" \
           "This runner never regenerates prompts or re-records audio."; \
@@ -138,20 +161,28 @@ _eval-record:
     cd {{daemon_dir}} && bash scripts/record_personal_clips.sh --manifest {{manifest_path}} --output-dir {{personal_dir}}/audio
 
 [private]
+_eval-archive kind output_path:
+    cd {{daemon_dir}} && kind="{{kind}}" && output_path="{{output_path}}" && history_dir="{{history_dir}}" && mkdir -p "$history_dir" && stamp="$(date -u +%Y%m%dT%H%M%S)-$(date +%N)" && archived_path="$history_dir/${stamp}-${kind}.json" && cp "$output_path" "$archived_path" && printf "Archived eval JSON: %s\n" "$archived_path"
+
+[private]
 _eval-calibrate-offline:
     cd {{daemon_dir}} && uv run python check_model.py {{unified_flags}} --bench-runtime offline --calibrate-baseline --baseline-output {{offline_baseline}} --bench-output {{personal_dir}}/latest-offline-calibration.json
+    just _eval-archive offline-calibration {{personal_dir}}/latest-offline-calibration.json
 
 [private]
 _eval-run-offline:
     cd {{daemon_dir}} && uv run python check_model.py {{unified_flags}} --bench-runtime offline --baseline {{offline_baseline}} --bench-output {{personal_dir}}/latest-offline.json
+    just _eval-archive offline {{personal_dir}}/latest-offline.json
 
 [private]
 _eval-calibrate-stream:
     cd {{daemon_dir}} && uv run python check_model.py {{unified_flags}} {{stream_runtime_flags}} --calibrate-baseline --baseline-output {{stream_baseline}} --bench-output {{personal_dir}}/latest-stream-calibration.json
+    just _eval-archive stream-seal-calibration {{personal_dir}}/latest-stream-calibration.json
 
 [private]
 _eval-run-stream:
     cd {{daemon_dir}} && uv run python check_model.py {{unified_flags}} {{stream_runtime_flags}} --baseline {{stream_baseline}} --bench-output {{personal_dir}}/latest-stream.json
+    just _eval-archive stream-seal {{personal_dir}}/latest-stream.json
 
 [private]
 _eval-compare:

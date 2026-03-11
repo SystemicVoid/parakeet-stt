@@ -1,6 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::io::Read;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,11 +10,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
 use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, Key};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::config::{ClipboardOptions, PasteShortcut};
 use crate::routing::decide_route;
-use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
+use crate::surface_focus::{FocusSnapshot, WaylandFocusCache, WaylandFocusObservation};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,11 +25,96 @@ const CLIPBOARD_MIME_TYPE: &str = "text/plain;charset=utf-8";
 const STAGE_CLIPBOARD_READY: &str = "clipboard_ready";
 const STAGE_ROUTE_SHORTCUT: &str = "route_shortcut";
 const STAGE_BACKEND: &str = "backend";
+// The command timeout still drives runtime helper subprocesses such as wl-copy.
 #[cfg(not(test))]
-const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 1_000;
+pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 1_000;
 #[cfg(test)]
-const INJECTOR_SUBPROCESS_TIMEOUT_MS: u64 = 150;
-const INJECTOR_SUBPROCESS_POLL_MS: u64 = 5;
+pub(crate) const INJECTOR_CHILD_COMMAND_TIMEOUT_MS: u64 = 150;
+// The worker-level timeout constants are only used by the test-only subprocess
+// harness in main.rs.
+#[cfg(test)]
+pub(crate) const INJECTOR_JOB_TIMEOUT_SLACK_MS: u64 = 0;
+#[cfg(test)]
+pub(crate) const INJECTOR_JOB_TIMEOUT_MS: u64 =
+    INJECTOR_CHILD_COMMAND_TIMEOUT_MS + INJECTOR_JOB_TIMEOUT_SLACK_MS;
+pub(crate) const INJECTOR_SUBPROCESS_POLL_INTERVAL_MS: u64 = 5;
+#[cfg(test)]
+pub(crate) const INJECTOR_PIPE_DRAIN_TIMEOUT_MS: u64 = 50;
+#[cfg(test)]
+pub(crate) const INJECTOR_PIPE_READER_JOIN_SLACK_MS: u64 = 10;
+pub(crate) const INJECTOR_CONTEXT_ENV: &str = "PARAKEET_INJECT_CONTEXT_JSON";
+pub(crate) const INJECTOR_REPORT_PREFIX: &str = "PARAKEET_INJECT_REPORT ";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ParentFocusCapture {
+    pub snapshot: Option<FocusSnapshot>,
+    pub source_selected: String,
+    pub wayland_cache_age_ms: Option<u64>,
+    pub wayland_fallback_reason: Option<String>,
+    pub captured_elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InjectorContext {
+    pub session_id: Uuid,
+    pub origin: String,
+    pub hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    pub stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    pub parent_focus: Option<ParentFocusCapture>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BackendAttemptReport {
+    pub route_attempt_name: String,
+    pub route_attempt_index: usize,
+    pub route_attempt_total: usize,
+    pub backend: String,
+    pub backend_attempt_index: usize,
+    pub backend_attempt_total: usize,
+    pub shortcut: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub exit_status: Option<String>,
+    pub stderr_excerpt: Option<String>,
+    pub warning_tags: Vec<String>,
+    pub backend_config: Option<String>,
+    pub error: Option<String>,
+    pub uinput_sender_generation: Option<u64>,
+    pub uinput_fresh_device: Option<bool>,
+    pub uinput_device_age_ms_at_attempt: Option<u64>,
+    pub uinput_use_count_before_attempt: Option<u64>,
+    pub uinput_created_this_job: Option<bool>,
+    pub uinput_create_elapsed_ms: Option<u64>,
+    pub uinput_last_create_error: Option<String>,
+    pub uinput_reused_after_failure: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InjectorChildReport {
+    pub session_id: Option<Uuid>,
+    pub origin: Option<String>,
+    pub trace_id: u64,
+    pub outcome: String,
+    pub error: Option<String>,
+    pub requested_len: usize,
+    pub requested_fingerprint: String,
+    pub clipboard_ready: bool,
+    pub clipboard_probe_count: u64,
+    pub post_clipboard_matches: Option<bool>,
+    pub parent_focus: Option<ParentFocusCapture>,
+    pub child_focus_before: Option<FocusSnapshot>,
+    pub child_focus_after: Option<FocusSnapshot>,
+    pub child_focus_source_selected: String,
+    pub child_focus_wayland_cache_age_ms: Option<u64>,
+    pub child_focus_wayland_fallback_reason: Option<String>,
+    pub route_focus_source: String,
+    pub route_class: String,
+    pub route_primary: String,
+    pub route_adaptive_fallback: Option<String>,
+    pub route_reason: String,
+    pub backend_attempts: Vec<BackendAttemptReport>,
+    pub elapsed_ms_total: u64,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum InjectionStage {
@@ -203,14 +291,7 @@ fn wait_for_child_exit(
                     timeout_ms = timeout.as_millis() as u64,
                     "subprocess exceeded timeout; killing child"
                 );
-                if let Err(err) = child.kill() {
-                    warn!(
-                        trace_id,
-                        command = command_name,
-                        error = %err,
-                        "failed to kill timed-out subprocess"
-                    );
-                }
+                kill_subprocess_tree(child, trace_id, command_name);
                 if let Err(err) = child.wait() {
                     warn!(
                         trace_id,
@@ -221,21 +302,46 @@ fn wait_for_child_exit(
                 }
                 anyhow::bail!("{command_name} timed out after {} ms", timeout.as_millis());
             }
-            None => std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_MS)),
+            None => std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_INTERVAL_MS)),
         }
     }
 }
 
-fn command_status_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-    trace_id: u64,
-    command_name: &'static str,
-) -> Result<ExitStatus> {
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn {command_name}"))?;
-    wait_for_child_exit(&mut child, timeout, trace_id, command_name)
+fn configure_subprocess_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn kill_subprocess_tree(child: &mut Child, trace_id: u64, command_name: &'static str) {
+    #[cfg(unix)]
+    {
+        let process_group_id = -(child.id() as i32);
+        let rc = unsafe { libc::kill(process_group_id, libc::SIGKILL) };
+        if rc == 0 {
+            return;
+        }
+
+        let err = std::io::Error::last_os_error();
+        warn!(
+            trace_id,
+            command = command_name,
+            pid = child.id(),
+            error = %err,
+            "failed to kill timed-out subprocess tree; falling back to direct child kill"
+        );
+    }
+
+    if let Err(err) = child.kill() {
+        warn!(
+            trace_id,
+            command = command_name,
+            pid = child.id(),
+            error = %err,
+            "failed to kill timed-out subprocess"
+        );
+    }
 }
 
 fn command_output_with_timeout(
@@ -244,6 +350,7 @@ fn command_output_with_timeout(
     trace_id: u64,
     command_name: &'static str,
 ) -> Result<TimedCommandOutput> {
+    configure_subprocess_process_group(&mut command);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -280,6 +387,10 @@ fn command_output_with_timeout(
 
 pub trait TextInjector: Send + Sync {
     fn inject(&self, text: &str) -> Result<()>;
+
+    fn inject_with_context(&self, text: &str, _context: Option<InjectorContext>) -> Result<()> {
+        self.inject(text)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,11 +413,42 @@ impl TextInjector for FailInjector {
 }
 
 #[derive(Debug, Clone)]
+pub struct UinputAttemptMetadata {
+    pub generation: u64,
+    pub fresh_device: bool,
+    pub device_age_ms_at_attempt: u64,
+    pub use_count_before_attempt: u64,
+    pub created_this_job: bool,
+    pub create_elapsed_ms: Option<u64>,
+    pub last_create_error: Option<String>,
+    pub reused_after_failure: bool,
+}
+
+pub trait PasteChordSender: std::fmt::Debug + Send + Sync {
+    fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()>;
+    fn backend_config(&self) -> Option<String>;
+}
+
+#[derive(Clone)]
 pub enum PasteKeySender {
-    Ydotool(PathBuf),
-    Uinput(Arc<UinputChordSender>),
-    Chain(Vec<PasteKeySender>),
+    Uinput {
+        sender: Arc<dyn PasteChordSender>,
+        metadata: Option<UinputAttemptMetadata>,
+    },
     Disabled,
+}
+
+impl std::fmt::Debug for PasteKeySender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uinput { sender, metadata } => f
+                .debug_struct("Uinput")
+                .field("sender", sender)
+                .field("metadata", metadata)
+                .finish(),
+            Self::Disabled => f.write_str("Disabled"),
+        }
+    }
 }
 
 pub struct UinputChordSender {
@@ -392,17 +534,29 @@ impl UinputChordSender {
     }
 }
 
+impl PasteChordSender for UinputChordSender {
+    fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
+        UinputChordSender::send_shortcut(self, shortcut)
+    }
+
+    fn backend_config(&self) -> Option<String> {
+        Some(format!("dwell_ms={}", self.dwell_ms()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClipboardInjector {
     sender: PasteKeySender,
     options: ClipboardOptions,
     copy_only: bool,
     wayland_focus_cache: Option<WaylandFocusCache>,
+    context: Option<InjectorContext>,
+    forced_shortcut: Option<PasteShortcut>,
 }
 
 #[derive(Debug, Clone)]
 struct FocusResolutionOutcome {
-    snapshot: Option<crate::surface_focus::FocusSnapshot>,
+    snapshot: Option<FocusSnapshot>,
     source_selected: &'static str,
     wayland_cache_age_ms: Option<u64>,
     wayland_fallback_reason: Option<&'static str>,
@@ -417,6 +571,18 @@ struct ShortcutAttemptContext {
     backend_attempt_total: usize,
 }
 
+#[derive(Debug)]
+struct BackendAttemptOutcome {
+    status: &'static str,
+    duration_ms: u64,
+    exit_status: Option<String>,
+    stderr_excerpt: Option<String>,
+    warning_tags: Vec<String>,
+    backend_config: Option<String>,
+    error: Option<String>,
+    uinput_metadata: Option<UinputAttemptMetadata>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InjectionOutcome {
     SuccessAssumed,
@@ -424,6 +590,7 @@ enum InjectionOutcome {
     ChordFailed,
     NoEffectSuspected,
     CopyOnly,
+    ClipboardWriteFailed,
 }
 
 impl InjectionOutcome {
@@ -434,6 +601,7 @@ impl InjectionOutcome {
             Self::ChordFailed => "chord_failed",
             Self::NoEffectSuspected => "no_effect_suspected",
             Self::CopyOnly => "copy_only",
+            Self::ClipboardWriteFailed => "clipboard_write_failed",
         }
     }
 }
@@ -443,13 +611,142 @@ impl ClipboardInjector {
     const CLIPBOARD_READY_SCHEDULE_MS: [u64; 8] = [5, 10, 15, 20, 30, 40, 50, 70];
     const WAYLAND_STALE_MS: u64 = 30_000;
     const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
+    const ROUTE_FOCUS_SOURCE_NOT_APPLICABLE: &str = "n/a";
+    const ROUTE_CLASS_NOT_APPLICABLE: &str = "N/A";
+    const ROUTE_PRIMARY_NOT_APPLICABLE: &str = "N/A";
+    const ROUTE_REASON_NOT_APPLICABLE: &str = "n/a";
 
+    #[allow(dead_code)]
     pub fn new(sender: PasteKeySender, options: ClipboardOptions, copy_only: bool) -> Self {
+        Self::new_with_context(sender, options, copy_only, None)
+    }
+
+    pub fn new_with_context(
+        sender: PasteKeySender,
+        options: ClipboardOptions,
+        copy_only: bool,
+        context: Option<InjectorContext>,
+    ) -> Self {
+        Self::new_with_overrides(sender, options, copy_only, context, None)
+    }
+
+    pub fn new_with_overrides(
+        sender: PasteKeySender,
+        options: ClipboardOptions,
+        copy_only: bool,
+        context: Option<InjectorContext>,
+        forced_shortcut: Option<PasteShortcut>,
+    ) -> Self {
+        Self::new_with_shared_focus_cache(
+            sender,
+            options,
+            copy_only,
+            context,
+            forced_shortcut,
+            Some(WaylandFocusCache::new()),
+        )
+    }
+
+    pub(crate) fn new_with_shared_focus_cache(
+        sender: PasteKeySender,
+        options: ClipboardOptions,
+        copy_only: bool,
+        context: Option<InjectorContext>,
+        forced_shortcut: Option<PasteShortcut>,
+        wayland_focus_cache: Option<WaylandFocusCache>,
+    ) -> Self {
         Self {
             sender,
             options,
             copy_only,
-            wayland_focus_cache: Some(WaylandFocusCache::new()),
+            wayland_focus_cache,
+            context,
+            forced_shortcut,
+        }
+    }
+
+    fn shortcut_name(shortcut: PasteShortcut) -> String {
+        match shortcut {
+            PasteShortcut::CtrlV => "CtrlV".to_string(),
+            PasteShortcut::CtrlShiftV => "CtrlShiftV".to_string(),
+        }
+    }
+
+    fn route_class_name(route: &crate::routing::RouteDecision) -> String {
+        format!("{:?}", route.class)
+    }
+
+    fn backend_attempt_report(
+        attempt: ShortcutAttemptContext,
+        backend_name: &str,
+        shortcut_name: &str,
+        outcome: BackendAttemptOutcome,
+    ) -> BackendAttemptReport {
+        BackendAttemptReport {
+            route_attempt_name: attempt.route_attempt_name.to_string(),
+            route_attempt_index: attempt.route_attempt_index,
+            route_attempt_total: attempt.route_attempt_total,
+            backend: backend_name.to_string(),
+            backend_attempt_index: attempt.backend_attempt_index,
+            backend_attempt_total: attempt.backend_attempt_total,
+            shortcut: shortcut_name.to_string(),
+            status: outcome.status.to_string(),
+            duration_ms: outcome.duration_ms,
+            exit_status: outcome.exit_status,
+            stderr_excerpt: outcome.stderr_excerpt,
+            warning_tags: outcome.warning_tags,
+            backend_config: outcome.backend_config,
+            error: outcome.error,
+            uinput_sender_generation: outcome.uinput_metadata.as_ref().map(|meta| meta.generation),
+            uinput_fresh_device: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.fresh_device),
+            uinput_device_age_ms_at_attempt: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.device_age_ms_at_attempt),
+            uinput_use_count_before_attempt: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.use_count_before_attempt),
+            uinput_created_this_job: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.created_this_job),
+            uinput_create_elapsed_ms: outcome
+                .uinput_metadata
+                .as_ref()
+                .and_then(|meta| meta.create_elapsed_ms),
+            uinput_last_create_error: outcome
+                .uinput_metadata
+                .as_ref()
+                .and_then(|meta| meta.last_create_error.clone()),
+            uinput_reused_after_failure: outcome
+                .uinput_metadata
+                .as_ref()
+                .map(|meta| meta.reused_after_failure),
+        }
+    }
+
+    fn emit_report(report: &InjectorChildReport) {
+        info!(
+            session = ?report.session_id,
+            origin = ?report.origin,
+            trace_id = report.trace_id,
+            outcome = report.outcome,
+            route_class = report.route_class,
+            route_primary = report.route_primary,
+            backend_attempt_count = report.backend_attempts.len(),
+            elapsed_ms_total = report.elapsed_ms_total,
+            "injector report"
+        );
+        match serde_json::to_string(report) {
+            Ok(encoded) => eprintln!("{INJECTOR_REPORT_PREFIX}{encoded}"),
+            Err(err) => eprintln!(
+                "{INJECTOR_REPORT_PREFIX}{{\"trace_id\":{},\"outcome\":\"report_encode_failed\",\"error\":\"{}\"}}",
+                report.trace_id, err
+            ),
         }
     }
 
@@ -468,7 +765,7 @@ impl ClipboardInjector {
 
         let output = command_output_with_timeout(
             command,
-            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
             0,
             "wl-paste",
         )?;
@@ -502,7 +799,14 @@ impl ClipboardInjector {
         command
             .arg("--type")
             .arg(CLIPBOARD_MIME_TYPE)
-            .stdin(Stdio::piped());
+            .stdin(Stdio::piped())
+            // Internal injector subprocesses pipe stderr back to the parent
+            // worker. If wl-copy helpers inherit that pipe, the worker can stay
+            // blocked until some unrelated clipboard change tears the helper
+            // down. Detach wl-copy stdio so clipboard ownership lifetime does
+            // not masquerade as injector job lifetime.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if let Some(seat) = options.seat.as_ref() {
             command.arg("--seat").arg(seat);
         }
@@ -513,6 +817,7 @@ impl ClipboardInjector {
             command.arg("--foreground");
         }
 
+        configure_subprocess_process_group(&mut command);
         let mut child = command.spawn().context("failed to spawn wl-copy")?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -531,7 +836,7 @@ impl ClipboardInjector {
         // with wait_with_output can hang because the helper keeps the pipe open.
         let status = wait_for_child_exit(
             &mut child,
-            Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_CHILD_COMMAND_TIMEOUT_MS),
             0,
             "wl-copy",
         )
@@ -619,18 +924,9 @@ impl ClipboardInjector {
             .unwrap_or_else(|| *Self::CLIPBOARD_READY_SCHEDULE_MS.last().unwrap_or(&70))
     }
 
-    fn ydotool_shortcut_args(shortcut: PasteShortcut) -> &'static [&'static str] {
-        match shortcut {
-            PasteShortcut::CtrlV => &["29:1", "47:1", "47:0", "29:0"],
-            PasteShortcut::CtrlShiftV => &["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
-        }
-    }
-
     fn sender_name(sender: &PasteKeySender) -> &'static str {
         match sender {
-            PasteKeySender::Ydotool(_) => "ydotool",
-            PasteKeySender::Uinput(_) => "uinput",
-            PasteKeySender::Chain(_) => "chain",
+            PasteKeySender::Uinput { .. } => "uinput",
             PasteKeySender::Disabled => "disabled",
         }
     }
@@ -681,90 +977,18 @@ impl ClipboardInjector {
         shortcut: PasteShortcut,
         sender: &PasteKeySender,
         attempt: ShortcutAttemptContext,
+        backend_attempts: &mut Vec<BackendAttemptReport>,
     ) -> Result<()> {
         let backend_name = Self::sender_name(sender);
+        let shortcut_name = Self::shortcut_name(shortcut);
         let stage_started = Self::stage_start(
             trace_id,
             InjectionStage::Backend,
             "starting backend shortcut emission",
         );
+        let backend_attempt_started = Instant::now();
         match sender {
-            PasteKeySender::Ydotool(binary) => {
-                debug!(
-                    trace_id,
-                    stage = STAGE_BACKEND,
-                    route_attempt_name = attempt.route_attempt_name,
-                    route_attempt_index = attempt.route_attempt_index,
-                    route_attempt_total = attempt.route_attempt_total,
-                    backend_attempt_index = attempt.backend_attempt_index,
-                    backend_attempt_total = attempt.backend_attempt_total,
-                    shortcut = ?shortcut,
-                    backend = "ydotool",
-                    binary = %binary.display(),
-                    args = ?Self::ydotool_shortcut_args(shortcut),
-                    "sending paste chord"
-                );
-                let mut command = Command::new(binary);
-                command
-                    .arg("key")
-                    .args(Self::ydotool_shortcut_args(shortcut));
-                let status = command_status_with_timeout(
-                    command,
-                    Duration::from_millis(INJECTOR_SUBPROCESS_TIMEOUT_MS),
-                    trace_id,
-                    "ydotool",
-                )
-                .context("stage=backend failed to run ydotool for paste chord");
-                let status = match status {
-                    Ok(status) => status,
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        Self::stage_failure(
-                            trace_id,
-                            InjectionStage::Backend,
-                            stage_started,
-                            &message,
-                            "backend shortcut emission failed",
-                        );
-                        return Err(err);
-                    }
-                };
-
-                debug!(
-                    trace_id,
-                    stage = STAGE_BACKEND,
-                    route_attempt_name = attempt.route_attempt_name,
-                    route_attempt_index = attempt.route_attempt_index,
-                    route_attempt_total = attempt.route_attempt_total,
-                    backend_attempt_index = attempt.backend_attempt_index,
-                    backend_attempt_total = attempt.backend_attempt_total,
-                    ?status,
-                    backend = "ydotool",
-                    "paste chord command finished"
-                );
-                if !status.success() {
-                    let message = format!(
-                        "stage=backend paste key chord {:?} via ydotool exited with status {}",
-                        shortcut, status
-                    );
-                    Self::stage_failure(
-                        trace_id,
-                        InjectionStage::Backend,
-                        stage_started,
-                        &message,
-                        "backend shortcut emission failed",
-                    );
-                    anyhow::bail!("{message}");
-                }
-                Self::stage_success(
-                    trace_id,
-                    InjectionStage::Backend,
-                    stage_started,
-                    "backend shortcut emission succeeded",
-                );
-                Result::<()>::Ok(())
-            }
-            PasteKeySender::Uinput(sender) => {
+            PasteKeySender::Uinput { sender, metadata } => {
                 debug!(
                     trace_id,
                     stage = STAGE_BACKEND,
@@ -775,7 +999,15 @@ impl ClipboardInjector {
                     backend_attempt_total = attempt.backend_attempt_total,
                     shortcut = ?shortcut,
                     backend = "uinput",
-                    dwell_ms = sender.dwell_ms(),
+                    backend_config = sender.backend_config().as_deref().unwrap_or("unknown"),
+                    uinput_sender_generation = metadata.as_ref().map(|value| value.generation),
+                    uinput_fresh_device = metadata.as_ref().map(|value| value.fresh_device),
+                    uinput_device_age_ms_at_attempt = metadata
+                        .as_ref()
+                        .map(|value| value.device_age_ms_at_attempt),
+                    uinput_use_count_before_attempt = metadata
+                        .as_ref()
+                        .map(|value| value.use_count_before_attempt),
                     "sending paste chord"
                 );
                 if let Err(err) = sender.send_shortcut(shortcut).with_context(|| {
@@ -785,6 +1017,21 @@ impl ClipboardInjector {
                     )
                 }) {
                     let message = format!("{err:#}");
+                    backend_attempts.push(Self::backend_attempt_report(
+                        attempt,
+                        backend_name,
+                        &shortcut_name,
+                        BackendAttemptOutcome {
+                            status: "error",
+                            duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                            exit_status: None,
+                            stderr_excerpt: None,
+                            warning_tags: Vec::new(),
+                            backend_config: sender.backend_config(),
+                            error: Some(message.clone()),
+                            uinput_metadata: metadata.clone(),
+                        },
+                    ));
                     Self::stage_failure(
                         trace_id,
                         InjectionStage::Backend,
@@ -806,21 +1053,40 @@ impl ClipboardInjector {
                     stage_started,
                     "backend shortcut emission succeeded",
                 );
+                backend_attempts.push(Self::backend_attempt_report(
+                    attempt,
+                    backend_name,
+                    &shortcut_name,
+                    BackendAttemptOutcome {
+                        status: "ok",
+                        duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                        exit_status: None,
+                        stderr_excerpt: None,
+                        warning_tags: Vec::new(),
+                        backend_config: sender.backend_config(),
+                        error: None,
+                        uinput_metadata: metadata.clone(),
+                    },
+                ));
                 Result::<()>::Ok(())
-            }
-            PasteKeySender::Chain(_) => {
-                let message = "stage=backend nested sender chain is not supported".to_string();
-                Self::stage_failure(
-                    trace_id,
-                    InjectionStage::Backend,
-                    stage_started,
-                    &message,
-                    "backend shortcut emission failed",
-                );
-                anyhow::bail!("{message}")
             }
             PasteKeySender::Disabled => {
                 let message = "stage=backend paste key sender is disabled".to_string();
+                backend_attempts.push(Self::backend_attempt_report(
+                    attempt,
+                    backend_name,
+                    &shortcut_name,
+                    BackendAttemptOutcome {
+                        status: "error",
+                        duration_ms: backend_attempt_started.elapsed().as_millis() as u64,
+                        exit_status: None,
+                        stderr_excerpt: None,
+                        warning_tags: Vec::new(),
+                        backend_config: None,
+                        error: Some(message.clone()),
+                        uinput_metadata: None,
+                    },
+                ));
                 Self::stage_failure(
                     trace_id,
                     InjectionStage::Backend,
@@ -851,80 +1117,26 @@ impl ClipboardInjector {
         route_attempt_index: usize,
         route_attempt_total: usize,
         shortcut: PasteShortcut,
+        backend_attempts: &mut Vec<BackendAttemptReport>,
     ) -> Result<()> {
-        match &self.sender {
-            PasteKeySender::Chain(backends) => {
-                let mut errors = Vec::new();
-                for (idx, backend) in backends.iter().enumerate() {
-                    let backend_attempt_index = idx + 1;
-                    let backend_attempt_total = backends.len();
-                    let attempt = ShortcutAttemptContext {
-                        route_attempt_name,
-                        route_attempt_index,
-                        route_attempt_total,
-                        backend_attempt_index,
-                        backend_attempt_total,
-                    };
-                    if backend_attempt_index > 1 {
-                        info!(
-                            trace_id,
-                            stage = STAGE_BACKEND,
-                            route_attempt_name,
-                            route_attempt_index,
-                            route_attempt_total,
-                            route_shortcut = ?shortcut,
-                            backend = Self::sender_name(backend),
-                            backend_attempt_index,
-                            backend_attempt_total,
-                            "attempting paste backend fallback"
-                        );
-                    }
-                    match Self::run_shortcut_with_sender(trace_id, shortcut, backend, attempt) {
-                        Ok(()) => return Ok(()),
-                        Err(err) => {
-                            let err_text = format!("{err:#}");
-                            warn!(
-                                trace_id,
-                                stage = STAGE_BACKEND,
-                                route_attempt_name,
-                                route_attempt_index,
-                                route_attempt_total,
-                                route_shortcut = ?shortcut,
-                                backend = Self::sender_name(backend),
-                                backend_attempt_index,
-                                backend_attempt_total,
-                                error = %err_text,
-                                "paste backend attempt failed"
-                            );
-                            errors.push(format!("{}: {}", Self::sender_name(backend), err_text));
-                        }
-                    }
-                }
-
-                anyhow::bail!(
-                    "stage=backend all paste backend attempts failed for shortcut {:?}: {}",
-                    shortcut,
-                    errors.join(" | ")
-                )
-            }
-            sender => Self::run_shortcut_with_sender(
-                trace_id,
-                shortcut,
-                sender,
-                ShortcutAttemptContext {
-                    route_attempt_name,
-                    route_attempt_index,
-                    route_attempt_total,
-                    backend_attempt_index: 1,
-                    backend_attempt_total: 1,
-                },
-            ),
-        }
+        Self::run_shortcut_with_sender(
+            trace_id,
+            shortcut,
+            &self.sender,
+            ShortcutAttemptContext {
+                route_attempt_name,
+                route_attempt_index,
+                route_attempt_total,
+                backend_attempt_index: 1,
+                backend_attempt_total: 1,
+            },
+            backend_attempts,
+        )
     }
 
     #[cfg(test)]
     fn run_shortcut(&self, trace_id: u64, shortcut: PasteShortcut) -> Result<()> {
-        self.run_shortcut_for_route(trace_id, "primary", 1, 1, shortcut)
+        self.run_shortcut_for_route(trace_id, "primary", 1, 1, shortcut, &mut Vec::new())
     }
 
     fn run_route_shortcuts(
@@ -932,6 +1144,7 @@ impl ClipboardInjector {
         trace_id: u64,
         primary: PasteShortcut,
         adaptive_fallback: Option<PasteShortcut>,
+        backend_attempts: &mut Vec<BackendAttemptReport>,
     ) -> Result<()> {
         let mut attempts = vec![("primary", primary)];
         if let Some(fallback) = adaptive_fallback {
@@ -965,6 +1178,7 @@ impl ClipboardInjector {
                 route_attempt_index,
                 total,
                 *shortcut,
+                backend_attempts,
             ) {
                 Ok(()) => {
                     debug!(
@@ -1147,6 +1361,66 @@ impl TextInjector for ClipboardInjector {
     fn inject(&self, text: &str) -> Result<()> {
         let trace_id = INJECTION_TRACE_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        let requested_fingerprint = fingerprint(text);
+        let session_id = self.context.as_ref().map(|context| context.session_id);
+        let origin = self.context.as_ref().map(|context| context.origin.clone());
+        let parent_focus = self
+            .context
+            .as_ref()
+            .and_then(|context| context.parent_focus.clone());
+        let mut backend_attempts = Vec::new();
+        let mut child_focus_after = None;
+        let mut child_focus_source_selected = "not_resolved".to_string();
+        let mut child_focus_wayland_cache_age_ms = None;
+        let mut child_focus_wayland_fallback_reason = None;
+        let mut route_focus_source = Self::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string();
+        let mut route_class = Self::ROUTE_CLASS_NOT_APPLICABLE.to_string();
+        let mut route_primary = Self::ROUTE_PRIMARY_NOT_APPLICABLE.to_string();
+        let mut route_adaptive_fallback = None;
+        let mut route_reason = Self::ROUTE_REASON_NOT_APPLICABLE.to_string();
+        let mut post_clipboard_matches = None;
+        let emit_report = |outcome: InjectionOutcome,
+                           error: Option<String>,
+                           clipboard_ready: bool,
+                           clipboard_probe_count: u64,
+                           post_clipboard_matches: Option<bool>,
+                           child_focus_before: Option<FocusSnapshot>,
+                           child_focus_after: Option<FocusSnapshot>,
+                           child_focus_source_selected: &str,
+                           child_focus_wayland_cache_age_ms: Option<u64>,
+                           child_focus_wayland_fallback_reason: Option<String>,
+                           route_focus_source: &str,
+                           route_class: &str,
+                           route_primary: &str,
+                           route_adaptive_fallback: Option<String>,
+                           route_reason: &str,
+                           backend_attempts: Vec<BackendAttemptReport>| {
+            Self::emit_report(&InjectorChildReport {
+                session_id,
+                origin: origin.clone(),
+                trace_id,
+                outcome: outcome.as_str().to_string(),
+                error,
+                requested_len: text.len(),
+                requested_fingerprint: requested_fingerprint.clone(),
+                clipboard_ready,
+                clipboard_probe_count,
+                post_clipboard_matches,
+                parent_focus: parent_focus.clone(),
+                child_focus_before,
+                child_focus_after,
+                child_focus_source_selected: child_focus_source_selected.to_string(),
+                child_focus_wayland_cache_age_ms,
+                child_focus_wayland_fallback_reason,
+                route_focus_source: route_focus_source.to_string(),
+                route_class: route_class.to_string(),
+                route_primary: route_primary.to_string(),
+                route_adaptive_fallback,
+                route_reason: route_reason.to_string(),
+                backend_attempts,
+                elapsed_ms_total: started.elapsed().as_millis() as u64,
+            });
+        };
 
         info!(
             trace_id,
@@ -1156,7 +1430,7 @@ impl TextInjector for ClipboardInjector {
             seat = ?self.options.seat,
             write_primary = self.options.write_primary,
             len = text.len(),
-            fingerprint = %fingerprint(text),
+            fingerprint = %requested_fingerprint,
             preview = %preview(text),
             "starting clipboard injection"
         );
@@ -1210,15 +1484,40 @@ impl TextInjector for ClipboardInjector {
 
         // 2. Write transcript into clipboard (always foreground).
         debug!(
-            trace_id,
-            elapsed_ms = started.elapsed().as_millis(),
-            requested_len = text.len(),
-            requested_fingerprint = %fingerprint(text),
-            "writing transcript to clipboard"
+                trace_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                requested_len = text.len(),
+                requested_fingerprint = %requested_fingerprint,
+                "writing transcript to clipboard"
         );
-        let (mut foreground_clipboard_source, mut foreground_primary_source) = self
+        let (mut foreground_clipboard_source, mut foreground_primary_source) = match self
             .write_clipboards(text, true)
-            .context("failed to set clipboard contents")?;
+            .context("failed to set clipboard contents")
+        {
+            Ok(sources) => sources,
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                emit_report(
+                    InjectionOutcome::ClipboardWriteFailed,
+                    Some(err_text.clone()),
+                    false,
+                    0,
+                    None,
+                    None,
+                    None,
+                    &child_focus_source_selected,
+                    child_focus_wayland_cache_age_ms,
+                    child_focus_wayland_fallback_reason.clone(),
+                    &route_focus_source,
+                    &route_class,
+                    &route_primary,
+                    route_adaptive_fallback.clone(),
+                    &route_reason,
+                    backend_attempts,
+                );
+                return Err(err);
+            }
+        };
 
         // 2b. Wait briefly for wl-copy ownership to become readable.
         let clipboard_ready_started = Self::stage_start(
@@ -1271,7 +1570,7 @@ impl TextInjector for ClipboardInjector {
                 probes = probe_count,
                 elapsed_ms = started.elapsed().as_millis(),
                 requested_len = text.len(),
-                requested_fingerprint = %fingerprint(text),
+                requested_fingerprint = %requested_fingerprint,
                 stored_len = observed.as_ref().map_or(0, |value| value.len()),
                 stored_fingerprint = %observed
                     .as_ref()
@@ -1290,6 +1589,24 @@ impl TextInjector for ClipboardInjector {
                 &mut foreground_primary_source,
                 trace_id,
             );
+            emit_report(
+                InjectionOutcome::CopyOnly,
+                None,
+                ready,
+                probe_count,
+                None,
+                None,
+                None,
+                &child_focus_source_selected,
+                child_focus_wayland_cache_age_ms,
+                child_focus_wayland_fallback_reason.clone(),
+                &route_focus_source,
+                &route_class,
+                &route_primary,
+                route_adaptive_fallback.clone(),
+                &route_reason,
+                backend_attempts,
+            );
             info!(
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),
@@ -1300,50 +1617,79 @@ impl TextInjector for ClipboardInjector {
             return Ok(());
         }
 
-        let FocusResolutionOutcome {
-            snapshot: focus_snapshot,
-            source_selected,
-            wayland_cache_age_ms,
-            wayland_fallback_reason,
-        } = self.resolve_focus_metadata(trace_id);
+        let child_focus = self.resolve_focus_metadata(trace_id);
+        let child_focus_before = child_focus.snapshot.clone();
+        child_focus_source_selected = child_focus.source_selected.to_string();
+        child_focus_wayland_cache_age_ms = child_focus.wayland_cache_age_ms;
+        child_focus_wayland_fallback_reason =
+            child_focus.wayland_fallback_reason.map(str::to_string);
 
-        let route = decide_route(focus_snapshot.as_ref());
-        if let Some(snapshot) = focus_snapshot.as_ref() {
-            info!(
-                trace_id,
-                focus_source_selected = source_selected,
-                focus_wayland_cache_age_ms = ?wayland_cache_age_ms,
-                focus_wayland_fallback_reason = ?wayland_fallback_reason,
-                resolver = snapshot.resolver,
-                focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
-                focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
-                focus_active = snapshot.active,
-                focus_focused = snapshot.focused,
-                route_class = ?route.class,
-                route_primary = ?route.primary,
-                route_adaptive_fallback = ?route.adaptive_fallback,
-                route_low_confidence = route.low_confidence,
-                route_reason = route.reason,
-                "resolved focused surface for adaptive routing"
-            );
-        } else {
-            info!(
-                trace_id,
-                focus_source_selected = source_selected,
-                focus_wayland_cache_age_ms = ?wayland_cache_age_ms,
-                focus_wayland_fallback_reason = ?wayland_fallback_reason,
-                route_class = ?route.class,
-                route_primary = ?route.primary,
-                route_adaptive_fallback = ?route.adaptive_fallback,
-                route_low_confidence = route.low_confidence,
-                route_reason = route.reason,
-                "no focused surface metadata; using unknown routing fallback"
-            );
-        }
+        let (route_primary_shortcut, route_adaptive_fallback_shortcut) =
+            if let Some(forced_shortcut) = self.forced_shortcut {
+                route_focus_source = "forced_shortcut".to_string();
+                route_class = "Forced".to_string();
+                route_primary = Self::shortcut_name(forced_shortcut);
+                route_adaptive_fallback = None;
+                route_reason = "forced_diagnostic_shortcut".to_string();
+                info!(
+                    trace_id,
+                    forced_shortcut = ?forced_shortcut,
+                    focus_source_selected = child_focus_source_selected,
+                    focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                    focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                    "using forced diagnostic route shortcut override"
+                );
+                (forced_shortcut, None)
+            } else {
+                route_focus_source = child_focus_source_selected.clone();
+                let route = decide_route(child_focus.snapshot.as_ref());
+                route_class = Self::route_class_name(&route);
+                route_primary = Self::shortcut_name(route.primary);
+                route_adaptive_fallback = route.adaptive_fallback.map(Self::shortcut_name);
+                route_reason = route.reason.to_string();
+
+                if let Some(snapshot) = child_focus.snapshot.as_ref() {
+                    info!(
+                        trace_id,
+                        focus_source_selected = route_focus_source,
+                        focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                        focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                        resolver = snapshot.resolver,
+                        focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
+                        focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
+                        focus_active = snapshot.active,
+                        focus_focused = snapshot.focused,
+                        route_class = ?route.class,
+                        route_primary = ?route.primary,
+                        route_adaptive_fallback = ?route.adaptive_fallback,
+                        route_low_confidence = route.low_confidence,
+                        route_reason = route.reason,
+                        "resolved focused surface for adaptive routing"
+                    );
+                } else {
+                    info!(
+                        trace_id,
+                        focus_source_selected = route_focus_source,
+                        focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                        focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                        route_class = ?route.class,
+                        route_primary = ?route.primary,
+                        route_adaptive_fallback = ?route.adaptive_fallback,
+                        route_low_confidence = route.low_confidence,
+                        route_reason = route.reason,
+                        "no focused surface metadata; using unknown routing fallback"
+                    );
+                }
+                (route.primary, route.adaptive_fallback)
+            };
 
         // 3. Send routed paste shortcut(s).
-        if let Err(err) = self.run_route_shortcuts(trace_id, route.primary, route.adaptive_fallback)
-        {
+        if let Err(err) = self.run_route_shortcuts(
+            trace_id,
+            route_primary_shortcut,
+            route_adaptive_fallback_shortcut,
+            &mut backend_attempts,
+        ) {
             outcome = InjectionOutcome::ChordFailed;
             let err_text = format!("{err:#}");
             let stage = if err_text.contains("stage=backend") {
@@ -1365,6 +1711,24 @@ impl TextInjector for ClipboardInjector {
                 &mut foreground_primary_source,
                 trace_id,
             );
+            emit_report(
+                outcome,
+                None,
+                ready,
+                probe_count,
+                post_clipboard_matches,
+                child_focus_before,
+                child_focus_after,
+                &child_focus_source_selected,
+                child_focus_wayland_cache_age_ms,
+                child_focus_wayland_fallback_reason.clone(),
+                &route_focus_source,
+                &route_class,
+                &route_primary,
+                route_adaptive_fallback.clone(),
+                &route_reason,
+                backend_attempts,
+            );
             return Err(anyhow::anyhow!("{err_text}"));
         }
 
@@ -1382,17 +1746,19 @@ impl TextInjector for ClipboardInjector {
         match Self::get_clipboard(&self.options, false) {
             Ok(value) => {
                 if value != text {
+                    post_clipboard_matches = Some(false);
                     warn!(
                         trace_id,
                         elapsed_ms = started.elapsed().as_millis(),
                         expected_len = text.len(),
-                        expected_fingerprint = %fingerprint(text),
+                        expected_fingerprint = %requested_fingerprint,
                         observed_len = value.len(),
                         observed_fingerprint = %fingerprint(&value),
                         "post-paste clipboard probe differs from requested text"
                     );
                     outcome = InjectionOutcome::NoEffectSuspected;
                 } else {
+                    post_clipboard_matches = Some(true);
                     debug!(
                         trace_id,
                         elapsed_ms = started.elapsed().as_millis(),
@@ -1411,6 +1777,9 @@ impl TextInjector for ClipboardInjector {
                 );
             }
         }
+
+        let child_focus_after_outcome = self.resolve_focus_metadata(trace_id);
+        child_focus_after = child_focus_after_outcome.snapshot.clone();
 
         // Restore policy is Never — transfer to background and keep transcript in clipboard.
         self.transfer_to_background_if_needed(
@@ -1451,8 +1820,32 @@ impl TextInjector for ClipboardInjector {
                 .load(Ordering::Relaxed),
             "clipboard injection flow finished"
         );
+        emit_report(
+            outcome,
+            None,
+            ready,
+            probe_count,
+            post_clipboard_matches,
+            child_focus_before,
+            child_focus_after,
+            &child_focus_source_selected,
+            child_focus_wayland_cache_age_ms,
+            child_focus_wayland_fallback_reason,
+            &route_focus_source,
+            &route_class,
+            &route_primary,
+            route_adaptive_fallback,
+            &route_reason,
+            backend_attempts,
+        );
 
         Ok(())
+    }
+
+    fn inject_with_context(&self, text: &str, context: Option<InjectorContext>) -> Result<()> {
+        let mut scoped = self.clone();
+        scoped.context = context;
+        scoped.inject(text)
     }
 }
 
@@ -1481,19 +1874,25 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{injector_metrics_snapshot, ClipboardInjector, PasteKeySender, UinputChordSender};
+    use super::{
+        configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
+        InjectionOutcome, InjectorChildReport, ParentFocusCapture, PasteKeySender,
+        ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender,
+    };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
+    use crate::surface_focus::FocusSnapshot;
     use evdev::Key;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    use uuid::Uuid;
 
     fn test_options() -> ClipboardOptions {
         ClipboardOptions {
-            key_backend: PasteKeyBackend::Auto,
+            key_backend: PasteKeyBackend::Uinput,
             backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
             post_chord_hold_ms: 700,
             seat: None,
@@ -1509,90 +1908,23 @@ mod tests {
     }
 
     #[test]
-    fn chain_sender_falls_through_to_next_backend() {
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
-                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-        };
-
-        // ydotool /bin/true with "key" arg should succeed (it's just /bin/true ignoring args)
-        assert!(injector.run_shortcut(1, PasteShortcut::CtrlV).is_ok());
-    }
-
-    #[test]
-    fn chain_sender_reports_all_backend_failures() {
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Disabled,
-                PasteKeySender::Ydotool(PathBuf::from("/bin/false")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-        };
-
-        let err = injector
-            .run_shortcut(1, PasteShortcut::CtrlV)
-            .expect_err("expected chain failure");
-        let message = format!("{err:#}");
-        assert!(message.contains("all paste backend attempts failed"));
-        assert!(message.contains("disabled"));
-        assert!(message.contains("ydotool"));
-    }
-
-    fn make_test_ydotool(content: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "parakeet-ptt-injector-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("current time should be after epoch")
-                .as_nanos()
-        ));
-        fs::write(&path, content).expect("test helper script should be writable");
-        let mut perms = fs::metadata(&path)
-            .expect("test helper script should exist")
-            .permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&path, perms).expect("test helper script should be executable");
-        path
-    }
-
-    #[test]
-    fn route_fallback_attempt_uses_adaptive_shortcut_after_primary_failure() {
-        let script = make_test_ydotool(
-            "#!/usr/bin/env bash\nif [ \"$#\" -eq 7 ]; then exit 1; fi\nexit 0\n",
-        );
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Ydotool(script.clone()),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-        };
-
-        let result =
-            injector.run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV));
-        fs::remove_file(&script).expect("test helper script should be removable");
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn route_fallback_failure_reports_attempt_details() {
         let injector = ClipboardInjector {
             sender: PasteKeySender::Disabled,
             options: test_options(),
             copy_only: false,
             wayland_focus_cache: None,
+            context: None,
+            forced_shortcut: None,
         };
 
         let err = injector
-            .run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV))
+            .run_route_shortcuts(
+                1,
+                PasteShortcut::CtrlShiftV,
+                Some(PasteShortcut::CtrlV),
+                &mut Vec::new(),
+            )
             .expect_err("expected route fallback failure");
         let message = format!("{err:#}");
         assert!(message.contains("all route shortcut attempts failed"));
@@ -1607,6 +1939,8 @@ mod tests {
             options: test_options(),
             copy_only: false,
             wayland_focus_cache: None,
+            context: None,
+            forced_shortcut: None,
         };
 
         let err = injector
@@ -1617,77 +1951,23 @@ mod tests {
     }
 
     #[test]
-    fn ydotool_spawn_failures_are_counted_as_backend_stage_failures() {
-        let missing_binary = std::env::temp_dir().join(format!(
-            "parakeet-ptt-missing-ydotool-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("current time should be after epoch")
-                .as_nanos()
-        ));
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Ydotool(missing_binary),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-        };
-        let attempts = 12;
-        let baseline = injector_metrics_snapshot().backend_failure_total;
-
-        for trace_id in 1..=attempts {
-            let err = injector
-                .run_shortcut(trace_id, PasteShortcut::CtrlV)
-                .expect_err("missing ydotool binary should fail to spawn");
-            let message = format!("{err:#}");
-            assert!(message.contains("failed to spawn ydotool"));
-            assert!(message.contains("stage=backend"));
-        }
-
-        let observed_delta = injector_metrics_snapshot()
-            .backend_failure_total
-            .saturating_sub(baseline);
-        assert!(
-            observed_delta >= attempts,
-            "expected at least {attempts} backend failures recorded, observed {observed_delta}",
-        );
-    }
-
-    #[test]
-    fn timed_out_ydotool_backend_fails_fast_and_chain_recovers() {
-        let hanging_script = make_test_ydotool("#!/usr/bin/env bash\nsleep 5\n");
-        let injector = ClipboardInjector {
-            sender: PasteKeySender::Chain(vec![
-                PasteKeySender::Ydotool(hanging_script.clone()),
-                PasteKeySender::Ydotool(PathBuf::from("/bin/true")),
-            ]),
-            options: test_options(),
-            copy_only: false,
-            wayland_focus_cache: None,
-        };
-
-        let started = Instant::now();
-        let result = injector.run_shortcut(1, PasteShortcut::CtrlV);
-        fs::remove_file(&hanging_script).expect("test helper script should be removable");
-
-        assert!(result.is_ok(), "chain backend should recover after timeout");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timed out backend should be killed promptly"
-        );
-    }
-
-    #[test]
     fn route_failures_are_stage_tagged() {
         let injector = ClipboardInjector {
             sender: PasteKeySender::Disabled,
             options: test_options(),
             copy_only: false,
             wayland_focus_cache: None,
+            context: None,
+            forced_shortcut: None,
         };
 
         let err = injector
-            .run_route_shortcuts(1, PasteShortcut::CtrlShiftV, Some(PasteShortcut::CtrlV))
+            .run_route_shortcuts(
+                1,
+                PasteShortcut::CtrlShiftV,
+                Some(PasteShortcut::CtrlV),
+                &mut Vec::new(),
+            )
             .expect_err("disabled backend should fail route stage");
         let message = format!("{err:#}");
         assert!(message.contains("stage=route_shortcut"));
@@ -1703,5 +1983,230 @@ mod tests {
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(8), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(9), 70);
         assert_eq!(ClipboardInjector::next_clipboard_ready_sleep_ms(128), 70);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_subprocess_process_group_moves_child_into_own_group() {
+        let mut command = Command::new("bash");
+        command.arg("-lc").arg(
+            r#"pid=$$; pgid=$(ps -o pgid= -p "$pid" | tr -d ' '); printf '%s %s\n' "$pid" "$pgid""#,
+        );
+        configure_subprocess_process_group(&mut command);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("test helper should spawn");
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout pipe should exist")
+            .read_to_string(&mut stdout)
+            .expect("stdout should be readable");
+        let status = child.wait().expect("child should exit");
+        assert!(status.success(), "helper should exit successfully");
+
+        let mut parts = stdout.split_whitespace();
+        let pid = parts.next().expect("helper should report pid");
+        let pgid = parts.next().expect("helper should report pgid");
+        assert_eq!(
+            parts.next(),
+            None,
+            "helper output should contain two fields"
+        );
+        assert_eq!(
+            pid, pgid,
+            "child should become leader of its own process group"
+        );
+    }
+
+    fn test_focus_snapshot(resolver: &str) -> FocusSnapshot {
+        FocusSnapshot {
+            app_name: Some("Ghostty".to_string()),
+            object_name: Some("terminal".to_string()),
+            object_path: Some("/com/example/terminal".to_string()),
+            service_name: Some("wayland".to_string()),
+            output_name: Some("DP-1".to_string()),
+            focused: true,
+            active: true,
+            resolver: resolver.to_string(),
+        }
+    }
+
+    #[test]
+    fn parent_focus_capture_round_trips_resolver_through_serde() {
+        let parent_focus = ParentFocusCapture {
+            snapshot: Some(test_focus_snapshot("wayland")),
+            source_selected: "wayland".to_string(),
+            wayland_cache_age_ms: Some(42),
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: Some(7),
+        };
+
+        let encoded = serde_json::to_string(&parent_focus).expect("parent focus should serialize");
+        let decoded: ParentFocusCapture =
+            serde_json::from_str(&encoded).expect("parent focus should deserialize");
+
+        assert_eq!(
+            decoded
+                .snapshot
+                .as_ref()
+                .expect("snapshot should round-trip")
+                .resolver,
+            "wayland"
+        );
+    }
+
+    #[test]
+    fn injector_child_report_round_trips_resolver_through_serde() {
+        let report = InjectorChildReport {
+            session_id: Some(Uuid::nil()),
+            origin: Some("test".to_string()),
+            trace_id: 9,
+            outcome: "success".to_string(),
+            error: None,
+            requested_len: 12,
+            requested_fingerprint: "abc123".to_string(),
+            clipboard_ready: true,
+            clipboard_probe_count: 2,
+            post_clipboard_matches: Some(true),
+            parent_focus: Some(ParentFocusCapture {
+                snapshot: Some(test_focus_snapshot("parent")),
+                source_selected: "wayland".to_string(),
+                wayland_cache_age_ms: Some(3),
+                wayland_fallback_reason: None,
+                captured_elapsed_ms: Some(4),
+            }),
+            child_focus_before: Some(test_focus_snapshot("before")),
+            child_focus_after: Some(test_focus_snapshot("after")),
+            child_focus_source_selected: "wayland".to_string(),
+            child_focus_wayland_cache_age_ms: Some(5),
+            child_focus_wayland_fallback_reason: None,
+            route_focus_source: "wayland".to_string(),
+            route_class: "Terminal".to_string(),
+            route_primary: "CtrlShiftV".to_string(),
+            route_adaptive_fallback: Some("CtrlV".to_string()),
+            route_reason: "focused terminal".to_string(),
+            backend_attempts: Vec::new(),
+            elapsed_ms_total: 25,
+        };
+
+        let encoded = serde_json::to_string(&report).expect("report should serialize");
+        let decoded: InjectorChildReport =
+            serde_json::from_str(&encoded).expect("report should deserialize");
+
+        assert_eq!(
+            decoded
+                .parent_focus
+                .as_ref()
+                .and_then(|focus| focus.snapshot.as_ref())
+                .expect("parent snapshot should round-trip")
+                .resolver,
+            "parent"
+        );
+        assert_eq!(
+            decoded
+                .child_focus_before
+                .as_ref()
+                .expect("child focus before should round-trip")
+                .resolver,
+            "before"
+        );
+        assert_eq!(decoded.error, None);
+        assert_eq!(
+            decoded
+                .child_focus_after
+                .as_ref()
+                .expect("child focus after should round-trip")
+                .resolver,
+            "after"
+        );
+    }
+
+    #[test]
+    fn clipboard_write_failed_report_round_trips_error_details() {
+        let report = InjectorChildReport {
+            session_id: Some(Uuid::nil()),
+            origin: Some("test".to_string()),
+            trace_id: 11,
+            outcome: InjectionOutcome::ClipboardWriteFailed.as_str().to_string(),
+            error: Some(
+                "failed to set clipboard contents: wl-copy exited with status 1".to_string(),
+            ),
+            requested_len: 4,
+            requested_fingerprint: "deadbeef".to_string(),
+            clipboard_ready: false,
+            clipboard_probe_count: 0,
+            post_clipboard_matches: None,
+            parent_focus: None,
+            child_focus_before: None,
+            child_focus_after: None,
+            child_focus_source_selected: "not_resolved".to_string(),
+            child_focus_wayland_cache_age_ms: None,
+            child_focus_wayland_fallback_reason: None,
+            route_focus_source: ClipboardInjector::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
+            route_class: ClipboardInjector::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
+            route_primary: ClipboardInjector::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
+            route_adaptive_fallback: None,
+            route_reason: ClipboardInjector::ROUTE_REASON_NOT_APPLICABLE.to_string(),
+            backend_attempts: Vec::new(),
+            elapsed_ms_total: 3,
+        };
+
+        let encoded = serde_json::to_string(&report).expect("report should serialize");
+        let decoded: InjectorChildReport =
+            serde_json::from_str(&encoded).expect("report should deserialize");
+
+        assert_eq!(decoded.outcome, "clipboard_write_failed");
+        assert_eq!(
+            decoded.error.as_deref(),
+            Some("failed to set clipboard contents: wl-copy exited with status 1")
+        );
+        assert_eq!(decoded.route_primary, "N/A");
+        assert_eq!(decoded.route_adaptive_fallback, None);
+    }
+
+    #[test]
+    fn backend_attempt_report_includes_uinput_lifecycle_metadata() {
+        let report = ClipboardInjector::backend_attempt_report(
+            ShortcutAttemptContext {
+                route_attempt_name: "primary",
+                route_attempt_index: 1,
+                route_attempt_total: 1,
+                backend_attempt_index: 1,
+                backend_attempt_total: 1,
+            },
+            "uinput",
+            "CtrlShiftV",
+            BackendAttemptOutcome {
+                status: "ok",
+                duration_ms: 12,
+                exit_status: None,
+                stderr_excerpt: None,
+                warning_tags: Vec::new(),
+                backend_config: Some("dwell_ms=18".to_string()),
+                error: None,
+                uinput_metadata: Some(UinputAttemptMetadata {
+                    generation: 4,
+                    fresh_device: true,
+                    device_age_ms_at_attempt: 203,
+                    use_count_before_attempt: 0,
+                    created_this_job: true,
+                    create_elapsed_ms: Some(7),
+                    last_create_error: None,
+                    reused_after_failure: true,
+                }),
+            },
+        );
+
+        assert_eq!(report.uinput_sender_generation, Some(4));
+        assert_eq!(report.uinput_fresh_device, Some(true));
+        assert_eq!(report.uinput_device_age_ms_at_attempt, Some(203));
+        assert_eq!(report.uinput_use_count_before_attempt, Some(0));
+        assert_eq!(report.uinput_created_this_job, Some(true));
+        assert_eq!(report.uinput_create_elapsed_ms, Some(7));
+        assert_eq!(report.uinput_last_create_error, None);
+        assert_eq!(report.uinput_reused_after_failure, Some(true));
     }
 }
