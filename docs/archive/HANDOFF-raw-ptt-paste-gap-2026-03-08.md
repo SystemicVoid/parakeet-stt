@@ -1,6 +1,14 @@
-# Handoff: Raw PTT Paste Gap Under `stt` / `stt llm` (2026-03-08)
+# Archived Handoff: Raw PTT Paste Gap Under `stt` / `stt llm` (2026-03-08)
 
-This file is the canonical running log for this bug investigation.
+> Archived on 2026-03-11 after PR #25 merged into `main` as commit `7c30635`.
+>
+> Closure context:
+> - This investigation track is closed.
+> - The merged fix replaced per-job `uinput` recreation with a persistent, recoverable in-process sender plus a one-time warm-up after fresh create or recovery.
+> - That change directly implements the reliability direction this log converged on; treat the remainder of this file as historical debugging context, not current operator guidance.
+> - Current runtime truth now lives in `docs/stt-troubleshooting.md`.
+
+This file was the canonical running log during the active bug investigation and is now preserved for historical context.
 
 Use it to record:
 
@@ -16,7 +24,12 @@ Goal:
 
 ## Status
 
-This issue is **not solved**.
+This issue is **closed for this investigation track**.
+
+Historical note:
+
+- On 2026-03-10, before PR #25 merged on 2026-03-11, the issue was still open and the branch was in a review-safe stopgap state.
+- The remainder of this section preserves that pre-closure context because it explains why the final fix took the shape it did.
 
 Current branch state as of **2026-03-10**:
 

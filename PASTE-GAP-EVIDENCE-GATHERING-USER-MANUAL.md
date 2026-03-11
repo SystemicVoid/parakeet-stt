@@ -197,7 +197,7 @@ If you need another sample after a code change or workstation change, repeat Ste
 just paste-gap-start label=ghostty attempts=10
 ```
 
-Historical multi-backend evidence from before the backend retirement is recorded in `HANDOFF-raw-ptt-paste-gap-2026-03-08.md`.
+Historical multi-backend evidence from before the backend retirement is recorded in `docs/archive/HANDOFF-raw-ptt-paste-gap-2026-03-08.md`.
 
 ## Step 5: Optional Direct Diagnostic Control
 
