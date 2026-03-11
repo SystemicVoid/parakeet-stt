@@ -1,11 +1,18 @@
-# Paste Reliability Analysis: Grounded Evidence and Recommended Design (2026-03-10)
+# Archived Investigation: Paste Reliability Analysis (2026-03-10)
+
+> Archived on 2026-03-11 after PR #25 merged into `main` as commit `7c30635`.
+>
+> Closure context:
+> - The merged implementation now keeps one in-process `uinput` sender alive while healthy, retries sender creation after `/dev/uinput` failures, and applies a one-time warm-up after fresh create or recovery.
+> - That outcome matches this document's final recommendation, so the rest of this file is preserved as pre-merge evidence rather than current operational guidance.
+> - Current runtime/operator truth now lives in `docs/stt-troubleshooting.md`.
 
 ## 0. Executive Summary
 
 - **Strongest read:** the main problem is the lifecycle of a freshly created `uinput` keyboard, not clipboard preparation, route selection, or missing seat keyboard capability.
 - **Best-supported final design:** keep one `uinput` device alive while healthy, lazily create or recreate it when needed, and apply a bounded warm-up only after a fresh create or recovery.
-- **Current state (`8564084`):** correct as a recovery stopgap, but likely a reliability regression because it recreates the risky "brand-new device" boundary on every paste job.
-- **Do not ship as the fix:** blind chord retries, text-mutating priming, or per-job create/destroy with only a bigger delay.
+- **Historical state (`8564084`, as of 2026-03-10):** correct as a recovery stopgap, but likely a reliability regression because it recreates the risky "brand-new device" boundary on every paste job.
+- **What this analysis argued should not ship as the fix:** blind chord retries, text-mutating priming, or per-job create/destroy with only a bigger delay.
 - **Most important next proof:** instrument fresh-vs-reused device age and rerun the A/B matrix so the final design is justified by measured behavior, not only by plausible mechanism.
 
 ## 1. Facts
