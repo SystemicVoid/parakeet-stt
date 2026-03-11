@@ -95,6 +95,7 @@ pub(crate) struct InjectorChildReport {
     pub origin: Option<String>,
     pub trace_id: u64,
     pub outcome: String,
+    pub error: Option<String>,
     pub requested_len: usize,
     pub requested_fingerprint: String,
     pub clipboard_ready: bool,
@@ -589,6 +590,7 @@ enum InjectionOutcome {
     ChordFailed,
     NoEffectSuspected,
     CopyOnly,
+    ClipboardWriteFailed,
 }
 
 impl InjectionOutcome {
@@ -599,6 +601,7 @@ impl InjectionOutcome {
             Self::ChordFailed => "chord_failed",
             Self::NoEffectSuspected => "no_effect_suspected",
             Self::CopyOnly => "copy_only",
+            Self::ClipboardWriteFailed => "clipboard_write_failed",
         }
     }
 }
@@ -608,6 +611,10 @@ impl ClipboardInjector {
     const CLIPBOARD_READY_SCHEDULE_MS: [u64; 8] = [5, 10, 15, 20, 30, 40, 50, 70];
     const WAYLAND_STALE_MS: u64 = 30_000;
     const WAYLAND_TRANSITION_GRACE_MS: u64 = 500;
+    const ROUTE_FOCUS_SOURCE_NOT_APPLICABLE: &str = "n/a";
+    const ROUTE_CLASS_NOT_APPLICABLE: &str = "N/A";
+    const ROUTE_PRIMARY_NOT_APPLICABLE: &str = "N/A";
+    const ROUTE_REASON_NOT_APPLICABLE: &str = "n/a";
 
     #[allow(dead_code)]
     pub fn new(sender: PasteKeySender, options: ClipboardOptions, copy_only: bool) -> Self {
@@ -1366,13 +1373,14 @@ impl TextInjector for ClipboardInjector {
         let mut child_focus_source_selected = "not_resolved".to_string();
         let mut child_focus_wayland_cache_age_ms = None;
         let mut child_focus_wayland_fallback_reason = None;
-        let mut route_focus_source = "not_selected".to_string();
-        let mut route_class = "Unknown".to_string();
-        let mut route_primary = Self::shortcut_name(PasteShortcut::CtrlShiftV);
-        let mut route_adaptive_fallback = Some(Self::shortcut_name(PasteShortcut::CtrlV));
-        let mut route_reason = "not_routed".to_string();
+        let mut route_focus_source = Self::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string();
+        let mut route_class = Self::ROUTE_CLASS_NOT_APPLICABLE.to_string();
+        let mut route_primary = Self::ROUTE_PRIMARY_NOT_APPLICABLE.to_string();
+        let mut route_adaptive_fallback = None;
+        let mut route_reason = Self::ROUTE_REASON_NOT_APPLICABLE.to_string();
         let mut post_clipboard_matches = None;
         let emit_report = |outcome: InjectionOutcome,
+                           error: Option<String>,
                            clipboard_ready: bool,
                            clipboard_probe_count: u64,
                            post_clipboard_matches: Option<bool>,
@@ -1392,6 +1400,7 @@ impl TextInjector for ClipboardInjector {
                 origin: origin.clone(),
                 trace_id,
                 outcome: outcome.as_str().to_string(),
+                error,
                 requested_len: text.len(),
                 requested_fingerprint: requested_fingerprint.clone(),
                 clipboard_ready,
@@ -1481,9 +1490,34 @@ impl TextInjector for ClipboardInjector {
                 requested_fingerprint = %requested_fingerprint,
                 "writing transcript to clipboard"
         );
-        let (mut foreground_clipboard_source, mut foreground_primary_source) = self
+        let (mut foreground_clipboard_source, mut foreground_primary_source) = match self
             .write_clipboards(text, true)
-            .context("failed to set clipboard contents")?;
+            .context("failed to set clipboard contents")
+        {
+            Ok(sources) => sources,
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                emit_report(
+                    InjectionOutcome::ClipboardWriteFailed,
+                    Some(err_text.clone()),
+                    false,
+                    0,
+                    None,
+                    None,
+                    None,
+                    &child_focus_source_selected,
+                    child_focus_wayland_cache_age_ms,
+                    child_focus_wayland_fallback_reason.clone(),
+                    &route_focus_source,
+                    &route_class,
+                    &route_primary,
+                    route_adaptive_fallback.clone(),
+                    &route_reason,
+                    backend_attempts,
+                );
+                return Err(err);
+            }
+        };
 
         // 2b. Wait briefly for wl-copy ownership to become readable.
         let clipboard_ready_started = Self::stage_start(
@@ -1557,6 +1591,7 @@ impl TextInjector for ClipboardInjector {
             );
             emit_report(
                 InjectionOutcome::CopyOnly,
+                None,
                 ready,
                 probe_count,
                 None,
@@ -1678,6 +1713,7 @@ impl TextInjector for ClipboardInjector {
             );
             emit_report(
                 outcome,
+                None,
                 ready,
                 probe_count,
                 post_clipboard_matches,
@@ -1786,6 +1822,7 @@ impl TextInjector for ClipboardInjector {
         );
         emit_report(
             outcome,
+            None,
             ready,
             probe_count,
             post_clipboard_matches,
@@ -1839,8 +1876,8 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::{
         configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
-        InjectorChildReport, ParentFocusCapture, PasteKeySender, ShortcutAttemptContext,
-        UinputAttemptMetadata, UinputChordSender,
+        InjectionOutcome, InjectorChildReport, ParentFocusCapture, PasteKeySender,
+        ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender,
     };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
@@ -2028,6 +2065,7 @@ mod tests {
             origin: Some("test".to_string()),
             trace_id: 9,
             outcome: "success".to_string(),
+            error: None,
             requested_len: 12,
             requested_fingerprint: "abc123".to_string(),
             clipboard_ready: true,
@@ -2075,6 +2113,7 @@ mod tests {
                 .resolver,
             "before"
         );
+        assert_eq!(decoded.error, None);
         assert_eq!(
             decoded
                 .child_focus_after
@@ -2083,6 +2122,49 @@ mod tests {
                 .resolver,
             "after"
         );
+    }
+
+    #[test]
+    fn clipboard_write_failed_report_round_trips_error_details() {
+        let report = InjectorChildReport {
+            session_id: Some(Uuid::nil()),
+            origin: Some("test".to_string()),
+            trace_id: 11,
+            outcome: InjectionOutcome::ClipboardWriteFailed.as_str().to_string(),
+            error: Some(
+                "failed to set clipboard contents: wl-copy exited with status 1".to_string(),
+            ),
+            requested_len: 4,
+            requested_fingerprint: "deadbeef".to_string(),
+            clipboard_ready: false,
+            clipboard_probe_count: 0,
+            post_clipboard_matches: None,
+            parent_focus: None,
+            child_focus_before: None,
+            child_focus_after: None,
+            child_focus_source_selected: "not_resolved".to_string(),
+            child_focus_wayland_cache_age_ms: None,
+            child_focus_wayland_fallback_reason: None,
+            route_focus_source: ClipboardInjector::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
+            route_class: ClipboardInjector::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
+            route_primary: ClipboardInjector::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
+            route_adaptive_fallback: None,
+            route_reason: ClipboardInjector::ROUTE_REASON_NOT_APPLICABLE.to_string(),
+            backend_attempts: Vec::new(),
+            elapsed_ms_total: 3,
+        };
+
+        let encoded = serde_json::to_string(&report).expect("report should serialize");
+        let decoded: InjectorChildReport =
+            serde_json::from_str(&encoded).expect("report should deserialize");
+
+        assert_eq!(decoded.outcome, "clipboard_write_failed");
+        assert_eq!(
+            decoded.error.as_deref(),
+            Some("failed to set clipboard contents: wl-copy exited with status 1")
+        );
+        assert_eq!(decoded.route_primary, "N/A");
+        assert_eq!(decoded.route_adaptive_fallback, None);
     }
 
     #[test]
