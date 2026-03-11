@@ -192,6 +192,10 @@ just eval-dataset candidates
 just eval-dataset materialize
 just eval-dataset record
 ```
+Each eval or calibration run also copies the generated JSON into
+`parakeet-stt-daemon/bench_audio/personal/history/` with a timestamped filename, so the
+current `latest-*.json` files stay convenient while older runs remain easy to compare.
+
 The benchmark command prints a per-sample + aggregate summary to stdout and writes JSON with:
 - `benchmark`, `bench_runtime`, `model`, `requested_device`, `effective_device`
 - `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_append_legacy`, `bench_runs`, `sample_count`
