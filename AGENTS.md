@@ -1,8 +1,6 @@
 # Repository Guidelines
 
-This file is a repo map, not a surprise log.
-
-Keep it short, stable, and biased toward source-of-truth locations. If something in the repo surprises an agent, prefer fixing the code, tests, CLI help, or canonical docs so the behavior becomes predictable. Only keep workflow rules here that an agent needs before acting.
+Keep it short, stable, and biased toward source-of-truth locations. If something in the repo surprises an agent, note it here but prefer fixing the code, tests, CLI help, or canonical docs so the behavior becomes predictable. Only keep workflow rules here that an agent needs before acting.
 
 ## Repo Map
 - `README.md`: quickstart and top-level workflow.

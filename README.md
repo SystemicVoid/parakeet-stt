@@ -12,9 +12,9 @@ Since `21d8f74` and follow-up commits, the injection path is now reliability-fir
 
 - Runtime injection surface is now `paste` or `copy-only` (legacy `type` mode removed).
 - Default routing mode is adaptive, selecting shortcut by focused surface class.
-- Default backend is `auto` with runtime ladder `uinput → ydotool`.
+- Default backend is `uinput`.
 - Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.
-- Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
+- Backend stage failure accounting is reported directly from the in-process injector runner.
 - Clipboard readiness barrier and post-chord ownership timing controls are implemented.
 - `stt diag-injector` reports capability prechecks and runs reproducible injection tests.
 - Event-loop lag summaries are derived from Tokio tick scheduling (not a drifting baseline), so percentile windows recover after transient stalls.
@@ -85,7 +85,6 @@ Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror 
 Default `stt` / `stt start` profile:
 
 - `--injection-mode paste`
-- `--paste-key-backend auto` (ladder: uinput → ydotool)
 - `--paste-backend-failure-policy copy-only`
 - `--uinput-dwell-ms 18`
 - `PARAKEET_STREAMING_ENABLED=true`
