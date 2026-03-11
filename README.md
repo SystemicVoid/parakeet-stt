@@ -6,25 +6,6 @@ It has two runtime components:
 - `parakeet-stt-daemon` (Python/FastAPI): captures audio and runs NeMo Parakeet ASR.
 - `parakeet-ptt` (Rust): global hotkey client, daemon WebSocket client, and text injector.
 
-## Current State (Mar 2026)
-
-Since `21d8f74` and follow-up commits, the injection path is now reliability-first:
-
-- Runtime injection surface is now `paste` or `copy-only` (legacy `type` mode removed).
-- Default routing mode is adaptive, selecting shortcut by focused surface class.
-- Default backend is `uinput`.
-- Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.
-- Backend stage failure accounting is reported directly from the in-process injector runner.
-- Clipboard readiness barrier and post-chord ownership timing controls are implemented.
-- `stt diag-injector` reports capability prechecks and runs reproducible injection tests.
-- Event-loop lag summaries are derived from Tokio tick scheduling (not a drifting baseline), so percentile windows recover after transient stalls.
-- Runtime helper launch is profile-based:
-  - `stt` / `stt start` defaults to online stream+seal + overlay enabled.
-  - `stt off` defaults to offline + overlay disabled.
-- Public release track: the next semver tag should be `v0.2.0` because this line adds new user-facing capability and default-behavior changes, not just bugfixes.
-
-This keeps the system usable now while uinput behavior is hardened across app surfaces.
-
 ## Prerequisites
 
 - Python 3.11+ (`uv`)
