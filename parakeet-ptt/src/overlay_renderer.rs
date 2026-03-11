@@ -17,7 +17,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -2219,6 +2219,12 @@ impl WaylandRuntime {
                 layer_surface.set_exclusive_zone(0);
                 layer_surface
                     .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+                // A fully transparent surface is still hit-testable on Wayland unless it
+                // advertises an empty input region. Without this, the hidden bottom-center
+                // layer surface leaves behind a "dead zone" over dock icons and web inputs.
+                let input_region = compositor.create_region(&queue_handle, ());
+                surface.set_input_region(Some(&input_region));
+                input_region.destroy();
                 layer_surface.set_size(dimensions.width, dimensions.height);
                 ShellSurface::Layer { layer_surface }
             }
@@ -2659,6 +2665,18 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandRuntimeState
         _: &mut Self,
         _: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         _: zwlr_layer_shell_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for WaylandRuntimeState {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
