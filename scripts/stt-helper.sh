@@ -71,12 +71,10 @@ stt() {
     local PORT="${PARAKEET_PORT:-8765}"
     local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
-    local default_paste_key_backend="${PARAKEET_PASTE_KEY_BACKEND:-auto}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
     local default_paste_seat="${PARAKEET_PASTE_SEAT:-}"
     local default_paste_write_primary="${PARAKEET_PASTE_WRITE_PRIMARY:-false}"
-    local default_ydotool_path="${PARAKEET_YDOTOOL_PATH:-}"
     local default_completion_sound="${PARAKEET_COMPLETION_SOUND:-true}"
     local default_completion_sound_path="${PARAKEET_COMPLETION_SOUND_PATH:-}"
     local default_completion_sound_volume="${PARAKEET_COMPLETION_SOUND_VOLUME:-100}"
@@ -111,12 +109,10 @@ stt() {
     local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
-        "paste-key-backend|paste_key_backend|default_paste_key_backend|PARAKEET_PASTE_KEY_BACKEND|Stable controls|<v>|auto|always|auto"
         "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"
         "uinput-dwell-ms|uinput_dwell_ms|default_uinput_dwell_ms|PARAKEET_UINPUT_DWELL_MS|Stable controls|<n>|18|always|18"
         "paste-seat|paste_seat|default_paste_seat|PARAKEET_PASTE_SEAT|Stable controls|<v>|<unset>|nonempty|"
         "paste-write-primary|paste_write_primary|default_paste_write_primary|PARAKEET_PASTE_WRITE_PRIMARY|Stable controls|<v>|false|always|false"
-        "ydotool|ydotool_path|default_ydotool_path|PARAKEET_YDOTOOL_PATH|Stable controls|<path>|<auto>|nonempty|"
         "completion-sound|completion_sound|default_completion_sound|PARAKEET_COMPLETION_SOUND|Stable controls|<v>|true|always|true"
         "completion-sound-path|completion_sound_path|default_completion_sound_path|PARAKEET_COMPLETION_SOUND_PATH|Stable controls|<path>|<system default>|nonempty|"
         "completion-sound-volume|completion_sound_volume|default_completion_sound_volume|PARAKEET_COMPLETION_SOUND_VOLUME|Stable controls|<n>|100|always|100"
@@ -247,6 +243,28 @@ stt() {
         done
     }
 
+    _build_start_cli_args() {
+        local -n out_ref="$1"
+        local launch_profile="$2"
+        local row opt_name var_name include_policy
+        out_ref=()
+        case "$launch_profile" in
+            offline)
+                out_ref+=(offline)
+                ;;
+            *)
+                out_ref+=(streaming)
+                ;;
+        esac
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
+            if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
+                continue
+            fi
+            out_ref+=("--$opt_name" "${!var_name}")
+        done
+    }
+
     _args_to_shell_words() {
         local -n in_ref="$1"
         local out
@@ -261,6 +279,24 @@ stt() {
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name _ <<<"$row"
             if ! grep -Fq -- "--$opt_name" <<<"$help_text"; then
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    _ptt_binary_supports_diag_injection_flags() {
+        local binary="$1"
+        local help_text
+        help_text="$("$binary" --help 2>&1)" || return 1
+        local required_flag
+        for required_flag in \
+            --test-injection \
+            --test-injection-count \
+            --test-injection-text-prefix \
+            --test-injection-interval-ms \
+            --test-injection-shortcut; do
+            if ! grep -Fq -- "$required_flag" <<<"$help_text"; then
                 return 1
             fi
         done
@@ -734,7 +770,7 @@ Commands:
   show | attach          Attach to tmux session.
   tmux [attach|kill]     Attach/kill helper tmux session.
   check                  Run daemon health check.
-  diag-injector          Run clipboard injector diagnostics.
+  diag-injector [opts]   Run clipboard injector diagnostics.
   help [start|llm]       Show this help or command-specific help.
 EOF
     }
@@ -864,8 +900,8 @@ CLIENTCMD
             _print_start_option_names
             ;;
         __start-args)
-            local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local -a ptt_args
@@ -891,9 +927,37 @@ CLIENTCMD
             _build_ptt_args ptt_args
             printf "%s\n" "${ptt_args[@]}"
             ;;
+        __start-cli-args)
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local -a start_cli_args
+            local launch_profile="stream-seal"
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
+                launch_profile="stream-seal"
+                shift
+            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
+                launch_profile="offline"
+                shift
+            fi
+            _apply_launch_profile_defaults "$launch_profile"
+            _load_start_vars_from_defaults
+
+            local parse_status=0
+            _parse_start_options "$@" || parse_status=$?
+            if [ "$parse_status" -eq 2 ]; then
+                return 0
+            elif [ "$parse_status" -ne 0 ]; then
+                return "$parse_status"
+            fi
+
+            _build_start_cli_args start_cli_args "$launch_profile"
+            printf "%s\n" "${start_cli_args[@]}"
+            ;;
         start)
-            local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local launch_profile="stream-seal"
@@ -938,7 +1002,6 @@ CLIENTCMD
 
             echo ">>> Starting Parakeet STT (detached tmux)..."
             echo "   - Injection mode: $injection_mode"
-            echo "   - Paste key backend: $paste_key_backend"
             echo "   - Paste backend failure policy: $paste_backend_failure_policy"
             echo "   - uinput dwell (ms): $uinput_dwell_ms"
             echo "   - Paste seat: ${paste_seat:-<default>}"
@@ -1310,8 +1373,8 @@ CLIENTCMD
             echo "${HOST}:${PORT}" >| "$PORT_FILE"
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local injection_mode paste_key_backend paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
             local ptt_rustflags="$default_ptt_rustflags"
@@ -1374,6 +1437,71 @@ CLIENTCMD
             (
                 cd "$CLIENT_DIR" || exit 1
                 set -e
+                local attempts="1"
+                local shortcut="auto"
+                local text_prefix="Parakeet Test"
+                local interval_ms="150"
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --attempts)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --attempts" >&2
+                                exit 2
+                            }
+                            attempts="$2"
+                            shift 2
+                            ;;
+                        --shortcut)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --shortcut" >&2
+                                exit 2
+                            }
+                            shortcut="$2"
+                            shift 2
+                            ;;
+                        --prefix)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --prefix" >&2
+                                exit 2
+                            }
+                            text_prefix="$2"
+                            shift 2
+                            ;;
+                        --interval-ms)
+                            [ "$#" -ge 2 ] || {
+                                echo "diag-injector requires a value after --interval-ms" >&2
+                                exit 2
+                            }
+                            interval_ms="$2"
+                            shift 2
+                            ;;
+                        *)
+                            echo "Unknown diag-injector argument: $1" >&2
+                            exit 2
+                            ;;
+                    esac
+                done
+
+                case "$shortcut" in
+                    auto|ctrl-v|ctrl-shift-v) ;;
+                    *)
+                        echo "diag-injector shortcut must be one of: auto|ctrl-v|ctrl-shift-v" >&2
+                        exit 2
+                        ;;
+                esac
+                [[ "$attempts" =~ ^[0-9]+$ ]] || {
+                    echo "diag-injector attempts must be an integer" >&2
+                    exit 2
+                }
+                [ "$attempts" -ge 1 ] || {
+                    echo "diag-injector attempts must be >= 1" >&2
+                    exit 2
+                }
+                [[ "$interval_ms" =~ ^[0-9]+$ ]] || {
+                    echo "diag-injector interval-ms must be an integer" >&2
+                    exit 2
+                }
+
                 local runner_mode runner_bin
                 local ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:-}"
                 local ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
@@ -1385,12 +1513,21 @@ CLIENTCMD
                 runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
                 runner_bin=""
                 if [ "$runner_mode" = "release" ]; then
-                    runner_bin="./target/release/parakeet-ptt"
-                elif [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                    echo "   - release binary missing expected start flags; using cargo run --release --bin parakeet-ptt"
+                    if _ptt_binary_supports_diag_injection_flags "$CLIENT_DIR/target/release/parakeet-ptt"; then
+                        runner_bin="./target/release/parakeet-ptt"
+                    else
+                        runner_mode="cargo"
+                    fi
+                fi
+                if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
+                    echo "   - release binary missing expected diag-injector flags; using cargo run --release --bin parakeet-ptt"
                 fi
 
-                echo "   - capability: ydotool=$(command -v ydotool >/dev/null 2>&1 && echo yes || echo no)"
+                echo "   - diag backend: uinput"
+                echo "   - diag attempts per backend: $attempts"
+                echo "   - diag forced shortcut: $shortcut"
+                echo "   - diag text prefix: $text_prefix"
+                echo "   - diag interval ms: $interval_ms"
                 if [ -e /dev/uinput ]; then
                     if [ -w /dev/uinput ]; then
                         echo "   - capability: /dev/uinput writable=yes"
@@ -1402,31 +1539,38 @@ CLIENTCMD
                 fi
 
                 run_case() {
-                    local backend="$1"
-                    local injection_mode paste_key_backend paste_backend_failure_policy
-                    local uinput_dwell_ms paste_seat paste_write_primary ydotool_path
+                    local injection_mode paste_backend_failure_policy
+                    local uinput_dwell_ms paste_seat paste_write_primary
                     local completion_sound completion_sound_path completion_sound_volume
                     local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
                     local -a ptt_args
+                    local -a diag_args
 
                     _load_start_vars_from_defaults
                     injection_mode="paste"
-                    paste_key_backend="$backend"
                     _build_ptt_args ptt_args no
 
-                    echo "   - case backend=$backend"
+                    diag_args=(
+                        --test-injection
+                        --test-injection-count "$attempts"
+                        --test-injection-text-prefix "$text_prefix"
+                        --test-injection-interval-ms "$interval_ms"
+                    )
+                    if [ "$shortcut" != "auto" ]; then
+                        diag_args+=(--test-injection-shortcut "$shortcut")
+                    fi
+
+                    echo "   - case backend=uinput"
                     if [ -n "$runner_bin" ]; then
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            "$runner_bin" --test-injection "${ptt_args[@]}"
+                            "$runner_bin" "${diag_args[@]}" "${ptt_args[@]}"
                     else
                         RUST_LOG="${RUST_LOG:-parakeet_ptt=info,parakeet_ptt::injector=debug}" \
-                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- --test-injection "${ptt_args[@]}"
+                            RUSTFLAGS="$ptt_rustflags" cargo run --release --bin parakeet-ptt -- "${diag_args[@]}" "${ptt_args[@]}"
                     fi
                 }
 
-                run_case "auto"
-                run_case "uinput"
-                run_case "ydotool"
+                run_case
             )
             ;;
         *)
@@ -1439,3 +1583,19 @@ CLIENTCMD
 }
 
 # To use: source scripts/stt-helper.sh (or copy this function into your shell rc)
+get_stt_start_args() {
+    if [ "$#" -lt 1 ]; then
+        echo "get_stt_start_args requires an output array name" >&2
+        return 2
+    fi
+    local out_name="$1"
+    shift
+    local -n out_ref="$out_name"
+    out_ref=()
+    local output
+    output="$(stt __start-cli-args "$@")" || return $?
+    local arg
+    while IFS= read -r arg; do
+        out_ref+=("$arg")
+    done <<<"$output"
+}

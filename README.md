@@ -12,9 +12,9 @@ Since `21d8f74` and follow-up commits, the injection path is now reliability-fir
 
 - Runtime injection surface is now `paste` or `copy-only` (legacy `type` mode removed).
 - Default routing mode is adaptive, selecting shortcut by focused surface class.
-- Default backend is `auto` with runtime ladder `uinput → ydotool`.
+- Default backend is `uinput`.
 - Backend failures default to `copy-only` so transcript delivery is preserved in clipboard.
-- Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
+- Backend stage failure accounting is reported directly from the in-process injector runner.
 - Clipboard readiness barrier and post-chord ownership timing controls are implemented.
 - `stt diag-injector` reports capability prechecks and runs reproducible injection tests.
 - Event-loop lag summaries are derived from Tokio tick scheduling (not a drifting baseline), so percentile windows recover after transient stalls.
@@ -85,7 +85,6 @@ Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror 
 Default `stt` / `stt start` profile:
 
 - `--injection-mode paste`
-- `--paste-key-backend auto` (ladder: uinput → ydotool)
 - `--paste-backend-failure-policy copy-only`
 - `--uinput-dwell-ms 18`
 - `PARAKEET_STREAMING_ENABLED=true`
@@ -193,6 +192,10 @@ just eval-dataset candidates
 just eval-dataset materialize
 just eval-dataset record
 ```
+Each eval or calibration run also copies the generated JSON into
+`parakeet-stt-daemon/bench_audio/personal/history/` with a timestamped filename, so the
+current `latest-*.json` files stay convenient while older runs remain easy to compare.
+
 The benchmark command prints a per-sample + aggregate summary to stdout and writes JSON with:
 - `benchmark`, `bench_runtime`, `model`, `requested_device`, `effective_device`
 - `bench_dir`, `manifest_path|transcripts_path`, `bench_tier`, `bench_append_legacy`, `bench_runs`, `sample_count`

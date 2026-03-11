@@ -17,7 +17,6 @@ Canonical-source policy:
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
 - Default startup profile is now online stream+seal (`stt` / `stt start`) with paste-mode and adaptive cross-surface shortcut routing using internal defaults:
   - `--injection-mode paste`
-  - `--paste-key-backend auto` (ladder: uinput → ydotool)
   - `--paste-backend-failure-policy copy-only`
   - daemon launch default: `PARAKEET_STREAMING_ENABLED=true` for the default profile
   - overlay launch default: `PARAKEET_OVERLAY_ENABLED=true` with `--overlay-adaptive-width=false`
@@ -27,15 +26,27 @@ Canonical-source policy:
 - Paste backend failures are policy-driven:
   - `copy-only` (default): preserve transcript delivery by writing clipboard even if key backend is unavailable.
   - `error`: fail fast for strict debugging.
-- `auto` backend now performs runtime fallback attempts (uinput → ydotool) per shortcut execution.
+- The in-process paste path now keeps one `uinput` virtual keyboard alive while healthy instead of creating a fresh device for every job.
+- If `/dev/uinput` is unavailable, the client no longer poisons the whole session:
+  - failed create attempts fall back per policy (`copy-only` or `error`)
+  - the worker retries sender creation on later jobs after a short internal backoff
+- Freshly created or recovered `uinput` devices now pay a one-time warm-up delay before the first real paste chord so COSMIC/libinput can discover and route the device before the shortcut is emitted.
 - Final-result injection is now enqueued to a dedicated bounded worker queue (`capacity=32`) so hotkey/websocket handling paths do not await blocking clipboard/chord execution inline.
 - Worker enqueue backpressure is timeout-limited (`20ms`) with explicit dropped-job warnings when the queue stays saturated.
 - Injector logs now tag stage outcomes and durations with `stage=<clipboard_ready|route_shortcut|backend>` and `status=<start|ok|fail>`.
-- Backend stage failure accounting includes `ydotool` spawn failures (missing/non-executable binary), not just non-zero exit statuses.
+- Backend stage failure accounting reflects initialization and command failures from the uinput-only injector path.
+- Backend-attempt summaries for `uinput` now include sender lifecycle fields so paste-gap runs can distinguish fresh vs reused devices:
+  - `ugen=<n>` sender generation
+  - `ufresh=1|0` whether this was the first routed use after create/recovery
+  - `uage_ms=<ms>` device age when the chord was attempted
+  - `uuse=<n>` prior successful uses on the current sender
+  - `ucreated_this_job=1|0` whether the sender was created for the current job
+  - `ucreate_ms=<ms>` sender creation latency for fresh jobs
+  - `urecovered=1|0` whether the current sender generation came from recovery after a prior create failure
 - Queue and stage metric summaries are emitted periodically from the client loop (`injector worker queue metrics summary`, `injector stage metrics summary`).
 - Event-loop lag summaries are emitted every 30 seconds (`event loop lag window summary`) with p50/p95/p99 fields, measured against the interval schedule so windows recover after transient stalls.
 - Hotkey listeners now seed already-held `llm_pre_modifier` state from the kernel when they attach or re-attach, so the first utterance after startup/resume/device recovery still routes to LLM mode if Shift was already held.
-- `stt diag-injector` reports backend capability prerequisites (`ydotool`, `/dev/uinput` write access) before running matrix cases.
+- `stt diag-injector` reports `/dev/uinput` capability before running reproducible uinput-only cases.
 - Client readiness wait for `stt start` is timeout-based (`PARAKEET_CLIENT_READY_TIMEOUT_SECONDS`, default `30`) and extends when cargo compile is still active.
 - Helper pane selection is index-agnostic (no `.0` assumption), so tmux `pane-base-index 1` configs are supported.
 - Adaptive routing treats `focus_focused=false` snapshots as low-confidence and routes using unknown policy (terminal-first default).
@@ -97,12 +108,10 @@ Paste/copy injection now exposes a stable operator surface through `stt start` a
 
 Client knobs:
 - `--injection-mode paste|copy-only`
-- `--paste-key-backend ydotool|uinput|auto` (default: `auto`, ladder: uinput→ydotool)
 - `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
 - `--uinput-dwell-ms <ms>` (default: `18`)
 - `--paste-seat <seat>` (optional)
 - `--paste-write-primary true|false` (default: `false`)
-- `--ydotool <path>` (optional explicit path override)
 - `--completion-sound true|false` (default: `true`)
 - `--completion-sound-path <path>` (optional)
 - `--completion-sound-volume <0-100>` (default: `100`)
@@ -112,7 +121,6 @@ Recommended baseline for Ghostty/COSMIC:
 
 ```bash
 stt start --paste \
-  --paste-key-backend auto \
   --paste-backend-failure-policy copy-only
 ```
 
@@ -136,4 +144,43 @@ Use the new helper matrix command:
 stt diag-injector
 ```
 
-It prints backend capability checks and then runs three `--test-injection` backend cases (`auto`, `uinput`, `ydotool`) with injector debug logging.
+It prints `/dev/uinput` capability checks and then runs reproducible `uinput` test-injection cases with injector debug logging.
+
+### Paste-gap matrix harness
+
+For the raw-paste Ghostty investigation, use the repo-local harness instead of manually juggling `/tmp` artifacts:
+
+```bash
+just paste-gap-start
+```
+
+That command:
+
+- records the current commit SHA and worktree status
+- clears `/tmp/parakeet-ptt.log`, `/tmp/parakeet-daemon.log`, and `/tmp/parakeet-ghostty-sink.txt`
+- starts `stt` with the fixed `uinput` path and `--paste-backend-failure-policy error`
+- seeds operator observation templates under `/tmp/parakeet-paste-gap/...`
+
+After the manual Ghostty utterance run, archive and summarize with:
+
+```bash
+just paste-gap-stop
+just paste-gap-diag
+just paste-gap-summary
+```
+
+Useful follow-ups:
+
+```bash
+just paste-gap-current
+just paste-gap-summary run_dir=/tmp/parakeet-paste-gap/<run-dir>
+```
+
+The harness writes:
+
+- `summary.txt`: counts by origin, route, backend-attempt string, focus app, and clipboard fields
+- `injector-subprocess-report.tsv`: mechanically extracted `injector subprocess report` rows
+- `injector-subprocess-report.raw.tsv`: raw-only subset for the failing path
+- `raw-observation-joined.tsv`: created only when raw report count matches the operator observation row count
+
+This keeps the experiment honest: same stack, same `/tmp` artifacts, different backend.

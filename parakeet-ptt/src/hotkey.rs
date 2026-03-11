@@ -905,12 +905,20 @@ fn find_hotkey_device_paths(talk_key: Key, llm_pre_modifier_keys: &[Key]) -> Res
 }
 
 fn is_hotkey_capable_device(device: &Device, talk_key: Key, llm_pre_modifier_keys: &[Key]) -> bool {
+    if device.name().is_some_and(is_ignored_hotkey_device_name) {
+        return false;
+    }
+
     device.supported_keys().is_some_and(|keys| {
         keys.contains(talk_key)
             || llm_pre_modifier_keys
                 .iter()
                 .any(|modifier| keys.contains(*modifier))
     })
+}
+
+fn is_ignored_hotkey_device_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("parakeet")
 }
 
 fn is_event_device_path(path: &Path) -> bool {
@@ -922,11 +930,12 @@ fn is_event_device_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_hotkey_event, handle_listener_exit, is_event_device_path, parse_key_name,
-        parse_pre_modifier_key_names, seed_listener_pre_modifier_state,
-        validate_hotkey_binding_config, HotkeyDiagnostics, HotkeyEvent, HotkeyIntent,
-        HotkeyListenerContext, HotkeySharedState, HotkeyTasks, ListenerExit, ListenerExitAction,
-        ListenerExitCleanup, ListenerExitReason, ListenerPressedState,
+        derive_hotkey_event, handle_listener_exit, is_event_device_path,
+        is_ignored_hotkey_device_name, parse_key_name, parse_pre_modifier_key_names,
+        seed_listener_pre_modifier_state, validate_hotkey_binding_config, HotkeyDiagnostics,
+        HotkeyEvent, HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks,
+        ListenerExit, ListenerExitAction, ListenerExitCleanup, ListenerExitReason,
+        ListenerPressedState,
     };
     use evdev::{AttributeSet, Key};
     use std::collections::HashSet;
@@ -1297,6 +1306,22 @@ mod tests {
         assert!(!is_event_device_path(Path::new(
             "/dev/input/by-id/keyboard"
         )));
+    }
+
+    #[test]
+    fn parakeet_virtual_keyboard_names_are_ignored() {
+        assert!(is_ignored_hotkey_device_name(
+            "Parakeet STT Virtual Keyboard"
+        ));
+        assert!(is_ignored_hotkey_device_name("parakeet helper keyboard"));
+    }
+
+    #[test]
+    fn non_parakeet_device_names_are_not_ignored() {
+        assert!(!is_ignored_hotkey_device_name(
+            "AT Translated Set 2 keyboard"
+        ));
+        assert!(!is_ignored_hotkey_device_name("Logitech MX Keys"));
     }
 
     #[tokio::test]
