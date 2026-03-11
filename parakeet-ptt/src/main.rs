@@ -1621,6 +1621,7 @@ fn log_injector_subprocess_stderr(session_id: Uuid, origin: InjectionOrigin, std
                         route_primary = report.route_primary,
                         route_adaptive_fallback = ?report.route_adaptive_fallback,
                         route_reason = report.route_reason,
+                        error = ?report.error,
                         backend_attempt_count = report.backend_attempts.len(),
                         backend_warning_tags = summarize_backend_warning_tags(&report.backend_attempts),
                         backend_exit_statuses = summarize_backend_exit_statuses(&report.backend_attempts),
