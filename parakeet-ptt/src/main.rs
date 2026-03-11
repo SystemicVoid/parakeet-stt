@@ -9,16 +9,24 @@ mod routing;
 mod state;
 mod surface_focus;
 
-use std::collections::HashMap;
-use std::ffi::OsString;
-use std::io::{Read, Write};
-#[cfg(unix)]
+use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
+#[cfg(all(test, unix))]
+use std::os::fd::AsRawFd;
+#[cfg(all(test, unix))]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::{Child, ExitStatus};
+#[cfg(test)]
+use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -42,26 +50,34 @@ use crate::config::{
 use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent, HotkeyIntent,
 };
-use crate::injector::{injector_metrics_snapshot, TextInjector};
+use crate::injector::{
+    injector_metrics_snapshot, BackendAttemptReport, ClipboardInjector, FailInjector,
+    InjectorChildReport, InjectorContext, ParentFocusCapture, PasteChordSender, PasteKeySender,
+    TextInjector, UinputAttemptMetadata, UinputChordSender, INJECTOR_CONTEXT_ENV,
+    INJECTOR_REPORT_PREFIX,
+};
+#[cfg(test)]
+use crate::injector::{
+    INJECTOR_JOB_TIMEOUT_MS, INJECTOR_PIPE_DRAIN_TIMEOUT_MS, INJECTOR_PIPE_READER_JOIN_SLACK_MS,
+    INJECTOR_SUBPROCESS_POLL_INTERVAL_MS,
+};
 use crate::overlay_process::OverlayProcessManager;
 use crate::protocol::{
     decode_server_message, start_message, stop_message, DecodedServerMessage, ServerMessage,
 };
 use crate::state::PttState;
-use crate::surface_focus::WaylandFocusCache;
+use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
 use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const INJECTION_QUEUE_CAPACITY: usize = 32;
 const INJECTION_ENQUEUE_TIMEOUT_MS: u64 = 20;
-#[cfg(not(test))]
-const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 1_500;
-#[cfg(test)]
-const INJECTION_EXECUTION_TIMEOUT_MS: u64 = 150;
-const INJECTION_SUBPROCESS_POLL_MS: u64 = 5;
+const INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT: usize = 120;
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
+const IN_PROCESS_UINPUT_WARMUP_MS: u64 = 200;
+const IN_PROCESS_UINPUT_RETRY_BACKOFF_MS: u64 = 500;
 const DEFAULT_LLM_PRE_MODIFIER_KEY: &str = "KEY_SHIFT";
 const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_LLM_MODEL: &str = "local";
@@ -106,6 +122,10 @@ struct InjectionJob {
     text: String,
     daemon_latency_ms: u64,
     daemon_audio_ms: u64,
+    origin: InjectionOrigin,
+    hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    parent_focus: Option<ParentFocusCapture>,
     enqueued_at: TokioInstant,
 }
 
@@ -116,8 +136,32 @@ impl InjectionJob {
             text,
             daemon_latency_ms,
             daemon_audio_ms,
+            origin: InjectionOrigin::Unspecified,
+            hotkey_up_elapsed_ms_at_enqueue: None,
+            stop_message_elapsed_ms_at_enqueue: None,
+            parent_focus: None,
             enqueued_at: TokioInstant::now(),
         }
+    }
+
+    fn with_origin(mut self, origin: InjectionOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    fn with_enqueue_timing(
+        mut self,
+        hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+        stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    ) -> Self {
+        self.hotkey_up_elapsed_ms_at_enqueue = hotkey_up_elapsed_ms_at_enqueue;
+        self.stop_message_elapsed_ms_at_enqueue = stop_message_elapsed_ms_at_enqueue;
+        self
+    }
+
+    fn with_parent_focus(mut self, parent_focus: Option<ParentFocusCapture>) -> Self {
+        self.parent_focus = parent_focus;
+        self
     }
 }
 
@@ -126,11 +170,41 @@ struct InjectionReport {
     session_id: Uuid,
     daemon_latency_ms: u64,
     daemon_audio_ms: u64,
+    origin: InjectionOrigin,
     queue_wait_ms: u64,
     run_ms: u64,
     total_worker_ms: u64,
+    hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    hotkey_up_elapsed_ms_at_worker_start: Option<u64>,
+    stop_message_elapsed_ms_at_worker_start: Option<u64>,
     error_kind: Option<InjectionErrorKind>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionOrigin {
+    RawFinalResult,
+    LlmAnswer,
+    Demo,
+    Unspecified,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedParentFocus {
+    focus: ParentFocusCapture,
+    captured_at: TokioInstant,
+}
+
+impl InjectionOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RawFinalResult => "raw_final_result",
+            Self::LlmAnswer => "llm_answer",
+            Self::Demo => "demo",
+            Self::Unspecified => "unspecified",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,6 +778,7 @@ impl InjectorWorkerHandle {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 enum InjectionRunError {
     BackendFailure(String),
@@ -711,59 +786,309 @@ enum InjectionRunError {
     WorkerTaskFailed(String),
 }
 
+#[derive(Debug, Default)]
+struct InjectionRunOutput {
+    stderr: Vec<u8>,
+}
+
 trait InjectionJobRunner: Send + Sync {
-    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError>;
+    fn run(&self, job: &InjectionJob)
+        -> std::result::Result<InjectionRunOutput, InjectionRunError>;
 }
 
-#[derive(Debug, Clone)]
-struct FailInjectionRunner {
-    kind: InjectionErrorKind,
-    message: Arc<str>,
+type InProcessInjectorBuilder = dyn Fn(&ClientConfig, PasteKeySender, Option<WaylandFocusCache>) -> Arc<dyn TextInjector>
+    + Send
+    + Sync;
+type InProcessPasteSenderFactory =
+    dyn Fn(&ClientConfig) -> Result<Arc<dyn PasteChordSender>> + Send + Sync;
+type InProcessSleepFn = dyn Fn(Duration) + Send + Sync;
+
+#[derive(Debug)]
+struct HealthyUinputSender {
+    sender: Arc<dyn PasteChordSender>,
+    generation: u64,
+    created_at: Instant,
+    use_count: u64,
+    fresh_pending: bool,
+    recovered_after_failure: bool,
 }
 
-impl FailInjectionRunner {
-    fn new(kind: InjectionErrorKind, message: impl Into<String>) -> Self {
+#[derive(Debug)]
+struct FailedUinputSender {
+    last_error: String,
+    retry_after: Instant,
+}
+
+#[derive(Debug)]
+enum UinputSenderState {
+    Uninitialized,
+    Healthy(HealthyUinputSender),
+    CreateFailed(FailedUinputSender),
+}
+
+#[derive(Debug)]
+struct UinputSenderManager {
+    state: UinputSenderState,
+    next_generation: u64,
+}
+
+impl Default for UinputSenderManager {
+    fn default() -> Self {
         Self {
-            kind,
-            message: Arc::<str>::from(message.into()),
+            state: UinputSenderState::Uninitialized,
+            next_generation: 1,
         }
     }
 }
 
-impl InjectionJobRunner for FailInjectionRunner {
-    fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
-        match self.kind {
-            InjectionErrorKind::BackendFailure => {
-                Err(InjectionRunError::BackendFailure(self.message.to_string()))
-            }
-            InjectionErrorKind::ExecutionTimeout => Err(InjectionRunError::ExecutionTimeout(
-                self.message.to_string(),
-            )),
-            InjectionErrorKind::WorkerTaskFailed => Err(InjectionRunError::WorkerTaskFailed(
-                self.message.to_string(),
-            )),
+#[derive(Clone)]
+struct InProcessInjectorRunner {
+    config: ClientConfig,
+    sender_manager: Arc<Mutex<UinputSenderManager>>,
+    focus_cache: Option<WaylandFocusCache>,
+    injector_builder: Arc<InProcessInjectorBuilder>,
+    sender_factory: Arc<InProcessPasteSenderFactory>,
+    sleep_fn: Arc<InProcessSleepFn>,
+    uinput_warmup: Duration,
+    uinput_retry_backoff: Duration,
+}
+
+impl InProcessInjectorRunner {
+    fn new(config: &ClientConfig) -> Self {
+        let focus_cache = Some(WaylandFocusCache::new());
+        Self {
+            config: config.clone(),
+            sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
+            focus_cache,
+            injector_builder: Arc::new(|config, sender, focus_cache| {
+                build_clipboard_injector_with_sender(
+                    config,
+                    sender,
+                    matches!(
+                        config.injection_mode,
+                        crate::config::InjectionMode::CopyOnly
+                    ),
+                    None,
+                    None,
+                    focus_cache,
+                )
+            }),
+            sender_factory: Arc::new(build_uinput_chord_sender),
+            sleep_fn: Arc::new(std::thread::sleep),
+            uinput_warmup: Duration::from_millis(IN_PROCESS_UINPUT_WARMUP_MS),
+            uinput_retry_backoff: Duration::from_millis(IN_PROCESS_UINPUT_RETRY_BACKOFF_MS),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct InjectorSubprocessRunner {
-    executable: PathBuf,
-    base_args: Vec<OsString>,
-    timeout: Duration,
-}
-
-impl InjectorSubprocessRunner {
-    fn new(config: &ClientConfig) -> Result<Self> {
-        Ok(Self {
-            executable: std::env::current_exe().context("failed to resolve current executable")?,
-            base_args: internal_inject_args_from_config(config),
-            timeout: Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
-        })
     }
 
     #[cfg(test)]
-    fn new_for_tests(executable: PathBuf, base_args: Vec<OsString>, timeout: Duration) -> Self {
+    fn new_for_tests(
+        config: &ClientConfig,
+        injector_builder: Arc<InProcessInjectorBuilder>,
+        sender_factory: Arc<InProcessPasteSenderFactory>,
+        sleep_fn: Arc<InProcessSleepFn>,
+        uinput_warmup: Duration,
+        uinput_retry_backoff: Duration,
+        focus_cache: Option<WaylandFocusCache>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            sender_manager: Arc::new(Mutex::new(UinputSenderManager::default())),
+            focus_cache,
+            injector_builder,
+            sender_factory,
+            sleep_fn,
+            uinput_warmup,
+            uinput_retry_backoff,
+        }
+    }
+
+    fn prepare_paste_key_sender(&self) -> std::result::Result<PasteKeySender, String> {
+        use crate::config::InjectionMode;
+
+        if matches!(self.config.injection_mode, InjectionMode::CopyOnly) {
+            return Ok(PasteKeySender::Disabled);
+        }
+
+        let mut created_this_job = false;
+        let mut create_elapsed_ms = None;
+        let mut recovered_after_failure = false;
+
+        loop {
+            enum Action {
+                Sleep(Duration),
+                Create,
+            }
+
+            let action = {
+                let mut manager = self
+                    .sender_manager
+                    .lock()
+                    .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                match &mut manager.state {
+                    UinputSenderState::Healthy(healthy) => {
+                        let age = healthy.created_at.elapsed();
+                        if healthy.fresh_pending && age < self.uinput_warmup {
+                            Action::Sleep(self.uinput_warmup - age)
+                        } else {
+                            let metadata = UinputAttemptMetadata {
+                                generation: healthy.generation,
+                                fresh_device: healthy.fresh_pending,
+                                device_age_ms_at_attempt: age.as_millis() as u64,
+                                use_count_before_attempt: healthy.use_count,
+                                created_this_job,
+                                create_elapsed_ms,
+                                last_create_error: None,
+                                reused_after_failure: healthy.recovered_after_failure,
+                            };
+                            return Ok(PasteKeySender::Uinput {
+                                sender: Arc::clone(&healthy.sender),
+                                metadata: Some(metadata),
+                            });
+                        }
+                    }
+                    UinputSenderState::Uninitialized => Action::Create,
+                    UinputSenderState::CreateFailed(failed) => {
+                        if Instant::now() < failed.retry_after {
+                            return Err(failed.last_error.clone());
+                        }
+                        recovered_after_failure = true;
+                        Action::Create
+                    }
+                }
+            };
+
+            match action {
+                Action::Sleep(duration) => (self.sleep_fn)(duration),
+                Action::Create => {
+                    let started = Instant::now();
+                    match (self.sender_factory)(&self.config) {
+                        Ok(sender) => {
+                            let mut manager = self
+                                .sender_manager
+                                .lock()
+                                .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                            let generation = manager.next_generation;
+                            manager.next_generation = manager.next_generation.saturating_add(1);
+                            manager.state = UinputSenderState::Healthy(HealthyUinputSender {
+                                sender,
+                                generation,
+                                created_at: Instant::now(),
+                                use_count: 0,
+                                fresh_pending: true,
+                                recovered_after_failure,
+                            });
+                            created_this_job = true;
+                            create_elapsed_ms = Some(started.elapsed().as_millis() as u64);
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                                err
+                            );
+                            let mut manager = self
+                                .sender_manager
+                                .lock()
+                                .map_err(|_| "uinput sender manager lock poisoned".to_string())?;
+                            manager.state = UinputSenderState::CreateFailed(FailedUinputSender {
+                                last_error: message.clone(),
+                                retry_after: Instant::now() + self.uinput_retry_backoff,
+                            });
+                            return Err(message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_successful_paste_key_sender(&self, sender: &PasteKeySender) {
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = sender
+        else {
+            return;
+        };
+
+        if let Ok(mut manager) = self.sender_manager.lock() {
+            if let UinputSenderState::Healthy(healthy) = &mut manager.state {
+                if healthy.generation == metadata.generation
+                    && healthy.use_count == metadata.use_count_before_attempt
+                {
+                    healthy.fresh_pending = false;
+                    healthy.use_count = healthy.use_count.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+impl InjectionJobRunner for InProcessInjectorRunner {
+    fn run(
+        &self,
+        job: &InjectionJob,
+    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
+        let context = InjectorContext {
+            session_id: job.session_id,
+            origin: job.origin.as_str().to_string(),
+            hotkey_up_elapsed_ms_at_enqueue: job.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
+            parent_focus: job.parent_focus.clone(),
+        };
+        let (injector, prepared_sender) = match self.prepare_paste_key_sender() {
+            Ok(sender) => {
+                let injector =
+                    (self.injector_builder)(&self.config, sender.clone(), self.focus_cache.clone());
+                (injector, Some(sender))
+            }
+            Err(reason) => (
+                build_backend_failure_fallback_injector(
+                    &self.config,
+                    reason,
+                    None,
+                    self.focus_cache.clone(),
+                ),
+                None,
+            ),
+        };
+        if let Err(err) = injector.inject_with_context(&job.text, Some(context)) {
+            let err_text = format!("{err:#}");
+            if err_text.contains("stage=backend")
+                && matches!(
+                    self.config.injection_mode,
+                    crate::config::InjectionMode::Paste
+                )
+            {
+                if let Ok(mut manager) = self.sender_manager.lock() {
+                    if matches!(manager.state, UinputSenderState::Healthy(_)) {
+                        manager.state = UinputSenderState::Uninitialized;
+                    }
+                }
+            }
+            return Err(InjectionRunError::BackendFailure(err_text));
+        }
+        if let Some(sender) = prepared_sender.as_ref() {
+            self.commit_successful_paste_key_sender(sender);
+        }
+        Ok(InjectionRunOutput::default())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct InjectorSubprocessRunner {
+    executable: PathBuf,
+    base_args: Vec<std::ffi::OsString>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+impl InjectorSubprocessRunner {
+    fn new_for_tests(
+        executable: PathBuf,
+        base_args: Vec<std::ffi::OsString>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             executable,
             base_args,
@@ -772,14 +1097,31 @@ impl InjectorSubprocessRunner {
     }
 }
 
+#[cfg(test)]
 impl InjectionJobRunner for InjectorSubprocessRunner {
-    fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+    fn run(
+        &self,
+        job: &InjectionJob,
+    ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
         let mut command = Command::new(&self.executable);
         command
             .args(&self.base_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        let context = InjectorContext {
+            session_id: job.session_id,
+            origin: job.origin.as_str().to_string(),
+            hotkey_up_elapsed_ms_at_enqueue: job.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue: job.stop_message_elapsed_ms_at_enqueue,
+            parent_focus: job.parent_focus.clone(),
+        };
+        let context_json = serde_json::to_string(&context).map_err(|err| {
+            InjectionRunError::WorkerTaskFailed(format!(
+                "failed to serialize injector subprocess context: {err}"
+            ))
+        })?;
+        command.env(INJECTOR_CONTEXT_ENV, context_json);
         configure_injector_subprocess(&mut command);
         let mut child = command.spawn().map_err(|err| {
             InjectionRunError::WorkerTaskFailed(format!(
@@ -789,7 +1131,7 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
         })?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes()).map_err(|err| {
+            stdin.write_all(job.text.as_bytes()).map_err(|err| {
                 InjectionRunError::WorkerTaskFailed(format!(
                     "failed to write injector subprocess stdin: {err}"
                 ))
@@ -797,127 +1139,247 @@ impl InjectionJobRunner for InjectorSubprocessRunner {
         }
         let _ = child.stdin.take();
 
-        let stderr_reader = child.stderr.take().map(spawn_pipe_reader).ok_or_else(|| {
-            InjectionRunError::WorkerTaskFailed(
-                "injector subprocess stderr pipe unavailable".to_string(),
-            )
-        })?;
+        // Drain stderr concurrently so the child cannot block on a full pipe before exit.
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|stderr| {
+                spawn_pipe_reader(
+                    stderr,
+                    Duration::from_millis(INJECTOR_PIPE_DRAIN_TIMEOUT_MS),
+                )
+            })
+            .ok_or_else(|| {
+                InjectionRunError::WorkerTaskFailed(
+                    "injector subprocess stderr pipe unavailable".to_string(),
+                )
+            })?;
         let status_result = wait_for_child_exit(&mut child, self.timeout);
-        let stderr = join_pipe_reader(stderr_reader, "stderr");
+        stderr_reader.start_deadline();
+        let stderr = collect_pipe_reader(
+            stderr_reader,
+            "stderr",
+            Duration::from_millis(
+                INJECTOR_PIPE_DRAIN_TIMEOUT_MS + INJECTOR_PIPE_READER_JOIN_SLACK_MS,
+            ),
+        );
 
         match status_result {
             Ok(status) => {
-                let stderr = stderr.map_err(InjectionRunError::WorkerTaskFailed)?;
+                let stderr = match stderr {
+                    Ok(outcome) => {
+                        if outcome.timed_out {
+                            debug!(
+                                timeout_ms = INJECTOR_PIPE_DRAIN_TIMEOUT_MS,
+                                drained_bytes = outcome.bytes.len(),
+                                "injector subprocess stderr post-exit drain hit deadline; continuing with partial output"
+                            );
+                        }
+                        outcome.bytes
+                    }
+                    Err(err) => return Err(InjectionRunError::WorkerTaskFailed(err)),
+                };
                 if status.success() {
-                    Ok(())
+                    Ok(InjectionRunOutput { stderr })
                 } else {
                     let detail = format_child_failure(status, &stderr);
                     Err(InjectionRunError::BackendFailure(detail))
                 }
             }
-            Err(err) => {
-                if let Ok(stderr) = stderr {
-                    return Err(enrich_run_error_with_stderr(err, &stderr));
+            Err(err) => match stderr {
+                Ok(outcome) => {
+                    if outcome.timed_out {
+                        debug!(
+                                timeout_ms = INJECTOR_PIPE_DRAIN_TIMEOUT_MS,
+                                drained_bytes = outcome.bytes.len(),
+                                "injector subprocess stderr post-exit drain hit deadline after failure; returning base error with partial stderr"
+                            );
+                    }
+                    Err(enrich_run_error_with_stderr(err, &outcome.bytes))
                 }
-                Err(err)
-            }
+                Err(read_err) => Err(InjectionRunError::WorkerTaskFailed(read_err)),
+            },
         }
     }
 }
 
 fn build_injection_runner(config: &ClientConfig) -> Arc<dyn InjectionJobRunner> {
-    match InjectorSubprocessRunner::new(config) {
-        Ok(runner) => Arc::new(runner),
-        Err(err) => {
-            let message = format!("failed to initialize injector subprocess runner: {err:#}");
-            error!(error = %message, "injector subprocess runner unavailable");
-            Arc::new(FailInjectionRunner::new(
-                InjectionErrorKind::WorkerTaskFailed,
-                message,
-            ))
-        }
+    Arc::new(InProcessInjectorRunner::new(config))
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PipeReadOutcome {
+    bytes: Vec<u8>,
+    timed_out: bool,
+}
+
+#[cfg(test)]
+struct PipeReaderHandle {
+    receiver: std::sync::mpsc::Receiver<std::io::Result<PipeReadOutcome>>,
+    deadline_started: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl PipeReaderHandle {
+    fn start_deadline(&self) {
+        self.deadline_started.store(true, Ordering::Release);
     }
 }
 
-fn internal_inject_args_from_config(config: &ClientConfig) -> Vec<OsString> {
-    let mut args = vec![OsString::from("--internal-inject-once")];
-
-    match config.injection_mode {
-        crate::config::InjectionMode::Paste => {
-            args.push(OsString::from("--injection-mode"));
-            args.push(OsString::from("paste"));
-        }
-        crate::config::InjectionMode::CopyOnly => {
-            args.push(OsString::from("--injection-mode"));
-            args.push(OsString::from("copy-only"));
-        }
-    }
-
-    match config.clipboard.key_backend {
-        crate::config::PasteKeyBackend::Ydotool => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("ydotool"));
-        }
-        crate::config::PasteKeyBackend::Uinput => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("uinput"));
-        }
-        crate::config::PasteKeyBackend::Auto => {
-            args.push(OsString::from("--paste-key-backend"));
-            args.push(OsString::from("auto"));
-        }
-    }
-
-    match config.clipboard.backend_failure_policy {
-        crate::config::PasteBackendFailurePolicy::CopyOnly => {
-            args.push(OsString::from("--paste-backend-failure-policy"));
-            args.push(OsString::from("copy-only"));
-        }
-        crate::config::PasteBackendFailurePolicy::Error => {
-            args.push(OsString::from("--paste-backend-failure-policy"));
-            args.push(OsString::from("error"));
-        }
-    }
-
-    args.push(OsString::from("--uinput-dwell-ms"));
-    args.push(OsString::from(config.uinput_dwell_ms.to_string()));
-    args.push(OsString::from("--paste-write-primary"));
-    args.push(OsString::from(config.clipboard.write_primary.to_string()));
-
-    if let Some(ydotool_path) = &config.ydotool_path {
-        args.push(OsString::from("--ydotool"));
-        args.push(ydotool_path.as_os_str().to_owned());
-    }
-    if let Some(seat) = &config.clipboard.seat {
-        args.push(OsString::from("--paste-seat"));
-        args.push(OsString::from(seat));
-    }
-
-    args
-}
-
-fn spawn_pipe_reader<R>(reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+#[cfg(test)]
+fn spawn_pipe_reader<R>(reader: R, timeout: Duration) -> PipeReaderHandle
 where
-    R: Read + Send + 'static,
+    R: Read + Send + AsRawFd + 'static,
 {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let deadline_started = Arc::new(AtomicBool::new(false));
+    let thread_deadline_started = Arc::clone(&deadline_started);
     std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    })
+        let result = read_pipe_until_deadline(reader, timeout, thread_deadline_started);
+        let _ = tx.send(result);
+    });
+    PipeReaderHandle {
+        receiver: rx,
+        deadline_started,
+    }
 }
 
-fn join_pipe_reader(
-    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+#[cfg(test)]
+fn read_pipe_until_deadline<R>(
+    mut reader: R,
+    timeout: Duration,
+    deadline_started: Arc<AtomicBool>,
+) -> std::io::Result<PipeReadOutcome>
+where
+    R: Read + AsRawFd,
+{
+    set_pipe_nonblocking(reader.as_raw_fd())?;
+    let mut deadline_started_at = None;
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        if deadline_started.load(Ordering::Acquire) {
+            let started = deadline_started_at.get_or_insert_with(std::time::Instant::now);
+            if started.elapsed() >= timeout {
+                return Ok(PipeReadOutcome {
+                    bytes: buffer,
+                    timed_out: true,
+                });
+            }
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                return Ok(PipeReadOutcome {
+                    bytes: buffer,
+                    timed_out: false,
+                });
+            }
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if deadline_started.load(Ordering::Acquire) {
+                    let started = deadline_started_at.get_or_insert_with(std::time::Instant::now);
+                    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                        return Ok(PipeReadOutcome {
+                            bytes: buffer,
+                            timed_out: true,
+                        });
+                    };
+                    if !wait_for_pipe_read_ready(reader.as_raw_fd(), remaining)? {
+                        return Ok(PipeReadOutcome {
+                            bytes: buffer,
+                            timed_out: true,
+                        });
+                    }
+                } else if !wait_for_pipe_read_ready(
+                    reader.as_raw_fd(),
+                    Duration::from_millis(INJECTOR_SUBPROCESS_POLL_INTERVAL_MS),
+                )? {
+                    continue;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+fn wait_for_pipe_read_ready(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<bool> {
+    let timeout_ms = timeout
+        .as_millis()
+        .min(i32::MAX as u128)
+        .try_into()
+        .unwrap_or(i32::MAX);
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+
+    loop {
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready > 0 {
+            if poll_fd.revents & libc::POLLNVAL != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe fd became invalid while draining output",
+                ));
+            }
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(test)]
+fn set_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let current_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if current_flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+
+    let updated_flags = unsafe { libc::fcntl(fd, libc::F_SETFL, current_flags | libc::O_NONBLOCK) };
+    if updated_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn collect_pipe_reader(
+    handle: PipeReaderHandle,
     label: &str,
-) -> std::result::Result<Vec<u8>, String> {
-    let read_result = handle
-        .join()
-        .map_err(|_| format!("{label} reader thread panicked"))?;
-    read_result.map_err(|err| format!("failed to read {label} pipe: {err}"))
+    timeout: Duration,
+) -> std::result::Result<PipeReadOutcome, String> {
+    // The read thread owns the real drain deadline. This outer wait only tolerates
+    // scheduler jitter while proving that the thread actually returned.
+    match handle.receiver.recv_timeout(timeout) {
+        Ok(read_result) => read_result.map_err(|err| format!("failed to read {label} pipe: {err}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{label} reader thread exceeded the drain deadline without returning"
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "{label} reader thread disconnected before returning output"
+        )),
+    }
 }
 
+#[cfg(test)]
 fn wait_for_child_exit(
     child: &mut Child,
     timeout: Duration,
@@ -936,7 +1398,9 @@ fn wait_for_child_exit(
                     timeout.as_millis()
                 )));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(INJECTION_SUBPROCESS_POLL_MS)),
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(INJECTOR_SUBPROCESS_POLL_INTERVAL_MS))
+            }
             Err(err) => {
                 return Err(InjectionRunError::WorkerTaskFailed(format!(
                     "failed to query injector subprocess state: {err}"
@@ -946,6 +1410,7 @@ fn wait_for_child_exit(
     }
 }
 
+#[cfg(test)]
 fn configure_injector_subprocess(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -955,6 +1420,7 @@ fn configure_injector_subprocess(command: &mut Command) {
     }
 }
 
+#[cfg(test)]
 fn kill_injector_subprocess(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -977,6 +1443,7 @@ fn kill_injector_subprocess(child: &mut Child) {
     }
 }
 
+#[cfg(test)]
 fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
     let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
     if trimmed.is_empty() {
@@ -985,6 +1452,7 @@ fn format_child_failure(status: ExitStatus, stderr: &[u8]) -> String {
     format!("injector subprocess exited with status {status}: {trimmed}")
 }
 
+#[cfg(test)]
 fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> InjectionRunError {
     let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
     if trimmed.is_empty() {
@@ -1001,6 +1469,199 @@ fn enrich_run_error_with_stderr(error: InjectionRunError, stderr: &[u8]) -> Inje
         InjectionRunError::WorkerTaskFailed(message) => {
             InjectionRunError::WorkerTaskFailed(format!("{message}; stderr: {trimmed}"))
         }
+    }
+}
+
+fn summarize_backend_attempts(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| {
+            let mut summary = format!(
+                "{}:{}:{}:{}ms",
+                attempt.route_attempt_name, attempt.backend, attempt.status, attempt.duration_ms
+            );
+            if let Some(exit_status) = attempt.exit_status.as_ref() {
+                summary.push_str(":exit=");
+                summary.push_str(exit_status);
+            }
+            if !attempt.warning_tags.is_empty() {
+                summary.push_str(":warn=");
+                summary.push_str(&attempt.warning_tags.join(","));
+            }
+            if let Some(config) = attempt.backend_config.as_ref() {
+                summary.push_str(":cfg=");
+                summary.push_str(config);
+            }
+            if let Some(generation) = attempt.uinput_sender_generation {
+                summary.push_str(":ugen=");
+                summary.push_str(&generation.to_string());
+            }
+            if let Some(fresh) = attempt.uinput_fresh_device {
+                summary.push_str(":ufresh=");
+                summary.push_str(if fresh { "1" } else { "0" });
+            }
+            if let Some(age_ms) = attempt.uinput_device_age_ms_at_attempt {
+                summary.push_str(":uage_ms=");
+                summary.push_str(&age_ms.to_string());
+            }
+            if let Some(use_count) = attempt.uinput_use_count_before_attempt {
+                summary.push_str(":uuse=");
+                summary.push_str(&use_count.to_string());
+            }
+            if let Some(created_this_job) = attempt.uinput_created_this_job {
+                summary.push_str(":ucreated_this_job=");
+                summary.push_str(if created_this_job { "1" } else { "0" });
+            }
+            if let Some(create_elapsed_ms) = attempt.uinput_create_elapsed_ms {
+                summary.push_str(":ucreate_ms=");
+                summary.push_str(&create_elapsed_ms.to_string());
+            }
+            if let Some(reused_after_failure) = attempt.uinput_reused_after_failure {
+                summary.push_str(":urecovered=");
+                summary.push_str(if reused_after_failure { "1" } else { "0" });
+            }
+            if let Some(last_create_error) = attempt.uinput_last_create_error.as_ref() {
+                summary.push_str(":uerr=");
+                summary.push_str(last_create_error);
+            }
+            if let Some(stderr_excerpt) = attempt.stderr_excerpt.as_ref() {
+                summary.push_str(":stderr=");
+                summary.push_str(stderr_excerpt);
+            }
+            if let Some(error) = attempt.error.as_ref() {
+                summary.push(':');
+                summary.push_str(error);
+            }
+            summary
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_backend_warning_tags(attempts: &[BackendAttemptReport]) -> String {
+    let tags = attempts
+        .iter()
+        .flat_map(|attempt| attempt.warning_tags.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if tags.is_empty() {
+        return "none".to_string();
+    }
+    tags.into_iter().collect::<Vec<_>>().join(",")
+}
+
+fn summarize_backend_exit_statuses(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .filter_map(|attempt| {
+            attempt
+                .exit_status
+                .as_ref()
+                .map(|status| format!("{}:{}", attempt.backend, status))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn summarize_backend_stderr_excerpts(attempts: &[BackendAttemptReport]) -> String {
+    attempts
+        .iter()
+        .filter_map(|attempt| {
+            attempt
+                .stderr_excerpt
+                .as_ref()
+                .map(|stderr| format!("{}:{}", attempt.backend, stderr))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn log_injector_subprocess_stderr(session_id: Uuid, origin: InjectionOrigin, stderr: &[u8]) {
+    if stderr.is_empty() {
+        return;
+    }
+
+    let stderr_text = String::from_utf8_lossy(stderr);
+    let mut logged_lines = 0usize;
+    let mut dropped_lines = 0usize;
+    for line in stderr_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if logged_lines >= INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT {
+            dropped_lines = dropped_lines.saturating_add(1);
+            continue;
+        }
+
+        logged_lines = logged_lines.saturating_add(1);
+        if let Some(payload) = trimmed.strip_prefix(INJECTOR_REPORT_PREFIX) {
+            match serde_json::from_str::<InjectorChildReport>(payload) {
+                Ok(report) => {
+                    info!(
+                        session = %session_id,
+                        origin = origin.as_str(),
+                        child_session = ?report.session_id,
+                        child_origin = ?report.origin,
+                        trace_id = report.trace_id,
+                        outcome = report.outcome,
+                        requested_len = report.requested_len,
+                        requested_fingerprint = report.requested_fingerprint,
+                        clipboard_ready = report.clipboard_ready,
+                        clipboard_probe_count = report.clipboard_probe_count,
+                        post_clipboard_matches = ?report.post_clipboard_matches,
+                        parent_focus_app = report.parent_focus.as_ref().and_then(|focus| focus.snapshot.as_ref()).and_then(|snapshot| snapshot.app_name.as_deref()),
+                        parent_focus_captured_elapsed_ms = report.parent_focus.as_ref().and_then(|focus| focus.captured_elapsed_ms),
+                        child_focus_before_app = report.child_focus_before.as_ref().and_then(|snapshot| snapshot.app_name.as_deref()),
+                        child_focus_after_app = report.child_focus_after.as_ref().and_then(|snapshot| snapshot.app_name.as_deref()),
+                        child_focus_source_selected = report.child_focus_source_selected,
+                        child_focus_wayland_cache_age_ms = ?report.child_focus_wayland_cache_age_ms,
+                        child_focus_wayland_fallback_reason = ?report.child_focus_wayland_fallback_reason,
+                        route_focus_source = report.route_focus_source,
+                        route_class = report.route_class,
+                        route_primary = report.route_primary,
+                        route_adaptive_fallback = ?report.route_adaptive_fallback,
+                        route_reason = report.route_reason,
+                        error = ?report.error,
+                        backend_attempt_count = report.backend_attempts.len(),
+                        backend_warning_tags = summarize_backend_warning_tags(&report.backend_attempts),
+                        backend_exit_statuses = summarize_backend_exit_statuses(&report.backend_attempts),
+                        backend_stderr_excerpts = summarize_backend_stderr_excerpts(&report.backend_attempts),
+                        backend_attempts = summarize_backend_attempts(&report.backend_attempts),
+                        elapsed_ms_total = report.elapsed_ms_total,
+                        "injector subprocess report"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        session = %session_id,
+                        origin = origin.as_str(),
+                        line_index = logged_lines,
+                        error = %err,
+                        line = %trimmed,
+                        "failed to parse injector subprocess report line"
+                    );
+                }
+            }
+            continue;
+        }
+        info!(
+            session = %session_id,
+            origin = origin.as_str(),
+            line_index = logged_lines,
+            line = %trimmed,
+            "injector subprocess log line"
+        );
+    }
+
+    if dropped_lines > 0 {
+        warn!(
+            session = %session_id,
+            origin = origin.as_str(),
+            logged_lines,
+            dropped_lines,
+            line_limit = INJECTOR_SUBPROCESS_STDERR_LOG_LINE_LIMIT,
+            "injector subprocess log lines were truncated"
+        );
     }
 }
 
@@ -1023,18 +1684,54 @@ fn spawn_injector_worker_with_capacity(
                 text,
                 daemon_latency_ms,
                 daemon_audio_ms,
+                origin,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                parent_focus,
                 enqueued_at,
             } = job;
 
             let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+            let hotkey_up_elapsed_ms_at_worker_start = hotkey_up_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(queue_wait_ms));
+            let stop_message_elapsed_ms_at_worker_start = stop_message_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(queue_wait_ms));
+            info!(
+                session = %session_id,
+                origin = origin.as_str(),
+                daemon_latency_ms,
+                daemon_audio_ms,
+                queue_wait_ms,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start,
+                "injector worker starting job"
+            );
             let worker_started = TokioInstant::now();
             let runner_for_job = Arc::clone(&worker_runner);
-            let result = tokio::task::spawn_blocking(move || runner_for_job.run(&text)).await;
+            let job_for_runner = InjectionJob {
+                session_id,
+                text: text.clone(),
+                daemon_latency_ms,
+                daemon_audio_ms,
+                origin,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                parent_focus,
+                enqueued_at,
+            };
+            let result =
+                tokio::task::spawn_blocking(move || runner_for_job.run(&job_for_runner)).await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
 
+            let mut run_output: Option<InjectionRunOutput> = None;
             let (error_kind, error) = match result {
-                Ok(Ok(())) => (None, None),
+                Ok(Ok(output)) => {
+                    run_output = Some(output);
+                    (None, None)
+                }
                 Ok(Err(InjectionRunError::BackendFailure(message))) => {
                     (Some(InjectionErrorKind::BackendFailure), Some(message))
                 }
@@ -1049,13 +1746,21 @@ fn spawn_injector_worker_with_capacity(
                     Some(format!("injector worker task failed: {err}")),
                 ),
             };
+            if let Some(output) = run_output {
+                log_injector_subprocess_stderr(session_id, origin, &output.stderr);
+            }
             let report = InjectionReport {
                 session_id,
                 daemon_latency_ms,
                 daemon_audio_ms,
+                origin,
                 queue_wait_ms,
                 run_ms,
                 total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start,
                 error_kind,
                 error,
             };
@@ -1153,10 +1858,6 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_LLM_PRE_MODIFIER_KEY)]
     llm_pre_modifier_key: String,
 
-    /// Path to ydotool binary (used when paste key backend is ydotool/auto)
-    #[arg(long)]
-    ydotool: Option<PathBuf>,
-
     /// Key dwell time in milliseconds for direct uinput paste chords
     #[arg(long, default_value_t = 18)]
     uinput_dwell_ms: u64,
@@ -1168,6 +1869,22 @@ struct Cli {
     /// Test injector only (injects a fixed string then exits)
     #[arg(long)]
     test_injection: bool,
+
+    /// Number of test-injection attempts to emit before exiting.
+    #[arg(long, default_value_t = 1, requires = "test_injection")]
+    test_injection_count: u32,
+
+    /// Prefix text used for test-injection payload(s).
+    #[arg(long, default_value = "Parakeet Test", requires = "test_injection")]
+    test_injection_text_prefix: String,
+
+    /// Delay between repeated test-injection attempts.
+    #[arg(long, default_value_t = 150, requires = "test_injection")]
+    test_injection_interval_ms: u64,
+
+    /// Optional forced route shortcut for test-injection runs.
+    #[arg(long, value_enum, requires = "test_injection")]
+    test_injection_shortcut: Option<CliTestInjectionShortcut>,
 
     /// Internal subprocess mode: read transcript text from stdin, inject once, then exit.
     #[arg(long, hide = true)]
@@ -1186,7 +1903,7 @@ struct Cli {
     injection_mode: CliInjectionMode,
 
     /// Keyboard injection backend for paste shortcut(s).
-    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Auto)]
+    #[arg(long, value_enum, default_value_t = CliPasteKeyBackend::Uinput)]
     paste_key_backend: CliPasteKeyBackend,
 
     /// Behavior when selected paste backend cannot be initialized or used.
@@ -1271,17 +1988,13 @@ impl From<CliInjectionMode> for crate::config::InjectionMode {
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum CliPasteKeyBackend {
-    Ydotool,
     Uinput,
-    Auto,
 }
 
 impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
     fn from(backend: CliPasteKeyBackend) -> Self {
         match backend {
-            CliPasteKeyBackend::Ydotool => crate::config::PasteKeyBackend::Ydotool,
             CliPasteKeyBackend::Uinput => crate::config::PasteKeyBackend::Uinput,
-            CliPasteKeyBackend::Auto => crate::config::PasteKeyBackend::Auto,
         }
     }
 }
@@ -1290,6 +2003,21 @@ impl From<CliPasteKeyBackend> for crate::config::PasteKeyBackend {
 enum CliPasteBackendFailurePolicy {
     CopyOnly,
     Error,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum CliTestInjectionShortcut {
+    CtrlV,
+    CtrlShiftV,
+}
+
+impl From<CliTestInjectionShortcut> for crate::config::PasteShortcut {
+    fn from(shortcut: CliTestInjectionShortcut) -> Self {
+        match shortcut {
+            CliTestInjectionShortcut::CtrlV => crate::config::PasteShortcut::CtrlV,
+            CliTestInjectionShortcut::CtrlShiftV => crate::config::PasteShortcut::CtrlShiftV,
+        }
+    }
 }
 
 impl From<CliPasteBackendFailurePolicy> for crate::config::PasteBackendFailurePolicy {
@@ -1331,7 +2059,6 @@ async fn main() -> Result<()> {
         cli.shared_secret.clone(),
         cli.hotkey.clone(),
         InjectionConfig {
-            ydotool_path: cli.ydotool.clone(),
             uinput_dwell_ms: cli.uinput_dwell_ms,
             injection_mode: cli.injection_mode.into(),
             clipboard: ClipboardOptions {
@@ -1362,11 +2089,38 @@ async fn main() -> Result<()> {
     };
 
     if cli.test_injection {
-        let injector = build_injector(&config);
-        injector
-            .inject("Parakeet Test")
-            .context("injector test failed")?;
-        info!("Injector test sent 'Parakeet Test'");
+        let forced_shortcut = cli.test_injection_shortcut.clone().map(Into::into);
+        let injector = build_injector_with_shortcut_override(&config, None, forced_shortcut);
+        let attempt_total = cli.test_injection_count.max(1);
+        for attempt_index in 0..attempt_total {
+            let payload = if attempt_total == 1 {
+                cli.test_injection_text_prefix.clone()
+            } else {
+                format!(
+                    "{} {:02}",
+                    cli.test_injection_text_prefix,
+                    attempt_index + 1
+                )
+            };
+            injector.inject(&payload).with_context(|| {
+                format!("injector test failed at attempt {}", attempt_index + 1)
+            })?;
+            info!(
+                test_attempt_index = attempt_index + 1,
+                test_attempt_total = attempt_total,
+                forced_shortcut = ?forced_shortcut,
+                payload_len = payload.len(),
+                "injector test attempt completed"
+            );
+            if attempt_index + 1 < attempt_total && cli.test_injection_interval_ms > 0 {
+                std::thread::sleep(Duration::from_millis(cli.test_injection_interval_ms));
+            }
+        }
+        info!(
+            test_attempt_total = attempt_total,
+            forced_shortcut = ?forced_shortcut,
+            "injector test run completed"
+        );
         return Ok(());
     }
 
@@ -1401,97 +2155,67 @@ fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
     std::io::stdin()
         .read_to_string(&mut text)
         .context("failed to read injector subprocess stdin")?;
-    build_injector(config)
+    let context = std::env::var(INJECTOR_CONTEXT_ENV)
+        .ok()
+        .and_then(|raw| match serde_json::from_str::<InjectorContext>(&raw) {
+            Ok(context) => Some(context),
+            Err(err) => {
+                warn!(error = %err, "failed to parse injector subprocess context env; continuing without parent focus context");
+                None
+            }
+        });
+    build_injector_with_shortcut_override(config, context, None)
         .inject(&text)
         .context("internal injection failed")
 }
 
-fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
-    use crate::config::{InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend};
-    use crate::injector::{ClipboardInjector, FailInjector, PasteKeySender, UinputChordSender};
+fn build_uinput_chord_sender(config: &ClientConfig) -> Result<Arc<dyn PasteChordSender>> {
+    Ok(Arc::new(UinputChordSender::new(config.uinput_dwell_ms)?))
+}
 
-    let resolve_binary = |configured: Option<&PathBuf>, binary: &str| -> Option<PathBuf> {
-        if let Some(path) = configured {
-            if path.exists() {
-                return Some(path.clone());
-            }
-            error!(?path, binary, "Configured binary path does not exist");
-            return None;
+fn build_backend_failure_fallback_injector(
+    config: &ClientConfig,
+    reason: String,
+    context: Option<InjectorContext>,
+    focus_cache: Option<WaylandFocusCache>,
+) -> Arc<dyn TextInjector> {
+    use crate::config::PasteBackendFailurePolicy;
+
+    match config.clipboard.backend_failure_policy {
+        PasteBackendFailurePolicy::CopyOnly => {
+            warn!(
+                reason = %reason,
+                "paste backend unavailable; falling back to copy-only injection"
+            );
+            build_clipboard_injector_with_sender(
+                config,
+                PasteKeySender::Disabled,
+                true,
+                context,
+                // Copy-only fallback never sends chords; forced shortcut is irrelevant.
+                None,
+                focus_cache,
+            )
         }
-        which::which(binary).ok()
-    };
-
-    let ydotool_binary = resolve_binary(config.ydotool_path.as_ref(), "ydotool");
-
-    let backend_failure_fallback = |reason: String| -> Arc<dyn TextInjector> {
-        match config.clipboard.backend_failure_policy {
-            PasteBackendFailurePolicy::CopyOnly => {
-                warn!(
-                    reason = %reason,
-                    "paste backend unavailable; falling back to copy-only injection"
-                );
-                Arc::new(ClipboardInjector::new(
-                    PasteKeySender::Disabled,
-                    config.clipboard.clone(),
-                    true,
-                ))
-            }
-            PasteBackendFailurePolicy::Error => {
-                error!(
-                    reason = %reason,
-                    "paste backend unavailable and policy=error; returning explicit injector error"
-                );
-                Arc::new(FailInjector::new(reason))
-            }
+        PasteBackendFailurePolicy::Error => {
+            error!(
+                reason = %reason,
+                "paste backend unavailable and policy=error; returning explicit injector error"
+            );
+            Arc::new(FailInjector::new(reason))
         }
-    };
+    }
+}
 
-    let sender = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
-        PasteKeySender::Disabled
-    } else {
-        match config.clipboard.key_backend {
-            PasteKeyBackend::Ydotool => {
-                let Some(path) = ydotool_binary.clone() else {
-                    return backend_failure_fallback(
-                        "paste_key_backend=ydotool but ydotool was not found".to_string(),
-                    );
-                };
-                PasteKeySender::Ydotool(path)
-            }
-            PasteKeyBackend::Uinput => match UinputChordSender::new(config.uinput_dwell_ms) {
-                Ok(sender) => PasteKeySender::Uinput(std::sync::Arc::new(sender)),
-                Err(err) => {
-                    return backend_failure_fallback(format!(
-                        "paste_key_backend=uinput could not initialize /dev/uinput: {}",
-                        err
-                    ));
-                }
-            },
-            PasteKeyBackend::Auto => match UinputChordSender::new(config.uinput_dwell_ms) {
-                Ok(sender) => {
-                    let mut senders = Vec::new();
-                    senders.push(PasteKeySender::Uinput(std::sync::Arc::new(sender)));
-                    if let Some(path) = ydotool_binary.clone() {
-                        senders.push(PasteKeySender::Ydotool(path));
-                    }
-                    PasteKeySender::Chain(senders)
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        dwell_ms = config.uinput_dwell_ms,
-                        "paste_key_backend=auto could not initialize uinput; trying ydotool backend"
-                    );
-                    let Some(path) = ydotool_binary.clone() else {
-                        return backend_failure_fallback(
-                            "paste_key_backend=auto could not initialize uinput and could not find ydotool".to_string(),
-                        );
-                    };
-                    PasteKeySender::Ydotool(path)
-                }
-            },
-        }
-    };
+fn build_clipboard_injector_with_sender(
+    config: &ClientConfig,
+    sender: PasteKeySender,
+    copy_only: bool,
+    context: Option<InjectorContext>,
+    forced_shortcut: Option<crate::config::PasteShortcut>,
+    focus_cache: Option<WaylandFocusCache>,
+) -> Arc<dyn TextInjector> {
+    use crate::config::InjectionMode;
 
     info!(
         mode = if matches!(config.injection_mode, InjectionMode::CopyOnly) {
@@ -1508,11 +2232,56 @@ fn build_injector(config: &ClientConfig) -> Arc<dyn TextInjector> {
         "Using clipboard injector"
     );
 
-    Arc::new(ClipboardInjector::new(
+    Arc::new(ClipboardInjector::new_with_shared_focus_cache(
         sender,
         config.clipboard.clone(),
-        matches!(config.injection_mode, InjectionMode::CopyOnly),
+        copy_only,
+        context,
+        forced_shortcut,
+        focus_cache,
     ))
+}
+
+fn build_fresh_paste_key_sender(config: &ClientConfig) -> Result<PasteKeySender> {
+    use crate::config::InjectionMode;
+
+    if matches!(config.injection_mode, InjectionMode::CopyOnly) {
+        return Ok(PasteKeySender::Disabled);
+    }
+
+    Ok(PasteKeySender::Uinput {
+        sender: build_uinput_chord_sender(config)?,
+        metadata: None,
+    })
+}
+
+fn build_injector_with_shortcut_override(
+    config: &ClientConfig,
+    context: Option<InjectorContext>,
+    forced_shortcut: Option<crate::config::PasteShortcut>,
+) -> Arc<dyn TextInjector> {
+    match build_fresh_paste_key_sender(config) {
+        Ok(sender) => build_clipboard_injector_with_sender(
+            config,
+            sender,
+            matches!(
+                config.injection_mode,
+                crate::config::InjectionMode::CopyOnly
+            ),
+            context,
+            forced_shortcut,
+            None,
+        ),
+        Err(err) => build_backend_failure_fallback_injector(
+            config,
+            format!(
+                "paste_key_backend=uinput could not initialize /dev/uinput: {}",
+                err
+            ),
+            context,
+            None,
+        ),
+    }
 }
 
 fn llm_chat_completions_url(base: &url::Url) -> Result<url::Url> {
@@ -1753,9 +2522,10 @@ async fn run_demo(
                     "final result received"
                 );
                 injector_worker
-                    .enqueue(InjectionJob::new(
-                        session_id, to_inject, latency_ms, audio_ms,
-                    ))
+                    .enqueue(
+                        InjectionJob::new(session_id, to_inject, latency_ms, audio_ms)
+                            .with_origin(InjectionOrigin::Demo),
+                    )
                     .await
                     .map_err(|failure| {
                         anyhow!("failed to enqueue demo injection job: {:?}", failure)
@@ -1888,6 +2658,9 @@ async fn run_hotkey_mode(
     let llm_busy_overlay_session = Uuid::nil();
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
     let mut hotkey_intent_diagnostics = HotkeyIntentDiagnostics::default();
+    let mut last_hotkey_up_at: Option<TokioInstant> = None;
+    let mut last_stop_message: Option<(Uuid, TokioInstant)> = None;
+    let mut parent_focus_by_session = HashMap::<Uuid, CapturedParentFocus>::new();
 
     loop {
         match WsClient::connect(&config).await {
@@ -1942,6 +2715,18 @@ async fn run_hotkey_mode(
                                         if let Some(session_id) = state.stop_listening() {
                                             let message = stop_message(session_id);
                                             send_message(&mut ws_write, &message).await?;
+                                            let now = TokioInstant::now();
+                                            last_hotkey_up_at = Some(now);
+                                            last_stop_message = Some((session_id, now));
+                                            if let Some(focus) = capture_parent_focus(overlay_router.focus_cache.as_ref()) {
+                                                parent_focus_by_session.insert(
+                                                    session_id,
+                                                    CapturedParentFocus {
+                                                        focus,
+                                                        captured_at: now,
+                                                    },
+                                                );
+                                            }
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         } else {
                                             hotkey_intent_diagnostics.note_hotkey_up_ignored();
@@ -2033,7 +2818,9 @@ async fn run_hotkey_mode(
                                                                     &mut state,
                                                                     &mut overlay_router,
                                                                     &injector_worker,
-                                                                    &audio_feedback,
+                                                                    &mut parent_focus_by_session,
+                                                                    last_hotkey_up_at,
+                                                                    last_stop_message,
                                                                 ).await?;
                                                                 if clear_intent {
                                                                     active_intent = None;
@@ -2109,6 +2896,7 @@ async fn run_hotkey_mode(
                                         llm_overlay_text.remove(&session_id);
                                         let session_end_reason =
                                             llm_deferred_session_end.remove(&session_id).flatten();
+                                        let session_end_was_deferred = session_end_reason.is_some();
                                         overlay_router.route_session_ended(
                                             None,
                                             session_id,
@@ -2141,9 +2929,42 @@ async fn run_hotkey_mode(
                                         } else {
                                             response_text
                                         };
+                                        let hotkey_up_elapsed_ms_at_enqueue =
+                                            elapsed_ms_since(last_hotkey_up_at);
+                                        let stop_message_elapsed_ms_at_enqueue =
+                                            last_stop_message.and_then(|(stopped_session_id, instant)| {
+                                                (stopped_session_id == session_id)
+                                                    .then(|| instant.elapsed().as_millis() as u64)
+                                            });
+                                        info!(
+                                            session = %session_id,
+                                            origin = InjectionOrigin::LlmAnswer.as_str(),
+                                            state_at_enqueue = state_label(&state),
+                                            session_end_was_deferred,
+                                            hotkey_up_elapsed_ms_at_enqueue,
+                                            stop_message_elapsed_ms_at_enqueue,
+                                            response_chars = to_inject.chars().count(),
+                                            "queueing llm answer injection job"
+                                        );
 
                                         match injector_worker
-                                            .enqueue(InjectionJob::new(session_id, to_inject, daemon_latency_ms, daemon_audio_ms))
+                                            .enqueue(
+                                                InjectionJob::new(
+                                                    session_id,
+                                                    to_inject,
+                                                    daemon_latency_ms,
+                                                    daemon_audio_ms,
+                                                )
+                                                .with_origin(InjectionOrigin::LlmAnswer)
+                                                .with_enqueue_timing(
+                                                    hotkey_up_elapsed_ms_at_enqueue,
+                                                    stop_message_elapsed_ms_at_enqueue,
+                                                )
+                                                .with_parent_focus(take_parent_focus_for_enqueue(
+                                                    &mut parent_focus_by_session,
+                                                    session_id,
+                                                )),
+                                            )
                                             .await
                                         {
                                             Ok(()) => debug!(session = %session_id, "llm final answer queued for injector worker"),
@@ -2212,12 +3033,17 @@ fn handle_injection_report(
         (Some(error_kind), Some(error)) => {
             warn!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 error_kind = error_kind.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 error = %error,
                 "injector worker reported failure"
             );
@@ -2225,11 +3051,16 @@ fn handle_injection_report(
         (None, None) => {
             info!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 "injector worker completed job"
             );
             audio_feedback.play_completion();
@@ -2237,12 +3068,17 @@ fn handle_injection_report(
         (error_kind, error) => {
             warn!(
                 session = %report.session_id,
+                origin = report.origin.as_str(),
                 error_kind = error_kind.map(InjectionErrorKind::as_str),
                 daemon_latency_ms = report.daemon_latency_ms,
                 daemon_audio_ms = report.daemon_audio_ms,
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
+                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
                 error = ?error,
                 "injector worker reported inconsistent error classification"
             );
@@ -2279,12 +3115,62 @@ fn handle_injection_report(
     overlay_router.route_injection_complete(report.session_id, success);
 }
 
+fn capture_parent_focus(focus_cache: Option<&WaylandFocusCache>) -> Option<ParentFocusCapture> {
+    let cache = focus_cache?;
+    match cache.observe(30_000, 500) {
+        WaylandFocusObservation::Fresh {
+            snapshot,
+            cache_age_ms,
+        } => Some(ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: Some(0),
+        }),
+        WaylandFocusObservation::LowConfidence {
+            snapshot,
+            cache_age_ms,
+            reason,
+        } => Some(ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache_low_confidence".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        }),
+        WaylandFocusObservation::Unavailable {
+            reason,
+            cache_age_ms,
+        } => Some(ParentFocusCapture {
+            snapshot: None,
+            source_selected: "wayland_unavailable".to_string(),
+            wayland_cache_age_ms: cache_age_ms,
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        }),
+    }
+}
+
+fn take_parent_focus_for_enqueue(
+    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
+    session_id: Uuid,
+) -> Option<ParentFocusCapture> {
+    parent_focus_by_session.remove(&session_id).map(|captured| {
+        let mut focus = captured.focus;
+        focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
+        focus
+    })
+}
+
 async fn handle_server_message(
     message: ServerMessage,
     state: &mut PttState,
     overlay_router: &mut OverlayRouter<impl OverlaySink>,
     injector_worker: &InjectorWorkerHandle,
-    _audio_feedback: &AudioFeedback,
+    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
+    last_hotkey_up_at: Option<TokioInstant>,
+    last_stop_message: Option<(Uuid, TokioInstant)>,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -2298,14 +3184,34 @@ async fn handle_server_message(
             audio_ms,
             ..
         } => {
+            let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(last_hotkey_up_at);
+            let stop_message_elapsed_ms_at_enqueue =
+                last_stop_message.and_then(|(stopped_session_id, instant)| {
+                    (stopped_session_id == session_id).then(|| instant.elapsed().as_millis() as u64)
+                });
             info!(
                 session = %session_id,
+                origin = InjectionOrigin::RawFinalResult.as_str(),
                 latency_ms,
                 audio_ms,
+                state_at_enqueue = state_label(state),
+                hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue,
                 "final result received"
             );
             match injector_worker
-                .enqueue(InjectionJob::new(session_id, text, latency_ms, audio_ms))
+                .enqueue(
+                    InjectionJob::new(session_id, text, latency_ms, audio_ms)
+                        .with_origin(InjectionOrigin::RawFinalResult)
+                        .with_enqueue_timing(
+                            hotkey_up_elapsed_ms_at_enqueue,
+                            stop_message_elapsed_ms_at_enqueue,
+                        )
+                        .with_parent_focus(take_parent_focus_for_enqueue(
+                            parent_focus_by_session,
+                            session_id,
+                        )),
+                )
                 .await
             {
                 Ok(()) => {
@@ -2341,6 +3247,9 @@ async fn handle_server_message(
                 "daemon error: {}",
                 message
             );
+            if let Some(session_id) = session_id {
+                parent_focus_by_session.remove(&session_id);
+            }
             state.reset();
         }
         ServerMessage::InterimState {
@@ -2369,6 +3278,7 @@ async fn handle_server_message(
             overlay_router.route_audio_level(session_id_from_state(state), session_id, level_db);
         }
         ServerMessage::SessionEnded { session_id, reason } => {
+            parent_focus_by_session.remove(&session_id);
             overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);
         }
         ServerMessage::Status { .. } => {}
@@ -2383,6 +3293,18 @@ fn session_id_from_state(state: &PttState) -> Option<Uuid> {
             Some(session_id)
         }
     }
+}
+
+fn state_label(state: &PttState) -> &'static str {
+    match state {
+        PttState::Idle => "idle",
+        PttState::Listening { .. } => "listening",
+        PttState::WaitingResult { .. } => "waiting_result",
+    }
+}
+
+fn elapsed_ms_since(instant: Option<TokioInstant>) -> Option<u64> {
+    instant.map(|value| value.elapsed().as_millis() as u64)
 }
 
 fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
@@ -2480,10 +3402,12 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2497,11 +3421,11 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crate::audio_feedback::AudioFeedback;
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, OverlayMode,
-        PasteBackendFailurePolicy, PasteKeyBackend,
+        PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
+    use crate::injector::{FailInjector, PasteChordSender, PasteKeySender, TextInjector};
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -2509,12 +3433,32 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        build_injector, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
-        sanitize_model_answer, spawn_injector_worker_with_capacity, EnqueueFailure,
-        HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob, InjectionJobRunner,
-        InjectionRunError, InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter,
-        OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTION_EXECUTION_TIMEOUT_MS,
+        collect_pipe_reader, drain_sse_lines, handle_server_message, maybe_defer_llm_session_end,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, spawn_pipe_reader,
+        EnqueueFailure, HotkeyIntentDiagnostics, InjectionErrorKind, InjectionJob,
+        InjectionJobRunner, InjectionRunError, InjectionRunOutput, InjectorContext,
+        InjectorSubprocessRunner, NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink,
+        RuntimeOverlaySink, SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
     };
+
+    async fn handle_server_message_for_tests<S: OverlaySink>(
+        message: ServerMessage,
+        state: &mut PttState,
+        overlay_router: &mut OverlayRouter<S>,
+        injector_worker: &super::InjectorWorkerHandle,
+    ) -> anyhow::Result<()> {
+        let mut parent_focus_by_session = HashMap::new();
+        handle_server_message(
+            message,
+            state,
+            overlay_router,
+            injector_worker,
+            &mut parent_focus_by_session,
+            None,
+            None,
+        )
+        .await
+    }
 
     struct SlowRunner {
         calls: Arc<AtomicU64>,
@@ -2522,10 +3466,13 @@ mod tests {
     }
 
     impl InjectionJobRunner for SlowRunner {
-        fn run(&self, _text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            _job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
-            Ok(())
+            Ok(InjectionRunOutput::default())
         }
     }
 
@@ -2534,12 +3481,15 @@ mod tests {
     }
 
     impl InjectionJobRunner for RecordingRunner {
-        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             self.seen
                 .lock()
                 .expect("recording lock should be available")
-                .push(text.to_string());
-            Ok(())
+                .push(job.text.to_string());
+            Ok(InjectionRunOutput::default())
         }
     }
 
@@ -2550,21 +3500,123 @@ mod tests {
     }
 
     impl InjectionJobRunner for TimeoutThenRecordingRunner {
-        fn run(&self, text: &str) -> std::result::Result<(), InjectionRunError> {
+        fn run(
+            &self,
+            job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             let call_index = self.calls.fetch_add(1, Ordering::Relaxed);
             if call_index == 0 {
                 std::thread::sleep(Duration::from_millis(self.timeout_run_ms));
                 return Err(InjectionRunError::ExecutionTimeout(format!(
-                    "injector execution timed out after {INJECTION_EXECUTION_TIMEOUT_MS} ms"
+                    "injector execution timed out after {INJECTOR_JOB_TIMEOUT_MS} ms"
                 )));
             }
 
             self.seen
                 .lock()
                 .expect("recording lock should be available")
-                .push(text.to_string());
+                .push(job.text.to_string());
+            Ok(InjectionRunOutput::default())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingTextInjector {
+        seen: Arc<Mutex<Vec<(String, Uuid)>>>,
+    }
+
+    impl TextInjector for RecordingTextInjector {
+        fn inject(&self, _text: &str) -> anyhow::Result<()> {
+            panic!("recording injector expects inject_with_context");
+        }
+
+        fn inject_with_context(
+            &self,
+            text: &str,
+            context: Option<InjectorContext>,
+        ) -> anyhow::Result<()> {
+            let session_id = context
+                .as_ref()
+                .map(|value| value.session_id)
+                .expect("in-process runner should pass injector context");
+            self.seen
+                .lock()
+                .expect("recording injector lock should be available")
+                .push((text.to_string(), session_id));
             Ok(())
         }
+    }
+
+    #[derive(Debug)]
+    struct RecordingPasteChordSender {
+        sends: Arc<AtomicU64>,
+        fail: bool,
+    }
+
+    impl PasteChordSender for RecordingPasteChordSender {
+        fn send_shortcut(&self, _shortcut: PasteShortcut) -> anyhow::Result<()> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                anyhow::bail!("stage=backend synthetic sender failure");
+            }
+            Ok(())
+        }
+
+        fn backend_config(&self) -> Option<String> {
+            Some("test_sender".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SenderDrivenInjector {
+        seen: Arc<Mutex<Vec<(String, Uuid)>>>,
+        sender: PasteKeySender,
+    }
+
+    impl TextInjector for SenderDrivenInjector {
+        fn inject(&self, _text: &str) -> anyhow::Result<()> {
+            panic!("sender-driven injector expects inject_with_context");
+        }
+
+        fn inject_with_context(
+            &self,
+            text: &str,
+            context: Option<InjectorContext>,
+        ) -> anyhow::Result<()> {
+            let session_id = context
+                .as_ref()
+                .map(|value| value.session_id)
+                .expect("sender-driven injector expects session context");
+            self.seen
+                .lock()
+                .expect("sender-driven injector lock should be available")
+                .push((text.to_string(), session_id));
+            if let PasteKeySender::Uinput { sender, .. } = &self.sender {
+                sender.send_shortcut(PasteShortcut::CtrlV)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn test_client_config() -> ClientConfig {
+        ClientConfig::new(
+            "ws://127.0.0.1:8765/ws",
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            InjectionConfig {
+                uinput_dwell_ms: 18,
+                injection_mode: InjectionMode::Paste,
+                clipboard: ClipboardOptions {
+                    key_backend: PasteKeyBackend::Uinput,
+                    backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
+                    post_chord_hold_ms: 700,
+                    seat: None,
+                    write_primary: false,
+                },
+            },
+            Duration::from_secs(1),
+        )
+        .expect("test client config should be valid")
     }
 
     fn make_test_script(content: &str) -> PathBuf {
@@ -2599,42 +3651,35 @@ mod tests {
     }
 
     #[test]
-    fn backend_failure_policy_error_returns_injector_error() {
-        let config = ClientConfig::new(
-            "ws://127.0.0.1:8765/ws",
-            None,
-            "KEY_RIGHTCTRL".to_string(),
-            InjectionConfig {
-                ydotool_path: Some(PathBuf::from("/definitely/missing/ydotool")),
-                uinput_dwell_ms: 18,
-                injection_mode: InjectionMode::Paste,
-                clipboard: ClipboardOptions {
-                    key_backend: PasteKeyBackend::Ydotool,
-                    backend_failure_policy: PasteBackendFailurePolicy::Error,
-                    post_chord_hold_ms: 700,
-                    seat: None,
-                    write_primary: false,
-                },
-            },
-            Duration::from_secs(5),
-        )
-        .expect("config should parse");
-
-        let injector = build_injector(&config);
-        let err = injector
-            .inject("test")
-            .expect_err("policy=error should fail injection");
-        let message = format!("{err:#}");
-        assert!(message.contains("ydotool"));
-        assert!(message.contains("not found"));
-    }
-
-    #[test]
-    fn cli_default_paste_key_backend_is_auto() {
+    fn cli_default_paste_key_backend_is_uinput() {
         let cli = super::Cli::parse_from(["parakeet-ptt"]);
         assert!(matches!(
             cli.paste_key_backend,
-            super::CliPasteKeyBackend::Auto
+            super::CliPasteKeyBackend::Uinput
+        ));
+    }
+
+    #[test]
+    fn cli_test_injection_defaults_are_stable() {
+        let cli = super::Cli::parse_from(["parakeet-ptt", "--test-injection"]);
+        assert!(cli.test_injection);
+        assert_eq!(cli.test_injection_count, 1);
+        assert_eq!(cli.test_injection_text_prefix, "Parakeet Test");
+        assert_eq!(cli.test_injection_interval_ms, 150);
+        assert_eq!(cli.test_injection_shortcut, None);
+    }
+
+    #[test]
+    fn cli_test_injection_accepts_forced_shortcut() {
+        let cli = super::Cli::parse_from([
+            "parakeet-ptt",
+            "--test-injection",
+            "--test-injection-shortcut",
+            "ctrl-shift-v",
+        ]);
+        assert!(matches!(
+            cli.test_injection_shortcut,
+            Some(super::CliTestInjectionShortcut::CtrlShiftV)
         ));
     }
 
@@ -2680,6 +3725,317 @@ mod tests {
         assert_eq!(cli.llm_base_url, super::DEFAULT_LLM_BASE_URL);
         assert_eq!(cli.llm_model, super::DEFAULT_LLM_MODEL);
         assert!(cli.llm_overlay_stream);
+    }
+
+    #[test]
+    fn in_process_runner_reuses_sender_across_jobs_when_healthy() {
+        let build_count = Arc::new(AtomicU64::new(0));
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let build_count = Arc::clone(&build_count);
+                let seen = Arc::clone(&seen);
+                move |_config, _sender, _focus_cache| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            None,
+        );
+
+        let session_one = Uuid::new_v4();
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_one, "first".to_string(), 0, 0))
+            .expect("first run should succeed");
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should succeed");
+
+        assert_eq!(build_count.load(Ordering::Relaxed), 2);
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[
+                ("first".to_string(), session_one),
+                ("second".to_string(), session_two)
+            ]
+        );
+    }
+
+    #[test]
+    fn in_process_runner_reuses_focus_cache_across_jobs() {
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed_focus_caches = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let shared_focus_cache = crate::surface_focus::WaylandFocusCache::new();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let seen = Arc::clone(&seen);
+                let observed_focus_caches = Arc::clone(&observed_focus_caches);
+                move |_config, _sender, focus_cache| {
+                    observed_focus_caches
+                        .lock()
+                        .expect("observed focus cache lock should be available")
+                        .push(focus_cache.expect("runner should reuse a shared focus cache"));
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            Some(shared_focus_cache.clone()),
+        );
+
+        let session_one = Uuid::new_v4();
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_one, "first".to_string(), 0, 0))
+            .expect("first run should succeed");
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should succeed");
+
+        let observed_focus_caches = observed_focus_caches
+            .lock()
+            .expect("observed focus cache lock should be available");
+        assert_eq!(observed_focus_caches.len(), 2);
+        assert!(observed_focus_caches[0].shares_worker_with(&observed_focus_caches[1]));
+        assert!(observed_focus_caches[0].shares_worker_with(&shared_focus_cache));
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[
+                ("first".to_string(), session_one),
+                ("second".to_string(), session_two)
+            ]
+        );
+    }
+
+    #[test]
+    fn in_process_runner_commits_sender_usage_only_after_success() {
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new(|_config, _sender, _focus_cache| {
+                Arc::new(FailInjector::new("unused test injector"))
+            }),
+            Arc::new(|_config| {
+                Ok(Arc::new(RecordingPasteChordSender {
+                    sends: Arc::new(AtomicU64::new(0)),
+                    fail: false,
+                }) as Arc<dyn PasteChordSender>)
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            None,
+        );
+
+        let sender = runner
+            .prepare_paste_key_sender()
+            .expect("preparing sender should succeed");
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = &sender
+        else {
+            panic!("paste mode should prepare a uinput sender");
+        };
+        assert!(metadata.fresh_device);
+        assert_eq!(metadata.use_count_before_attempt, 0);
+
+        {
+            let manager = runner
+                .sender_manager
+                .lock()
+                .expect("sender manager lock should be available");
+            let super::UinputSenderState::Healthy(healthy) = &manager.state else {
+                panic!("prepared sender should leave manager healthy");
+            };
+            assert!(healthy.fresh_pending);
+            assert_eq!(healthy.use_count, 0);
+        }
+
+        runner.commit_successful_paste_key_sender(&sender);
+        runner.commit_successful_paste_key_sender(&sender);
+
+        {
+            let manager = runner
+                .sender_manager
+                .lock()
+                .expect("sender manager lock should be available");
+            let super::UinputSenderState::Healthy(healthy) = &manager.state else {
+                panic!("committed sender should keep manager healthy");
+            };
+            assert!(!healthy.fresh_pending);
+            assert_eq!(healthy.use_count, 1);
+        }
+
+        let sender = runner
+            .prepare_paste_key_sender()
+            .expect("preparing reused sender should succeed");
+        let PasteKeySender::Uinput {
+            metadata: Some(metadata),
+            ..
+        } = &sender
+        else {
+            panic!("paste mode should keep using a uinput sender");
+        };
+        assert!(!metadata.fresh_device);
+        assert_eq!(metadata.use_count_before_attempt, 1);
+    }
+
+    #[test]
+    fn in_process_runner_retries_after_create_failure_without_restart() {
+        let build_count = Arc::new(AtomicU64::new(0));
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let build_count = Arc::clone(&build_count);
+                let seen = Arc::clone(&seen);
+                move |_config, _sender, _focus_cache| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(RecordingTextInjector {
+                        seen: Arc::clone(&seen),
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                move |_config| {
+                    let attempt = sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        anyhow::bail!("synthetic /dev/uinput unavailable");
+                    }
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::new(AtomicU64::new(0)),
+                        fail: false,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            None,
+        );
+
+        let _session_one = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(_session_one, "first".to_string(), 0, 0))
+            .expect("copy-only fallback should keep first run alive");
+        std::thread::sleep(Duration::from_millis(6));
+        let session_two = Uuid::new_v4();
+        runner
+            .run(&InjectionJob::new(session_two, "second".to_string(), 0, 0))
+            .expect("second run should recover after retry backoff");
+
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 2);
+        assert_eq!(build_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            seen.lock()
+                .expect("recording injector lock should be available")
+                .as_slice(),
+            &[("second".to_string(), session_two)]
+        );
+    }
+
+    #[test]
+    fn in_process_runner_drops_sender_after_explicit_send_error() {
+        let sender_create_count = Arc::new(AtomicU64::new(0));
+        let send_count = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = test_client_config();
+        let runner = super::InProcessInjectorRunner::new_for_tests(
+            &config,
+            Arc::new({
+                let seen = Arc::clone(&seen);
+                move |_config, sender, _focus_cache| {
+                    Arc::new(SenderDrivenInjector {
+                        seen: Arc::clone(&seen),
+                        sender,
+                    })
+                }
+            }),
+            Arc::new({
+                let sender_create_count = Arc::clone(&sender_create_count);
+                let send_count = Arc::clone(&send_count);
+                move |_config| {
+                    let generation = sender_create_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(RecordingPasteChordSender {
+                        sends: Arc::clone(&send_count),
+                        fail: generation == 0,
+                    }) as Arc<dyn PasteChordSender>)
+                }
+            }),
+            Arc::new(|_| {}),
+            Duration::from_millis(0),
+            Duration::from_millis(5),
+            None,
+        );
+
+        let first = runner.run(&InjectionJob::new(
+            Uuid::new_v4(),
+            "first".to_string(),
+            0,
+            0,
+        ));
+        assert!(matches!(first, Err(InjectionRunError::BackendFailure(_))));
+
+        let second = runner.run(&InjectionJob::new(
+            Uuid::new_v4(),
+            "second".to_string(),
+            0,
+            0,
+        ));
+        assert!(second.is_ok());
+        assert_eq!(sender_create_count.load(Ordering::Relaxed), 2);
+        assert_eq!(send_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            seen.lock()
+                .expect("sender-driven injector lock should be available")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -2779,7 +4135,6 @@ mod tests {
         let session_id = state.begin_listening().expect("state should start");
         state.stop_listening();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
-        let feedback = AudioFeedback::new(false, None, 100);
         let message = ServerMessage::FinalResult {
             session_id,
             text: "hello from daemon".to_string(),
@@ -2790,7 +4145,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        handle_server_message(message, &mut state, &mut overlay_router, &worker, &feedback)
+        handle_server_message_for_tests(message, &mut state, &mut overlay_router, &worker)
             .await
             .expect("server message should enqueue successfully");
         let elapsed = started.elapsed();
@@ -2870,9 +4225,7 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
@@ -2881,11 +4234,10 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim state should route to overlay");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -2894,11 +4246,10 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text should route to overlay");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::SessionEnded {
                 session_id,
                 reason: Some("normal".to_string()),
@@ -2906,7 +4257,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("session ended should route to overlay");
@@ -2966,9 +4316,7 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
@@ -2977,11 +4325,10 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim state should route");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "only final injects".to_string(),
@@ -2993,11 +4340,10 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should enqueue exactly once");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -3006,7 +4352,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text should stay in overlay route");
@@ -3070,9 +4415,7 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
@@ -3081,7 +4424,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("overlay disconnect should be non-fatal");
@@ -3092,7 +4434,7 @@ mod tests {
             1
         );
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final survives overlay disconnect".to_string(),
@@ -3104,7 +4446,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -3177,10 +4518,8 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
         for seq in 1..=4 {
-            handle_server_message(
+            handle_server_message_for_tests(
                 ServerMessage::InterimText {
                     session_id,
                     seq,
@@ -3189,13 +4528,12 @@ mod tests {
                 &mut state,
                 &mut overlay_router,
                 &worker,
-                &feedback,
             )
             .await
             .expect("overlay failures should remain non-fatal");
         }
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final survives repeated overlay failures".to_string(),
@@ -3207,7 +4545,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -3286,9 +4623,7 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
@@ -3297,7 +4632,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("first interim text should route");
@@ -3316,7 +4650,7 @@ mod tests {
 
         drop(rx_first);
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 2,
@@ -3325,7 +4659,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("interim text after crash should remain non-fatal");
@@ -3346,7 +4679,7 @@ mod tests {
             .await
             .is_err());
 
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::FinalResult {
                 session_id,
                 text: "final after overlay restart".to_string(),
@@ -3358,7 +4691,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("final result should still enqueue");
@@ -3408,9 +4740,7 @@ mod tests {
             .begin_listening()
             .expect("state should begin listening");
         state.stop_listening();
-        let feedback = AudioFeedback::new(false, None, 100);
-
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 10,
@@ -3419,11 +4749,10 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("first interim text should route");
-        handle_server_message(
+        handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 9,
@@ -3432,7 +4761,6 @@ mod tests {
             &mut state,
             &mut overlay_router,
             &worker,
-            &feedback,
         )
         .await
         .expect("stale interim text should be dropped without failure");
@@ -3467,7 +4795,7 @@ mod tests {
         let injector = Arc::new(TimeoutThenRecordingRunner {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
-            timeout_run_ms: INJECTION_EXECUTION_TIMEOUT_MS + 75,
+            timeout_run_ms: INJECTOR_JOB_TIMEOUT_MS + 75,
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
@@ -3556,7 +4884,7 @@ mod tests {
         let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
             script.clone(),
             vec![OsString::from(log_path.as_os_str())],
-            Duration::from_millis(INJECTION_EXECUTION_TIMEOUT_MS),
+            Duration::from_millis(INJECTOR_JOB_TIMEOUT_MS),
         ));
         let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
 
@@ -3602,6 +4930,158 @@ mod tests {
 
         let written = fs::read_to_string(&log_path).expect("log file should be readable");
         assert_eq!(written, "second survives\n");
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[test]
+    fn injector_subprocess_runner_does_not_wait_for_background_grandchild_stderr_close() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-inherited-stderr-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\npayload=\"$(cat)\"\nprintf '%s %s\\n' \"$(date +%s%3N)\" \"$payload\" >>\"$log_path\"\n(sleep 0.4) &\nexit 0\n",
+        );
+        let runner = InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_secs(2),
+        );
+
+        let started = Instant::now();
+        runner
+            .run(&InjectionJob::new(
+                Uuid::new_v4(),
+                "clipboard helper should not pin the worker".to_string(),
+                0,
+                0,
+            ))
+            .expect("runner should treat the injector subprocess as successful");
+        let elapsed = started.elapsed();
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        assert!(
+            written.contains("clipboard helper should not pin the worker"),
+            "script should record the injected payload"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "runner should not wait for inherited stderr handles from background helpers, elapsed={elapsed:?}"
+        );
+
+        fs::remove_file(&script).expect("test script should be removable");
+        fs::remove_file(&log_path).expect("log file should be removable");
+    }
+
+    #[test]
+    fn pipe_reader_applies_deadline_only_after_it_is_started() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should open");
+        writer
+            .write_all(b"partial stderr")
+            .expect("writer should accept bytes");
+
+        let stderr_reader = spawn_pipe_reader(reader, Duration::from_millis(40));
+        assert!(
+            matches!(
+                stderr_reader
+                    .receiver
+                    .recv_timeout(Duration::from_millis(80)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "reader should keep waiting for EOF until the post-exit deadline is armed"
+        );
+
+        let started = Instant::now();
+        stderr_reader.start_deadline();
+        let outcome = collect_pipe_reader(stderr_reader, "stderr", Duration::from_millis(200))
+            .expect("reader should return once the post-exit drain deadline elapses");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.bytes, b"partial stderr");
+        assert!(
+            outcome.timed_out,
+            "open writers should force a timed post-exit drain result instead of blocking for EOF"
+        );
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "pipe reader should stop itself near the post-exit drain deadline, elapsed={elapsed:?}"
+        );
+
+        drop(writer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_helper_lifetime_does_not_delay_following_injection_jobs() {
+        let log_path = std::env::temp_dir().join(format!(
+            "parakeet-ptt-background-helper-queue-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time should be after epoch")
+                .as_nanos()
+        ));
+        let script = make_test_script(
+            "#!/usr/bin/env bash\nset -euo pipefail\nlog_path=\"$1\"\npayload=\"$(cat)\"\nprintf '%s %s\\n' \"$(date +%s%3N)\" \"$payload\" >>\"$log_path\"\n(sleep 0.4) &\nexit 0\n",
+        );
+        let runner = Arc::new(InjectorSubprocessRunner::new_for_tests(
+            script.clone(),
+            vec![OsString::from(log_path.as_os_str())],
+            Duration::from_secs(2),
+        ));
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(runner, 4);
+
+        worker
+            .enqueue(InjectionJob::new(Uuid::new_v4(), "first".to_string(), 1, 1))
+            .await
+            .expect("first enqueue should pass");
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "second".to_string(),
+                2,
+                2,
+            ))
+            .await
+            .expect("second enqueue should pass");
+
+        timeout(Duration::from_millis(250), reports.recv())
+            .await
+            .expect("first report should not wait for background helper exit")
+            .expect("report stream should remain open");
+        timeout(Duration::from_millis(250), reports.recv())
+            .await
+            .expect("second report should not be blocked behind the prior helper lifetime")
+            .expect("report stream should remain open");
+
+        let written = fs::read_to_string(&log_path).expect("log file should be readable");
+        let entries = written
+            .lines()
+            .map(|line| {
+                let (timestamp, payload) = line
+                    .split_once(' ')
+                    .expect("log line should contain timestamp and payload");
+                (
+                    timestamp
+                        .parse::<u128>()
+                        .expect("timestamp should parse as milliseconds"),
+                    payload.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 2, "both jobs should have executed");
+        assert_eq!(entries[0].1, "first");
+        assert_eq!(entries[1].1, "second");
+        assert!(
+            entries[1].0.saturating_sub(entries[0].0) < 200,
+            "second job should start promptly instead of waiting for prior clipboard helper teardown"
+        );
 
         fs::remove_file(&script).expect("test script should be removable");
         fs::remove_file(&log_path).expect("log file should be removable");

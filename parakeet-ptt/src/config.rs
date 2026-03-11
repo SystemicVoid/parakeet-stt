@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -281,9 +280,7 @@ pub enum PasteShortcut {
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum PasteKeyBackend {
-    Ydotool,
     Uinput,
-    Auto,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -303,7 +300,6 @@ pub struct ClipboardOptions {
 
 #[derive(Clone, Debug)]
 pub struct InjectionConfig {
-    pub ydotool_path: Option<PathBuf>,
     pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -314,7 +310,6 @@ pub struct ClientConfig {
     pub endpoint: Url,
     pub shared_secret: Option<String>,
     pub hotkey: String,
-    pub ydotool_path: Option<PathBuf>,
     pub uinput_dwell_ms: u64,
     pub injection_mode: InjectionMode,
     pub clipboard: ClipboardOptions,
@@ -335,7 +330,6 @@ impl ClientConfig {
             endpoint,
             shared_secret,
             hotkey,
-            ydotool_path: injection.ydotool_path,
             uinput_dwell_ms: injection.uinput_dwell_ms,
             injection_mode: injection.injection_mode,
             clipboard: injection.clipboard,
