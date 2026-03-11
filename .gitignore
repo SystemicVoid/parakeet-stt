@@ -28,11 +28,6 @@ parakeet-ptt/.claude/
 /xdg-activation-v1.xml
 /xdg-shell.xml
 
-# Local drafts
-/BUSINESS-POSITIONING-DRAFT-2026-02-23.md
-/blog-article-palmai.md
-/overlay-renderer-perf-validation-and-handoff-2026-03-05.md
-
 # Local bench audio + logs (A/B streaming validation)
 # Ignore both directory and symlink forms used across worktrees.
 /parakeet-stt-daemon/bench_audio
