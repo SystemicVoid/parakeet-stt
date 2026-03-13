@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import sys
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,20 @@ if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - import bootstrap
 _CHECK_MODEL = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _CHECK_MODEL
 _SPEC.loader.exec_module(_CHECK_MODEL)
+
+_CONSTANTS = importlib.import_module("check_model_lib.constants")
+_RUNNER = importlib.import_module("check_model_lib.runner")
+_RUNTIME = importlib.import_module("check_model_lib.runtime")
+
+PROBE_STREAM_BATCH_SIZE = _CONSTANTS.PROBE_STREAM_BATCH_SIZE
+PROBE_STREAM_CHUNK_SECS = _CONSTANTS.PROBE_STREAM_CHUNK_SECS
+PROBE_STREAM_LEFT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_LEFT_CONTEXT_SECS
+PROBE_STREAM_RIGHT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_RIGHT_CONTEXT_SECS
+SAMPLE_RATE = _CONSTANTS.SAMPLE_RATE
+read_wav_samples = _RUNTIME._read_wav_samples
+run_streaming_probe = _RUNNER.run_streaming_probe
+split_chunks = _RUNTIME.split_chunks
+write_wav = _RUNTIME.write_wav
 
 collect_benchmark_cases = _CHECK_MODEL.collect_benchmark_cases
 compute_command_exact_match_rate = _CHECK_MODEL.compute_command_exact_match_rate
@@ -433,6 +449,193 @@ def test_apply_profile_defaults_disables_relative_gates_without_baseline() -> No
     assert args.max_punctuation_f1_drop is None
     assert args.max_terminal_punctuation_accuracy_drop is None
     assert args.max_warm_p95_finalize_ms_delta is None
+
+
+def test_apply_profile_defaults_preserves_explicit_relative_gates_without_baseline() -> None:
+    args = argparse.Namespace(
+        bench_tier="all",
+        bench_runs=None,
+        warmup_samples=None,
+        max_weighted_wer=None,
+        min_command_exact_match=None,
+        min_command_normalized_exact_match=None,
+        min_command_intent_slot_match=None,
+        min_critical_token_recall=None,
+        min_punctuation_f1=None,
+        min_terminal_punctuation_accuracy=None,
+        max_warm_p95_finalize_ms=None,
+        max_weighted_wer_delta=0.12,
+        max_command_exact_match_drop=0.07,
+        max_command_normalized_exact_match_drop=0.08,
+        max_command_intent_slot_match_drop=0.09,
+        max_critical_token_recall_drop=0.04,
+        max_punctuation_f1_drop=0.05,
+        max_terminal_punctuation_accuracy_drop=0.06,
+        max_warm_p95_finalize_ms_delta=25.0,
+        calibrate_baseline=False,
+        baseline=None,
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.max_weighted_wer_delta == pytest.approx(0.12)
+    assert args.max_command_exact_match_drop == pytest.approx(0.07)
+    assert args.max_command_normalized_exact_match_drop == pytest.approx(0.08)
+    assert args.max_command_intent_slot_match_drop == pytest.approx(0.09)
+    assert args.max_critical_token_recall_drop == pytest.approx(0.04)
+    assert args.max_punctuation_f1_drop == pytest.approx(0.05)
+    assert args.max_terminal_punctuation_accuracy_drop == pytest.approx(0.06)
+    assert args.max_warm_p95_finalize_ms_delta == pytest.approx(25.0)
+
+
+def test_apply_profile_defaults_calibrate_baseline_still_clears_relative_gates() -> None:
+    args = argparse.Namespace(
+        bench_tier="all",
+        bench_runs=None,
+        warmup_samples=None,
+        max_weighted_wer=None,
+        min_command_exact_match=None,
+        min_command_normalized_exact_match=None,
+        min_command_intent_slot_match=None,
+        min_critical_token_recall=None,
+        min_punctuation_f1=None,
+        min_terminal_punctuation_accuracy=None,
+        max_warm_p95_finalize_ms=None,
+        max_weighted_wer_delta=0.12,
+        max_command_exact_match_drop=0.07,
+        max_command_normalized_exact_match_drop=0.08,
+        max_command_intent_slot_match_drop=0.09,
+        max_critical_token_recall_drop=0.04,
+        max_punctuation_f1_drop=0.05,
+        max_terminal_punctuation_accuracy_drop=0.06,
+        max_warm_p95_finalize_ms_delta=25.0,
+        calibrate_baseline=True,
+        baseline=None,
+    )
+
+    apply_profile_defaults(args)
+
+    assert args.max_weighted_wer_delta is None
+    assert args.max_command_exact_match_drop is None
+    assert args.max_command_normalized_exact_match_drop is None
+    assert args.max_command_intent_slot_match_drop is None
+    assert args.max_critical_token_recall_drop is None
+    assert args.max_punctuation_f1_drop is None
+    assert args.max_terminal_punctuation_accuracy_drop is None
+    assert args.max_warm_p95_finalize_ms_delta is None
+
+
+def test_write_wav_fallback_downmixes_multichannel_audio(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "soundfile", None)
+    wav_path = tmp_path / "stereo.wav"
+    samples = np.array([[1.0, 1.0], [0.5, -0.5], [-1.0, -1.0]], dtype=np.float32)
+
+    write_wav(wav_path, samples)
+
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getframerate() == SAMPLE_RATE
+        pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2")
+
+    np.testing.assert_array_equal(pcm, np.array([32767, 0, -32767], dtype=np.int16))
+
+
+def test_read_wav_samples_falls_back_when_soundfile_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "soundfile", None)
+    wav_path = tmp_path / "mono.wav"
+    pcm = np.array([0, 16384, -16384], dtype=np.int16)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.astype("<i2").tobytes())
+
+    samples, sample_rate = read_wav_samples(wav_path)
+
+    assert sample_rate == SAMPLE_RATE
+    np.testing.assert_allclose(samples, np.array([0.0, 0.5, -0.5], dtype=np.float32))
+
+
+def test_read_wav_samples_falls_back_on_expected_soundfile_read_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wav_path = tmp_path / "stereo.wav"
+    left = np.array([32767, 16384], dtype=np.int16)
+    right = np.array([-32767, 16384], dtype=np.int16)
+    interleaved = np.column_stack((left, right)).reshape(-1)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(interleaved.astype("<i2").tobytes())
+
+    class _FakeSoundFile:
+        @staticmethod
+        def read(*args, **kwargs) -> tuple[np.ndarray, int]:
+            del args, kwargs
+            raise RuntimeError("decode failed")
+
+    monkeypatch.setitem(sys.modules, "soundfile", _FakeSoundFile)
+
+    samples, sample_rate = read_wav_samples(wav_path)
+
+    assert sample_rate == SAMPLE_RATE
+    np.testing.assert_allclose(samples, np.array([0.0, 0.5], dtype=np.float32))
+
+
+def test_split_chunks_rejects_non_positive_chunk_size() -> None:
+    with pytest.raises(ValueError, match=r"chunk_size must be a positive int, got 0"):
+        split_chunks(np.arange(4, dtype=np.float32), 0)
+
+
+def test_run_streaming_probe_uses_probe_stream_constants(monkeypatch) -> None:
+    captured: dict[str, float | int] = {}
+
+    class _FakeSession:
+        def feed(self, chunk: np.ndarray) -> None:
+            del chunk
+
+        def finalize(self) -> str:
+            return "ok"
+
+    class _FakeStreamer:
+        def __init__(
+            self,
+            model: object,
+            *,
+            chunk_secs: float,
+            right_context_secs: float,
+            left_context_secs: float,
+            batch_size: int,
+        ) -> None:
+            del model
+            captured["chunk_secs"] = chunk_secs
+            captured["right_context_secs"] = right_context_secs
+            captured["left_context_secs"] = left_context_secs
+            captured["batch_size"] = batch_size
+            self.chunk_secs = chunk_secs
+            self.chunk_helper = object()
+
+        def start_session(self, sample_rate: int) -> _FakeSession:
+            assert sample_rate == SAMPLE_RATE
+            return _FakeSession()
+
+    monkeypatch.setattr(
+        "check_model_lib.runner.ParakeetStreamingTranscriber",
+        _FakeStreamer,
+    )
+
+    result = run_streaming_probe(object(), np.zeros((0,), dtype=np.float32))
+
+    assert "succeeded" in result
+    assert captured == {
+        "chunk_secs": PROBE_STREAM_CHUNK_SECS,
+        "right_context_secs": PROBE_STREAM_RIGHT_CONTEXT_SECS,
+        "left_context_secs": PROBE_STREAM_LEFT_CONTEXT_SECS,
+        "batch_size": PROBE_STREAM_BATCH_SIZE,
+    }
 
 
 class _DummyStreamSession:
