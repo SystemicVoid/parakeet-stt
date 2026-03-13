@@ -20,6 +20,7 @@ Keep it short, stable, and biased toward source-of-truth locations. If something
 - Overlay reliability gate: `just phase6-contract` (single pass), `just phase6-promotion 3` (promotion gate with repeated clean runs + eval compare).
 - Eval shortcuts (existing dataset): `just eval compare` (default), `just eval offline`, `just eval stream`, `just eval calibrate-offline`, `just eval calibrate-stream`.
 - Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` so the package environment and imports resolve correctly.
+- Rust crate-scope caveat: run `cargo` commands from `parakeet-ptt/` (the crate root), not the repo root.
 - Commit-hook behavior: if pre-commit rewrites staged files, re-stage them and retry the commit.
 
 ## Runtime Operator Defaults (2026-03)
