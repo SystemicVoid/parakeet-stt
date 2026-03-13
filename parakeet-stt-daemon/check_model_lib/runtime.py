@@ -14,39 +14,50 @@ from check_model_lib.constants import SAMPLE_RATE
 
 
 def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
+    sf: Any | None
+    soundfile_error: Exception | None = None
     try:
-        import soundfile as sf
+        import soundfile as sf_mod
+    except ImportError as err:
+        sf = None  # pragma: no cover - minimal fallback
+        soundfile_error = err
+    else:
+        sf = sf_mod
 
-        samples, sample_rate = sf.read(path, dtype="float32", always_2d=False)
-        sample_array = np.asarray(samples, dtype=np.float32)
-    except Exception as err:  # pragma: no cover - minimal fallback
-        with wave.open(str(path), "rb") as wf:
-            sample_rate = wf.getframerate()
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            raw = wf.readframes(wf.getnframes())
-        dtype_map: dict[int, tuple[str, float]] = {
-            1: ("<u1", 128.0),
-            2: ("<i2", 32768.0),
-            4: ("<i4", 2147483648.0),
-        }
-        if sample_width not in dtype_map:
-            raise ValueError(
-                f"Unsupported wav sample width ({sample_width} bytes) in {path}"
-            ) from err
-        dtype, scale = dtype_map[sample_width]
-        sample_array = np.frombuffer(raw, dtype=np.dtype(dtype)).astype(np.float32)
-        if sample_width == 1:
-            sample_array = (sample_array - 128.0) / scale
+    if sf is not None:
+        try:
+            samples, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+            sample_array = np.asarray(samples, dtype=np.float32)
+        except (OSError, RuntimeError, TypeError, ValueError) as err:
+            soundfile_error = err  # pragma: no cover - minimal fallback
         else:
-            sample_array = sample_array / scale
-        if channels > 1:
-            sample_array = sample_array.reshape(-1, channels).mean(axis=1)
-        return sample_array.reshape(-1), sample_rate
+            if sample_array.ndim > 1:
+                sample_array = sample_array.mean(axis=1)
+            return sample_array.reshape(-1), int(sample_rate)
 
-    if sample_array.ndim > 1:
-        sample_array = sample_array.mean(axis=1)
-    return sample_array.reshape(-1), int(sample_rate)
+    with wave.open(str(path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+    dtype_map: dict[int, tuple[str, float]] = {
+        1: ("<u1", 128.0),
+        2: ("<i2", 32768.0),
+        4: ("<i4", 2147483648.0),
+    }
+    if sample_width not in dtype_map:
+        raise ValueError(
+            f"Unsupported wav sample width ({sample_width} bytes) in {path}"
+        ) from soundfile_error
+    dtype, scale = dtype_map[sample_width]
+    sample_array = np.frombuffer(raw, dtype=np.dtype(dtype)).astype(np.float32)
+    if sample_width == 1:
+        sample_array = (sample_array - 128.0) / scale
+    else:
+        sample_array = sample_array / scale
+    if channels > 1:
+        sample_array = sample_array.reshape(-1, channels).mean(axis=1)
+    return sample_array.reshape(-1), sample_rate
 
 
 def _trim_tail_with_rms(
