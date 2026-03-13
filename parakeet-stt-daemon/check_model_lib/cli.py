@@ -6,6 +6,12 @@ import argparse
 import tempfile
 from pathlib import Path
 
+from parakeet_stt_daemon.model import (
+    DEFAULT_MODEL_NAME,
+    ParakeetTranscriber,
+    load_parakeet_model,
+)
+
 from check_model_lib.constants import (
     BENCH_AUDIO_DIR,
     DEFAULT_BASELINE_OUTPUT,
@@ -21,11 +27,6 @@ from check_model_lib.constants import (
 )
 from check_model_lib.runner import run_offline_benchmark, run_streaming_probe
 from check_model_lib.runtime import generate_sine, write_wav
-from parakeet_stt_daemon.model import (
-    DEFAULT_MODEL_NAME,
-    ParakeetTranscriber,
-    load_parakeet_model,
-)
 
 
 def _apply_profile_defaults(args: argparse.Namespace) -> None:
@@ -58,29 +59,30 @@ def _apply_profile_defaults(args: argparse.Namespace) -> None:
         "max_terminal_punctuation_accuracy_drop": "max_terminal_punctuation_accuracy_drop",
         "max_warm_p95_finalize_ms_delta": "max_warm_p95_finalize_ms_delta",
     }
+    relative_threshold_args = (
+        "max_weighted_wer_delta",
+        "max_command_exact_match_drop",
+        "max_command_normalized_exact_match_drop",
+        "max_command_intent_slot_match_drop",
+        "max_critical_token_recall_drop",
+        "max_punctuation_f1_drop",
+        "max_terminal_punctuation_accuracy_drop",
+        "max_warm_p95_finalize_ms_delta",
+    )
+    profile_injected: set[str] = set()
     for profile_key, arg_name in profile_to_arg.items():
         if getattr(args, arg_name) is None and profile_key in profile:
             setattr(args, arg_name, float(profile[profile_key]))
+            profile_injected.add(arg_name)
 
     if args.calibrate_baseline:
-        args.max_weighted_wer_delta = None
-        args.max_command_exact_match_drop = None
-        args.max_command_normalized_exact_match_drop = None
-        args.max_command_intent_slot_match_drop = None
-        args.max_critical_token_recall_drop = None
-        args.max_punctuation_f1_drop = None
-        args.max_terminal_punctuation_accuracy_drop = None
-        args.max_warm_p95_finalize_ms_delta = None
+        for arg_name in relative_threshold_args:
+            setattr(args, arg_name, None)
     elif args.baseline is None:
         # Keep profile defaults usable before a baseline exists.
-        args.max_weighted_wer_delta = None
-        args.max_command_exact_match_drop = None
-        args.max_command_normalized_exact_match_drop = None
-        args.max_command_intent_slot_match_drop = None
-        args.max_critical_token_recall_drop = None
-        args.max_punctuation_f1_drop = None
-        args.max_terminal_punctuation_accuracy_drop = None
-        args.max_warm_p95_finalize_ms_delta = None
+        for arg_name in relative_threshold_args:
+            if arg_name in profile_injected:
+                setattr(args, arg_name, None)
 
 
 def parse_args() -> argparse.Namespace:
