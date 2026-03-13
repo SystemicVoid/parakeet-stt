@@ -31,6 +31,7 @@ from .messages import (
     InterimTextMessage,
     ParsedMessage,
     SessionEndedMessage,
+    SessionEndReason,
     SessionStarted,
     StartSession,
     StatusMessage,
@@ -318,7 +319,9 @@ class DaemonServer:
                         "AUDIO_DEVICE",
                         "No audio captured for session",
                     )
-                    await self._emit_session_ended(websocket, session.session_id, reason="error")
+                    await self._emit_session_ended(
+                        websocket, session.session_id, reason=SessionEndReason.ERROR
+                    )
                     await self.sessions.clear(session.session_id, owner_token=owner_token)
                     self._clear_overlay_session_runtime(session.session_id)
                     self._live_interim_audio = np.zeros((0,), dtype=np.float32)
@@ -361,7 +364,9 @@ class DaemonServer:
                     await self._send_error(
                         websocket, session.session_id, "MODEL", "Transcription failed"
                     )
-                    await self._emit_session_ended(websocket, session.session_id, reason="error")
+                    await self._emit_session_ended(
+                        websocket, session.session_id, reason=SessionEndReason.ERROR
+                    )
                     await self.sessions.clear(session.session_id, owner_token=owner_token)
                     self._clear_overlay_session_runtime(session.session_id)
                     self._live_interim_audio = np.zeros((0,), dtype=np.float32)
@@ -383,7 +388,9 @@ class DaemonServer:
                 send_started = datetime.now(tz=UTC)
                 await self._send_message(websocket, completion.model_dump(mode="json"))
                 send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
-                await self._emit_session_ended(websocket, session.session_id, reason="final")
+                await self._emit_session_ended(
+                    websocket, session.session_id, reason=SessionEndReason.FINAL
+                )
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 self._live_interim_audio = np.zeros((0,), dtype=np.float32)
@@ -442,7 +449,9 @@ class DaemonServer:
             require_owner_match=True,
         )
         if cleaned:
-            await self._emit_session_ended(websocket, message.session_id, reason="abort")
+            await self._emit_session_ended(
+                websocket, message.session_id, reason=SessionEndReason.ABORT
+            )
             code = "SESSION_ABORTED"
             error_message = f"Session aborted: {message.reason}"
         else:
@@ -575,7 +584,7 @@ class DaemonServer:
         )
         try:
             await self._send_error(websocket, session_id, "AUDIO_DEVICE", message)
-            await self._emit_session_ended(websocket, session_id, reason="error")
+            await self._emit_session_ended(websocket, session_id, reason=SessionEndReason.ERROR)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to report session guard abort for {}: {}", session_id, exc)
 
@@ -1104,7 +1113,7 @@ class DaemonServer:
         websocket: WebSocket,
         session_id: UUID,
         *,
-        reason: Literal["final", "abort", "error"],
+        reason: SessionEndReason,
     ) -> None:
         if not self.settings.overlay_events_enabled:
             return
@@ -1171,7 +1180,7 @@ class DaemonServer:
         requested_device = getattr(self, "_requested_device", str(self.settings.device))
         effective_device = getattr(self, "_effective_device", requested_device)
         return StatusMessage(
-            state=state.value,
+            state=state,
             sessions_active=int(active is not None),
             gpu_mem_mb=self._gpu_mem_mb(),
             device=requested_device,

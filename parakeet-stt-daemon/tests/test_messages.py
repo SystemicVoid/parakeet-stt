@@ -7,7 +7,11 @@ from parakeet_stt_daemon.messages import (
     InterimStateMessage,
     InterimStateValue,
     InterimTextMessage,
+    SessionEndedMessage,
+    SessionEndReason,
+    StatusMessage,
 )
+from parakeet_stt_daemon.session import SessionState
 from pydantic import ValidationError
 
 
@@ -61,3 +65,38 @@ def test_interim_state_accepts_enum_values() -> None:
     assert msg.session_id == session_id
     assert msg.seq == 0
     assert msg.state == InterimStateValue.PROCESSING
+
+
+def test_status_message_accepts_session_state_enum() -> None:
+    msg = StatusMessage(state=SessionState.IDLE, sessions_active=0)
+    assert msg.state == SessionState.IDLE
+    dumped = msg.model_dump(mode="json")
+    assert dumped["state"] == "idle"
+
+
+def test_status_message_accepts_session_state_string() -> None:
+    msg = StatusMessage.model_validate(
+        {"type": "status", "state": "listening", "sessions_active": 1}
+    )
+    assert msg.state == SessionState.LISTENING
+
+
+def test_status_message_rejects_invalid_state() -> None:
+    with pytest.raises(ValidationError):
+        StatusMessage.model_validate({"type": "status", "state": "unknown", "sessions_active": 0})
+
+
+def test_session_ended_accepts_reason_enum() -> None:
+    sid = uuid4()
+    msg = SessionEndedMessage(session_id=sid, reason=SessionEndReason.FINAL)
+    assert msg.reason == SessionEndReason.FINAL
+    dumped = msg.model_dump(mode="json")
+    assert dumped["reason"] == "final"
+
+
+def test_session_ended_accepts_none_reason() -> None:
+    sid = uuid4()
+    msg = SessionEndedMessage(session_id=sid)
+    assert msg.reason is None
+    dumped = msg.model_dump(mode="json")
+    assert dumped["reason"] is None
