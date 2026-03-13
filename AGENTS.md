@@ -17,7 +17,6 @@ Keep it short, stable, and biased toward source-of-truth locations. If something
 
 ## Build, Test, and Development Commands
 - Unified quality gate (repo root): `prek install -t pre-commit -t pre-push`, then `prek run --all-files` and `prek run --stage pre-push --all-files`.
-- main branch requires pull requests; force pushes blocked, admin protections enabled.
 - Overlay reliability gate: `just phase6-contract` (single pass), `just phase6-promotion 3` (promotion gate with repeated clean runs + eval compare).
 - Eval shortcuts (existing dataset): `just eval compare` (default), `just eval offline`, `just eval stream`, `just eval calibrate-offline`, `just eval calibrate-stream`.
 - Python package-scope caveat: run daemon Python commands from `parakeet-stt-daemon/` so the package environment and imports resolve correctly.

@@ -20,6 +20,7 @@ parakeet-stt-daemon/test-run.py
 parakeet-ptt/.claude/
 /.parakeet-stt.local.env
 /.parakeet-stt.local.sh
+/.factory/
 
 # Wayland protocol XML scratch drops (kept under docs/protocol-references/)
 /cosmic-toplevel-info-unstable-v1.xml
@@ -34,3 +35,7 @@ parakeet-ptt/.claude/
 /parakeet-stt-daemon/bench_audio/
 /tmp-logs-streaming-offline-comparison.txt
 Screenshot_2026-03-02_19-38-17.png
+
+# Debug investigation notes (local-only)
+/OVERLAY-FLASH-BUG.md
+OPEN-ISSUES-TRACKER.md

@@ -183,14 +183,7 @@ enum CliAnchor {
     BottomRight,
 }
 
-fn parse_bool_override(raw: &str) -> Option<bool> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
+use crate::env_parse::parse_bool_override;
 
 fn resolve_adaptive_width_override(cli_override: Option<bool>) -> bool {
     if let Some(adaptive_width) = cli_override {
@@ -745,6 +738,7 @@ fn should_apply_breathing(phase: OverlayRenderPhase, accent_transition_active: b
     phase == OverlayRenderPhase::Listening && !accent_transition_active
 }
 
+#[cfg(test)]
 fn shared_prefix_len(previous: &str, current: &str) -> usize {
     previous
         .chars()
@@ -753,6 +747,7 @@ fn shared_prefix_len(previous: &str, current: &str) -> usize {
         .count()
 }
 
+#[cfg(test)]
 fn shared_suffix_len(previous: &str, current: &str, shared_prefix: usize) -> usize {
     let previous_chars = previous.chars().collect::<Vec<_>>();
     let current_chars = current.chars().collect::<Vec<_>>();
@@ -768,6 +763,7 @@ fn shared_suffix_len(previous: &str, current: &str, shared_prefix: usize) -> usi
     suffix
 }
 
+#[cfg(test)]
 fn changed_char_range(previous: &str, current: &str) -> Option<(usize, usize)> {
     if previous == current {
         return None;
@@ -781,6 +777,27 @@ fn changed_char_range(previous: &str, current: &str) -> Option<(usize, usize)> {
     } else {
         Some((shared_prefix, changed_end))
     }
+}
+
+/// Compute the animation range for interim text updates using an
+/// append-only policy: only newly appended tail characters are animated
+/// with a fade-in.  In-place corrections (rewrites, capitalization
+/// changes, and mid-string insertions are applied instantly without any
+/// fade animation.
+///
+/// This avoids the "full string flash" artifact caused by STT model
+/// instability where early characters change on re-transcription of a
+/// rolling audio window.
+fn appended_char_range(previous: &str, current: &str) -> Option<(usize, usize)> {
+    if previous == current {
+        return None;
+    }
+    if !current.starts_with(previous) {
+        return None;
+    }
+    let previous_len = previous.chars().count();
+    let current_len = current.chars().count();
+    (current_len > previous_len).then_some((previous_len, current_len))
 }
 
 fn interim_char_fade_alpha(now_ms: u64, changed_ms: u64) -> f32 {
@@ -1703,7 +1720,7 @@ impl WaylandOverlayBackend {
 
         if self.prev_headline != intent.headline {
             if let Some((changed_start, changed_end)) =
-                changed_char_range(&self.prev_headline, &intent.headline)
+                appended_char_range(&self.prev_headline, &intent.headline)
             {
                 self.changed_char_start = changed_start;
                 self.changed_char_end = changed_end;
@@ -3393,9 +3410,9 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_color_for_phase, apply_breathing_alpha, changed_char_range, damage_width_for_commit,
-        ease_out_cubic, interim_char_fade_alpha, layout_text_lines, output_name_match_index,
-        parse_font_descriptor, parse_generic_family_kind, render_frame,
+        accent_color_for_phase, appended_char_range, apply_breathing_alpha, changed_char_range,
+        damage_width_for_commit, ease_out_cubic, interim_char_fade_alpha, layout_text_lines,
+        output_name_match_index, parse_font_descriptor, parse_generic_family_kind, render_frame,
         resolve_adaptive_width_with_env_input, resolve_backend_selection, rounded_rect_coverage,
         shared_prefix_len, shared_suffix_len, should_apply_breathing, staggered_char_fade_alpha,
         BackendSelection, BackendSignals, CliAnchor, CliBackendMode, FadeDirection, FadeState,
@@ -3696,6 +3713,45 @@ mod tests {
     #[test]
     fn changed_range_detects_append_updates() {
         assert_eq!(changed_char_range("hello", "hello world"), Some((5, 11)));
+    }
+
+    #[test]
+    fn appended_range_animates_only_new_tail() {
+        assert_eq!(appended_char_range("hello", "hello world"), Some((5, 11)));
+    }
+
+    #[test]
+    fn appended_range_none_for_prefix_rewrite_with_growth() {
+        assert_eq!(appended_char_range("Hello world", "hello World nice"), None);
+    }
+
+    #[test]
+    fn appended_range_none_for_pure_rewrite_same_length() {
+        // STT model changes early text without growing
+        assert_eq!(appended_char_range("hello world", "jello world"), None);
+    }
+
+    #[test]
+    fn appended_range_none_for_case_change() {
+        assert_eq!(appended_char_range("Hello", "hello"), None);
+    }
+
+    #[test]
+    fn appended_range_none_for_shrink() {
+        assert_eq!(appended_char_range("hello world", "hello"), None);
+    }
+
+    #[test]
+    fn appended_range_none_for_mid_string_insertion() {
+        assert_eq!(
+            appended_char_range("hello world", "hello brave world"),
+            None
+        );
+    }
+
+    #[test]
+    fn appended_range_none_for_identical() {
+        assert_eq!(appended_char_range("hello", "hello"), None);
     }
 
     #[test]
