@@ -129,14 +129,7 @@ fn resolve_overlay_enable_gate(
     }
 }
 
-fn parse_overlay_enabled_override(raw: &str) -> Option<bool> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
+use parakeet_ptt::env_parse::parse_bool_override as parse_overlay_enabled_override;
 
 pub fn resolve_overlay_adaptive_width(overlay_adaptive_width_override: Option<bool>) -> bool {
     if let Some(overlay_adaptive_width) = overlay_adaptive_width_override {
