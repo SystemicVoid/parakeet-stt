@@ -29,6 +29,7 @@ PROBE_STREAM_CHUNK_SECS = _CONSTANTS.PROBE_STREAM_CHUNK_SECS
 PROBE_STREAM_LEFT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_LEFT_CONTEXT_SECS
 PROBE_STREAM_RIGHT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_RIGHT_CONTEXT_SECS
 SAMPLE_RATE = _CONSTANTS.SAMPLE_RATE
+read_wav_samples = _RUNTIME._read_wav_samples
 run_streaming_probe = _RUNNER.run_streaming_probe
 split_chunks = _RUNTIME.split_chunks
 write_wav = _RUNTIME.write_wav
@@ -537,6 +538,51 @@ def test_write_wav_fallback_downmixes_multichannel_audio(tmp_path: Path, monkeyp
         pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2")
 
     np.testing.assert_array_equal(pcm, np.array([32767, 0, -32767], dtype=np.int16))
+
+
+def test_read_wav_samples_falls_back_when_soundfile_is_missing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "soundfile", None)
+    wav_path = tmp_path / "mono.wav"
+    pcm = np.array([0, 16384, -16384], dtype=np.int16)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.astype("<i2").tobytes())
+
+    samples, sample_rate = read_wav_samples(wav_path)
+
+    assert sample_rate == SAMPLE_RATE
+    np.testing.assert_allclose(samples, np.array([0.0, 0.5, -0.5], dtype=np.float32))
+
+
+def test_read_wav_samples_falls_back_on_expected_soundfile_read_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wav_path = tmp_path / "stereo.wav"
+    left = np.array([32767, 16384], dtype=np.int16)
+    right = np.array([-32767, 16384], dtype=np.int16)
+    interleaved = np.column_stack((left, right)).reshape(-1)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(interleaved.astype("<i2").tobytes())
+
+    class _FakeSoundFile:
+        @staticmethod
+        def read(*args, **kwargs) -> tuple[np.ndarray, int]:
+            del args, kwargs
+            raise RuntimeError("decode failed")
+
+    monkeypatch.setitem(sys.modules, "soundfile", _FakeSoundFile)
+
+    samples, sample_rate = read_wav_samples(wav_path)
+
+    assert sample_rate == SAMPLE_RATE
+    np.testing.assert_allclose(samples, np.array([0.0, 0.5], dtype=np.float32))
 
 
 def test_split_chunks_rejects_non_positive_chunk_size() -> None:
