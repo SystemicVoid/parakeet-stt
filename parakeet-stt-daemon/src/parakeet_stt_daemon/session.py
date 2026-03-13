@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from uuid import UUID
 
 
-class SessionState(str, Enum):
+class SessionState(StrEnum):
     IDLE = "idle"
     LISTENING = "listening"
     PROCESSING = "processing"
