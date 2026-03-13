@@ -8,22 +8,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .session import SessionState
+
 Timestamp = datetime
 
 
-class ClientMessageType(str, Enum):
+class ClientMessageType(StrEnum):
     START_SESSION = "start_session"
     STOP_SESSION = "stop_session"
     ABORT_SESSION = "abort_session"
 
 
-class ServerMessageType(str, Enum):
+class ServerMessageType(StrEnum):
     SESSION_STARTED = "session_started"
     FINAL_RESULT = "final_result"
     ERROR = "error"
@@ -34,11 +36,17 @@ class ServerMessageType(str, Enum):
     AUDIO_LEVEL = "audio_level"
 
 
-class InterimStateValue(str, Enum):
+class InterimStateValue(StrEnum):
     LISTENING = "listening"
     PROCESSING = "processing"
     INTERIM = "interim"
     FINALIZING = "finalizing"
+
+
+class SessionEndReason(StrEnum):
+    FINAL = "final"
+    ABORT = "abort"
+    ERROR = "error"
 
 
 class StartSession(BaseModel):
@@ -116,7 +124,7 @@ class StatusMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[ServerMessageType.STATUS] = Field(default=ServerMessageType.STATUS)
-    state: Literal["idle", "listening", "processing"]
+    state: SessionState
     sessions_active: int
     gpu_mem_mb: int | None = None
     device: str | None = None
@@ -176,7 +184,7 @@ class SessionEndedMessage(BaseModel):
 
     type: Literal[ServerMessageType.SESSION_ENDED] = Field(default=ServerMessageType.SESSION_ENDED)
     session_id: UUID
-    reason: Literal["final", "abort", "error"] | None = None
+    reason: SessionEndReason | None = None
 
 
 ServerMessage = (
@@ -218,6 +226,7 @@ __all__ = [
     "ServerMessage",
     "ServerMessageType",
     "InterimStateValue",
+    "SessionEndReason",
     "StartSession",
     "StopSession",
     "AbortSession",
