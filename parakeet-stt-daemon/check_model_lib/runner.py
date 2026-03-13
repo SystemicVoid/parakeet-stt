@@ -9,10 +9,19 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from parakeet_stt_daemon.model import (
+    ParakeetStreamingTranscriber,
+    ParakeetTranscriber,
+    load_parakeet_model,
+)
 
 from check_model_lib.constants import (
     DEFAULT_BASELINE_OUTPUT,
     DEFAULT_BENCH_OUTPUT,
+    PROBE_STREAM_BATCH_SIZE,
+    PROBE_STREAM_CHUNK_SECS,
+    PROBE_STREAM_LEFT_CONTEXT_SECS,
+    PROBE_STREAM_RIGHT_CONTEXT_SECS,
     SAMPLE_RATE,
 )
 from check_model_lib.corpus import BenchmarkCase, _resolve_benchmark_cases
@@ -41,11 +50,6 @@ from check_model_lib.runtime import (
     split_chunks,
 )
 from check_model_lib.thresholds import evaluate_regression_thresholds
-from parakeet_stt_daemon.model import (
-    ParakeetStreamingTranscriber,
-    ParakeetTranscriber,
-    load_parakeet_model,
-)
 
 
 def _run_benchmark_once(
@@ -473,10 +477,10 @@ def run_streaming_probe(model, samples: np.ndarray) -> str:
     try:
         streamer = ParakeetStreamingTranscriber(
             model,
-            chunk_secs=1.6,
-            right_context_secs=2.4,
-            left_context_secs=2.0,
-            batch_size=4,
+            chunk_secs=PROBE_STREAM_CHUNK_SECS,
+            right_context_secs=PROBE_STREAM_RIGHT_CONTEXT_SECS,
+            left_context_secs=PROBE_STREAM_LEFT_CONTEXT_SECS,
+            batch_size=PROBE_STREAM_BATCH_SIZE,
         )
     except Exception as exc:  # noqa: BLE001 - probe command must report any helper init failure
         return f"streaming helper init failed: {exc}"

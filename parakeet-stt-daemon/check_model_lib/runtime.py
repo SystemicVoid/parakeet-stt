@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
 
 from check_model_lib.constants import SAMPLE_RATE
-from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
 
 
 def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
@@ -150,7 +150,10 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
             pass  # pragma: no cover - minimal fallback
 
     # Minimal fallback path for environments without soundfile or where writes fail.
-    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+    mono_samples = np.asarray(samples, dtype=np.float32)
+    if mono_samples.ndim == 2:
+        mono_samples = mono_samples.mean(axis=1)
+    pcm = (np.clip(mono_samples, -1.0, 1.0) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -159,4 +162,6 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
 
 
 def split_chunks(samples: np.ndarray, chunk_size: int) -> list[np.ndarray]:
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
     return [samples[idx : idx + chunk_size] for idx in range(0, samples.size, chunk_size)]
