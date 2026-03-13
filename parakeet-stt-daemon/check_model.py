@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import sys
 import tempfile
 import time
 import unicodedata
@@ -13,139 +13,41 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-from parakeet_stt_daemon.model import (
+# Bootstrap sibling package imports for both direct execution and importlib loading.
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+import numpy as np  # noqa: E402
+from check_model_lib.constants import (  # noqa: E402
+    _ALLOWED_DOMAINS,
+    _COMMAND_ARTICLES,
+    _COMMAND_FILLER_TOKENS,
+    _COMMAND_INTENT_SYNONYMS,
+    _COMMAND_TRANSLATION,
+    _PUNCT_TOKEN_RE,
+    _TERMINAL_PUNCT_RE,
+    _TOKEN_RE,
+    _TRANSCRIPT_LINE_RE,
+    BENCH_AUDIO_DIR,
+    DEFAULT_BASELINE_OUTPUT,
+    DEFAULT_BENCH_OUTPUT,
+    DEFAULT_STREAM_BATCH_SIZE,
+    DEFAULT_STREAM_CHUNK_SECS,
+    DEFAULT_STREAM_LEFT_CONTEXT_SECS,
+    DEFAULT_STREAM_MAX_TAIL_TRIM_SECS,
+    DEFAULT_STREAM_RIGHT_CONTEXT_SECS,
+    DEFAULT_STREAM_SILENCE_FLOOR_DB,
+    HARNESS_DIR,
+    PROFILE_DEFAULTS,
+    SAMPLE_RATE,
+)
+from parakeet_stt_daemon.model import (  # noqa: E402
     DEFAULT_MODEL_NAME,
     ParakeetStreamingTranscriber,
     ParakeetTranscriber,
     load_parakeet_model,
 )
-
-SAMPLE_RATE = 16_000
-BENCH_AUDIO_DIR = Path(__file__).resolve().parent / "bench_audio"
-DEFAULT_BENCH_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_results.json"
-DEFAULT_BASELINE_OUTPUT = BENCH_AUDIO_DIR / "offline_benchmark_baseline.json"
-_TRANSCRIPT_LINE_RE = re.compile(r"^\s*(?P<index>\d+)\.\s*(?P<text>.+?)\s*$")
-_TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
-_PUNCT_TOKEN_RE = re.compile(r"[.,?!;:]", flags=re.UNICODE)
-_TERMINAL_PUNCT_RE = re.compile(r"([.?!])\s*$", flags=re.UNICODE)
-_ALLOWED_DOMAINS = {"command", "dictation"}
-
-DEFAULT_STREAM_CHUNK_SECS = 2.4
-DEFAULT_STREAM_RIGHT_CONTEXT_SECS = 1.6
-DEFAULT_STREAM_LEFT_CONTEXT_SECS = 10.0
-DEFAULT_STREAM_BATCH_SIZE = 32
-DEFAULT_STREAM_SILENCE_FLOOR_DB = -40.0
-DEFAULT_STREAM_MAX_TAIL_TRIM_SECS = 0.35
-
-_COMMAND_ARTICLES = frozenset({"a", "an", "the"})
-_COMMAND_FILLER_TOKENS = frozenset(
-    {
-        "and",
-        "can",
-        "could",
-        "for",
-        "i",
-        "like",
-        "me",
-        "my",
-        "of",
-        "on",
-        "or",
-        "please",
-        "then",
-        "to",
-        "uh",
-        "um",
-        "we",
-        "with",
-        "you",
-    }
-)
-_COMMAND_INTENT_SYNONYMS = {
-    "begin": "start",
-    "browse": "open",
-    "build": "run",
-    "change": "edit",
-    "create": "make",
-    "delete": "remove",
-    "execute": "run",
-    "find": "search",
-    "launch": "open",
-    "modify": "edit",
-    "new": "make",
-    "open": "open",
-    "remove": "remove",
-    "rename": "move",
-    "run": "run",
-    "search": "search",
-    "start": "start",
-    "update": "edit",
-}
-
-_COMMAND_TRANSLATION = str.maketrans(
-    {
-        "“": '"',
-        "”": '"',
-        "‘": "'",
-        "’": "'",
-        "—": "-",
-        "–": "-",
-        "‑": "-",
-        "‐": "-",
-    }
-)
-
-PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
-    "all": {
-        "bench_runs": 2,
-        "warmup_samples": 1,
-        "max_weighted_wer": 0.20,
-        "min_command_exact_match": 0.70,
-        "min_critical_token_recall": 0.94,
-        "min_punctuation_f1": 0.70,
-        "min_terminal_punctuation_accuracy": 0.85,
-        "max_warm_p95_finalize_ms": 180.0,
-        "max_weighted_wer_delta": 0.03,
-        "max_command_exact_match_drop": 0.05,
-        "max_critical_token_recall_drop": 0.03,
-        "max_punctuation_f1_drop": 0.08,
-        "max_terminal_punctuation_accuracy_drop": 0.08,
-        "max_warm_p95_finalize_ms_delta": 40.0,
-    },
-    "smoke": {
-        "bench_runs": 1,
-        "warmup_samples": 1,
-        "max_weighted_wer": 0.28,
-        "min_command_exact_match": 0.60,
-        "min_critical_token_recall": 0.90,
-        "max_warm_p95_finalize_ms": 240.0,
-    },
-    "daily": {
-        "bench_runs": 2,
-        "warmup_samples": 1,
-        "max_weighted_wer": 0.20,
-        "min_command_exact_match": 0.70,
-        "min_critical_token_recall": 0.94,
-        "max_warm_p95_finalize_ms": 180.0,
-        "max_weighted_wer_delta": 0.03,
-        "max_command_exact_match_drop": 0.05,
-        "max_critical_token_recall_drop": 0.03,
-        "max_warm_p95_finalize_ms_delta": 40.0,
-    },
-    "weekly": {
-        "bench_runs": 3,
-        "warmup_samples": 1,
-        "max_weighted_wer": 0.18,
-        "min_command_exact_match": 0.75,
-        "min_critical_token_recall": 0.95,
-        "max_warm_p95_finalize_ms": 160.0,
-        "max_weighted_wer_delta": 0.02,
-        "max_command_exact_match_drop": 0.04,
-        "max_critical_token_recall_drop": 0.02,
-        "max_warm_p95_finalize_ms_delta": 30.0,
-    },
-}
 
 
 @dataclass(frozen=True)
@@ -1887,7 +1789,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path for benchmark JSON output "
-            f"(defaults to {DEFAULT_BENCH_OUTPUT.relative_to(Path(__file__).resolve().parent)})"
+            f"(defaults to {DEFAULT_BENCH_OUTPUT.relative_to(HARNESS_DIR)})"
         ),
     )
     parser.add_argument(
@@ -1958,7 +1860,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to write baseline JSON when --calibrate-baseline is set "
-            f"(defaults to {DEFAULT_BASELINE_OUTPUT.relative_to(Path(__file__).resolve().parent)})"
+            f"(defaults to {DEFAULT_BASELINE_OUTPUT.relative_to(HARNESS_DIR)})"
         ),
     )
     parser.add_argument(
