@@ -576,7 +576,9 @@ PY
     }
 
     _tmux_kill_session() {
-        _tmux_has_session "$1" && tmux kill-session -t "$1"
+        if _tmux_has_session "$1"; then
+            tmux kill-session -t "$1"
+        fi
     }
 
     _llm_health_url() {
@@ -703,7 +705,8 @@ PY
 
     _stop_llm_server() {
         local stopped=0
-        if _tmux_kill_session "$LLM_TMUX_SESSION"; then
+        if _tmux_has_session "$LLM_TMUX_SESSION"; then
+            _tmux_kill_session "$LLM_TMUX_SESSION"
             stopped=1
         fi
         if _http_ok_once "$(_llm_health_url)"; then
