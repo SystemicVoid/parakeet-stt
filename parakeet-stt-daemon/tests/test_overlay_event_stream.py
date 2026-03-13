@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import numpy as np
+from loguru import logger
 from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import (
@@ -166,6 +169,7 @@ def _build_server(
     server._overlay_event_seq_by_session = {}
     server._overlay_last_interim_text_by_session = {}
     server._overlay_interim_transcript_by_session = {}
+    server._overlay_interim_source_seq_by_session = {}
     server._overlay_state_by_session = {}
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
@@ -211,6 +215,16 @@ def _pause_guard_sleep(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
 
     monkeypatch.setattr(server_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
     return guard_sleep_entered, allow_guard_resume
+
+
+@contextmanager
+def _capture_loguru_messages() -> Any:
+    buffer = io.StringIO()
+    handler_id = logger.add(buffer, format="{message}")
+    try:
+        yield buffer
+    finally:
+        logger.remove(handler_id)
 
 
 def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> None:
@@ -551,6 +565,150 @@ def test_live_interim_zero_overlap_rewrite_replaces_mutable_tail(monkeypatch) ->
             if payload["type"] == "interim_text"
         ]
         assert interim_texts == ["their", "there speech"]
+
+    asyncio.run(scenario())
+
+
+def test_live_interim_stabilizer_logs_when_streaming_debug_enabled(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        monkeypatch.setenv("PARAKEET_STREAMING_DEBUG", "1")
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=["alpha beta", "beta gamma"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        with _capture_loguru_messages() as log_output:
+            await server._handle_start(cast(Any, websocket), _start_message(session_id))
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.1, dtype=np.float32)
+            )
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.2, dtype=np.float32)
+            )
+
+        messages = log_output.getvalue()
+        assert "overlay_stabilizer" in messages
+        assert f"session_id={session_id}" in messages
+        assert "source=live source_seq=0" in messages
+        assert "source=live source_seq=1" in messages
+        assert 'raw_text="beta gamma"' in messages
+        assert "overlap=1" in messages
+        assert 'current_display="alpha beta gamma"' in messages
+
+    asyncio.run(scenario())
+
+
+def test_stop_path_stabilizer_logs_when_streaming_debug_enabled(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        monkeypatch.setenv("PARAKEET_STREAMING_DEBUG", "true")
+
+        ready_chunks = [np.full((400,), 0.1, dtype=np.float32) for _ in range(2)]
+        server = _build_server(
+            overlay_events_enabled=True,
+            ready_chunks=ready_chunks,
+            incremental_outputs=["phase one", "one two"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        with _capture_loguru_messages() as log_output:
+            await server._handle_start(cast(Any, websocket), _start_message(session_id))
+            await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
+
+        messages = log_output.getvalue()
+        assert "source=stop_replay source_seq=0" in messages
+        assert "source=stop_replay source_seq=1" in messages
+        assert 'raw_text="one two"' in messages
+        assert "overlap=1" in messages
+        assert 'current_display="phase one two"' in messages
+
+    asyncio.run(scenario())
+
+
+def test_stabilizer_logs_empty_candidate_action_when_debug_enabled(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        monkeypatch.setenv("PARAKEET_STREAMING_DEBUG", "on")
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=["   "],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        with _capture_loguru_messages() as log_output:
+            await server._handle_start(cast(Any, websocket), _start_message(session_id))
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.1, dtype=np.float32)
+            )
+
+        messages = log_output.getvalue()
+        assert "overlay_stabilizer" in messages
+        assert "action=empty" in messages
+        assert 'normalized_text=""' in messages
+        assert all(payload["type"] != "interim_text" for payload in websocket.sent_json)
+
+    asyncio.run(scenario())
+
+
+def test_stabilizer_logs_skip_on_live_transcribe_error_when_debug_enabled(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        monkeypatch.setenv("PARAKEET_STREAMING_DEBUG", "yes")
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=["ignored"],
+            incremental_fail_at_call=1,
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        with _capture_loguru_messages() as log_output:
+            await server._handle_start(cast(Any, websocket), _start_message(session_id))
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.1, dtype=np.float32)
+            )
+
+        messages = log_output.getvalue()
+        assert "overlay_stabilizer_skip" in messages
+        assert "source=live source_seq=0" in messages
+        assert "reason=transcribe_error" in messages
+        assert "error_class=RuntimeError" in messages
+
+    asyncio.run(scenario())
+
+
+def test_stabilizer_logging_is_disabled_by_default(monkeypatch) -> None:
+    async def scenario() -> None:
+        _disable_server_sleep(monkeypatch)
+        monkeypatch.delenv("PARAKEET_STREAMING_DEBUG", raising=False)
+
+        server = _build_server(
+            overlay_events_enabled=True,
+            incremental_outputs=["alpha beta", "beta gamma"],
+        )
+        websocket = FakeWebSocket()
+        session_id = uuid4()
+
+        with _capture_loguru_messages() as log_output:
+            await server._handle_start(cast(Any, websocket), _start_message(session_id))
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.1, dtype=np.float32)
+            )
+            await server._emit_live_interim_from_chunk(
+                cast(Any, websocket), session_id, np.full((400,), 0.2, dtype=np.float32)
+            )
+
+        messages = log_output.getvalue()
+        assert "overlay_stabilizer" not in messages
+        assert "overlay_stabilizer_skip" not in messages
 
     asyncio.run(scenario())
 
