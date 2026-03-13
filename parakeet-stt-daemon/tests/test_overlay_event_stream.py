@@ -1110,7 +1110,7 @@ def test_phase6_overlay_crash_mid_session_contract_keeps_final_non_fatal(monkeyp
     asyncio.run(scenario())
 
 
-def test_live_interim_context_window_is_bounded() -> None:
+def test_live_interim_context_window_grows_across_session() -> None:
     async def scenario() -> None:
         server = _build_server(
             overlay_events_enabled=True,
@@ -1124,16 +1124,14 @@ def test_live_interim_context_window_is_bounded() -> None:
         for _ in range(8):
             await server._emit_live_interim_from_chunk(cast(Any, websocket), session_id, chunk)
 
-        max_seen = max(cast(Any, server.transcriber).sample_sizes)
-        expected_max = int(
-            server.audio.sample_rate * server_module.OVERLAY_INTERIM_CONTEXT_WINDOW_SECS
-        )
-        assert max_seen <= expected_max
+        sample_sizes = cast(Any, server.transcriber).sample_sizes
+        assert sample_sizes == sorted(sample_sizes)
+        assert sample_sizes[-1] == 8 * 8_000
 
     asyncio.run(scenario())
 
 
-def test_stop_path_interim_context_window_is_bounded(monkeypatch) -> None:
+def test_stop_path_interim_context_window_grows_across_chunks(monkeypatch) -> None:
     async def scenario() -> None:
         _disable_server_sleep(monkeypatch)
 
@@ -1149,10 +1147,8 @@ def test_stop_path_interim_context_window_is_bounded(monkeypatch) -> None:
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
         await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
 
-        max_seen = max(cast(Any, server.transcriber).sample_sizes)
-        expected_max = int(
-            server.audio.sample_rate * server_module.OVERLAY_INTERIM_CONTEXT_WINDOW_SECS
-        )
-        assert max_seen <= expected_max
+        sample_sizes = cast(Any, server.transcriber).sample_sizes
+        assert sample_sizes == sorted(sample_sizes)
+        assert sample_sizes[-1] == 8 * 8_000
 
     asyncio.run(scenario())

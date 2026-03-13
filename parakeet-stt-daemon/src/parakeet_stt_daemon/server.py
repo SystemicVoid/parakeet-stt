@@ -54,7 +54,6 @@ ErrorCode = Literal[
     "INVALID_REQUEST",
     "UNEXPECTED",
 ]
-OVERLAY_INTERIM_CONTEXT_WINDOW_SECS = 2.0
 OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
 SESSION_GUARD_POLL_SECS = 0.1
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
@@ -645,19 +644,14 @@ class DaemonServer:
     def _owner_token_for_websocket(self, websocket: WebSocket) -> int:
         return id(websocket)
 
+    @staticmethod
     def _append_overlay_interim_context(
-        self,
         existing: np.ndarray,
         chunk_audio: np.ndarray,
     ) -> np.ndarray:
         if existing.size == 0:
-            combined = np.array(chunk_audio, copy=True)
-        else:
-            combined = np.concatenate((existing, chunk_audio))
-        max_samples = max(1, int(self.audio.sample_rate * OVERLAY_INTERIM_CONTEXT_WINDOW_SECS))
-        if combined.size > max_samples:
-            return combined[-max_samples:]
-        return combined
+            return np.array(chunk_audio, copy=True)
+        return np.concatenate((existing, chunk_audio))
 
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
