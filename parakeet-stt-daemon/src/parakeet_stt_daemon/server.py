@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from typing import Literal
@@ -55,6 +56,23 @@ OVERLAY_INTERIM_CONTEXT_WINDOW_SECS = 2.0
 OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
 SESSION_GUARD_POLL_SECS = 0.1
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
+
+
+@dataclass
+class OverlayInterimTranscriptState:
+    committed_tokens: list[str] = field(default_factory=list)
+    draft_tokens: list[str] = field(default_factory=list)
+
+
+def _longest_casefold_suffix_prefix_overlap(existing: list[str], current: list[str]) -> int:
+    max_overlap = min(len(existing), len(current))
+    for overlap in range(max_overlap, 0, -1):
+        if all(
+            existing[len(existing) - overlap + index].casefold() == current[index].casefold()
+            for index in range(overlap)
+        ):
+            return overlap
+    return 0
 
 
 class DaemonServer:
@@ -119,6 +137,7 @@ class DaemonServer:
             self.audio.configure_stream_chunk_size(chunk_samples)
         self._overlay_event_seq_by_session: dict[UUID, int] = {}
         self._overlay_last_interim_text_by_session: dict[UUID, str] = {}
+        self._overlay_interim_transcript_by_session: dict[UUID, OverlayInterimTranscriptState] = {}
         self._overlay_state_by_session: dict[UUID, str] = {}
         self._overlay_events_emitted = 0
         self._overlay_events_dropped = 0
@@ -302,7 +321,13 @@ class DaemonServer:
                 finalize_ms: int | None = None
                 infer_ms: int | None = None
                 try:
-                    interim_updates = await self._collect_interim_text_updates(ready_chunks)
+                    interim_updates = await self._collect_interim_text_updates(
+                        session.session_id,
+                        ready_chunks,
+                    )
+                    flushed_interim = self._flush_overlay_interim_pending_tail(session.session_id)
+                    if flushed_interim is not None:
+                        interim_updates.append(flushed_interim)
                     if interim_updates:
                         await self._emit_interim_state(
                             websocket,
@@ -708,6 +733,9 @@ class DaemonServer:
         overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
         if isinstance(overlay_last_text, dict):
             overlay_last_text.pop(session_id, None)
+        overlay_transcripts = getattr(self, "_overlay_interim_transcript_by_session", None)
+        if isinstance(overlay_transcripts, dict):
+            overlay_transcripts.pop(session_id, None)
 
     def _next_overlay_seq(self, session_id: UUID) -> int:
         overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
@@ -786,7 +814,58 @@ class DaemonServer:
         message = AudioLevelMessage(session_id=session_id, level_db=level_db)
         await self._send_overlay_message(websocket, session_id, message.model_dump(mode="json"))
 
-    async def _collect_interim_text_updates(self, ready_chunks: list[np.ndarray]) -> list[str]:
+    def _overlay_interim_transcript_state(
+        self,
+        session_id: UUID,
+    ) -> OverlayInterimTranscriptState:
+        overlay_transcripts = getattr(self, "_overlay_interim_transcript_by_session", None)
+        if not isinstance(overlay_transcripts, dict):
+            overlay_transcripts = {}
+            self._overlay_interim_transcript_by_session = overlay_transcripts
+        state = overlay_transcripts.get(session_id)
+        if state is None:
+            state = OverlayInterimTranscriptState()
+            overlay_transcripts[session_id] = state
+        return state
+
+    def _overlay_interim_display_tokens(self, session_id: UUID) -> list[str]:
+        state = self._overlay_interim_transcript_state(session_id)
+        return [*state.committed_tokens, *state.draft_tokens]
+
+    def _overlay_interim_display_text(self, session_id: UUID) -> str | None:
+        display_tokens = self._overlay_interim_display_tokens(session_id)
+        if not display_tokens:
+            return None
+        return " ".join(display_tokens)
+
+    def _stabilize_overlay_interim_text(self, session_id: UUID, text: str) -> str | None:
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return None
+
+        state = self._overlay_interim_transcript_state(session_id)
+        raw_tokens = normalized.split()
+        previous_display_tokens = [*state.committed_tokens, *state.draft_tokens]
+        previous_display = " ".join(previous_display_tokens)
+        overlap = _longest_casefold_suffix_prefix_overlap(previous_display_tokens, raw_tokens)
+
+        if overlap > 0:
+            state.committed_tokens = previous_display_tokens[:-overlap]
+        state.draft_tokens = raw_tokens
+
+        current_display = " ".join([*state.committed_tokens, *state.draft_tokens])
+        if current_display == previous_display:
+            return None
+        return current_display
+
+    def _flush_overlay_interim_pending_tail(self, session_id: UUID) -> str | None:
+        return self._overlay_interim_display_text(session_id)
+
+    async def _collect_interim_text_updates(
+        self,
+        session_id: UUID,
+        ready_chunks: list[np.ndarray],
+    ) -> list[str]:
         if not self.settings.overlay_events_enabled:
             return []
         if not ready_chunks:
@@ -794,7 +873,6 @@ class DaemonServer:
 
         rolling_audio = np.zeros((0,), dtype=np.float32)
         updates: list[str] = []
-        last_text = ""
 
         for chunk in ready_chunks:
             chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
@@ -809,11 +887,9 @@ class DaemonServer:
                     exc.__class__.__name__,
                 )
                 break
-            normalized = " ".join(candidate.split()).strip()
-            if not normalized or normalized == last_text:
-                continue
-            updates.append(normalized)
-            last_text = normalized
+            stabilized = self._stabilize_overlay_interim_text(session_id, candidate)
+            if stabilized is not None:
+                updates.append(stabilized)
         return updates
 
     async def _emit_interim_text(
@@ -829,8 +905,10 @@ class DaemonServer:
         if not normalized:
             return
         last_by_session = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if isinstance(last_by_session, dict) and last_by_session.get(session_id) == normalized:
-            return
+        if isinstance(last_by_session, dict):
+            prev = last_by_session.get(session_id)
+            if prev == normalized:
+                return
         message = InterimTextMessage(
             session_id=session_id,
             seq=self._next_overlay_seq(session_id),
@@ -889,7 +967,9 @@ class DaemonServer:
             )
             self._live_interim_failed = True
             return
-        await self._emit_interim_text(websocket, session_id, text=candidate)
+        stabilized = self._stabilize_overlay_interim_text(session_id, candidate)
+        if stabilized is not None:
+            await self._emit_interim_text(websocket, session_id, text=stabilized)
 
     def status(self) -> StatusMessage:
         active = self.sessions.active

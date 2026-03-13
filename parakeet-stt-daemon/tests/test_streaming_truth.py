@@ -6,6 +6,7 @@ import asyncio
 from typing import Any, cast
 from uuid import uuid4
 
+import numpy as np
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
@@ -74,12 +75,15 @@ def _build_server(
     server._last_finalize_ms = None
     server._last_infer_ms = None
     server._last_send_ms = None
-    server._live_interim_chunks = []
+    server._live_interim_audio = np.zeros((0,), dtype=np.float32)
     server._live_interim_failed = False
     server._overlay_event_seq_by_session = {}
     server._overlay_last_interim_text_by_session = {}
+    server._overlay_interim_transcript_by_session = {}
+    server._overlay_state_by_session = {}
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
+    server._websocket_send_locks = {}
     server._vad_model = None
     server._vad_failure_reason = None
     server._vad_enabled = vad_enabled
