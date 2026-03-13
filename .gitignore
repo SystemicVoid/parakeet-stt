@@ -39,3 +39,6 @@ Screenshot_2026-03-02_19-38-17.png
 # Debug investigation notes (local-only)
 /OVERLAY-FLASH-BUG.md
 OPEN-ISSUES-TRACKER.md
+
+# OB1 local config
+.ob1/
