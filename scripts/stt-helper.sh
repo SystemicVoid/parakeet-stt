@@ -564,6 +564,21 @@ PY
         return 0
     }
 
+    _tmux_require() {
+        if ! command -v tmux >/dev/null 2>&1; then
+            echo "${1:-tmux is not installed; install it first (sudo apt install tmux).}"
+            return 1
+        fi
+    }
+
+    _tmux_has_session() {
+        command -v tmux >/dev/null 2>&1 && tmux has-session -t "$1" 2>/dev/null
+    }
+
+    _tmux_kill_session() {
+        _tmux_has_session "$1" && tmux kill-session -t "$1"
+    }
+
     _llm_health_url() {
         printf "http://%s:%s/health" "$default_llm_server_host" "$default_llm_server_port"
     }
@@ -600,10 +615,7 @@ PY
     }
 
     _llm_validate_server_config() {
-        if ! command -v tmux >/dev/null 2>&1; then
-            echo "   - tmux is required for 'stt llm'. Install with: sudo apt install tmux"
-            return 1
-        fi
+        _tmux_require "   - tmux is required for 'stt llm'. Install with: sudo apt install tmux" || return 1
         if ! command -v "$default_llm_server_bin" >/dev/null 2>&1; then
             echo "   - LLM server binary '$default_llm_server_bin' was not found in PATH."
             return 1
@@ -651,9 +663,7 @@ PY
             return 0
         fi
 
-        if tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
-            tmux kill-session -t "$LLM_TMUX_SESSION"
-        fi
+        _tmux_kill_session "$LLM_TMUX_SESSION"
         if _pid_alive "$LLM_PID_FILE"; then
             _stop_pid "$LLM_PID_FILE" >/dev/null 2>&1 || true
         fi
@@ -693,8 +703,7 @@ PY
 
     _stop_llm_server() {
         local stopped=0
-        if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
-            tmux kill-session -t "$LLM_TMUX_SESSION"
+        if _tmux_kill_session "$LLM_TMUX_SESSION"; then
             stopped=1
         fi
         if _http_ok_once "$(_llm_health_url)"; then
@@ -1077,10 +1086,7 @@ CLIENTCMD
                 return 1
             fi
 
-            if ! command -v tmux >/dev/null 2>&1; then
-                echo "   - tmux is required for the default start path. Install with: sudo apt install tmux"
-                return 1
-            fi
+            _tmux_require "   - tmux is required for the default start path. Install with: sudo apt install tmux" || return 1
             if [ ! -x "$CLIENT_DIR/target/release/parakeet-ptt" ] && ! command -v cargo >/dev/null 2>&1; then
                 echo "   - Release binary missing and 'cargo' not found. Build the client first."
                 return 1
@@ -1094,9 +1100,7 @@ CLIENTCMD
             echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
             _log_client "start client in tmux (mode: $injection_mode)"
 
-            if tmux has-session -t "$TMUX_SESSION" >/dev/null 2>&1; then
-                tmux kill-session -t "$TMUX_SESSION"
-            fi
+            _tmux_kill_session "$TMUX_SESSION"
 
             local -a ptt_args
             _build_ptt_args ptt_args
@@ -1223,7 +1227,7 @@ CLIENTCMD
                     if [ -f "$LLM_PORT_FILE" ]; then
                         echo "   - LLM port file: $(cat "$LLM_PORT_FILE")"
                     fi
-                    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+                    if _tmux_has_session "$LLM_TMUX_SESSION"; then
                         echo "   - LLM tmux session: $LLM_TMUX_SESSION"
                     fi
                     stt status
@@ -1233,11 +1237,8 @@ CLIENTCMD
                     tail -f "$LOG_LLM"
                     ;;
                 show|attach)
-                    if ! command -v tmux >/dev/null 2>&1; then
-                        echo "tmux is not installed; install it first (sudo apt install tmux)."
-                        return 1
-                    fi
-                    if tmux has-session -t "$LLM_TMUX_SESSION" 2>/dev/null; then
+                    _tmux_require || return 1
+                    if _tmux_has_session "$LLM_TMUX_SESSION"; then
                         echo "Attaching to llama tmux session '$LLM_TMUX_SESSION' (Ctrl+b d to detach)..."
                         tmux attach -t "$LLM_TMUX_SESSION"
                     else
@@ -1271,9 +1272,7 @@ CLIENTCMD
                 kill -TERM "$(cat "$CLIENT_PID_FILE")" 2>/dev/null || true
             fi
             pkill -f "[p]arakeet-ptt" >/dev/null 2>&1 && echo "   - Client stopped"
-            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-                tmux kill-session -t "$TMUX_SESSION"
-            fi
+            _tmux_kill_session "$TMUX_SESSION"
 
             if _socket_ready_once; then
                 _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
@@ -1303,11 +1302,8 @@ CLIENTCMD
             esac
             ;;
         show|attach)
-            if ! command -v tmux >/dev/null 2>&1; then
-                echo "tmux is not installed; install it first (sudo apt install tmux)."
-                return 1
-            fi
-            if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            _tmux_require || return 1
+            if _tmux_has_session "$TMUX_SESSION"; then
                 echo "Attaching to tmux session '$TMUX_SESSION' (Ctrl+b d to detach)..."
                 tmux attach -t "$TMUX_SESSION"
             else
@@ -1338,17 +1334,14 @@ CLIENTCMD
                 echo "   - Matching processes:"
                 pgrep -af "[p]arakeet" | sed 's/^/     /'
             fi
-            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            if _tmux_has_session "$TMUX_SESSION"; then
                 echo "   - tmux session: $TMUX_SESSION"
             fi
             ;;
         tmux)
-            if ! command -v tmux >/dev/null 2>&1; then
-                echo "tmux is not installed; install it first (sudo apt install tmux)."
-                return 1
-            fi
+            _tmux_require || return 1
             local action="${1:-attach}"
-            if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            if _tmux_has_session "$TMUX_SESSION"; then
                 if [ "$action" = "kill" ]; then
                     tmux kill-session -t "$TMUX_SESSION"
                     echo "Killed tmux session '$TMUX_SESSION'."
