@@ -98,6 +98,7 @@ stt() {
     local default_llm_temperature="${PARAKEET_LLM_TEMPERATURE:-0.7}"
     local default_llm_system_prompt="${PARAKEET_LLM_SYSTEM_PROMPT:-You are a concise assistant. Return only the final answer text for direct insertion.}"
     local default_llm_overlay_stream="${PARAKEET_LLM_OVERLAY_STREAM:-true}"
+    local default_daemon_device="${PARAKEET_DEVICE:-cuda}"
     local default_daemon_streaming_enabled="false"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
@@ -141,6 +142,9 @@ stt() {
     elif [ "$cmd" = "on" ]; then
         cmd="start"
         set -- streaming "$@"
+    elif [ "$cmd" = "cpu" ]; then
+        cmd="start"
+        set -- cpu "$@"
     fi
 
     _apply_launch_profile_defaults() {
@@ -159,6 +163,17 @@ stt() {
 
         if [ "$profile" = "offline" ]; then
             # "stt off" favors fastest accurate offline dictation with no overlay.
+            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+                default_overlay_enabled="false"
+            fi
+            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+                default_overlay_adaptive_width="false"
+            fi
+        fi
+
+        if [ "$profile" = "cpu" ]; then
+            # "stt cpu" runs offline on CPU; no streaming, no overlay.
+            default_daemon_device="cpu"
             if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
                 default_overlay_enabled="false"
             fi
@@ -251,6 +266,9 @@ stt() {
         case "$launch_profile" in
             offline)
                 out_ref+=(offline)
+                ;;
+            cpu)
+                out_ref+=(cpu)
                 ;;
             *)
                 out_ref+=(streaming)
@@ -767,12 +785,14 @@ Usage:
   stt start [options]
   stt stream [options]
   stt off [options]
+  stt cpu [options]
   stt <command> [args]
 
 Commands:
   start [options]        Start daemon + client (default command).
   stream [options]       Start daemon/client in stream+seal mode.
   off [options]          Start daemon/client in offline mode (overlay off).
+  cpu [options]          Start daemon/client in offline CPU-only mode.
   llm [args]             Start/stop/status the managed llama + STT stack.
   stop                   Stop daemon/client and remove pid/port files.
   restart [options]      Restart with the same options as start.
@@ -790,12 +810,13 @@ EOF
         _apply_launch_profile_defaults "stream-seal"
         cat <<EOF
 Usage:
-  stt start [streaming|offline] [options]
+  stt start [streaming|offline|cpu] [options]
 
 Modes:
   (default) streaming    Launch daemon with stream+seal + overlay defaults.
   streaming|stream       Launch daemon with stream+seal enabled.
   offline|off            Launch daemon with streaming disabled.
+  cpu                    Launch daemon in offline mode on CPU (no GPU).
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
@@ -808,6 +829,7 @@ EOF
         cat <<EOF
 
 Other environment overrides:
+  PARAKEET_DEVICE=$default_daemon_device
   PARAKEET_HOST=$HOST
   PARAKEET_PORT=$PORT
   PARAKEET_CLIENT_READY_TIMEOUT_SECONDS=$default_client_ready_timeout_seconds
@@ -924,6 +946,9 @@ CLIENTCMD
             elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
                 launch_profile="offline"
                 shift
+            elif [ "${1:-}" = "cpu" ]; then
+                launch_profile="cpu"
+                shift
             fi
             _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
@@ -952,6 +977,9 @@ CLIENTCMD
             elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
                 launch_profile="offline"
                 shift
+            elif [ "${1:-}" = "cpu" ]; then
+                launch_profile="cpu"
+                shift
             fi
             _apply_launch_profile_defaults "$launch_profile"
             _load_start_vars_from_defaults
@@ -979,7 +1007,11 @@ CLIENTCMD
             elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
                 launch_profile="offline"
                 shift
+            elif [ "${1:-}" = "cpu" ]; then
+                launch_profile="cpu"
+                shift
             fi
+            local daemon_device="$default_daemon_device"
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local daemon_chunk_secs="$default_daemon_chunk_secs"
             local daemon_right_context_secs="$default_daemon_right_context_secs"
@@ -1031,6 +1063,7 @@ CLIENTCMD
             echo "   - LLM temperature: $llm_temperature"
             echo "   - LLM overlay stream: $llm_overlay_stream"
             echo "   - Launch profile: $launch_profile"
+            echo "   - Daemon device: $daemon_device"
             echo "   - Daemon streaming enabled: $daemon_streaming_enabled"
             echo "   - Daemon overlay events enabled: $daemon_overlay_events_enabled"
             echo "   - Daemon chunk/right/left/batch: ${daemon_chunk_secs}/${daemon_right_context_secs}/${daemon_left_context_secs}/${daemon_batch_size}"
@@ -1073,7 +1106,7 @@ CLIENTCMD
                     PARAKEET_BATCH_SIZE="$daemon_batch_size" \
                     PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
-                    setsid uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" </dev/null >> "$LOG_DAEMON" 2>&1 &
+                    setsid uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" --device "$daemon_device" </dev/null >> "$LOG_DAEMON" 2>&1 &
                     echo $! >| "$DAEMON_PID_FILE"
                 )
             fi
@@ -1174,7 +1207,7 @@ CLIENTCMD
                     local _STT_SKIP_LOCAL_OVERRIDES=1
                     stt start "$@"
                     ;;
-                stream|streaming|offline|off|on|--*)
+                stream|streaming|offline|off|on|cpu|--*)
                     local llm_base_url
                     echo ">>> Starting managed llama + Parakeet STT..."
                     echo "   - LLM binary: $default_llm_server_bin"
@@ -1258,7 +1291,7 @@ CLIENTCMD
             ;;
         restart)
             local restart_mode=""
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ]; then
+            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ] || [ "${1:-}" = "cpu" ]; then
                 restart_mode="$1"
                 shift
             fi
@@ -1378,7 +1411,7 @@ CLIENTCMD
             _load_start_vars_from_defaults
 
             local daemon_overlay_events_enabled="$overlay_enabled"
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_OVERLAY_EVENTS_ENABLED=\"$daemon_overlay_events_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" >> \"$LOG_DAEMON\" 2>&1"
+            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_OVERLAY_EVENTS_ENABLED=\"$daemon_overlay_events_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --device \"$default_daemon_device\" >> \"$LOG_DAEMON\" 2>&1"
 
             if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
                 echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
