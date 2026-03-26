@@ -56,7 +56,7 @@ def test_defaults_apply_without_env_or_cli(monkeypatch) -> None:
     assert settings.status_enabled is True
     assert settings.streaming_enabled is False
     assert settings.overlay_events_enabled is False
-    assert settings.max_session_seconds == 90.0
+    assert settings.max_session_seconds == 600.0
     assert settings.max_session_samples is None
 
 

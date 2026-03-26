@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -19,7 +19,7 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session import Session, SessionManager
 
 
 class FakeAudio:
@@ -28,6 +28,7 @@ class FakeAudio:
     def __init__(self) -> None:
         self.abort_calls = 0
         self.start_calls = 0
+        self.stop_calls = 0
         self.raise_on_start = False
         self._session_limit_exceeded = False
 
@@ -38,6 +39,11 @@ class FakeAudio:
 
     def abort_session(self) -> None:
         self.abort_calls += 1
+
+    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+        self.stop_calls += 1
+        samples = np.ones((1_600,), dtype=np.float32)
+        return samples, [], np.zeros((0,), dtype=np.float32)
 
     def take_stream_chunks(self) -> list[object]:
         return []
@@ -150,6 +156,17 @@ def _build_server() -> DaemonServer:
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     server._websocket_send_locks = {}
+
+    async def fake_collect_interim_text_updates(
+        _session_id: UUID, _ready_chunks: list[object]
+    ) -> list[str]:
+        return []
+
+    async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
+        return "final text", 7
+
+    server._collect_interim_text_updates = fake_collect_interim_text_updates
+    server._finalise_transcription = fake_finalize
     return cast(DaemonServer, server)
 
 
@@ -581,7 +598,7 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
     asyncio.run(scenario())
 
 
-def test_session_guard_aborts_when_audio_sample_limit_exceeded(monkeypatch) -> None:
+def test_session_guard_emits_warning_and_stops_when_audio_limit_exceeded(monkeypatch) -> None:
     async def scenario() -> None:
         guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
         server = _build_server()
@@ -593,18 +610,38 @@ def test_session_guard_aborts_when_audio_sample_limit_exceeded(monkeypatch) -> N
         await asyncio.wait_for(guard_sleep_entered.wait(), timeout=1.0)
         audio._session_limit_exceeded = True
         allow_guard_resume.set()
-        await asyncio.wait_for(_wait_for_session_to_clear(server), timeout=1.0)
+        # Guard should stop on its own without aborting the session.
+        await asyncio.sleep(0.15)
 
-        assert server.sessions.active is None
-        assert audio.abort_calls == 1
-        error_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        # Session stays active — finalization happens on stop_session.
+        assert server.sessions.active is not None
+        assert audio.abort_calls == 0
+        warning_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "session_warning"
         ]
-        assert error_payloads
-        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
-        assert "max buffered audio" in cast(str, error_payloads[-1]["message"])
+        assert warning_payloads
+        assert warning_payloads[-1]["warning"] == "approaching_limit"
 
     asyncio.run(scenario())
+
+
+def test_session_guard_warning_threshold_tracks_effective_sample_cap() -> None:
+    server = _build_server()
+    server.settings = ServerSettings(
+        device="cpu",
+        status_enabled=True,
+        streaming_enabled=False,
+        max_session_seconds=90.0,
+        max_session_samples=16_000,
+    )
+    server._session_age_limit_ms = 90_000
+    server._session_sample_limit = 16_000
+    session = Session(session_id=uuid4(), owner_token=1)
+    session.started_at = datetime.now(tz=UTC) - timedelta(milliseconds=850)
+
+    assert server._effective_session_limit_seconds() == 1.0
+    assert server._session_guard_warning_due(session) is True
+    assert 0.0 <= server._session_remaining_seconds(session) <= 0.2
 
 
 def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> None:
@@ -635,7 +672,7 @@ def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> No
     asyncio.run(scenario())
 
 
-def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
+def test_session_guard_auto_stops_when_duration_limit_exceeded() -> None:
     async def scenario() -> None:
         server = _build_server()
         audio = cast(FakeAudio, server.audio)
@@ -647,13 +684,17 @@ def test_session_guard_aborts_when_duration_limit_exceeded() -> None:
         await asyncio.sleep(0.15)
 
         assert server.sessions.active is None
-        assert audio.abort_calls == 1
-        error_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "error"
+        assert audio.abort_calls == 0
+        assert audio.stop_calls == 1
+        warning_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "session_warning"
         ]
-        assert error_payloads
-        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
-        assert "max duration" in cast(str, error_payloads[-1]["message"])
+        final_payloads = [
+            payload for payload in websocket.sent_json if payload.get("type") == "final_result"
+        ]
+        assert warning_payloads
+        assert final_payloads
+        assert warning_payloads[-1]["warning"] == "approaching_limit"
 
     asyncio.run(scenario())
 

@@ -29,6 +29,9 @@ pub enum OverlayIpcMessage {
         session_id: Uuid,
         reason: Option<String>,
     },
+    SessionWarning {
+        session_id: Uuid,
+    },
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -33,6 +34,7 @@ from .messages import (
     SessionEndedMessage,
     SessionEndReason,
     SessionStarted,
+    SessionWarningMessage,
     StartSession,
     StatusMessage,
     StopSession,
@@ -57,6 +59,7 @@ ErrorCode = Literal[
 ]
 OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
 SESSION_GUARD_POLL_SECS = 0.1
+SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
@@ -279,164 +282,164 @@ class DaemonServer:
 
     async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
         logger.debug("stop_session received: {}", message)
-        owner_token = self._owner_token_for_websocket(websocket)
-        await asyncio.sleep(0.25)  # brief post-roll to capture tail audio before stopping
-        abort_trigger: Literal["duration", "samples"] | None = None
+        await self._stop_active_session(
+            websocket,
+            message.session_id,
+            owner_token=self._owner_token_for_websocket(websocket),
+            post_roll_secs=0.25,
+        )
+
+    async def _stop_active_session(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        *,
+        owner_token: int,
+        post_roll_secs: float,
+    ) -> None:
+        if post_roll_secs > 0:
+            await asyncio.sleep(post_roll_secs)  # brief post-roll to capture tail audio
         async with self._session_lock_for_runtime():
             try:
-                session = await self.sessions.stop_session(
-                    message.session_id,
-                    owner_token=owner_token,
-                )
+                session = await self.sessions.stop_session(session_id, owner_token=owner_token)
             except SessionNotFoundError:
                 await self._send_error(
-                    websocket, message.session_id, "SESSION_NOT_FOUND", "No matching active session"
+                    websocket, session_id, "SESSION_NOT_FOUND", "No matching active session"
                 )
                 return
-            abort_trigger = self._session_guard_abort_trigger(session)
             self._stop_session_guard_loop()
-            if abort_trigger is None:
-                await self._emit_interim_state(
+            await self._emit_interim_state(
+                websocket,
+                session.session_id,
+                state=InterimStateValue.PROCESSING,
+            )
+            audio_stop_started = time.perf_counter()
+            audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
+            await self._stop_stream_drain_loop()
+            # Final correctness must come from the capture layer's canonical buffer,
+            # not whatever the drain task managed to mirror into `_active_stream`.
+            self._active_stream = None
+            audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
+            audio_duration_raw = len(audio_samples) / self.audio.sample_rate
+            audio_ms = int(audio_duration_raw * 1000)
+
+            if audio_samples.size == 0:
+                self._set_overlay_session_state(session.session_id, "terminal")
+                await self._send_error(
                     websocket,
                     session.session_id,
-                    state=InterimStateValue.PROCESSING,
+                    "AUDIO_DEVICE",
+                    "No audio captured for session",
                 )
-                audio_stop_started = time.perf_counter()
-                audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
-                await self._stop_stream_drain_loop()
-                # Final correctness must come from the capture layer's canonical buffer,
-                # not whatever the drain task managed to mirror into `_active_stream`.
-                self._active_stream = None
-                audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
-                audio_duration_raw = len(audio_samples) / self.audio.sample_rate
-                audio_ms = int(audio_duration_raw * 1000)
-
-                if audio_samples.size == 0:
-                    self._set_overlay_session_state(session.session_id, "terminal")
-                    await self._send_error(
-                        websocket,
-                        session.session_id,
-                        "AUDIO_DEVICE",
-                        "No audio captured for session",
-                    )
-                    await self._emit_session_ended(
-                        websocket, session.session_id, reason=SessionEndReason.ERROR
-                    )
-                    await self.sessions.clear(session.session_id, owner_token=owner_token)
-                    self._clear_overlay_session_runtime(session.session_id)
-                    self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                    self._live_interim_failed = False
-                    return
-
-                finalize_ms: int | None = None
-                infer_ms: int | None = None
-                try:
-                    interim_updates = await self._collect_interim_text_updates(
-                        session.session_id,
-                        ready_chunks,
-                    )
-                    flushed_interim = self._flush_overlay_interim_pending_tail(session.session_id)
-                    if flushed_interim is not None:
-                        interim_updates.append(flushed_interim)
-                    if interim_updates:
-                        await self._emit_interim_state(
-                            websocket,
-                            session.session_id,
-                            state=InterimStateValue.INTERIM,
-                        )
-                        for interim_text in interim_updates:
-                            await self._emit_interim_text(
-                                websocket,
-                                session.session_id,
-                                text=interim_text,
-                            )
-                    await self._emit_interim_state(
-                        websocket,
-                        session.session_id,
-                        state=InterimStateValue.FINALIZING,
-                    )
-                    finalize_started = time.perf_counter()
-                    text, infer_ms = await self._finalise_transcription(audio_samples)
-                    finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
-                    self._set_overlay_session_state(session.session_id, "terminal")
-                    await self._send_error(
-                        websocket, session.session_id, "MODEL", "Transcription failed"
-                    )
-                    await self._emit_session_ended(
-                        websocket, session.session_id, reason=SessionEndReason.ERROR
-                    )
-                    await self.sessions.clear(session.session_id, owner_token=owner_token)
-                    self._clear_overlay_session_runtime(session.session_id)
-                    self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                    self._live_interim_failed = False
-                    return
-
-                latency_ms = int(
-                    (datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000
-                )
-                completion = FinalResult(
-                    session_id=session.session_id,
-                    text=text,
-                    latency_ms=latency_ms,
-                    audio_ms=audio_ms,
-                    lang=self.settings.language,
-                    confidence=None,
-                )
-                self._set_overlay_session_state(session.session_id, "terminal")
-                send_started = datetime.now(tz=UTC)
-                await self._send_message(websocket, completion.model_dump(mode="json"))
-                send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
                 await self._emit_session_ended(
-                    websocket, session.session_id, reason=SessionEndReason.FINAL
+                    websocket, session.session_id, reason=SessionEndReason.ERROR
                 )
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 self._live_interim_audio = np.zeros((0,), dtype=np.float32)
                 self._live_interim_failed = False
-                self._last_audio_ms = audio_ms
-                self._last_audio_stop_ms = audio_stop_ms
-                self._last_finalize_ms = finalize_ms
-                self._last_infer_ms = infer_ms
-                self._last_send_ms = send_ms
+                return
 
-                # Diagnostic logging for truncation investigation
-                text_len = len(text)
-                chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
-                logger.info(
-                    "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
-                    "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
-                    "chars_per_sec={:.1f}, live_session_helper_active={}, "
-                    "live_session_helper_scope={}, stream_fallback_reason={}, "
-                    "finalization_mode={}, final_audio_source={}, tail_trim_mode={}, "
-                    "vad_enabled={}, vad_active={}, vad_fallback_reason={}",
+            finalize_ms: int | None = None
+            infer_ms: int | None = None
+            try:
+                interim_updates = await self._collect_interim_text_updates(
                     session.session_id,
-                    audio_duration_raw,
-                    audio_ms,
-                    audio_stop_ms,
-                    latency_ms,
-                    finalize_ms,
-                    infer_ms,
-                    send_ms,
-                    text_len,
-                    chars_per_sec,
-                    self._stream_helper_active(),
-                    self._stream_helper_scope(),
-                    self._stream_fallback_reason(),
-                    self._finalization_mode(),
-                    self._final_audio_source(),
-                    self._tail_trim_mode(),
-                    bool(getattr(self, "_vad_enabled", False)),
-                    self._vad_active(),
-                    self._vad_fallback_reason(),
+                    ready_chunks,
                 )
-        if abort_trigger is not None:
-            await self._abort_session_due_to_limit(
-                websocket,
+                flushed_interim = self._flush_overlay_interim_pending_tail(session.session_id)
+                if flushed_interim is not None:
+                    interim_updates.append(flushed_interim)
+                if interim_updates:
+                    await self._emit_interim_state(
+                        websocket,
+                        session.session_id,
+                        state=InterimStateValue.INTERIM,
+                    )
+                    for interim_text in interim_updates:
+                        await self._emit_interim_text(
+                            websocket,
+                            session.session_id,
+                            text=interim_text,
+                        )
+                await self._emit_interim_state(
+                    websocket,
+                    session.session_id,
+                    state=InterimStateValue.FINALIZING,
+                )
+                finalize_started = time.perf_counter()
+                text, infer_ms = await self._finalise_transcription(audio_samples)
+                finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
+                self._set_overlay_session_state(session.session_id, "terminal")
+                await self._send_error(
+                    websocket, session.session_id, "MODEL", "Transcription failed"
+                )
+                await self._emit_session_ended(
+                    websocket, session.session_id, reason=SessionEndReason.ERROR
+                )
+                await self.sessions.clear(session.session_id, owner_token=owner_token)
+                self._clear_overlay_session_runtime(session.session_id)
+                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+                self._live_interim_failed = False
+                return
+
+            latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
+            completion = FinalResult(
+                session_id=session.session_id,
+                text=text,
+                latency_ms=latency_ms,
+                audio_ms=audio_ms,
+                lang=self.settings.language,
+                confidence=None,
+            )
+            self._set_overlay_session_state(session.session_id, "terminal")
+            send_started = datetime.now(tz=UTC)
+            await self._send_message(websocket, completion.model_dump(mode="json"))
+            send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
+            await self._emit_session_ended(
+                websocket, session.session_id, reason=SessionEndReason.FINAL
+            )
+            await self.sessions.clear(session.session_id, owner_token=owner_token)
+            self._clear_overlay_session_runtime(session.session_id)
+            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
+            self._live_interim_failed = False
+            self._last_audio_ms = audio_ms
+            self._last_audio_stop_ms = audio_stop_ms
+            self._last_finalize_ms = finalize_ms
+            self._last_infer_ms = infer_ms
+            self._last_send_ms = send_ms
+
+            # Diagnostic logging for truncation investigation
+            text_len = len(text)
+            chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
+            logger.info(
+                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
+                "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
+                "chars_per_sec={:.1f}, live_session_helper_active={}, "
+                "live_session_helper_scope={}, stream_fallback_reason={}, "
+                "finalization_mode={}, final_audio_source={}, tail_trim_mode={}, "
+                "vad_enabled={}, vad_active={}, vad_fallback_reason={}",
                 session.session_id,
-                owner_token=owner_token,
-                trigger=abort_trigger,
+                audio_duration_raw,
+                audio_ms,
+                audio_stop_ms,
+                latency_ms,
+                finalize_ms,
+                infer_ms,
+                send_ms,
+                text_len,
+                chars_per_sec,
+                self._stream_helper_active(),
+                self._stream_helper_scope(),
+                self._stream_fallback_reason(),
+                self._finalization_mode(),
+                self._final_audio_source(),
+                self._tail_trim_mode(),
+                bool(getattr(self, "_vad_enabled", False)),
+                self._vad_active(),
+                self._vad_fallback_reason(),
             )
 
     async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
@@ -544,50 +547,6 @@ class DaemonServer:
             self._live_interim_failed = False
             return active_session_id is not None
 
-    async def _abort_session_due_to_limit(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        *,
-        owner_token: int,
-        trigger: Literal["duration", "samples"],
-    ) -> None:
-        cleaned = await self._cleanup_active_session(
-            f"session {trigger} limit exceeded",
-            expected_session_id=session_id,
-            expected_owner_token=owner_token,
-            require_session_match=True,
-            require_owner_match=True,
-        )
-        if not cleaned:
-            return
-
-        if trigger == "duration":
-            limit_seconds = float(getattr(self.settings, "max_session_seconds", 0.0))
-            message = (
-                "Session exceeded max duration "
-                f"({limit_seconds:.1f}s); capture aborted to protect daemon memory"
-            )
-        else:
-            limit_samples = int(getattr(self, "_session_sample_limit", 0))
-            message = (
-                "Session exceeded max buffered audio "
-                f"({limit_samples} samples); capture aborted to protect daemon memory"
-            )
-
-        logger.warning(
-            "Session {} aborted by session guard (trigger={}, limit_seconds={}, limit_samples={})",
-            session_id,
-            trigger,
-            getattr(self.settings, "max_session_seconds", None),
-            getattr(self, "_session_sample_limit", None),
-        )
-        try:
-            await self._send_error(websocket, session_id, "AUDIO_DEVICE", message)
-            await self._emit_session_ended(websocket, session_id, reason=SessionEndReason.ERROR)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to report session guard abort for {}: {}", session_id, exc)
-
     def _audio_session_limit_exceeded(self) -> bool:
         checker = getattr(self.audio, "session_limit_exceeded", None)
         if not callable(checker):
@@ -598,23 +557,50 @@ class DaemonServer:
             logger.debug("Failed checking audio session limit state: {}", exc)
             return False
 
-    def _session_guard_abort_trigger(
-        self, session: Session
-    ) -> Literal["duration", "samples"] | None:
-        if self._audio_session_limit_exceeded():
-            return "samples"
+    def _session_guard_warning_due(self, session: Session) -> bool:
+        """Return True when session has reached the warning threshold (80% of limit)."""
+        effective_limit_ms = self._effective_session_limit_ms()
+        if effective_limit_ms is None:
+            return False
+        threshold_ms = int(effective_limit_ms * SESSION_GUARD_WARNING_FRACTION)
+        return session.audio_duration_ms >= threshold_ms
 
+    def _session_remaining_seconds(self, session: Session) -> float:
+        effective_limit_ms = self._effective_session_limit_ms()
+        if effective_limit_ms is None:
+            return 0.0
+        return max(0.0, (effective_limit_ms - session.audio_duration_ms) / 1000.0)
+
+    def _effective_session_limit_ms(self) -> int | None:
+        limits_ms: list[int] = []
         session_age_limit_ms = getattr(self, "_session_age_limit_ms", None)
-        if session_age_limit_ms is None:
-            return None
-        if session.audio_duration_ms >= int(session_age_limit_ms):
-            return "duration"
-        return None
+        if session_age_limit_ms is not None:
+            limits_ms.append(max(1, int(session_age_limit_ms)))
+
+        explicit_sample_limit = getattr(self.settings, "max_session_samples", None)
+        sample_rate = int(getattr(self.audio, "sample_rate", 0))
+        session_sample_limit = getattr(self, "_session_sample_limit", None)
+        if (
+            explicit_sample_limit is not None
+            and session_sample_limit is not None
+            and sample_rate > 0
+        ):
+            sample_limit_ms = math.ceil((int(session_sample_limit) * 1000) / sample_rate)
+            limits_ms.append(max(1, sample_limit_ms))
+
+        return min(limits_ms) if limits_ms else None
+
+    def _effective_session_limit_seconds(self) -> float:
+        effective_limit_ms = self._effective_session_limit_ms()
+        if effective_limit_ms is None:
+            return 0.0
+        return effective_limit_ms / 1000.0
 
     def _start_session_guard_loop(self, websocket: WebSocket, session_id: UUID) -> None:
         if getattr(self, "_session_guard_task", None) is not None:
             return
         self._session_guard_running = True
+        self._session_guard_warning_emitted = False
 
         async def _guard() -> None:
             try:
@@ -622,15 +608,47 @@ class DaemonServer:
                     active = self.sessions.active
                     if active is None or active.session_id != session_id:
                         break
-                    abort_trigger = self._session_guard_abort_trigger(active)
-                    if abort_trigger is not None:
-                        await self._abort_session_due_to_limit(
+
+                    if self._audio_session_limit_exceeded():
+                        logger.info(
+                            "Session {} reached limit; guard stopping "
+                            "(finalization deferred to stop_session)",
+                            session_id,
+                        )
+                        if not self._session_guard_warning_emitted:
+                            self._session_guard_warning_emitted = True
+                            await self._emit_session_warning(websocket, session_id, active)
+                        break
+
+                    # The wall-clock guard remains a hard ceiling even if the audio
+                    # callback has not yet accumulated the equivalent sample cap.
+                    session_age_limit_ms = getattr(self, "_session_age_limit_ms", None)
+                    duration_limit_reached = session_age_limit_ms is not None and (
+                        active.audio_duration_ms >= int(session_age_limit_ms)
+                    )
+                    if duration_limit_reached:
+                        if not self._session_guard_warning_emitted:
+                            self._session_guard_warning_emitted = True
+                            await self._emit_session_warning(websocket, session_id, active)
+                        logger.info(
+                            "Session {} reached wall-clock limit; auto-stopping",
+                            session_id,
+                        )
+                        await self._stop_active_session(
                             websocket,
                             session_id,
                             owner_token=self._owner_token_for_websocket(websocket),
-                            trigger=abort_trigger,
+                            post_roll_secs=0.0,
                         )
                         break
+
+                    # At 80%: emit warning so overlay turns amber.
+                    if not self._session_guard_warning_emitted and self._session_guard_warning_due(
+                        active
+                    ):
+                        self._session_guard_warning_emitted = True
+                        await self._emit_session_warning(websocket, session_id, active)
+
                     await _REAL_ASYNCIO_SLEEP(SESSION_GUARD_POLL_SECS)
             except asyncio.CancelledError:
                 raise
@@ -1128,6 +1146,33 @@ class DaemonServer:
         overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
         if isinstance(overlay_last_text, dict):
             overlay_last_text.pop(session_id, None)
+
+    async def _emit_session_warning(
+        self,
+        websocket: WebSocket,
+        session_id: UUID,
+        session: Session,
+    ) -> None:
+        remaining = self._session_remaining_seconds(session)
+        limit = self._effective_session_limit_seconds()
+        logger.info(
+            "Session {} warning: {:.0f}s remaining of {:.0f}s limit",
+            session_id,
+            remaining,
+            limit,
+        )
+        message = SessionWarningMessage(
+            session_id=session_id,
+            warning="approaching_limit",
+            remaining_seconds=round(remaining, 1),
+            limit_seconds=limit,
+        )
+        # Session warning is sent on the main websocket, not the overlay channel,
+        # so the client can forward it to the overlay.
+        try:
+            await self._send_message(websocket, message.model_dump(mode="json"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to send session warning for {}: {}", session_id, exc)
 
     async def _emit_live_interim_from_chunk(
         self,
