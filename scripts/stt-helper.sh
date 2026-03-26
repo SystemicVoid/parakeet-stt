@@ -105,9 +105,10 @@ stt() {
     local default_daemon_left_context_secs="10.0"
     local default_daemon_batch_size="32"
     local default_client_ready_timeout_seconds="${PARAKEET_CLIENT_READY_TIMEOUT_SECONDS:-30}"
-    # Keep helper builds portable by default; users can opt in to host-specific flags.
+    # Keep rebuild fallbacks portable by default; users can opt in to host-specific flags.
     local default_ptt_rustflags="${PARAKEET_PTT_RUSTFLAGS:-}"
-    local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-cargo}"
+    # Prefer a prebuilt release binary when available so helper startup is deterministic.
+    local default_ptt_runner_preference="${PARAKEET_PTT_RUNNER_PREFERENCE:-release}"
     local -a start_option_rows=(
         "injection-mode|injection_mode|default_injection_mode|PARAKEET_INJECTION_MODE|Injection mode|<mode>|paste|always|paste"
         "paste-backend-failure-policy|paste_backend_failure_policy|default_paste_backend_failure_policy|PARAKEET_PASTE_BACKEND_FAILURE_POLICY|Stable controls|<v>|copy-only|always|copy-only"

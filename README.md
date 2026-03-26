@@ -95,7 +95,8 @@ Local LLM query mode overrides:
 Helper readiness timing:
 
 - `PARAKEET_CLIENT_READY_TIMEOUT_SECONDS` controls client readiness wait (default `30`)
-- helper extends readiness wait when `cargo run --release` compile activity is detected
+- helper prefers a compatible prebuilt `target/release/parakeet-ptt` binary by default
+- helper extends readiness wait when it falls back to `cargo run --release` and compile activity is detected
 
 COSMIC focus-navigation baseline for best adaptive behavior:
 - `Focus follows cursor = ON`
@@ -127,13 +128,14 @@ cargo test
 
 Local hardware-optimized release build (Zen 5 / local machine only):
 ```bash
-just build
-```
-`just build` builds all Rust binaries in `parakeet-ptt` with `RUSTFLAGS="-C target-cpu=native"` by default. That keeps the build tuned for the current host without hardcoding a microarchitecture name in multiple places.
-
-If you need to override the flags for a one-off build:
-```bash
 PARAKEET_PTT_RUSTFLAGS="-C target-cpu=znver5" just build
+```
+After that build, `stt start` will prefer the compatible prebuilt `target/release/parakeet-ptt`
+binary instead of recompiling on launch.
+
+If you need the portable host-default build path instead:
+```bash
+just build
 ```
 
 Daemon checks:
