@@ -59,6 +59,10 @@ class FakeWebSocket:
         self.sent_json.append(payload)
 
 
+def _set_dynamic_attr(target: object, name: str, value: object) -> None:
+    setattr(cast(Any, target), name, value)
+
+
 class FakeIncrementalTranscriber:
     def __init__(
         self,
@@ -358,7 +362,7 @@ def test_overlay_send_failures_do_not_block_final_result(monkeypatch) -> None:
                 raise RuntimeError("overlay sink failed")
             websocket.sent_json.append(payload)
 
-        websocket.send_json = send_json  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", send_json)
 
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
         await server._handle_stop(cast(Any, websocket), _stop_message(session_id))
@@ -798,7 +802,7 @@ def test_stop_waits_for_in_flight_live_interim_before_final_send(monkeypatch) ->
                 await allow_final_send.wait()
             websocket.sent_json.append(payload)
 
-        websocket.send_json = send_json  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", send_json)
 
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
         live_task = asyncio.create_task(
@@ -852,11 +856,15 @@ def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None
         server = _build_server(overlay_events_enabled=True)
         transcriber = SerializingTranscriber()
         server.transcriber = transcriber
-        server._trim_tail_silence = (  # type: ignore[method-assign]
-            lambda samples, _sample_rate, _window_ms=50: samples
+        _set_dynamic_attr(
+            server,
+            "_trim_tail_silence",
+            lambda samples, _sample_rate, _window_ms=50: samples,
         )
-        server._finalise_transcription = (  # type: ignore[method-assign]
-            DaemonServer._finalise_transcription.__get__(server, DaemonServer)
+        _set_dynamic_attr(
+            server,
+            "_finalise_transcription",
+            DaemonServer._finalise_transcription.__get__(server, DaemonServer),
         )
         websocket = FakeWebSocket()
         session_id = uuid4()
@@ -1086,7 +1094,7 @@ def test_phase6_overlay_crash_mid_session_contract_keeps_final_non_fatal(monkeyp
                     raise RuntimeError("overlay process unavailable")
             websocket.sent_json.append(payload)
 
-        websocket.send_json = flaky_send_json  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", flaky_send_json)
 
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
         await server._emit_live_interim_from_chunk(
