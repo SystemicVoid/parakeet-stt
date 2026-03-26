@@ -91,6 +91,10 @@ def _build_server(
     return cast(DaemonServer, server)
 
 
+def _set_dynamic_attr(target: object, name: str, value: object) -> None:
+    setattr(cast(Any, target), name, value)
+
+
 def test_status_streaming_disabled_by_config() -> None:
     """When streaming is disabled by config, helper fields reflect that."""
     server = _build_server(streaming_enabled=False)
@@ -161,7 +165,7 @@ def test_prepare_vad_marks_missing_dependency_explicitly() -> None:
         exc.name = "onnxruntime"
         raise exc
 
-    server._load_vad_model = fake_load_vad_model  # type: ignore[method-assign]
+    _set_dynamic_attr(server, "_load_vad_model", fake_load_vad_model)
 
     server.prepare_vad()
 
@@ -292,7 +296,7 @@ def test_trim_tail_silence_default_path_uses_rms() -> None:
     def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
         return "rms"
 
-    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
 
     result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
     assert result == "rms"
@@ -309,8 +313,8 @@ def test_trim_tail_silence_vad_opt_in_uses_vad_when_available() -> None:
     def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
         return "rms"
 
-    server._trim_tail_with_vad = fake_vad  # type: ignore[method-assign]
-    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+    _set_dynamic_attr(server, "_trim_tail_with_vad", fake_vad)
+    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
 
     result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
     assert result == "vad"
@@ -327,8 +331,8 @@ def test_trim_tail_silence_vad_opt_in_falls_back_to_rms() -> None:
     def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
         return "rms"
 
-    server._trim_tail_with_vad = fake_vad  # type: ignore[method-assign]
-    server._trim_tail_with_rms = fake_rms  # type: ignore[method-assign]
+    _set_dynamic_attr(server, "_trim_tail_with_vad", fake_vad)
+    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
 
     result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
     assert result == "rms"

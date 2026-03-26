@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import tempfile
 import wave
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
@@ -124,6 +124,12 @@ def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None
         wf.writeframes(pcm.tobytes())
 
 
+def _model_transcribe(model: ASRModel, *args: Any, **kwargs: Any) -> list[Any]:
+    # NeMo's runtime API is stable enough for this wrapper, but its stubs are not.
+    transcribe = cast(Callable[..., list[Any]], cast(Any, model).transcribe)
+    return transcribe(*args, **kwargs)
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -181,15 +187,14 @@ class ParakeetTranscriber:
         if not paths:
             return []
         logger.info("Transcribing {} file(s) with Parakeet", len(paths))
-        # NeMo's type stubs are incomplete; transcribe() returns list of transcription results
-        outputs = self.model.transcribe(list(paths), timestamps=timestamps)  # type: ignore[operator]
+        outputs = _model_transcribe(self.model, list(paths), timestamps=timestamps)
         return [_extract_text(item) for item in outputs]
 
     def transcribe_iter(self, paths: Iterable[str], *, timestamps: bool = False) -> list[str]:
         return self.transcribe_files(list(paths), timestamps=timestamps)
 
     def transcribe_wav(self, path: str) -> str:
-        outputs = self.model.transcribe([path], batch_size=1)  # type: ignore[operator]
+        outputs = _model_transcribe(self.model, [path], batch_size=1)
         if not outputs:
             return ""
         return _extract_text(outputs[0])
@@ -201,7 +206,7 @@ class ParakeetTranscriber:
             logger.debug("Skipping transcription for empty audio buffer")
             return ""
         try:
-            outputs = self.model.transcribe([audio], batch_size=1, verbose=False)  # type: ignore[operator]
+            outputs = _model_transcribe(self.model, [audio], batch_size=1, verbose=False)
             if not outputs:
                 return ""
             return _extract_text(outputs[0])
@@ -275,14 +280,20 @@ class ParakeetStreamingTranscriber:
             return
 
         try:
-            from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT
+            from nemo.collections.asr.parts.utils.streaming_utils import (
+                BatchedFrameASRTDT as _BatchedFrameASRTDT,
+            )
         except ImportError:  # pragma: no cover - optional helper
-            BatchedFrameASRTDT = None  # type: ignore[assignment]
+            batched_frame_asr_tdt = None
+        else:
+            batched_frame_asr_tdt = cast(type[Any], _BatchedFrameASRTDT)
 
         try:
-            from omegaconf import open_dict
+            from omegaconf import open_dict as _open_dict_fn
         except ImportError:  # pragma: no cover - optional dependency
-            open_dict = None  # type: ignore[assignment]
+            open_dict_fn = None
+        else:
+            open_dict_fn = cast(Callable[[Any], Any], _open_dict_fn)
 
         total_buffer_secs = self.chunk_secs + self.right_context_secs
         model_is_tdt = _is_tdt_model(self.model)
@@ -294,18 +305,18 @@ class ParakeetStreamingTranscriber:
         if configured is not None:
             max_steps_per_timestep = int(configured)
         try:
-            if model_is_tdt and BatchedFrameASRTDT is None:
+            if model_is_tdt and batched_frame_asr_tdt is None:
                 logger.warning(
                     "TDT model detected but BatchedFrameASRTDT is unavailable; "
                     "falling back to RNNT helper"
                 )
-            if model_is_tdt and BatchedFrameASRTDT is not None:
+            if model_is_tdt and batched_frame_asr_tdt is not None:
                 try:
                     change_decoding = getattr(self.model, "change_decoding_strategy", None)
                     if callable(change_decoding) and decoding_cfg is not None:
                         try:
-                            if open_dict is not None:
-                                with open_dict(decoding_cfg):
+                            if open_dict_fn is not None:
+                                with open_dict_fn(decoding_cfg):
                                     _set_cfg_value(decoding_cfg, "strategy", "greedy")
                                     _set_cfg_value(decoding_cfg, "preserve_alignments", True)
                                     _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
@@ -336,7 +347,7 @@ class ParakeetStreamingTranscriber:
                             "TDT streaming helper forces batch_size=1 (config requested {})",
                             self.batch_size,
                         )
-                    self.chunk_helper = BatchedFrameASRTDT(
+                    self.chunk_helper = batched_frame_asr_tdt(
                         asr_model=self.model,
                         frame_len=self.chunk_secs,
                         total_buffer=total_buffer_secs,

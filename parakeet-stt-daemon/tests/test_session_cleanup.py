@@ -111,6 +111,10 @@ class FakeWebSocket:
         self.sent_json.append(payload)
 
 
+def _set_dynamic_attr(target: object, name: str, value: object) -> None:
+    setattr(cast(Any, target), name, value)
+
+
 def _start_message(session_id: UUID) -> StartSession:
     return StartSession(
         type=ClientMessageType.START_SESSION,
@@ -264,7 +268,7 @@ def test_handler_exception_cleans_active_session_state() -> None:
         async def explode_dispatch(*_args, **_kwargs) -> None:
             raise RuntimeError("boom")
 
-        server._dispatch = explode_dispatch  # type: ignore[method-assign]
+        _set_dynamic_attr(server, "_dispatch", explode_dispatch)
         await server.handle_websocket(cast(Any, websocket))
 
         assert server.sessions.active is None
@@ -413,7 +417,7 @@ def test_start_session_rolls_back_when_drain_loop_start_fails() -> None:
         def explode_start_stream_drain_loop(_websocket: Any, _session_id: UUID) -> None:
             raise RuntimeError("drain loop failed")
 
-        server._start_stream_drain_loop = explode_start_stream_drain_loop  # type: ignore[method-assign]
+        _set_dynamic_attr(server, "_start_stream_drain_loop", explode_start_stream_drain_loop)
         websocket = FakeWebSocket([])
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
 
@@ -443,7 +447,7 @@ def test_start_session_rolls_back_when_session_started_send_fails() -> None:
                 raise RuntimeError("send failed")
             websocket.sent_json.append(payload)
 
-        websocket.send_json = fail_first_send  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", fail_first_send)
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
 
         assert server.sessions.active is None
@@ -474,7 +478,7 @@ def test_start_session_streaming_send_failure_stops_drain_loop() -> None:
                 raise RuntimeError("send failed")
             websocket.sent_json.append(payload)
 
-        websocket.send_json = fail_first_send  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", fail_first_send)
         await server._handle_start(cast(Any, websocket), _start_message(session_id))
         await asyncio.sleep(0)
 
@@ -501,7 +505,7 @@ def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
         async def raise_disconnect(_payload: dict) -> None:
             raise WebSocketDisconnect()
 
-        websocket.send_json = raise_disconnect  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", raise_disconnect)
         try:
             await server._handle_start(cast(Any, websocket), _start_message(session_id))
         except WebSocketDisconnect:
@@ -528,7 +532,7 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
         async def raise_disconnect(_payload: dict) -> None:
             raise WebSocketDisconnect()
 
-        websocket.send_json = raise_disconnect  # type: ignore[method-assign]
+        _set_dynamic_attr(websocket, "send_json", raise_disconnect)
         original_cleanup = server._cleanup_active_session
         cleanup_calls = 0
 
@@ -552,7 +556,7 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
                 require_owner_match=require_owner_match,
             )
 
-        server._cleanup_active_session = cleanup_with_interleaving  # type: ignore[method-assign]
+        _set_dynamic_attr(server, "_cleanup_active_session", cleanup_with_interleaving)
         await server.handle_websocket(cast(Any, websocket))
 
         assert cleanup_calls == 2
