@@ -37,22 +37,25 @@ pub struct OverlayRenderIntent {
     pub visible: bool,
     pub headline: String,
     pub detail: Option<String>,
+    pub warning: bool,
 }
 
 impl OverlayVisibility {
-    pub fn to_render_intent(&self) -> OverlayRenderIntent {
+    pub fn to_render_intent(&self, warning: bool) -> OverlayRenderIntent {
         match self {
             Self::Hidden => OverlayRenderIntent {
                 phase: OverlayRenderPhase::Hidden,
                 visible: false,
                 headline: String::new(),
                 detail: None,
+                warning: false,
             },
             Self::Listening { .. } => OverlayRenderIntent {
                 phase: OverlayRenderPhase::Listening,
                 visible: true,
                 headline: "Listening...".to_string(),
                 detail: None,
+                warning,
             },
             Self::Interim { text, .. } => OverlayRenderIntent {
                 phase: OverlayRenderPhase::Interim,
@@ -63,6 +66,7 @@ impl OverlayVisibility {
                     text.clone()
                 },
                 detail: None,
+                warning,
             },
             Self::Finalizing {
                 reason, last_text, ..
@@ -81,6 +85,7 @@ impl OverlayVisibility {
                     })
                     .unwrap_or_else(|| "Finalizing...".to_string()),
                 detail: None,
+                warning,
             },
         }
     }
@@ -100,6 +105,7 @@ pub struct OverlayStateMachine {
     last_seq: Option<u64>,
     finalize_deadline_ms: Option<u64>,
     auto_hide_after_ms: u64,
+    warning_active: bool,
 }
 
 impl OverlayStateMachine {
@@ -110,11 +116,16 @@ impl OverlayStateMachine {
             last_seq: None,
             finalize_deadline_ms: None,
             auto_hide_after_ms: auto_hide_after.as_millis() as u64,
+            warning_active: false,
         }
     }
 
     pub fn visibility(&self) -> &OverlayVisibility {
         &self.visibility
+    }
+
+    pub fn warning_active(&self) -> bool {
+        self.warning_active
     }
 
     pub fn apply_event(&mut self, message: OverlayIpcMessage, now_ms: u64) -> ApplyOutcome {
@@ -168,12 +179,20 @@ impl OverlayStateMachine {
 
                 self.active_session_id = Some(session_id);
                 self.last_seq = None;
+                self.warning_active = false;
                 self.visibility = OverlayVisibility::Finalizing {
                     session_id,
                     reason,
                     last_text,
                 };
                 self.finalize_deadline_ms = Some(now_ms.saturating_add(self.auto_hide_after_ms));
+                ApplyOutcome::Applied
+            }
+            OverlayIpcMessage::SessionWarning { session_id } => {
+                if self.active_session_id != Some(session_id) {
+                    return ApplyOutcome::DroppedSessionMismatch;
+                }
+                self.warning_active = true;
                 ApplyOutcome::Applied
             }
             OverlayIpcMessage::InjectionComplete {
@@ -188,6 +207,7 @@ impl OverlayStateMachine {
                     self.active_session_id = None;
                     self.last_seq = None;
                     self.finalize_deadline_ms = None;
+                    self.warning_active = false;
                     ApplyOutcome::Applied
                 }
                 _ => ApplyOutcome::DroppedSessionMismatch,
@@ -202,6 +222,7 @@ impl OverlayStateMachine {
                 self.active_session_id = None;
                 self.last_seq = None;
                 self.finalize_deadline_ms = None;
+                self.warning_active = false;
                 return true;
             }
         }
@@ -213,6 +234,7 @@ impl OverlayStateMachine {
         if self.active_session_id != Some(session_id) {
             self.active_session_id = Some(session_id);
             self.last_seq = None;
+            self.warning_active = false;
         }
 
         if let Some(last_seq) = self.last_seq {
@@ -435,12 +457,13 @@ mod tests {
     #[test]
     fn hidden_visibility_maps_to_hidden_render_intent() {
         assert_eq!(
-            OverlayVisibility::Hidden.to_render_intent(),
+            OverlayVisibility::Hidden.to_render_intent(false),
             OverlayRenderIntent {
                 phase: OverlayRenderPhase::Hidden,
                 visible: false,
                 headline: String::new(),
                 detail: None,
+                warning: false,
             }
         );
     }
@@ -453,12 +476,13 @@ mod tests {
                 session_id,
                 text: "   ".to_string(),
             }
-            .to_render_intent(),
+            .to_render_intent(false),
             OverlayRenderIntent {
                 phase: OverlayRenderPhase::Interim,
                 visible: true,
                 headline: "Listening...".to_string(),
                 detail: None,
+                warning: false,
             }
         );
     }
@@ -472,12 +496,13 @@ mod tests {
                 reason: None,
                 last_text: None,
             }
-            .to_render_intent(),
+            .to_render_intent(false),
             OverlayRenderIntent {
                 phase: OverlayRenderPhase::Finalizing,
                 visible: true,
                 headline: "Finalizing...".to_string(),
                 detail: None,
+                warning: false,
             }
         );
     }
@@ -491,12 +516,13 @@ mod tests {
                 reason: Some("normal".to_string()),
                 last_text: Some("recognized text".to_string()),
             }
-            .to_render_intent(),
+            .to_render_intent(false),
             OverlayRenderIntent {
                 phase: OverlayRenderPhase::Finalizing,
                 visible: true,
                 headline: "recognized text".to_string(),
                 detail: None,
+                warning: false,
             }
         );
     }

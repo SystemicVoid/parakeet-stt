@@ -234,6 +234,7 @@ pub struct OverlayProcessManager {
     sink: Option<OverlayProcessSink>,
     active_output_name: Option<String>,
     latest_message: Option<OverlayIpcMessage>,
+    latest_warning: Option<OverlayIpcMessage>,
     focus_cache: Option<WaylandFocusCache>,
     pending_output_name: Option<String>,
     utterance_active: bool,
@@ -267,7 +268,6 @@ impl OverlayProcessManager {
     }
 
     pub fn send(&mut self, message: OverlayIpcMessage) {
-        let is_output_hint = matches!(&message, OverlayIpcMessage::OutputHint { .. });
         let starts_utterance = matches!(
             &message,
             OverlayIpcMessage::InterimState { .. } | OverlayIpcMessage::InterimText { .. }
@@ -276,8 +276,8 @@ impl OverlayProcessManager {
         if let OverlayIpcMessage::OutputHint { output_name } = &message {
             self.pending_output_name = Some(output_name.clone());
             self.output_wait_started_at = None;
-        } else if is_replayable_overlay_message(&message) {
-            self.latest_message = Some(message.clone());
+        } else {
+            self.remember_replay_state(&message);
         }
 
         if starts_utterance {
@@ -296,17 +296,19 @@ impl OverlayProcessManager {
         let sink_was_missing = self.sink.is_none();
         if sink_was_missing {
             self.try_spawn_sink();
+            if self.sink.is_none() {
+                return;
+            }
+            if self.sync_sink_after_respawn(message).is_err() {
+                self.metrics.note_replay_dropped();
+                self.sink = None;
+                self.active_output_name = None;
+            }
+            return;
         }
 
         match self.try_send_to_active(message.clone()) {
             Ok(()) => {
-                if sink_was_missing
-                    && is_output_hint
-                    && self.latest_message.is_some()
-                    && self.replay_latest_message().is_err()
-                {
-                    self.metrics.note_replay_dropped();
-                }
                 return;
             }
             Err(OverlaySendError::Disconnected) => {
@@ -317,8 +319,13 @@ impl OverlayProcessManager {
         }
 
         self.try_spawn_sink();
-        if self.replay_latest_message().is_err() {
+        if self.sink.is_none() {
+            return;
+        }
+        if self.sync_sink_after_respawn(message).is_err() {
             self.metrics.note_replay_dropped();
+            self.sink = None;
+            self.active_output_name = None;
         }
     }
 
@@ -328,6 +335,87 @@ impl OverlayProcessManager {
 
     pub fn has_active_sink(&self) -> bool {
         self.sink.is_some()
+    }
+
+    fn remember_replay_state(&mut self, message: &OverlayIpcMessage) {
+        match message {
+            OverlayIpcMessage::InterimState { session_id, .. }
+            | OverlayIpcMessage::InterimText { session_id, .. } => {
+                if overlay_message_session_id(self.latest_warning.as_ref()) != Some(*session_id) {
+                    self.latest_warning = None;
+                }
+                self.latest_message = Some(message.clone());
+            }
+            OverlayIpcMessage::SessionEnded { .. } => {
+                self.latest_message = Some(message.clone());
+                self.latest_warning = None;
+            }
+            OverlayIpcMessage::SessionWarning { session_id } => {
+                if overlay_message_session_id(self.latest_message.as_ref()) == Some(*session_id) {
+                    self.latest_warning = Some(message.clone());
+                }
+            }
+            OverlayIpcMessage::InjectionComplete { .. } => {
+                self.latest_warning = None;
+            }
+            OverlayIpcMessage::OutputHint { .. } | OverlayIpcMessage::AudioLevel { .. } => {}
+        }
+    }
+
+    fn sync_sink_after_respawn(
+        &mut self,
+        current_message: OverlayIpcMessage,
+    ) -> std::result::Result<(), OverlaySendError> {
+        let replay_messages = self.replay_messages();
+        match current_message {
+            OverlayIpcMessage::OutputHint { .. } => {
+                self.try_send_to_active(current_message)?;
+                self.replay_message_sequence(replay_messages)
+            }
+            OverlayIpcMessage::AudioLevel { .. } | OverlayIpcMessage::InjectionComplete { .. } => {
+                self.replay_message_sequence(replay_messages)?;
+                self.try_send_to_active(current_message)
+            }
+            OverlayIpcMessage::InterimState { .. }
+            | OverlayIpcMessage::InterimText { .. }
+            | OverlayIpcMessage::SessionEnded { .. }
+            | OverlayIpcMessage::SessionWarning { .. } => {
+                if replay_messages.is_empty() {
+                    self.try_send_to_active(current_message)
+                } else {
+                    self.replay_message_sequence(replay_messages)
+                }
+            }
+        }
+    }
+
+    fn replay_messages(&self) -> Vec<OverlayIpcMessage> {
+        let mut replay_messages = Vec::new();
+        if let Some(message) = self.latest_message.clone() {
+            let latest_session_id = overlay_message_session_id(Some(&message));
+            replay_messages.push(message);
+            if overlay_message_session_id(self.latest_warning.as_ref()) == latest_session_id {
+                if let Some(warning) = self.latest_warning.clone() {
+                    replay_messages.push(warning);
+                }
+            }
+        }
+        replay_messages
+    }
+
+    fn replay_message_sequence(
+        &mut self,
+        replay_messages: Vec<OverlayIpcMessage>,
+    ) -> std::result::Result<(), OverlaySendError> {
+        if replay_messages.is_empty() {
+            return Ok(());
+        }
+
+        for message in replay_messages {
+            self.try_send_to_active(message)?;
+        }
+        self.metrics.note_replay_sent();
+        Ok(())
     }
 
     fn try_spawn_sink(&mut self) {
@@ -389,24 +477,6 @@ impl OverlayProcessManager {
                     backoff_ms = self.respawn_backoff.as_millis(),
                     "overlay process spawn failed; overlay routing remains non-fatal"
                 );
-            }
-        }
-    }
-
-    fn replay_latest_message(&mut self) -> std::result::Result<(), OverlaySendError> {
-        let Some(message) = self.latest_message.clone() else {
-            return Ok(());
-        };
-
-        match self.try_send_to_active(message) {
-            Ok(()) => {
-                self.metrics.note_replay_sent();
-                Ok(())
-            }
-            Err(err) => {
-                self.sink = None;
-                self.active_output_name = None;
-                Err(err)
             }
         }
     }
@@ -494,6 +564,7 @@ impl OverlayProcessManager {
             sink: None,
             active_output_name: None,
             latest_message: None,
+            latest_warning: None,
             focus_cache,
             pending_output_name: None,
             utterance_active: false,
@@ -565,14 +636,15 @@ impl OverlayProcessManager {
     }
 }
 
-fn is_replayable_overlay_message(message: &OverlayIpcMessage) -> bool {
+fn overlay_message_session_id(message: Option<&OverlayIpcMessage>) -> Option<uuid::Uuid> {
     match message {
-        OverlayIpcMessage::InterimState { .. }
-        | OverlayIpcMessage::InterimText { .. }
-        | OverlayIpcMessage::SessionEnded { .. } => true,
-        OverlayIpcMessage::InjectionComplete { .. }
-        | OverlayIpcMessage::OutputHint { .. }
-        | OverlayIpcMessage::AudioLevel { .. } => false,
+        Some(OverlayIpcMessage::InterimState { session_id, .. })
+        | Some(OverlayIpcMessage::InterimText { session_id, .. })
+        | Some(OverlayIpcMessage::AudioLevel { session_id, .. })
+        | Some(OverlayIpcMessage::InjectionComplete { session_id, .. })
+        | Some(OverlayIpcMessage::SessionEnded { session_id, .. })
+        | Some(OverlayIpcMessage::SessionWarning { session_id, .. }) => Some(*session_id),
+        Some(OverlayIpcMessage::OutputHint { .. }) | None => None,
     }
 }
 
@@ -795,6 +867,80 @@ mod tests {
             .expect("second sink should receive replay")
             .expect("second sink should remain open");
         assert_eq!(replayed, state_message);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_replays_warning_state_after_disconnect() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = queued_launcher(queue);
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::from_millis(0),
+        );
+
+        let session_id = Uuid::new_v4();
+        let state_message = OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 2,
+            text: "current-state".to_string(),
+        };
+        manager.send(state_message.clone());
+        let first_state = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive state")
+            .expect("first sink should remain open");
+        assert_eq!(first_state, state_message);
+
+        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        manager.send(warning_message.clone());
+        let first_warning = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive warning")
+            .expect("first sink should remain open");
+        assert_eq!(first_warning, warning_message);
+
+        drop(rx_first);
+
+        let audio_level_message = OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db: -28.0,
+        };
+        manager.send(audio_level_message.clone());
+
+        let replayed_state = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed state")
+            .expect("second sink should remain open");
+        assert_eq!(replayed_state, state_message);
+
+        let replayed_warning = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed warning")
+            .expect("second sink should remain open");
+        assert_eq!(replayed_warning, warning_message);
+
+        let forwarded_audio_level = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive current audio level")
+            .expect("second sink should remain open");
+        assert_eq!(forwarded_audio_level, audio_level_message);
     }
 
     #[tokio::test(flavor = "current_thread")]

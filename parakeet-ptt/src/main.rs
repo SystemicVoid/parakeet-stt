@@ -371,6 +371,9 @@ enum OverlayEvent {
         session_id: Uuid,
         success: bool,
     },
+    SessionWarning {
+        session_id: Uuid,
+    },
 }
 
 trait OverlaySink {
@@ -438,6 +441,9 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
             session_id,
             success,
         },
+        OverlayEvent::SessionWarning { session_id } => {
+            OverlayIpcMessage::SessionWarning { session_id }
+        }
     }
 }
 
@@ -582,6 +588,14 @@ impl<S: OverlaySink> OverlayRouter<S> {
             session_id,
             success,
         });
+    }
+
+    fn route_session_warning(&mut self, session_id: Uuid) {
+        if self.active_session_id != Some(session_id) {
+            return;
+        }
+        self.sink
+            .on_overlay_event(OverlayEvent::SessionWarning { session_id });
     }
 
     fn maybe_emit_output_hint(&mut self) {
@@ -3280,6 +3294,20 @@ async fn handle_server_message(
         ServerMessage::SessionEnded { session_id, reason } => {
             parent_focus_by_session.remove(&session_id);
             overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);
+        }
+        ServerMessage::SessionWarning {
+            session_id,
+            warning: _,
+            remaining_seconds,
+            limit_seconds,
+        } => {
+            info!(
+                session = %session_id,
+                remaining_seconds,
+                limit_seconds,
+                "session warning: approaching limit"
+            );
+            overlay_router.route_session_warning(session_id);
         }
         ServerMessage::Status { .. } => {}
     }

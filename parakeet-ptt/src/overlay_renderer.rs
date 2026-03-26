@@ -715,6 +715,9 @@ fn accent_color_for_phase(phase: OverlayRenderPhase) -> Option<[u8; 4]> {
     }
 }
 
+/// Amber warning color: [B, G, R, A] = RGB(255, 165, 0) — session approaching limit.
+const WARNING_ACCENT_COLOR: [u8; 4] = [0, 165, 255, 255];
+
 fn should_trigger_success_flash(
     previous_phase: OverlayRenderPhase,
     next_phase: OverlayRenderPhase,
@@ -1583,7 +1586,7 @@ impl TextRenderer {
 }
 
 trait OverlayBackend {
-    fn render(&mut self, state: &OverlayVisibility) -> Result<()>;
+    fn render(&mut self, state: &OverlayVisibility, warning: bool) -> Result<()>;
     fn is_fading(&self) -> bool {
         false
     }
@@ -1597,7 +1600,7 @@ struct NoopBackend {
 }
 
 impl OverlayBackend for NoopBackend {
-    fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
+    fn render(&mut self, state: &OverlayVisibility, _warning: bool) -> Result<()> {
         debug!(reason = %self.reason, ?state, "overlay renderer running in noop mode");
         Ok(())
     }
@@ -1621,6 +1624,7 @@ struct WaylandOverlayBackend {
     width_state: WidthState,
     listening_max_phrase_width: f32,
     waveform: Option<WaveformCanvas>,
+    last_warning: bool,
     started: Instant,
 }
 
@@ -1653,6 +1657,7 @@ impl WaylandOverlayBackend {
             width_state: WidthState::new(initial_width, 0),
             listening_max_phrase_width,
             waveform: None,
+            last_warning: false,
             started: Instant::now(),
         }
     }
@@ -1755,8 +1760,8 @@ impl WaylandOverlayBackend {
 }
 
 impl OverlayBackend for WaylandOverlayBackend {
-    fn render(&mut self, state: &OverlayVisibility) -> Result<()> {
-        let intent = state.to_render_intent();
+    fn render(&mut self, state: &OverlayVisibility, warning: bool) -> Result<()> {
+        let intent = state.to_render_intent(warning);
         let now = self.now_ms();
         self.update_interim_headline_state(&intent, now);
 
@@ -1831,6 +1836,28 @@ impl OverlayBackend for WaylandOverlayBackend {
             self.last_phase = intent.phase;
         }
 
+        // Detect warning flag changes — cross-fade to/from amber.
+        if intent.warning != self.last_warning {
+            let from = if self.last_warning {
+                Some(WARNING_ACCENT_COLOR)
+            } else {
+                accent_color_for_phase(intent.phase)
+            };
+            let to = if intent.warning {
+                Some(WARNING_ACCENT_COLOR)
+            } else {
+                accent_color_for_phase(intent.phase)
+            };
+            if let (Some(from_color), Some(to_color)) = (from, to) {
+                self.accent_transition = Some(AccentTransition {
+                    from_color,
+                    to_color,
+                    started_ms: now,
+                });
+            }
+            self.last_warning = intent.warning;
+        }
+
         // Clean up completed fades
         if let Some(fade) = &self.fade {
             if fade.is_complete(now) {
@@ -1850,11 +1877,13 @@ impl OverlayBackend for WaylandOverlayBackend {
             }
         }
 
-        // Resolve accent color: success flash > transition blend > static.
+        // Resolve accent color: success flash > transition blend > warning > static.
         let mut accent_color = if let Some(flash) = &self.success_flash {
             Some(flash.color(now))
         } else if let Some(transition) = &self.accent_transition {
             Some(transition.blended_color(now))
+        } else if intent.warning {
+            Some(WARNING_ACCENT_COLOR)
         } else {
             accent_color_for_phase(intent.phase)
         };
@@ -3327,7 +3356,7 @@ where
     let mut machine = OverlayStateMachine::new(Duration::from_millis(cli.auto_hide_ms.max(1)));
     built_backend
         .backend
-        .render(machine.visibility())
+        .render(machine.visibility(), machine.warning_active())
         .context("initial overlay render failed")?;
 
     let stdin = BufReader::new(tokio::io::stdin());
@@ -3355,7 +3384,7 @@ where
                                     ApplyOutcome::Applied => {
                                         built_backend
                                             .backend
-                                            .render(machine.visibility())
+                                            .render(machine.visibility(), machine.warning_active())
                                             .context("overlay render failed while applying event")?;
                                     }
                                     ApplyOutcome::DroppedStaleSeq => {
@@ -3389,7 +3418,7 @@ where
                 if time_advanced || fading {
                     built_backend
                         .backend
-                        .render(machine.visibility())
+                        .render(machine.visibility(), machine.warning_active())
                         .context("overlay render failed while advancing auto-hide timer")?;
                 }
             }
@@ -3815,6 +3844,7 @@ mod tests {
                 visible: false,
                 headline: String::new(),
                 detail: None,
+                warning: false,
             },
             &ui,
             &mut text_renderer,
@@ -3839,6 +3869,7 @@ mod tests {
                 visible: true,
                 headline: "listening".to_string(),
                 detail: None,
+                warning: false,
             },
             &ui,
             &mut text_renderer,
@@ -3890,6 +3921,7 @@ mod tests {
             visible: true,
             headline: "listening".to_string(),
             detail: None,
+            warning: false,
         };
 
         let accent = accent_color_for_phase(OverlayRenderPhase::Listening);

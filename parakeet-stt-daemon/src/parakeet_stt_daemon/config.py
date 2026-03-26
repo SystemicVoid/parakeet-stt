@@ -60,12 +60,12 @@ class ServerSettings(BaseSettings):
         default=32, ge=1, le=128, description="Batch size used by streaming inference helper."
     )
     max_session_seconds: float = Field(
-        default=90.0,
+        default=600.0,
         ge=1.0,
         le=1800.0,
         description=(
-            "Hard session duration limit (seconds). Active sessions exceeding this are aborted "
-            "to prevent runaway buffering."
+            "Hard session duration limit (seconds). Sessions reaching this limit stop "
+            "accepting new audio and finalize on key release."
         ),
     )
     max_session_samples: int | None = Field(

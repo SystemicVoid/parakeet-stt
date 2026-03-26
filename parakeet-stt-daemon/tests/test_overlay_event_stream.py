@@ -245,7 +245,7 @@ def test_overlay_events_disabled_emits_only_baseline_messages(monkeypatch) -> No
     asyncio.run(scenario())
 
 
-def test_stop_session_aborts_when_sample_limit_already_breached(monkeypatch) -> None:
+def test_stop_session_finalizes_gracefully_when_sample_limit_breached(monkeypatch) -> None:
     async def scenario() -> None:
         _disable_server_sleep(monkeypatch)
         guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
@@ -264,16 +264,11 @@ def test_stop_session_aborts_when_sample_limit_already_breached(monkeypatch) -> 
         await asyncio.sleep(0)
 
         sent_types = [cast(str, payload["type"]) for payload in websocket.sent_json]
-        assert "final_result" not in sent_types
-        assert audio.abort_calls == 1
-        assert audio.stop_calls == 0
+        # Graceful cutoff: finalization runs on capped audio instead of aborting.
+        assert "final_result" in sent_types
+        assert audio.abort_calls == 0
+        assert audio.stop_calls == 1
         assert server.sessions.active is None
-        error_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "error"
-        ]
-        assert error_payloads
-        assert error_payloads[-1]["code"] == "AUDIO_DEVICE"
-        assert "max buffered audio" in cast(str, error_payloads[-1]["message"])
 
     asyncio.run(scenario())
 

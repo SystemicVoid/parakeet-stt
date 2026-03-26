@@ -34,6 +34,7 @@ class ServerMessageType(StrEnum):
     INTERIM_TEXT = "interim_text"
     SESSION_ENDED = "session_ended"
     AUDIO_LEVEL = "audio_level"
+    SESSION_WARNING = "session_warning"
 
 
 class InterimStateValue(StrEnum):
@@ -187,6 +188,18 @@ class SessionEndedMessage(BaseModel):
     reason: SessionEndReason | None = None
 
 
+class SessionWarningMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.SESSION_WARNING] = Field(
+        default=ServerMessageType.SESSION_WARNING
+    )
+    session_id: UUID
+    warning: Literal["approaching_limit"]
+    remaining_seconds: float
+    limit_seconds: float
+
+
 ServerMessage = (
     SessionStarted
     | FinalResult
@@ -196,6 +209,7 @@ ServerMessage = (
     | InterimTextMessage
     | AudioLevelMessage
     | SessionEndedMessage
+    | SessionWarningMessage
 )
 
 
@@ -238,6 +252,7 @@ __all__ = [
     "InterimTextMessage",
     "AudioLevelMessage",
     "SessionEndedMessage",
+    "SessionWarningMessage",
     "ParsedMessage",
     "parse_client_message",
 ]

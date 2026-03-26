@@ -83,6 +83,12 @@ pub enum ServerMessage {
         session_id: Uuid,
         reason: Option<String>,
     },
+    SessionWarning {
+        session_id: Uuid,
+        warning: String,
+        remaining_seconds: f32,
+        limit_seconds: f32,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -125,6 +131,7 @@ fn is_known_server_message_type(message_type: &str) -> bool {
             | "interim_text"
             | "audio_level"
             | "session_ended"
+            | "session_warning"
     )
 }
 
@@ -367,6 +374,12 @@ mod tests {
             ServerMessage::SessionEnded {
                 session_id,
                 reason: Some("final".to_string()),
+            },
+            ServerMessage::SessionWarning {
+                session_id,
+                warning: "approaching_limit".to_string(),
+                remaining_seconds: 120.0,
+                limit_seconds: 600.0,
             },
         ];
 
