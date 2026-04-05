@@ -157,6 +157,10 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
             raise
     logger.info("Loaded Parakeet model '{}' on device {}", model_name, resolved_device)
 
+    # from_pretrained() leaves the model in training mode, wasting VRAM on
+    # dropout masks and training-only state.
+    model.eval()
+
     # Optional attention tweak is aligned with the HF card guidance.
     change_attention = getattr(model, "change_attention_model", None)
     if callable(change_attention):
