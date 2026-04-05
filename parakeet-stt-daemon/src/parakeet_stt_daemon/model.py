@@ -130,6 +130,27 @@ def _model_transcribe(model: ASRModel, *args: Any, **kwargs: Any) -> list[Any]:
     return transcribe(*args, **kwargs)
 
 
+def _disable_cuda_graph_decoder(model: ASRModel) -> None:
+    """Disable CUDA graph decoder on the model's decoding strategy.
+
+    NeMo's greedy TDT/RNNT decoder defaults to ``use_cuda_graph_decoder=True``
+    which pre-allocates several GB of pinned VRAM for batched graph replay.
+    A single-user real-time daemon never benefits from this — disabling it
+    typically reclaims 5-8 GB of VRAM.
+    """
+    decoding = getattr(model, "decoding", None)
+    disable_fn = getattr(decoding, "disable_cuda_graphs", None) if decoding is not None else None
+    if callable(disable_fn):
+        try:
+            disabled = disable_fn()
+            if disabled:
+                logger.info("Disabled CUDA graph decoder to reduce VRAM usage")
+            else:
+                logger.debug("CUDA graph decoder was already disabled or not applicable")
+        except Exception as exc:  # noqa: BLE001 - best-effort VRAM optimisation
+            logger.debug("Could not disable CUDA graph decoder: {}", exc)
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:
@@ -168,6 +189,9 @@ def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cud
             change_attention(self_attention_model="rel_pos_local_attn", att_context_size=[256, 256])
         except (AttributeError, RuntimeError, TypeError, ValueError) as exc:  # pragma: no cover
             logger.warning("Failed to adjust attention window: {}", exc)
+
+    # Must run after change_attention_model which may rebuild the decoding strategy.
+    _disable_cuda_graph_decoder(model)
 
     object.__setattr__(model, "_parakeet_effective_device", resolved_device)
     return model
@@ -341,6 +365,9 @@ class ParakeetStreamingTranscriber:
                                     greedy_cfg, "max_symbols_per_step", int(max_steps_per_timestep)
                                 )
                             change_decoding(decoding_cfg)
+                            # change_decoding_strategy recreates the decoder with
+                            # CUDA graphs re-enabled; disable them again.
+                            _disable_cuda_graph_decoder(self.model)
                         except Exception as exc:  # noqa: BLE001 - NeMo config shape varies by build
                             logger.warning(
                                 "Failed to adjust decoding strategy for TDT streaming: {}", exc
