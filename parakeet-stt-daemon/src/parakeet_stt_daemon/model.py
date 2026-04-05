@@ -151,6 +151,17 @@ def _disable_cuda_graph_decoder(model: ASRModel) -> None:
             logger.debug("Could not disable CUDA graph decoder: {}", exc)
 
 
+def _release_cuda_cache(device: str) -> None:
+    """Release PyTorch's CUDA caching allocator memory back to the driver."""
+    if device != "cuda" or torch is None:
+        return
+    try:
+        torch.cuda.empty_cache()
+        logger.debug("Released CUDA cache after model setup")
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+        logger.debug("CUDA cache release failed: {}", exc)
+
+
 def load_parakeet_model(model_name: str = DEFAULT_MODEL_NAME, device: str = "cuda") -> ASRModel:
     """Load the Parakeet model with a minimal amount of glue."""
     try:

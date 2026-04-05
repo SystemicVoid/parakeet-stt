@@ -44,6 +44,7 @@ from .model import (
     ParakeetStreamingSession,
     ParakeetStreamingTranscriber,
     ParakeetTranscriber,
+    _release_cuda_cache,
     load_parakeet_model,
 )
 from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
@@ -1499,6 +1500,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             await asyncio.to_thread(server.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
+        _release_cuda_cache(settings.device)
         if server._vad_enabled:
             await asyncio.to_thread(server.prepare_vad)
         runtime_degraded = (
