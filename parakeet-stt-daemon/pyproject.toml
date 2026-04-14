@@ -40,7 +40,7 @@ parakeet-stt-daemon = "parakeet_stt_daemon.__main__:main"
 [dependency-groups]
 dev = [
   "ruff>=0.14.0",
-  "pytest>=8.4.0",
+  "pytest>=9.0.3",
   "deptry>=0.24.0",
 ]
 
