@@ -795,7 +795,7 @@ Commands:
   off [options]          Start daemon/client in offline mode (overlay off).
   cpu [options]          Start daemon/client in offline CPU-only mode.
   llm [args]             Start/stop/status the managed llama + STT stack.
-  stop                   Stop daemon/client and remove pid/port files.
+  stop                   Stop daemon/client, managed llama-server, and remove pid/port files.
   restart [options]      Restart with the same options as start.
   status                 Show daemon/client/tmux status.
   logs [client|daemon|both]
@@ -854,7 +854,7 @@ Usage:
 
 Behavior:
   stt llm               Start managed llama-server, then delegate to 'stt start'.
-  stt llm stop          Stop both the STT stack and the managed llama-server.
+  stt llm stop          Stop the STT stack; helper-managed llama-server is included.
   stt llm status        Show managed llama status, then normal STT status.
   stt llm logs          Tail /tmp/parakeet-llama-server.log.
   stt llm show          Attach to the llama tmux session.
@@ -1239,12 +1239,6 @@ CLIENTCMD
                 stop)
                     shift
                     stt stop
-                    echo ">>> Stopping managed llama-server..."
-                    if _stop_llm_server; then
-                        echo "   - LLM server stopped"
-                    else
-                        echo "   - LLM server not running"
-                    fi
                     ;;
                 status)
                     local llm_health_url
@@ -1318,6 +1312,10 @@ CLIENTCMD
                 if _stop_pid "$DAEMON_PID_FILE"; then
                     echo "   - Daemon stopped"
                 fi
+            fi
+
+            if _stop_llm_server; then
+                echo "   - Managed LLM server stopped"
             fi
 
             rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE" "$PORT_FILE"
