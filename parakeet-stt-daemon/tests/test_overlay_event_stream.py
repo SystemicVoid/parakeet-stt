@@ -790,7 +790,7 @@ def test_stop_waits_for_in_flight_live_interim_before_final_send(monkeypatch) ->
 
         server = _build_server(overlay_events_enabled=True)
         transcriber = BlockingIncrementalTranscriber("late interim")
-        server.transcriber = transcriber
+        _set_dynamic_attr(server, "transcriber", transcriber)
         websocket = FakeWebSocket()
         session_id = uuid4()
         final_started = asyncio.Event()
@@ -855,7 +855,7 @@ def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None
 
         server = _build_server(overlay_events_enabled=True)
         transcriber = SerializingTranscriber()
-        server.transcriber = transcriber
+        _set_dynamic_attr(server, "transcriber", transcriber)
         _set_dynamic_attr(
             server,
             "_trim_tail_silence",
