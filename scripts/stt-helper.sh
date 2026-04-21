@@ -386,6 +386,89 @@ stt() {
         return 0
     }
 
+    _resolve_start_launch_profile() {
+        local -n out_ref="$1"
+        local candidate="${2:-}"
+        out_ref="stream-seal"
+        case "$candidate" in
+            stream|streaming|on)
+                return 0
+                ;;
+            offline|off)
+                out_ref="offline"
+                return 0
+                ;;
+            cpu)
+                out_ref="cpu"
+                return 0
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    _resolve_start_runtime_config() {
+        local launch_profile="$1"
+        shift
+
+        _apply_launch_profile_defaults "$launch_profile"
+        _load_start_vars_from_defaults
+
+        daemon_device="$default_daemon_device"
+        daemon_streaming_enabled="$default_daemon_streaming_enabled"
+        daemon_chunk_secs="$default_daemon_chunk_secs"
+        daemon_right_context_secs="$default_daemon_right_context_secs"
+        daemon_left_context_secs="$default_daemon_left_context_secs"
+        daemon_batch_size="$default_daemon_batch_size"
+        daemon_overlay_events_enabled="false"
+
+        if [ "$launch_profile" = "stream-seal" ]; then
+            daemon_streaming_enabled="true"
+        fi
+
+        local parse_status=0
+        _parse_start_options "$@" || parse_status=$?
+        if [ "$parse_status" -ne 0 ]; then
+            return "$parse_status"
+        fi
+
+        # Keep daemon overlay event emission in lockstep with the user-facing
+        # --overlay-enabled start control so one switch enables both paths.
+        daemon_overlay_events_enabled="$overlay_enabled"
+        return 0
+    }
+
+    _daemon_effective_device_matches_request() {
+        local requested_device="$1"
+        local current_effective_device="$2"
+
+        if [ "$current_effective_device" = "$requested_device" ]; then
+            return 0
+        fi
+
+        # Accelerator requests can legitimately fall back to CPU at runtime.
+        if [ "$requested_device" != "cpu" ] && [ "$current_effective_device" = "cpu" ]; then
+            return 0
+        fi
+
+        return 1
+    }
+
+    _daemon_runtime_matches_request() {
+        local requested_device="$1"
+        local requested_streaming_enabled="$2"
+        local requested_overlay_events_enabled="$3"
+        local current_effective_device="$4"
+        local current_streaming_enabled="$5"
+        local current_overlay_events_enabled="$6"
+
+        _daemon_effective_device_matches_request "$requested_device" "$current_effective_device" || return 1
+        [ "$current_streaming_enabled" = "$requested_streaming_enabled" ] || return 1
+        [ "$current_overlay_events_enabled" = "$requested_overlay_events_enabled" ] || return 1
+        return 0
+    }
+
     _pid_alive() {
         local pid_file="$1"
         [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" >/dev/null 2>&1
@@ -449,6 +532,23 @@ PY
         return $?
     }
 
+    _http_get() {
+        local url="$1"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsS --max-time 2 "$url"
+            return $?
+        fi
+
+        python3 - "$url" <<'PY'
+import sys
+import urllib.request
+
+with urllib.request.urlopen(sys.argv[1], timeout=2) as response:
+    sys.stdout.write(response.read().decode("utf-8"))
+PY
+        return $?
+    }
+
     _wait_for_http() {
         local url="$1"
         local pid_file="$2"
@@ -475,6 +575,17 @@ PY
                 return 0
             fi
             sleep 0.5
+        done
+        return 1
+    }
+
+    _wait_for_socket_gone() {
+        local tries="${1:-20}"
+        for _ in $(seq 1 "$tries"); do
+            if ! _socket_ready_once; then
+                return 0
+            fi
+            sleep 0.2
         done
         return 1
     }
@@ -580,6 +691,74 @@ PY
         local listener_pid
         listener_pid="$(_listener_pid "$port")" || return 1
         printf "%s\n" "$listener_pid" >| "$pid_file"
+        return 0
+    }
+
+    _daemon_status_runtime_truth() {
+        local status_url="$1"
+        local body
+        body="$(_http_get "$status_url")" || return 1
+
+        STATUS_JSON="$body" python3 - <<'PY'
+import json
+import os
+import sys
+
+body = os.environ.get("STATUS_JSON", "")
+try:
+    payload = json.loads(body)
+except Exception:
+    sys.exit(1)
+
+required = {
+    "device": payload.get("device"),
+    "effective_device": payload.get("effective_device"),
+    "streaming_enabled": payload.get("streaming_enabled"),
+    "overlay_events_enabled": payload.get("overlay_events_enabled"),
+}
+for value in required.values():
+    if value is None:
+        sys.exit(1)
+
+for key in ("device", "effective_device"):
+    print(f"{key}={required[key]}")
+for key in ("streaming_enabled", "overlay_events_enabled"):
+    value = required[key]
+    if not isinstance(value, bool):
+        sys.exit(1)
+    print(f"{key}={'true' if value else 'false'}")
+PY
+    }
+
+    _stop_running_daemon() {
+        if _socket_ready_once; then
+            _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
+        fi
+
+        if _pid_alive "$DAEMON_PID_FILE"; then
+            _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
+        fi
+
+        local listener_pid
+        listener_pid="$(_listener_pid "$PORT")" || true
+        if [ -n "$listener_pid" ] && ps -p "$listener_pid" >/dev/null 2>&1; then
+            kill -TERM "$listener_pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+                if ! ps -p "$listener_pid" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.2
+            done
+            if ps -p "$listener_pid" >/dev/null 2>&1; then
+                kill -KILL "$listener_pid" 2>/dev/null || true
+            fi
+        fi
+
+        if ! _wait_for_socket_gone 20; then
+            return 1
+        fi
+
+        rm -f "$DAEMON_PID_FILE"
         return 0
     }
 
@@ -939,27 +1118,19 @@ CLIENTCMD
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local daemon_device daemon_streaming_enabled daemon_chunk_secs daemon_right_context_secs daemon_left_context_secs daemon_batch_size daemon_overlay_events_enabled
             local -a ptt_args
-            local launch_profile="stream-seal"
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
-                launch_profile="stream-seal"
-                shift
-            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
-                launch_profile="offline"
-                shift
-            elif [ "${1:-}" = "cpu" ]; then
-                launch_profile="cpu"
+            local launch_profile
+            if _resolve_start_launch_profile launch_profile "${1:-}"; then
                 shift
             fi
-            _apply_launch_profile_defaults "$launch_profile"
-            _load_start_vars_from_defaults
 
-            local parse_status=0
-            _parse_start_options "$@" || parse_status=$?
-            if [ "$parse_status" -eq 2 ]; then
-                return 0
-            elif [ "$parse_status" -ne 0 ]; then
-                return "$parse_status"
+            if ! _resolve_start_runtime_config "$launch_profile" "$@"; then
+                local resolve_status=$?
+                if [ "$resolve_status" -eq 2 ]; then
+                    return 0
+                fi
+                return "$resolve_status"
             fi
 
             _build_ptt_args ptt_args
@@ -970,75 +1141,87 @@ CLIENTCMD
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local daemon_device daemon_streaming_enabled daemon_chunk_secs daemon_right_context_secs daemon_left_context_secs daemon_batch_size daemon_overlay_events_enabled
             local -a start_cli_args
-            local launch_profile="stream-seal"
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
-                launch_profile="stream-seal"
-                shift
-            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
-                launch_profile="offline"
-                shift
-            elif [ "${1:-}" = "cpu" ]; then
-                launch_profile="cpu"
+            local launch_profile
+            if _resolve_start_launch_profile launch_profile "${1:-}"; then
                 shift
             fi
-            _apply_launch_profile_defaults "$launch_profile"
-            _load_start_vars_from_defaults
 
-            local parse_status=0
-            _parse_start_options "$@" || parse_status=$?
-            if [ "$parse_status" -eq 2 ]; then
-                return 0
-            elif [ "$parse_status" -ne 0 ]; then
-                return "$parse_status"
+            if ! _resolve_start_runtime_config "$launch_profile" "$@"; then
+                local resolve_status=$?
+                if [ "$resolve_status" -eq 2 ]; then
+                    return 0
+                fi
+                return "$resolve_status"
             fi
 
             _build_start_cli_args start_cli_args "$launch_profile"
             printf "%s\n" "${start_cli_args[@]}"
+            ;;
+        __start-runtime-config)
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local daemon_device daemon_streaming_enabled daemon_chunk_secs daemon_right_context_secs daemon_left_context_secs daemon_batch_size daemon_overlay_events_enabled
+            local launch_profile
+            if _resolve_start_launch_profile launch_profile "${1:-}"; then
+                shift
+            fi
+
+            if ! _resolve_start_runtime_config "$launch_profile" "$@"; then
+                local resolve_status=$?
+                if [ "$resolve_status" -eq 2 ]; then
+                    return 0
+                fi
+                return "$resolve_status"
+            fi
+
+            cat <<EOF
+launch_profile=$launch_profile
+daemon_device=$daemon_device
+daemon_streaming_enabled=$daemon_streaming_enabled
+daemon_overlay_events_enabled=$daemon_overlay_events_enabled
+daemon_chunk_secs=$daemon_chunk_secs
+daemon_right_context_secs=$daemon_right_context_secs
+daemon_left_context_secs=$daemon_left_context_secs
+daemon_batch_size=$daemon_batch_size
+EOF
+            ;;
+        __daemon-runtime-matches)
+            if [ "$#" -ne 6 ]; then
+                echo "usage: stt __daemon-runtime-matches <requested_device> <requested_streaming_enabled> <requested_overlay_events_enabled> <current_effective_device> <current_streaming_enabled> <current_overlay_events_enabled>" >&2
+                return 2
+            fi
+
+            if _daemon_runtime_matches_request "$1" "$2" "$3" "$4" "$5" "$6"; then
+                echo "match=true"
+            else
+                echo "match=false"
+            fi
             ;;
         start)
             local injection_mode paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary
             local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
             local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
-            local launch_profile="stream-seal"
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "on" ]; then
-                launch_profile="stream-seal"
-                shift
-            elif [ "${1:-}" = "offline" ] || [ "${1:-}" = "off" ]; then
-                launch_profile="offline"
-                shift
-            elif [ "${1:-}" = "cpu" ]; then
-                launch_profile="cpu"
+            local launch_profile
+            if _resolve_start_launch_profile launch_profile "${1:-}"; then
                 shift
             fi
-            local daemon_device="$default_daemon_device"
-            local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local daemon_chunk_secs="$default_daemon_chunk_secs"
-            local daemon_right_context_secs="$default_daemon_right_context_secs"
-            local daemon_left_context_secs="$default_daemon_left_context_secs"
-            local daemon_batch_size="$default_daemon_batch_size"
-            local daemon_overlay_events_enabled="false"
-            if [ "$launch_profile" = "stream-seal" ]; then
-                daemon_streaming_enabled="true"
-            fi
+            local daemon_device daemon_streaming_enabled daemon_chunk_secs daemon_right_context_secs daemon_left_context_secs daemon_batch_size daemon_overlay_events_enabled
             local client_ready_timeout_seconds="$default_client_ready_timeout_seconds"
             local ptt_rustflags="$default_ptt_rustflags"
             local ptt_runner_preference="$default_ptt_runner_preference"
-            _apply_launch_profile_defaults "$launch_profile"
-            _load_start_vars_from_defaults
 
-            local parse_status=0
-            _parse_start_options "$@" || parse_status=$?
-            if [ "$parse_status" -eq 2 ]; then
-                return 0
-            elif [ "$parse_status" -ne 0 ]; then
-                return "$parse_status"
+            if ! _resolve_start_runtime_config "$launch_profile" "$@"; then
+                local resolve_status=$?
+                if [ "$resolve_status" -eq 2 ]; then
+                    return 0
+                fi
+                return "$resolve_status"
             fi
-
-            # Keep daemon overlay event emission in lockstep with the user-facing
-            # --overlay-enabled start control so one switch enables both paths.
-            daemon_overlay_events_enabled="$overlay_enabled"
 
             if ! [[ "$client_ready_timeout_seconds" =~ ^[0-9]+$ ]] || [ "$client_ready_timeout_seconds" -lt 1 ]; then
                 echo "   - Invalid PARAKEET_CLIENT_READY_TIMEOUT_SECONDS='$client_ready_timeout_seconds'; defaulting to 30."
@@ -1083,21 +1266,60 @@ CLIENTCMD
             fi
 
             local daemon_reused=0
-            if _pid_alive "$DAEMON_PID_FILE"; then
-                if _socket_ready_once; then
-                    _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
-                    echo "   - Daemon already running (pid $(cat "$DAEMON_PID_FILE"))."
-                    daemon_reused=1
+            local daemon_status_url="http://${HOST}:${PORT}/status"
+            if _socket_ready_once; then
+                local current_device=""
+                local current_effective_device=""
+                local current_streaming_enabled=""
+                local current_overlay_events_enabled=""
+                local runtime_truth
+
+                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
+                runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url" 2>/dev/null)" || runtime_truth=""
+
+                echo "   - Requested daemon runtime: device=$daemon_device, streaming_enabled=$daemon_streaming_enabled, overlay_events_enabled=$daemon_overlay_events_enabled"
+                if [ -n "$runtime_truth" ]; then
+                    while IFS='=' read -r key value; do
+                        case "$key" in
+                            device) current_device="$value" ;;
+                            effective_device) current_effective_device="$value" ;;
+                            streaming_enabled) current_streaming_enabled="$value" ;;
+                            overlay_events_enabled) current_overlay_events_enabled="$value" ;;
+                        esac
+                    done <<< "$runtime_truth"
+                    echo "   - Existing daemon runtime: device=$current_device, effective_device=$current_effective_device, streaming_enabled=$current_streaming_enabled, overlay_events_enabled=$current_overlay_events_enabled"
+                    if _daemon_runtime_matches_request \
+                        "$daemon_device" \
+                        "$daemon_streaming_enabled" \
+                        "$daemon_overlay_events_enabled" \
+                        "$current_effective_device" \
+                        "$current_streaming_enabled" \
+                        "$current_overlay_events_enabled"; then
+                        echo "   - Reusing existing daemon (pid $(cat "$DAEMON_PID_FILE" 2>/dev/null))."
+                        daemon_reused=1
+                    else
+                        echo "   - Existing daemon runtime does not match request; restarting."
+                        if ! _stop_running_daemon; then
+                            echo "   - Failed to stop the running daemon before relaunch."
+                            return 1
+                        fi
+                    fi
                 else
-                    echo "   - Daemon pid $(cat "$DAEMON_PID_FILE") is stale (socket not ready); restarting."
-                    _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
-                    rm -f "$DAEMON_PID_FILE"
+                    echo "   - Existing daemon status missing or unparseable; restarting to enforce requested runtime."
+                    if ! _stop_running_daemon; then
+                        echo "   - Failed to stop the running daemon before relaunch."
+                        return 1
+                    fi
                 fi
+            elif _pid_alive "$DAEMON_PID_FILE"; then
+                echo "   - Daemon pid $(cat "$DAEMON_PID_FILE") is stale (socket not ready); restarting."
+                _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
+                rm -f "$DAEMON_PID_FILE"
             fi
 
             if [ "$daemon_reused" -ne 1 ]; then
                 echo "   - Launching daemon..."
-                _log_daemon "launch via stt helper (streaming=${daemon_streaming_enabled})"
+                _log_daemon "launch via stt helper (device=${daemon_device}, streaming=${daemon_streaming_enabled}, overlay_events=${daemon_overlay_events_enabled})"
                 (
                     cd "$DAEMON_DIR" || exit 1
                     PARAKEET_STREAMING_ENABLED="$daemon_streaming_enabled" \
