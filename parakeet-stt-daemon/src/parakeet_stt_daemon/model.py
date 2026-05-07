@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import tempfile
 import wave
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
@@ -99,6 +99,39 @@ def _set_cfg_value(cfg: Any, key: str, value: Any) -> bool:
     return False
 
 
+def _disable_cuda_graph_decoder_config(decoding_cfg: Any) -> bool:
+    """Disable NeMo CUDA graph decoder flags before decoding objects are built."""
+    changed = False
+    greedy_cfg = _get_cfg_value(decoding_cfg, "greedy")
+    if greedy_cfg is not None:
+        changed = _set_cfg_value(greedy_cfg, "use_cuda_graph_decoder", False) or changed
+    beam_cfg = _get_cfg_value(decoding_cfg, "beam")
+    if beam_cfg is not None:
+        changed = _set_cfg_value(beam_cfg, "allow_cuda_graphs", False) or changed
+    return changed
+
+
+def _iter_cuda_graph_decoder_candidates(model: ASRModel) -> Iterator[Any]:
+    """Yield likely NeMo decoder objects that may own CUDA graph state."""
+    seen: set[int] = set()
+    stack = [model]
+    candidate_attrs = ("decoding", "decoding_computer")
+    while stack:
+        candidate = stack.pop()
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        yield candidate
+        for attr in candidate_attrs:
+            try:
+                stack.append(getattr(candidate, attr))
+            except AttributeError:
+                continue
+
+
 def _write_audio_file(path: Path, samples: np.ndarray, sample_rate: int) -> None:
     sf: Any | None
     try:
@@ -138,17 +171,32 @@ def _disable_cuda_graph_decoder(model: ASRModel) -> None:
     A single-user real-time daemon never benefits from this — disabling it
     typically reclaims 5-8 GB of VRAM.
     """
-    decoding = getattr(model, "decoding", None)
-    disable_fn = getattr(decoding, "disable_cuda_graphs", None) if decoding is not None else None
-    if callable(disable_fn):
+    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
+    decoding_cfg = _get_cfg_value(cfg, "decoding")
+    if _disable_cuda_graph_decoder_config(decoding_cfg):
+        logger.debug("Disabled CUDA graph decoder in NeMo decoding config")
+
+    disabled_any = False
+    for candidate in _iter_cuda_graph_decoder_candidates(model):
+        disable_fn = getattr(candidate, "disable_cuda_graphs", None)
+        if not callable(disable_fn):
+            continue
         try:
             disabled = disable_fn()
             if disabled:
-                logger.info("Disabled CUDA graph decoder to reduce VRAM usage")
-            else:
-                logger.debug("CUDA graph decoder was already disabled or not applicable")
+                disabled_any = True
+                logger.info(
+                    "Disabled CUDA graph decoder on {} to reduce VRAM usage",
+                    type(candidate).__name__,
+                )
         except Exception as exc:  # noqa: BLE001 - best-effort VRAM optimisation
-            logger.debug("Could not disable CUDA graph decoder: {}", exc)
+            logger.debug(
+                "Could not disable CUDA graph decoder on {}: {}",
+                type(candidate).__name__,
+                exc,
+            )
+    if not disabled_any:
+        logger.debug("CUDA graph decoder was already disabled or not applicable")
 
 
 def _release_cuda_cache(device: str) -> None:
@@ -338,7 +386,7 @@ class ParakeetStreamingTranscriber:
         model_is_tdt = _is_tdt_model(self.model)
         max_steps_per_timestep = 5
         cfg = getattr(self.model, "_cfg", None) or getattr(self.model, "cfg", None)
-        decoding_cfg = getattr(cfg, "decoding", None)
+        decoding_cfg = _get_cfg_value(cfg, "decoding")
         greedy_cfg = getattr(decoding_cfg, "greedy", None)
         configured = _get_cfg_value(greedy_cfg, "max_symbols_per_step")
         if configured is not None:
@@ -357,6 +405,7 @@ class ParakeetStreamingTranscriber:
                             if open_dict_fn is not None:
                                 with open_dict_fn(decoding_cfg):
                                     _set_cfg_value(decoding_cfg, "strategy", "greedy")
+                                    _disable_cuda_graph_decoder_config(decoding_cfg)
                                     _set_cfg_value(decoding_cfg, "preserve_alignments", True)
                                     _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
                                     beam_cfg = _get_cfg_value(decoding_cfg, "beam")
@@ -368,6 +417,7 @@ class ParakeetStreamingTranscriber:
                                     )
                             else:
                                 _set_cfg_value(decoding_cfg, "strategy", "greedy")
+                                _disable_cuda_graph_decoder_config(decoding_cfg)
                                 _set_cfg_value(decoding_cfg, "preserve_alignments", True)
                                 _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
                                 beam_cfg = _get_cfg_value(decoding_cfg, "beam")
