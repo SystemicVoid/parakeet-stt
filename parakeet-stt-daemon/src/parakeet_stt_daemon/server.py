@@ -1396,13 +1396,18 @@ class DaemonServer:
             None,
             partial(self._trim_tail_silence, audio_samples, self.audio.sample_rate),
         )
+        effective_device = str(getattr(self, "_effective_device", self.settings.device))
         if trimmed.size == 0:
             logger.info("Skipping offline transcription: silence trimming removed all samples")
+            _release_cuda_cache(effective_device)
             return "", 0
         infer_started = time.perf_counter()
-        text = await self._transcribe_samples_serialized(trimmed)
-        infer_ms = int((time.perf_counter() - infer_started) * 1000)
-        return text, infer_ms
+        try:
+            text = await self._transcribe_samples_serialized(trimmed)
+            infer_ms = int((time.perf_counter() - infer_started) * 1000)
+            return text, infer_ms
+        finally:
+            _release_cuda_cache(effective_device)
 
     def _start_stream_drain_loop(self, websocket: WebSocket, session_id: UUID) -> None:
         if self._stream_drain_task is not None:

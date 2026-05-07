@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.model import ParakeetTranscriber
 from parakeet_stt_daemon.server import DaemonServer
@@ -124,18 +125,26 @@ def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
     asyncio.run(scenario())
 
 
-def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty() -> None:
+def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monkeypatch) -> None:
     async def scenario() -> None:
         server = cast(Any, DaemonServer.__new__(DaemonServer))
-        server.settings = ServerSettings(device="cpu", streaming_enabled=False)
+        server.settings = ServerSettings(device="cuda", streaming_enabled=False)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
         server.streaming_transcriber = None
         server._active_stream = None
         server._vad_enabled = False
+        server._effective_device = "cuda"
         server._trim_tail_silence = lambda _samples, _sample_rate: np.zeros(
             (0,),
             dtype=np.float32,
+        )
+        released_devices: list[str] = []
+
+        monkeypatch.setattr(
+            server_module,
+            "_release_cuda_cache",
+            lambda device: released_devices.append(device),
         )
 
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
@@ -145,6 +154,7 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty() -> 
         assert text == ""
         assert infer_ms == 0
         assert server.transcriber.calls == []
+        assert released_devices == ["cuda"]
 
     asyncio.run(scenario())
 
@@ -211,5 +221,34 @@ def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
 
         assert text == "offline text"
         assert infer_ms >= 0
+
+    asyncio.run(scenario())
+
+
+def test_server_finalize_releases_cuda_cache_after_model_call(monkeypatch) -> None:
+    async def scenario() -> None:
+        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server.settings = ServerSettings(device="cuda", streaming_enabled=False)
+        server.audio = SimpleNamespace(sample_rate=16_000)
+        server.transcriber = _RecordingTranscriber()
+        server.streaming_transcriber = None
+        server._active_stream = None
+        server._effective_device = "cuda"
+        server._trim_tail_silence = lambda samples, _sample_rate: samples
+        released_devices: list[str] = []
+
+        monkeypatch.setattr(
+            server_module,
+            "_release_cuda_cache",
+            lambda device: released_devices.append(device),
+        )
+
+        text, infer_ms = await cast(DaemonServer, server)._finalise_transcription(
+            np.array([0.2, 0.1, 0.05], dtype=np.float32)
+        )
+
+        assert text == "offline text"
+        assert infer_ms >= 0
+        assert released_devices == ["cuda"]
 
     asyncio.run(scenario())
