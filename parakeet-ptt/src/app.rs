@@ -2650,6 +2650,14 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                             Some(progress) = llm_rx.recv() => {
                                 match progress {
                                     LlmProgress::Delta { session_id, delta } => {
+                                        if llm_in_flight_session != Some(session_id) {
+                                            debug!(
+                                                session = %session_id,
+                                                in_flight_session = ?llm_in_flight_session,
+                                                "ignoring stale llm delta for non-active session"
+                                            );
+                                            continue;
+                                        }
                                         let entry = llm_overlay_text.entry(session_id).or_default();
                                         entry.push_str(&delta);
                                         let seq = llm_seq.entry(session_id).or_insert(0);
@@ -2779,6 +2787,16 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                 hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
                 state.reset();
                 active_intent = None;
+                clear_transient_session_state(TransientSessionState {
+                    llm_busy: &mut llm_busy,
+                    llm_in_flight_session: &mut llm_in_flight_session,
+                    llm_seq: &mut llm_seq,
+                    llm_overlay_text: &mut llm_overlay_text,
+                    llm_deferred_session_end: &mut llm_deferred_session_end,
+                    parent_focus_by_session: &mut parent_focus_by_session,
+                    last_hotkey_up_at: &mut last_hotkey_up_at,
+                    last_stop_message: &mut last_stop_message,
+                });
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -2940,6 +2958,39 @@ fn take_parent_focus_for_enqueue(
         focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
         focus
     })
+}
+
+struct TransientSessionState<'a> {
+    llm_busy: &'a mut bool,
+    llm_in_flight_session: &'a mut Option<Uuid>,
+    llm_seq: &'a mut HashMap<Uuid, u64>,
+    llm_overlay_text: &'a mut HashMap<Uuid, String>,
+    llm_deferred_session_end: &'a mut HashMap<Uuid, Option<String>>,
+    parent_focus_by_session: &'a mut HashMap<Uuid, CapturedParentFocus>,
+    last_hotkey_up_at: &'a mut Option<TokioInstant>,
+    last_stop_message: &'a mut Option<(Uuid, TokioInstant)>,
+}
+
+fn clear_transient_session_state(transient: TransientSessionState<'_>) {
+    let TransientSessionState {
+        llm_busy,
+        llm_in_flight_session,
+        llm_seq,
+        llm_overlay_text,
+        llm_deferred_session_end,
+        parent_focus_by_session,
+        last_hotkey_up_at,
+        last_stop_message,
+    } = transient;
+
+    *llm_busy = false;
+    *llm_in_flight_session = None;
+    llm_seq.clear();
+    llm_overlay_text.clear();
+    llm_deferred_session_end.clear();
+    parent_focus_by_session.clear();
+    *last_hotkey_up_at = None;
+    *last_stop_message = None;
 }
 
 async fn handle_server_message(
@@ -3215,7 +3266,9 @@ mod tests {
         PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use crate::hotkey::{HotkeyEvent, HotkeyIntent};
-    use crate::injector::{FailInjector, PasteChordSender, PasteKeySender, TextInjector};
+    use crate::injector::{
+        FailInjector, ParentFocusCapture, PasteChordSender, PasteKeySender, TextInjector,
+    };
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -3223,14 +3276,15 @@ mod tests {
     use crate::state::PttState;
 
     use super::{
-        collect_pipe_reader, drain_sse_lines, handle_injection_report, handle_server_message,
-        maybe_defer_llm_session_end, run, sanitize_model_answer,
-        spawn_injector_worker_with_capacity, spawn_pipe_reader, BoxFuture, ClientPorts,
-        DaemonConnection, DaemonConnector, EnqueueFailure, HotkeyIntentDiagnostics, HotkeyRuntime,
-        HotkeySource, InjectionErrorKind, InjectionJob, InjectionJobRunner, InjectionOrigin,
-        InjectionReport, InjectionRunError, InjectionRunOutput, InjectorContext,
-        InjectorSubprocessRunner, LlmAnswerer, LlmProgress, NoopOverlaySink, OverlayEvent,
-        OverlayRouter, OverlaySink, RuntimeOverlaySink, SessionIntent, INJECTOR_JOB_TIMEOUT_MS,
+        clear_transient_session_state, collect_pipe_reader, drain_sse_lines,
+        handle_injection_report, handle_server_message, maybe_defer_llm_session_end, run,
+        sanitize_model_answer, spawn_injector_worker_with_capacity, spawn_pipe_reader, BoxFuture,
+        CapturedParentFocus, ClientPorts, DaemonConnection, DaemonConnector, EnqueueFailure,
+        HotkeyIntentDiagnostics, HotkeyRuntime, HotkeySource, InjectionErrorKind, InjectionJob,
+        InjectionJobRunner, InjectionOrigin, InjectionReport, InjectionRunError,
+        InjectionRunOutput, InjectorContext, InjectorSubprocessRunner, LlmAnswerer, LlmProgress,
+        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        SessionIntent, TransientSessionState, INJECTOR_JOB_TIMEOUT_MS,
     };
 
     async fn handle_server_message_for_tests<S: OverlaySink>(
@@ -3250,6 +3304,52 @@ mod tests {
             None,
         )
         .await
+    }
+
+    #[test]
+    fn clear_transient_session_state_resets_reconnect_caches() {
+        let session_id = Uuid::new_v4();
+        let mut llm_busy = true;
+        let mut llm_in_flight_session = Some(session_id);
+        let mut llm_seq = HashMap::from([(session_id, 7)]);
+        let mut llm_overlay_text = HashMap::from([(session_id, "partial answer".to_string())]);
+        let mut llm_deferred_session_end =
+            HashMap::from([(session_id, Some("connection_drop".to_string()))]);
+        let mut parent_focus_by_session = HashMap::from([(
+            session_id,
+            CapturedParentFocus {
+                focus: ParentFocusCapture {
+                    snapshot: None,
+                    source_selected: "test".to_string(),
+                    wayland_cache_age_ms: None,
+                    wayland_fallback_reason: None,
+                    captured_elapsed_ms: None,
+                },
+                captured_at: tokio::time::Instant::now(),
+            },
+        )]);
+        let mut last_hotkey_up_at = Some(tokio::time::Instant::now());
+        let mut last_stop_message = Some((session_id, tokio::time::Instant::now()));
+
+        clear_transient_session_state(TransientSessionState {
+            llm_busy: &mut llm_busy,
+            llm_in_flight_session: &mut llm_in_flight_session,
+            llm_seq: &mut llm_seq,
+            llm_overlay_text: &mut llm_overlay_text,
+            llm_deferred_session_end: &mut llm_deferred_session_end,
+            parent_focus_by_session: &mut parent_focus_by_session,
+            last_hotkey_up_at: &mut last_hotkey_up_at,
+            last_stop_message: &mut last_stop_message,
+        });
+
+        assert!(!llm_busy);
+        assert!(llm_in_flight_session.is_none());
+        assert!(llm_seq.is_empty());
+        assert!(llm_overlay_text.is_empty());
+        assert!(llm_deferred_session_end.is_empty());
+        assert!(parent_focus_by_session.is_empty());
+        assert!(last_hotkey_up_at.is_none());
+        assert!(last_stop_message.is_none());
     }
 
     struct SlowRunner {
