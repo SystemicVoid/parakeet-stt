@@ -717,6 +717,7 @@ fields = (
     "stream_helper_active",
     "stream_helper_scope",
     "stream_fallback_reason",
+    "chunk_secs",
     "finalization_mode",
     "final_audio_source",
     "tail_trim_mode",
@@ -732,6 +733,9 @@ bool_fields = {
     "vad_active",
     "overlay_events_enabled",
 }
+numeric_fields = {
+    "chunk_secs",
+}
 for key in fields:
     if key not in payload:
         sys.exit(1)
@@ -742,6 +746,21 @@ for key in fields:
         if not isinstance(value, bool):
             sys.exit(1)
         print(f"{key}={'true' if value else 'false'}")
+    elif key in numeric_fields:
+        if value is None:
+            print(f"{key}=")
+        elif isinstance(value, bool):
+            sys.exit(1)
+        elif isinstance(value, (int, float)):
+            print(f"{key}={value}")
+        elif isinstance(value, str):
+            try:
+                float(value)
+            except ValueError:
+                sys.exit(1)
+            print(f"{key}={value}")
+        else:
+            sys.exit(1)
     else:
         if value is not None and not isinstance(value, str):
             sys.exit(1)

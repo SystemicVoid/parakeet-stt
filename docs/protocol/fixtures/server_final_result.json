@@ -1,0 +1,9 @@
+{
+  "type": "final_result",
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "text": "hello world",
+  "latency_ms": 42,
+  "audio_ms": 3758,
+  "lang": "en",
+  "confidence": 0.5
+}

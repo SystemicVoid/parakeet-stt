@@ -51,7 +51,7 @@ class SessionEndReason(StrEnum):
 
 
 class StartSession(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ClientMessageType.START_SESSION]
     session_id: UUID
@@ -61,7 +61,7 @@ class StartSession(BaseModel):
 
 
 class StopSession(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ClientMessageType.STOP_SESSION]
     session_id: UUID
@@ -69,7 +69,7 @@ class StopSession(BaseModel):
 
 
 class AbortSession(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ClientMessageType.ABORT_SESSION]
     session_id: UUID
@@ -81,7 +81,7 @@ ClientMessage = StartSession | StopSession | AbortSession
 
 
 class SessionStarted(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.SESSION_STARTED] = Field(
         default=ServerMessageType.SESSION_STARTED
@@ -93,7 +93,7 @@ class SessionStarted(BaseModel):
 
 
 class FinalResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.FINAL_RESULT] = Field(default=ServerMessageType.FINAL_RESULT)
     session_id: UUID
@@ -105,7 +105,7 @@ class FinalResult(BaseModel):
 
 
 class ErrorMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.ERROR] = Field(default=ServerMessageType.ERROR)
     session_id: UUID | None = None
@@ -122,7 +122,7 @@ class ErrorMessage(BaseModel):
 
 
 class StatusMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.STATUS] = Field(default=ServerMessageType.STATUS)
     state: SessionState
@@ -155,7 +155,7 @@ class StatusMessage(BaseModel):
 
 
 class InterimStateMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.INTERIM_STATE] = Field(default=ServerMessageType.INTERIM_STATE)
     session_id: UUID
@@ -164,7 +164,7 @@ class InterimStateMessage(BaseModel):
 
 
 class InterimTextMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.INTERIM_TEXT] = Field(default=ServerMessageType.INTERIM_TEXT)
     session_id: UUID
@@ -173,7 +173,7 @@ class InterimTextMessage(BaseModel):
 
 
 class AudioLevelMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.AUDIO_LEVEL] = Field(default=ServerMessageType.AUDIO_LEVEL)
     session_id: UUID
@@ -181,7 +181,7 @@ class AudioLevelMessage(BaseModel):
 
 
 class SessionEndedMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.SESSION_ENDED] = Field(default=ServerMessageType.SESSION_ENDED)
     session_id: UUID
@@ -189,7 +189,7 @@ class SessionEndedMessage(BaseModel):
 
 
 class SessionWarningMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal[ServerMessageType.SESSION_WARNING] = Field(
         default=ServerMessageType.SESSION_WARNING
