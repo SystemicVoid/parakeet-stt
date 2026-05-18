@@ -355,8 +355,11 @@ impl OverlayProcessManager {
                     self.latest_warning = Some(message.clone());
                 }
             }
-            OverlayIpcMessage::InjectionComplete { .. } => {
-                self.latest_warning = None;
+            OverlayIpcMessage::InjectionComplete { session_id, .. } => {
+                if overlay_message_session_id(self.latest_message.as_ref()) == Some(*session_id) {
+                    self.latest_message = None;
+                    self.latest_warning = None;
+                }
             }
             OverlayIpcMessage::OutputHint { .. } | OverlayIpcMessage::AudioLevel { .. } => {}
         }
@@ -944,7 +947,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn manager_replay_ignores_injection_complete_as_latest_state() {
+    async fn manager_clears_replay_state_after_injection_complete() {
         let (tx_first, mut rx_first) = mpsc::unbounded_channel();
         let first_sink = OverlayProcessSink::from_sender_for_tests(
             tx_first,
@@ -993,13 +996,96 @@ mod tests {
 
         drop(rx_first);
 
-        manager.send(injection_complete_message);
+        let output_hint = OverlayIpcMessage::OutputHint {
+            output_name: "DP-1".to_string(),
+        };
+        manager.send(output_hint.clone());
 
-        let replayed = timeout(Duration::from_millis(100), rx_second.recv())
+        let forwarded = timeout(Duration::from_millis(100), rx_second.recv())
             .await
-            .expect("second sink should receive replay")
+            .expect("second sink should receive current non-session event")
             .expect("second sink should remain open");
-        assert_eq!(replayed, state_message);
+        assert_eq!(forwarded, output_hint);
+        assert!(timeout(Duration::from_millis(50), rx_second.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_preserves_warning_replay_after_mismatched_injection_complete() {
+        let (tx_first, mut rx_first) = mpsc::unbounded_channel();
+        let first_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_first,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let (tx_second, mut rx_second) = mpsc::unbounded_channel();
+        let second_sink = OverlayProcessSink::from_sender_for_tests(
+            tx_second,
+            Arc::new(OverlayProcessMetrics::default()),
+        );
+
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            Ok(first_sink),
+            Ok(second_sink),
+        ])));
+        let launcher = queued_launcher(queue);
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::LayerShell,
+            true,
+            launcher,
+            Duration::from_millis(0),
+        );
+
+        let session_id = Uuid::new_v4();
+        let state_message = OverlayIpcMessage::InterimText {
+            session_id,
+            seq: 2,
+            text: "current-state".to_string(),
+        };
+        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        manager.send(state_message.clone());
+        manager.send(warning_message.clone());
+        manager.send(OverlayIpcMessage::InjectionComplete {
+            session_id: Uuid::new_v4(),
+            success: true,
+        });
+
+        for expected in [&state_message, &warning_message] {
+            let received = timeout(Duration::from_millis(100), rx_first.recv())
+                .await
+                .expect("first sink should receive session event")
+                .expect("first sink should remain open");
+            assert_eq!(&received, expected);
+        }
+        let _ = timeout(Duration::from_millis(100), rx_first.recv())
+            .await
+            .expect("first sink should receive mismatched completion")
+            .expect("first sink should remain open");
+
+        drop(rx_first);
+
+        let audio_level_message = OverlayIpcMessage::AudioLevel {
+            session_id,
+            level_db: -28.0,
+        };
+        manager.send(audio_level_message.clone());
+
+        let replayed_state = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed state")
+            .expect("second sink should remain open");
+        assert_eq!(replayed_state, state_message);
+        let replayed_warning = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive replayed warning")
+            .expect("second sink should remain open");
+        assert_eq!(replayed_warning, warning_message);
+        let forwarded_audio_level = timeout(Duration::from_millis(100), rx_second.recv())
+            .await
+            .expect("second sink should receive current audio level")
+            .expect("second sink should remain open");
+        assert_eq!(forwarded_audio_level, audio_level_message);
     }
 
     #[tokio::test(flavor = "current_thread")]
