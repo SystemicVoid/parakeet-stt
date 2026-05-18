@@ -37,7 +37,6 @@ from .events import (
 from .messages import (
     InterimStateValue,
     SessionEndReason,
-    StatusMessage,
 )
 from .model import (
     ParakeetStreamingSession,
@@ -50,6 +49,15 @@ from .overlay_interim import (
     OverlayInterimTranscriptContext,
     OverlayInterimTranscriptStabilizer,
     append_overlay_interim_context,
+)
+from .runtime_truth_snapshot import (
+    RuntimeTruth,
+    RuntimeTruthMetrics,
+    RuntimeTruthState,
+    format_log_record,
+)
+from .runtime_truth_snapshot import (
+    snapshot as runtime_truth_snapshot,
 )
 from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 from .tail_trim import SealPathTailTrimmer
@@ -331,6 +339,9 @@ class SessionOrchestrator:
 
             latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
             send_started = datetime.now(tz=UTC)
+            runtime_truth = self.runtime_truth(
+                overlay_events_enabled=self.settings.overlay_events_enabled
+            )
             await event_sink.emit(
                 FinalResultEvent(
                     session_id=session.session_id,
@@ -339,9 +350,9 @@ class SessionOrchestrator:
                     audio_ms=audio_ms,
                     lang=self.settings.language,
                     confidence=None,
-                    tail_trim_mode=self._tail_trim_mode(),
-                    vad_active=self._vad_active(),
-                    vad_fallback_reason=self._vad_fallback_reason(),
+                    tail_trim_mode=runtime_truth.tail_trim_mode,
+                    vad_active=runtime_truth.vad_active,
+                    vad_fallback_reason=runtime_truth.vad_fallback_reason,
                 )
             )
             send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
@@ -364,10 +375,7 @@ class SessionOrchestrator:
             logger.info(
                 "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
                 "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
-                "chars_per_sec={:.1f}, live_session_helper_active={}, "
-                "live_session_helper_scope={}, stream_fallback_reason={}, "
-                "finalization_mode={}, final_audio_source={}, tail_trim_mode={}, "
-                "vad_enabled={}, vad_active={}, vad_fallback_reason={}",
+                "chars_per_sec={:.1f}, runtime_truth={}",
                 session.session_id,
                 audio_duration_raw,
                 audio_ms,
@@ -378,15 +386,7 @@ class SessionOrchestrator:
                 send_ms,
                 text_len,
                 chars_per_sec,
-                self._stream_helper_active(),
-                self._stream_helper_scope(),
-                self._stream_fallback_reason(),
-                self._finalization_mode(),
-                self._final_audio_source(),
-                self._tail_trim_mode(),
-                bool(getattr(self, "_vad_enabled", False)),
-                self._vad_active(),
-                self._vad_fallback_reason(),
+                format_log_record(runtime_truth.to_log_record()),
             )
 
     async def _handle_abort(self, message: AbortSessionIntent) -> None:
@@ -845,38 +845,31 @@ class SessionOrchestrator:
         if stabilized is not None:
             await self._emit_interim_text(event_sink, session_id, text=stabilized.text)
 
-    def status(
+    def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
+        return runtime_truth_snapshot(
+            self,
+            last_trim_outcome=self._tail_trimmer_for_runtime().last_outcome,
+            overlay_events_enabled=overlay_events_enabled,
+        )
+
+    def runtime_status_state(self) -> RuntimeTruthState:
+        active = self.sessions.active
+        return RuntimeTruthState(
+            state=active.state if active else SessionState.IDLE,
+            sessions_active=int(active is not None),
+            active_session_age_ms=active.audio_duration_ms if active else None,
+        )
+
+    def runtime_status_metrics(
         self,
         *,
-        overlay_events_enabled: bool,
         overlay_events_emitted: int,
         overlay_events_dropped: int,
-    ) -> StatusMessage:
-        active = self.sessions.active
-        state = active.state if active else SessionState.IDLE
-        requested_device = getattr(self, "_requested_device", str(self.settings.device))
-        effective_device = getattr(self, "_effective_device", requested_device)
-        return StatusMessage(
-            state=state,
-            sessions_active=int(active is not None),
+    ) -> RuntimeTruthMetrics:
+        return RuntimeTruthMetrics(
             gpu_mem_mb=self._gpu_mem_mb(),
-            device=requested_device,
-            effective_device=effective_device,
-            streaming_enabled=self.settings.streaming_enabled,
-            stream_helper_active=self._stream_helper_active(),
-            stream_helper_scope=self._stream_helper_scope(),
-            stream_fallback_reason=self._stream_fallback_reason(),
-            finalization_mode=self._finalization_mode(),
-            final_audio_source=self._final_audio_source(),
-            tail_trim_mode=self._tail_trim_mode(),
-            vad_enabled=bool(getattr(self, "_vad_enabled", False)),
-            vad_active=self._vad_active(),
-            vad_fallback_reason=self._vad_fallback_reason(),
-            overlay_events_enabled=overlay_events_enabled,
             overlay_events_emitted=overlay_events_emitted,
             overlay_events_dropped=overlay_events_dropped,
-            chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
-            active_session_age_ms=active.audio_duration_ms if active else None,
             audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
             finalize_ms=getattr(self, "_last_finalize_ms", None),
             infer_ms=getattr(self, "_last_infer_ms", None),
@@ -885,38 +878,6 @@ class SessionOrchestrator:
             last_infer_ms=getattr(self, "_last_infer_ms", None),
             last_send_ms=getattr(self, "_last_send_ms", None),
         )
-
-    def _stream_helper_active(self) -> bool:
-        if not self.settings.streaming_enabled:
-            return False
-        if self.streaming_transcriber is None:
-            return False
-        return self.streaming_transcriber.helper_active
-
-    def _stream_helper_scope(self) -> Literal["live_session_only"]:
-        return "live_session_only"
-
-    def _stream_fallback_reason(self) -> str | None:
-        if not self.settings.streaming_enabled:
-            return None
-        if self.streaming_transcriber is None:
-            return "streaming_transcriber_unavailable"
-        return self.streaming_transcriber.fallback_reason
-
-    def _finalization_mode(self) -> Literal["offline_seal"]:
-        return "offline_seal"
-
-    def _final_audio_source(self) -> Literal["canonical_session_audio"]:
-        return "canonical_session_audio"
-
-    def _tail_trim_mode(self) -> Literal["rms", "vad"]:
-        return self._tail_trimmer_for_runtime().last_outcome.tail_trim_mode
-
-    def _vad_active(self) -> bool:
-        return self._tail_trimmer_for_runtime().last_outcome.vad_active
-
-    def _vad_fallback_reason(self) -> str | None:
-        return self._tail_trimmer_for_runtime().last_outcome.vad_fallback_reason
 
     def prepare_vad(self) -> None:
         self._tail_trimmer_for_runtime().prepare()

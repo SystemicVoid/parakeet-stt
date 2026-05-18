@@ -710,23 +710,45 @@ try:
 except Exception:
     sys.exit(1)
 
-required = {
-    "device": payload.get("device"),
-    "effective_device": payload.get("effective_device"),
-    "streaming_enabled": payload.get("streaming_enabled"),
-    "overlay_events_enabled": payload.get("overlay_events_enabled"),
+fields = (
+    "device",
+    "effective_device",
+    "streaming_enabled",
+    "stream_helper_active",
+    "stream_helper_scope",
+    "stream_fallback_reason",
+    "finalization_mode",
+    "final_audio_source",
+    "tail_trim_mode",
+    "vad_enabled",
+    "vad_active",
+    "vad_fallback_reason",
+    "overlay_events_enabled",
+)
+bool_fields = {
+    "streaming_enabled",
+    "stream_helper_active",
+    "vad_enabled",
+    "vad_active",
+    "overlay_events_enabled",
 }
-for value in required.values():
-    if value is None:
+for key in fields:
+    if key not in payload:
         sys.exit(1)
 
-for key in ("device", "effective_device"):
-    print(f"{key}={required[key]}")
-for key in ("streaming_enabled", "overlay_events_enabled"):
-    value = required[key]
-    if not isinstance(value, bool):
-        sys.exit(1)
-    print(f"{key}={'true' if value else 'false'}")
+for key in fields:
+    value = payload[key]
+    if key in bool_fields:
+        if not isinstance(value, bool):
+            sys.exit(1)
+        print(f"{key}={'true' if value else 'false'}")
+    else:
+        if value is not None and not isinstance(value, str):
+            sys.exit(1)
+        if value is None:
+            print(f"{key}=")
+        else:
+            print(f"{key}={value}")
 PY
     }
 
@@ -1200,6 +1222,14 @@ EOF
             else
                 echo "match=false"
             fi
+            ;;
+        __daemon-status-runtime-truth)
+            if [ "$#" -ne 1 ]; then
+                echo "usage: stt __daemon-status-runtime-truth <status-url>" >&2
+                return 2
+            fi
+
+            _daemon_status_runtime_truth "$1"
             ;;
         start)
             local injection_mode paste_backend_failure_policy

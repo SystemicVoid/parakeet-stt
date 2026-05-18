@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ import numpy as np
 
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import StatusMessage
+from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
 from parakeet_stt_daemon.session import SessionManager
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
@@ -105,10 +107,21 @@ def _build_server(
 
 
 def _status(orchestrator: SessionOrchestrator) -> StatusMessage:
-    return orchestrator.status(
+    truth = _truth(orchestrator)
+    return truth.to_status(
+        orchestrator.runtime_status_state(),
+        orchestrator.runtime_status_metrics(
+            overlay_events_emitted=0,
+            overlay_events_dropped=0,
+        ),
+    )
+
+
+def _truth(orchestrator: SessionOrchestrator) -> RuntimeTruth:
+    return snapshot(
+        orchestrator,
+        last_trim_outcome=orchestrator.tail_trimmer.last_outcome,
         overlay_events_enabled=orchestrator.settings.overlay_events_enabled,
-        overlay_events_emitted=0,
-        overlay_events_dropped=0,
     )
 
 
@@ -150,6 +163,57 @@ def test_status_streaming_enabled_helper_active() -> None:
     assert status.tail_trim_mode == "rms"
 
 
+def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
+    transcriber = FakeStreamingTranscriber(helper_active=True, helper_class_name="FakeHelper")
+    server = _build_server(streaming_transcriber=transcriber)
+
+    truth = _truth(server)
+    status = _status(server)
+    log_record = truth.to_log_record()
+
+    assert status.model_dump(include=set(_helper_expected_status_fields())) == {
+        "device": "cpu",
+        "effective_device": "cpu",
+        "streaming_enabled": True,
+        "stream_helper_active": True,
+        "stream_helper_scope": "live_session_only",
+        "stream_fallback_reason": None,
+        "finalization_mode": "offline_seal",
+        "final_audio_source": "canonical_session_audio",
+        "tail_trim_mode": "rms",
+        "vad_enabled": False,
+        "vad_active": False,
+        "vad_fallback_reason": None,
+        "overlay_events_enabled": False,
+    }
+    assert log_record["live_session_helper_active"] is True
+    assert log_record["live_session_helper_class"] == "FakeHelper"
+    assert log_record["finalization_mode"] == "offline_seal"
+    assert log_record["tail_trim_mode"] == "rms"
+
+
+def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> None:
+    orchestrator = SimpleNamespace(
+        settings=SimpleNamespace(
+            streaming_enabled=True, chunk_secs=None, overlay_events_enabled=False
+        ),
+        streaming_transcriber=None,
+    )
+    truth = snapshot(
+        orchestrator,
+        last_trim_outcome=SimpleNamespace(
+            tail_trim_mode="rms",
+            vad_active=False,
+            vad_fallback_reason=None,
+        ),
+    )
+
+    assert truth.device is None
+    assert truth.effective_device is None
+    assert truth.chunk_secs is None
+    assert truth.stream_fallback_reason == "streaming_transcriber_unavailable"
+
+
 def test_status_vad_enabled_pending_load_is_explicit() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
 
@@ -186,8 +250,9 @@ def test_prepare_vad_marks_missing_dependency_explicitly() -> None:
 
     server.prepare_vad()
 
-    assert server._vad_active() is False
-    assert server._vad_fallback_reason() == "load_failed:missing_dependency:onnxruntime"
+    truth = _truth(server)
+    assert truth.vad_active is False
+    assert truth.vad_fallback_reason == "load_failed:missing_dependency:onnxruntime"
 
 
 def test_status_streaming_enabled_helper_inactive() -> None:
@@ -221,13 +286,13 @@ def test_status_streaming_enabled_transcriber_none() -> None:
 
 
 def test_stream_helper_active_reflects_transcriber_state() -> None:
-    """_stream_helper_active() delegates to transcriber.helper_active."""
+    """RuntimeTruth delegates Stream path activity to transcriber.helper_active."""
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    assert server._stream_helper_active() is True
+    assert _truth(server).stream_helper_active is True
 
     transcriber.helper_active = False
-    assert server._stream_helper_active() is False
+    assert _truth(server).stream_helper_active is False
 
 
 def test_stream_fallback_reason_init_failed() -> None:
@@ -238,7 +303,7 @@ def test_stream_fallback_reason_init_failed() -> None:
     )
     server = _build_server(streaming_transcriber=transcriber)
 
-    assert server._stream_fallback_reason() == "init_failed:RuntimeError"
+    assert _truth(server).stream_fallback_reason == "init_failed:RuntimeError"
 
 
 def test_stream_fallback_reason_none_when_active() -> None:
@@ -246,7 +311,7 @@ def test_stream_fallback_reason_none_when_active() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
 
-    assert server._stream_fallback_reason() is None
+    assert _truth(server).stream_fallback_reason is None
 
 
 def test_status_includes_active_session_age_when_session_active() -> None:
@@ -303,3 +368,21 @@ def test_status_last_timings_populated_after_session() -> None:
     assert status.last_audio_ms == 2500
     assert status.last_infer_ms == 120
     assert status.last_send_ms == 3
+
+
+def _helper_expected_status_fields() -> tuple[str, ...]:
+    return (
+        "device",
+        "effective_device",
+        "streaming_enabled",
+        "stream_helper_active",
+        "stream_helper_scope",
+        "stream_fallback_reason",
+        "finalization_mode",
+        "final_audio_source",
+        "tail_trim_mode",
+        "vad_enabled",
+        "vad_active",
+        "vad_fallback_reason",
+        "overlay_events_enabled",
+    )
