@@ -753,6 +753,8 @@ for key in fields:
         elif isinstance(value, bool):
             sys.exit(1)
         elif isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                sys.exit(1)
             print(f"{key}={value}")
         elif isinstance(value, str):
             try:

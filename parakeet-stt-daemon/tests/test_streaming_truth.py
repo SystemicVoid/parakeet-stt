@@ -215,7 +215,7 @@ def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> N
 
 
 def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
-    for chunk_secs in ("not-a-number", "nan", "inf", True):
+    for chunk_secs in ("not-a-number", "nan", "inf", float("nan"), float("inf"), True):
         orchestrator = SimpleNamespace(
             settings=SimpleNamespace(
                 streaming_enabled=True,
