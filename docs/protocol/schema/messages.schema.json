@@ -355,7 +355,12 @@
           "$ref": "#/$defs/nullable_non_negative_integer"
         },
         "chunk_secs": {
-          "$ref": "#/$defs/nullable_number"
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0.1,
+          "maximum": 10.0
         },
         "active_session_age_ms": {
           "$ref": "#/$defs/nullable_non_negative_integer"
