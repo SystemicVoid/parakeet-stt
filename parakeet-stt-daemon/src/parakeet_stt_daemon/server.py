@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
-import os
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from typing import Literal
@@ -47,6 +44,11 @@ from .model import (
     _release_cuda_cache,
     load_parakeet_model,
 )
+from .overlay_interim import (
+    OverlayInterimTranscriptContext,
+    OverlayInterimTranscriptStabilizer,
+    append_overlay_interim_context,
+)
 from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 
 ErrorCode = Literal[
@@ -62,28 +64,6 @@ OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
 SESSION_GUARD_POLL_SECS = 0.1
 SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
-
-
-@dataclass
-class OverlayInterimTranscriptState:
-    committed_tokens: list[str] = field(default_factory=list)
-    draft_tokens: list[str] = field(default_factory=list)
-
-
-def _streaming_debug_enabled() -> bool:
-    raw = os.getenv("PARAKEET_STREAMING_DEBUG", "")
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _longest_casefold_suffix_prefix_overlap(existing: list[str], current: list[str]) -> int:
-    max_overlap = min(len(existing), len(current))
-    for overlap in range(max_overlap, 0, -1):
-        if all(
-            existing[len(existing) - overlap + index].casefold() == current[index].casefold()
-            for index in range(overlap)
-        ):
-            return overlap
-    return 0
 
 
 class DaemonServer:
@@ -148,8 +128,9 @@ class DaemonServer:
             self.audio.configure_stream_chunk_size(chunk_samples)
         self._overlay_event_seq_by_session: dict[UUID, int] = {}
         self._overlay_last_interim_text_by_session: dict[UUID, str] = {}
-        self._overlay_interim_transcript_by_session: dict[UUID, OverlayInterimTranscriptState] = {}
-        self._overlay_interim_source_seq_by_session: dict[UUID, dict[str, int]] = {}
+        self._overlay_interim_stabilizer_by_session: dict[
+            UUID, OverlayInterimTranscriptStabilizer
+        ] = {}
         self._overlay_state_by_session: dict[UUID, str] = {}
         self._overlay_events_emitted = 0
         self._overlay_events_dropped = 0
@@ -348,9 +329,11 @@ class DaemonServer:
                     session.session_id,
                     ready_chunks,
                 )
-                flushed_interim = self._flush_overlay_interim_pending_tail(session.session_id)
+                flushed_interim = self._overlay_interim_stabilizer(
+                    session.session_id
+                ).flush_pending_tail()
                 if flushed_interim is not None:
-                    interim_updates.append(flushed_interim)
+                    interim_updates.append(flushed_interim.text)
                 if interim_updates:
                     await self._emit_interim_state(
                         websocket,
@@ -672,15 +655,6 @@ class DaemonServer:
     def _owner_token_for_websocket(self, websocket: WebSocket) -> int:
         return id(websocket)
 
-    @staticmethod
-    def _append_overlay_interim_context(
-        existing: np.ndarray,
-        chunk_audio: np.ndarray,
-    ) -> np.ndarray:
-        if existing.size == 0:
-            return np.array(chunk_audio, copy=True)
-        return np.concatenate((existing, chunk_audio))
-
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
     ) -> None:
@@ -763,12 +737,34 @@ class DaemonServer:
         overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
         if isinstance(overlay_last_text, dict):
             overlay_last_text.pop(session_id, None)
-        overlay_transcripts = getattr(self, "_overlay_interim_transcript_by_session", None)
-        if isinstance(overlay_transcripts, dict):
-            overlay_transcripts.pop(session_id, None)
-        overlay_source_seqs = getattr(self, "_overlay_interim_source_seq_by_session", None)
-        if isinstance(overlay_source_seqs, dict):
-            overlay_source_seqs.pop(session_id, None)
+        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
+        if isinstance(overlay_stabilizers, dict):
+            overlay_stabilizers.pop(session_id, None)
+
+    def _overlay_interim_stabilizer(
+        self,
+        session_id: UUID,
+    ) -> OverlayInterimTranscriptStabilizer:
+        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
+        if not isinstance(overlay_stabilizers, dict):
+            overlay_stabilizers = {}
+            self._overlay_interim_stabilizer_by_session = overlay_stabilizers
+        stabilizer = overlay_stabilizers.get(session_id)
+        if stabilizer is None:
+            stabilizer = OverlayInterimTranscriptStabilizer()
+            overlay_stabilizers[session_id] = stabilizer
+        return stabilizer
+
+    def _overlay_interim_context(
+        self,
+        session_id: UUID,
+        context_samples: int,
+    ) -> OverlayInterimTranscriptContext:
+        return OverlayInterimTranscriptContext(
+            session_id=session_id,
+            context_samples=context_samples,
+            sample_rate=int(self.audio.sample_rate),
+        )
 
     def _next_overlay_seq(self, session_id: UUID) -> int:
         overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
@@ -847,212 +843,6 @@ class DaemonServer:
         message = AudioLevelMessage(session_id=session_id, level_db=level_db)
         await self._send_overlay_message(websocket, session_id, message.model_dump(mode="json"))
 
-    def _overlay_interim_transcript_state(
-        self,
-        session_id: UUID,
-    ) -> OverlayInterimTranscriptState:
-        overlay_transcripts = getattr(self, "_overlay_interim_transcript_by_session", None)
-        if not isinstance(overlay_transcripts, dict):
-            overlay_transcripts = {}
-            self._overlay_interim_transcript_by_session = overlay_transcripts
-        state = overlay_transcripts.get(session_id)
-        if state is None:
-            state = OverlayInterimTranscriptState()
-            overlay_transcripts[session_id] = state
-        return state
-
-    def _overlay_interim_display_tokens(self, session_id: UUID) -> list[str]:
-        state = self._overlay_interim_transcript_state(session_id)
-        return [*state.committed_tokens, *state.draft_tokens]
-
-    def _overlay_interim_display_text(self, session_id: UUID) -> str | None:
-        display_tokens = self._overlay_interim_display_tokens(session_id)
-        if not display_tokens:
-            return None
-        return " ".join(display_tokens)
-
-    def _overlay_stabilizer_debug_enabled(self) -> bool:
-        return self.settings.overlay_events_enabled and _streaming_debug_enabled()
-
-    def _next_overlay_interim_source_seq(self, session_id: UUID, source: str) -> int:
-        source_seqs = getattr(self, "_overlay_interim_source_seq_by_session", None)
-        if not isinstance(source_seqs, dict):
-            source_seqs = {}
-            self._overlay_interim_source_seq_by_session = source_seqs
-        session_seqs = source_seqs.get(session_id)
-        if not isinstance(session_seqs, dict):
-            session_seqs = {}
-            source_seqs[session_id] = session_seqs
-        current = int(session_seqs.get(source, 0))
-        session_seqs[source] = current + 1
-        return current
-
-    def _log_overlay_stabilizer_event(
-        self,
-        session_id: UUID,
-        *,
-        source: str,
-        source_seq: int,
-        context_samples: int,
-        raw_text: str,
-        normalized_text: str,
-        previous_display: str,
-        committed_before: list[str],
-        draft_before: list[str],
-        raw_tokens: list[str],
-        overlap: int,
-        committed_after: list[str],
-        draft_after: list[str],
-        current_display: str,
-        action: str,
-    ) -> None:
-        if not self._overlay_stabilizer_debug_enabled():
-            return
-        context_secs = (
-            context_samples / self.audio.sample_rate if self.audio.sample_rate > 0 else 0.0
-        )
-        logger.info(
-            (
-                "overlay_stabilizer session_id={} source={} source_seq={} context_samples={} "
-                "context_secs={:.3f} action={} raw_text={} normalized_text={} "
-                "previous_display={} committed_before={} draft_before={} raw_tokens={} "
-                "overlap={} committed_after={} draft_after={} current_display={}"
-            ),
-            session_id,
-            source,
-            source_seq,
-            context_samples,
-            context_secs,
-            action,
-            json.dumps(raw_text, ensure_ascii=True),
-            json.dumps(normalized_text, ensure_ascii=True),
-            json.dumps(previous_display, ensure_ascii=True),
-            json.dumps(committed_before, ensure_ascii=True),
-            json.dumps(draft_before, ensure_ascii=True),
-            json.dumps(raw_tokens, ensure_ascii=True),
-            overlap,
-            json.dumps(committed_after, ensure_ascii=True),
-            json.dumps(draft_after, ensure_ascii=True),
-            json.dumps(current_display, ensure_ascii=True),
-        )
-
-    def _log_overlay_stabilizer_skip(
-        self,
-        session_id: UUID,
-        *,
-        source: str,
-        source_seq: int,
-        context_samples: int,
-        reason: str,
-        error_class: str | None = None,
-    ) -> None:
-        if not self._overlay_stabilizer_debug_enabled():
-            return
-        context_secs = (
-            context_samples / self.audio.sample_rate if self.audio.sample_rate > 0 else 0.0
-        )
-        logger.info(
-            (
-                "overlay_stabilizer_skip session_id={} source={} source_seq={} "
-                "context_samples={} context_secs={:.3f} reason={} error_class={}"
-            ),
-            session_id,
-            source,
-            source_seq,
-            context_samples,
-            context_secs,
-            reason,
-            error_class,
-        )
-
-    def _stabilize_overlay_interim_text(
-        self,
-        session_id: UUID,
-        text: str,
-        *,
-        source: str,
-        source_seq: int,
-        context_samples: int,
-    ) -> str | None:
-        state = self._overlay_interim_transcript_state(session_id)
-        committed_before = [*state.committed_tokens]
-        draft_before = [*state.draft_tokens]
-        previous_display_tokens = [*committed_before, *draft_before]
-        previous_display = " ".join(previous_display_tokens)
-        normalized = " ".join(text.split()).strip()
-        if not normalized:
-            self._log_overlay_stabilizer_event(
-                session_id,
-                source=source,
-                source_seq=source_seq,
-                context_samples=context_samples,
-                raw_text=text,
-                normalized_text=normalized,
-                previous_display=previous_display,
-                committed_before=committed_before,
-                draft_before=draft_before,
-                raw_tokens=[],
-                overlap=0,
-                committed_after=committed_before,
-                draft_after=draft_before,
-                current_display=previous_display,
-                action="empty",
-            )
-            return None
-
-        raw_tokens = normalized.split()
-        overlap = _longest_casefold_suffix_prefix_overlap(previous_display_tokens, raw_tokens)
-
-        if overlap > 0:
-            state.committed_tokens = previous_display_tokens[:-overlap]
-        state.draft_tokens = raw_tokens
-
-        committed_after = [*state.committed_tokens]
-        draft_after = [*state.draft_tokens]
-        current_display = " ".join([*committed_after, *draft_after])
-        action = "emit"
-        if current_display == previous_display:
-            action = "no_change"
-            self._log_overlay_stabilizer_event(
-                session_id,
-                source=source,
-                source_seq=source_seq,
-                context_samples=context_samples,
-                raw_text=text,
-                normalized_text=normalized,
-                previous_display=previous_display,
-                committed_before=committed_before,
-                draft_before=draft_before,
-                raw_tokens=raw_tokens,
-                overlap=overlap,
-                committed_after=committed_after,
-                draft_after=draft_after,
-                current_display=current_display,
-                action=action,
-            )
-            return None
-        self._log_overlay_stabilizer_event(
-            session_id,
-            source=source,
-            source_seq=source_seq,
-            context_samples=context_samples,
-            raw_text=text,
-            normalized_text=normalized,
-            previous_display=previous_display,
-            committed_before=committed_before,
-            draft_before=draft_before,
-            raw_tokens=raw_tokens,
-            overlap=overlap,
-            committed_after=committed_after,
-            draft_after=draft_after,
-            current_display=current_display,
-            action=action,
-        )
-        return current_display
-
-    def _flush_overlay_interim_pending_tail(self, session_id: UUID) -> str | None:
-        return self._overlay_interim_display_text(session_id)
-
     async def _collect_interim_text_updates(
         self,
         session_id: UUID,
@@ -1070,8 +860,10 @@ class DaemonServer:
             chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
             if chunk_audio.size == 0:
                 continue
-            rolling_audio = self._append_overlay_interim_context(rolling_audio, chunk_audio)
-            source_seq = self._next_overlay_interim_source_seq(session_id, "stop_replay")
+            rolling_audio = append_overlay_interim_context(rolling_audio, chunk_audio)
+            stabilizer = self._overlay_interim_stabilizer(session_id)
+            source_seq = stabilizer.next_source_seq("stop_replay")
+            context = self._overlay_interim_context(session_id, int(rolling_audio.size))
             try:
                 candidate = await self._transcribe_samples_serialized(rolling_audio)
             except Exception as exc:  # noqa: BLE001
@@ -1079,24 +871,22 @@ class DaemonServer:
                     "Incremental interim source unavailable for this session: {}",
                     exc.__class__.__name__,
                 )
-                self._log_overlay_stabilizer_skip(
-                    session_id,
+                stabilizer.record_skip(
                     source="stop_replay",
                     source_seq=source_seq,
-                    context_samples=int(rolling_audio.size),
+                    context=context,
                     reason="transcribe_error",
                     error_class=exc.__class__.__name__,
                 )
                 break
-            stabilized = self._stabilize_overlay_interim_text(
-                session_id,
+            stabilized = stabilizer.accept(
+                "stop_replay",
+                source_seq,
                 candidate,
-                source="stop_replay",
-                source_seq=source_seq,
-                context_samples=int(rolling_audio.size),
+                context,
             )
             if stabilized is not None:
-                updates.append(stabilized)
+                updates.append(stabilized.text)
         return updates
 
     async def _emit_interim_text(
@@ -1188,11 +978,13 @@ class DaemonServer:
         chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
         if chunk_audio.size == 0:
             return
-        self._live_interim_audio = self._append_overlay_interim_context(
+        self._live_interim_audio = append_overlay_interim_context(
             self._live_interim_audio,
             chunk_audio,
         )
-        source_seq = self._next_overlay_interim_source_seq(session_id, "live")
+        stabilizer = self._overlay_interim_stabilizer(session_id)
+        source_seq = stabilizer.next_source_seq("live")
+        context = self._overlay_interim_context(session_id, int(self._live_interim_audio.size))
         try:
             candidate = await self._transcribe_samples_serialized(self._live_interim_audio)
         except Exception as exc:  # noqa: BLE001
@@ -1200,25 +992,23 @@ class DaemonServer:
                 "Live incremental interim source unavailable for this session: {}",
                 exc.__class__.__name__,
             )
-            self._log_overlay_stabilizer_skip(
-                session_id,
+            stabilizer.record_skip(
                 source="live",
                 source_seq=source_seq,
-                context_samples=int(self._live_interim_audio.size),
+                context=context,
                 reason="transcribe_error",
                 error_class=exc.__class__.__name__,
             )
             self._live_interim_failed = True
             return
-        stabilized = self._stabilize_overlay_interim_text(
-            session_id,
+        stabilized = stabilizer.accept(
+            "live",
+            source_seq,
             candidate,
-            source="live",
-            source_seq=source_seq,
-            context_samples=int(self._live_interim_audio.size),
+            context,
         )
         if stabilized is not None:
-            await self._emit_interim_text(websocket, session_id, text=stabilized)
+            await self._emit_interim_text(websocket, session_id, text=stabilized.text)
 
     def status(self) -> StatusMessage:
         active = self.sessions.active

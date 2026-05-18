@@ -7,6 +7,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
+
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
