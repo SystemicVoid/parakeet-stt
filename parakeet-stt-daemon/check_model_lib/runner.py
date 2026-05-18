@@ -9,11 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from parakeet_stt_daemon.model import (
-    ParakeetStreamingTranscriber,
-    ParakeetTranscriber,
-    load_parakeet_model,
-)
 
 from check_model_lib.constants import (
     DEFAULT_BASELINE_OUTPUT,
@@ -50,6 +45,11 @@ from check_model_lib.runtime import (
     split_chunks,
 )
 from check_model_lib.thresholds import evaluate_regression_thresholds
+from parakeet_stt_daemon.model import (
+    ParakeetStreamingTranscriber,
+    ParakeetTranscriber,
+    load_parakeet_model,
+)
 
 
 def _run_benchmark_once(
