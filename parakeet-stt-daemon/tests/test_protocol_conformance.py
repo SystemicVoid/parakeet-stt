@@ -98,6 +98,13 @@ def _round_trip_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _iter_validation_errors(error: Any) -> list[Any]:
+    return [
+        error,
+        *(nested for context in error.context for nested in _iter_validation_errors(context)),
+    ]
+
+
 def test_fixture_inventory_covers_current_wire_messages() -> None:
     assert {path.name for path in _fixture_paths()} == EXPECTED_FIXTURES
 
@@ -106,6 +113,15 @@ def test_fixtures_validate_against_canonical_schema(validator: Any) -> None:
     for path in _fixture_paths():
         errors = sorted(validator.iter_errors(_load_json(path)), key=lambda error: error.path)
         assert not errors, f"{path.name}: {errors}"
+
+
+def test_status_schema_rejects_negative_chunk_secs(validator: Any) -> None:
+    fixture = _load_json(FIXTURE_DIR / "status_default.json") | {"chunk_secs": -0.1}
+
+    errors = sorted(validator.iter_errors(fixture), key=lambda error: error.path)
+    nested_errors = [nested for error in errors for nested in _iter_validation_errors(error)]
+
+    assert any(list(error.path) == ["chunk_secs"] for error in nested_errors)
 
 
 def test_fixtures_round_trip_through_pydantic_models() -> None:
