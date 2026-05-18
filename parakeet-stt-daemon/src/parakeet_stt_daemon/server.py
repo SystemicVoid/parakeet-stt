@@ -18,20 +18,24 @@ from loguru import logger
 
 from .audio import AudioInput
 from .config import ServerSettings
+from .events import (
+    AudioLevelEvent,
+    ErrorCode,
+    FinalResultEvent,
+    InterimStateEvent,
+    InterimTextEvent,
+    SessionEndedEvent,
+    SessionErrorEvent,
+    SessionStartedEvent,
+    SessionWarningEvent,
+    WebSocketEventSink,
+)
 from .messages import (
     AbortSession,
-    AudioLevelMessage,
     ClientMessageType,
-    ErrorMessage,
-    FinalResult,
-    InterimStateMessage,
     InterimStateValue,
-    InterimTextMessage,
     ParsedMessage,
-    SessionEndedMessage,
     SessionEndReason,
-    SessionStarted,
-    SessionWarningMessage,
     StartSession,
     StatusMessage,
     StopSession,
@@ -52,15 +56,6 @@ from .overlay_interim import (
 from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
 from .tail_trim import SealPathTailTrimmer
 
-ErrorCode = Literal[
-    "SESSION_BUSY",
-    "SESSION_NOT_FOUND",
-    "SESSION_ABORTED",
-    "AUDIO_DEVICE",
-    "MODEL",
-    "INVALID_REQUEST",
-    "UNEXPECTED",
-]
 OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
 SESSION_GUARD_POLL_SECS = 0.1
 SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
@@ -223,13 +218,14 @@ class DaemonServer:
                 self._start_stream_drain_loop(websocket, message.session_id)
             self._start_session_guard_loop(websocket, message.session_id)
 
-            response = SessionStarted(
-                session_id=message.session_id,
-                ts=datetime.now(tz=UTC),
-                mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
-                lang=message.preferred_lang,
+            await self._event_sink(websocket).emit(
+                SessionStartedEvent(
+                    session_id=message.session_id,
+                    ts=datetime.now(tz=UTC),
+                    mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
+                    lang=message.preferred_lang,
+                )
             )
-            await self._send_message(websocket, response.model_dump(mode="json"))
             await self._emit_interim_state(
                 websocket,
                 message.session_id,
@@ -373,17 +369,21 @@ class DaemonServer:
                 return
 
             latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
-            completion = FinalResult(
-                session_id=session.session_id,
-                text=text,
-                latency_ms=latency_ms,
-                audio_ms=audio_ms,
-                lang=self.settings.language,
-                confidence=None,
-            )
             self._set_overlay_session_state(session.session_id, "terminal")
             send_started = datetime.now(tz=UTC)
-            await self._send_message(websocket, completion.model_dump(mode="json"))
+            await self._event_sink(websocket).emit(
+                FinalResultEvent(
+                    session_id=session.session_id,
+                    text=text,
+                    latency_ms=latency_ms,
+                    audio_ms=audio_ms,
+                    lang=self.settings.language,
+                    confidence=None,
+                    tail_trim_mode=self._tail_trim_mode(),
+                    vad_active=self._vad_active(),
+                    vad_fallback_reason=self._vad_fallback_reason(),
+                )
+            )
             send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
             await self._emit_session_ended(
                 websocket, session.session_id, reason=SessionEndReason.FINAL
@@ -661,8 +661,9 @@ class DaemonServer:
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
     ) -> None:
-        err = ErrorMessage(session_id=session_id, code=code, message=message)
-        await self._send_message(websocket, err.model_dump(mode="json"))
+        await self._event_sink(websocket).emit(
+            SessionErrorEvent(session_id=session_id, code=code, message=message)
+        )
 
     def _send_lock_for_websocket(self, websocket: WebSocket) -> asyncio.Lock:
         websocket_send_locks = getattr(self, "_websocket_send_locks", None)
@@ -675,9 +676,20 @@ class DaemonServer:
             websocket_send_locks[id(websocket)] = lock
         return lock
 
-    async def _send_message(self, websocket: WebSocket, payload: dict) -> None:
-        async with self._send_lock_for_websocket(websocket):
-            await websocket.send_json(payload)
+    def _event_sink(self, websocket: WebSocket) -> WebSocketEventSink:
+        return WebSocketEventSink(
+            websocket=websocket,
+            send_lock=lambda: self._send_lock_for_websocket(websocket),
+            overlay_events_enabled=self.settings.overlay_events_enabled,
+            next_overlay_seq=self._next_overlay_seq,
+            overlay_session_state=self._overlay_session_state,
+            set_overlay_session_state=self._set_overlay_session_state,
+            last_interim_text=self._overlay_last_interim_text,
+            record_interim_text=self._record_overlay_interim_text,
+            clear_interim_text=self._clear_overlay_interim_text,
+            increment_overlay_events_emitted=self._increment_overlay_events_emitted,
+            increment_overlay_events_dropped=self._increment_overlay_events_dropped,
+        )
 
     def _session_lock_for_runtime(self) -> asyncio.Lock:
         lock = getattr(self, "_session_lock", None)
@@ -737,12 +749,28 @@ class DaemonServer:
         overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
         if isinstance(overlay_seq_by_session, dict):
             overlay_seq_by_session.pop(session_id, None)
-        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if isinstance(overlay_last_text, dict):
-            overlay_last_text.pop(session_id, None)
+        self._clear_overlay_interim_text(session_id)
         overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
         if isinstance(overlay_stabilizers, dict):
             overlay_stabilizers.pop(session_id, None)
+
+    def _overlay_last_interim_text(self, session_id: UUID) -> str | None:
+        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+        if not isinstance(overlay_last_text, dict):
+            return None
+        return overlay_last_text.get(session_id)
+
+    def _record_overlay_interim_text(self, session_id: UUID, text: str) -> None:
+        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+        if not isinstance(overlay_last_text, dict):
+            overlay_last_text = {}
+            self._overlay_last_interim_text_by_session = overlay_last_text
+        overlay_last_text[session_id] = text
+
+    def _clear_overlay_interim_text(self, session_id: UUID) -> None:
+        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
+        if isinstance(overlay_last_text, dict):
+            overlay_last_text.pop(session_id, None)
 
     def _overlay_interim_stabilizer(
         self,
@@ -778,41 +806,11 @@ class DaemonServer:
         overlay_seq_by_session[session_id] = current + 1
         return current
 
-    async def _send_overlay_message(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        payload: dict,
-        *,
-        allow_terminal: bool = False,
-        next_state: str | None = None,
-    ) -> bool:
-        if not self.settings.overlay_events_enabled:
-            return False
-        try:
-            async with self._send_lock_for_websocket(websocket):
-                current_state = self._overlay_session_state(session_id)
-                if current_state == "ended" or (current_state == "terminal" and not allow_terminal):
-                    self._overlay_events_dropped = (
-                        int(getattr(self, "_overlay_events_dropped", 0)) + 1
-                    )
-                    logger.debug(
-                        "Dropping overlay event {} for session {} after terminal transition",
-                        payload.get("type"),
-                        session_id,
-                    )
-                    return False
-                await websocket.send_json(payload)
-            if next_state is not None:
-                self._set_overlay_session_state(session_id, next_state)
-            self._overlay_events_emitted = int(getattr(self, "_overlay_events_emitted", 0)) + 1
-            return True
-        except Exception as exc:  # noqa: BLE001
-            # Overlay events are display-only signals and must never break
-            # transcription/injection flow.
-            self._overlay_events_dropped = int(getattr(self, "_overlay_events_dropped", 0)) + 1
-            logger.debug("Dropping overlay event after send failure: {}", exc)
-            return False
+    def _increment_overlay_events_emitted(self) -> None:
+        self._overlay_events_emitted = int(getattr(self, "_overlay_events_emitted", 0)) + 1
+
+    def _increment_overlay_events_dropped(self) -> None:
+        self._overlay_events_dropped = int(getattr(self, "_overlay_events_dropped", 0)) + 1
 
     async def _emit_interim_state(
         self,
@@ -821,14 +819,9 @@ class DaemonServer:
         *,
         state: InterimStateValue,
     ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        message = InterimStateMessage(
-            session_id=session_id,
-            seq=self._next_overlay_seq(session_id),
-            state=state,
+        await self._event_sink(websocket).emit(
+            InterimStateEvent(session_id=session_id, state=state)
         )
-        await self._send_overlay_message(websocket, session_id, message.model_dump(mode="json"))
 
     async def _emit_audio_level(
         self,
@@ -836,15 +829,7 @@ class DaemonServer:
         session_id: UUID,
         rms: float,
     ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        if not np.isfinite(rms):
-            return
-        level_db = 20.0 * np.log10(max(rms, 1e-6))
-        if not np.isfinite(level_db):
-            return
-        message = AudioLevelMessage(session_id=session_id, level_db=level_db)
-        await self._send_overlay_message(websocket, session_id, message.model_dump(mode="json"))
+        await self._event_sink(websocket).emit(AudioLevelEvent(session_id=session_id, rms=rms))
 
     async def _collect_interim_text_updates(
         self,
@@ -899,26 +884,7 @@ class DaemonServer:
         *,
         text: str,
     ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        normalized = " ".join(text.split()).strip()
-        if not normalized:
-            return
-        last_by_session = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if isinstance(last_by_session, dict):
-            prev = last_by_session.get(session_id)
-            if prev == normalized:
-                return
-        message = InterimTextMessage(
-            session_id=session_id,
-            seq=self._next_overlay_seq(session_id),
-            text=normalized,
-        )
-        if await self._send_overlay_message(websocket, session_id, message.model_dump(mode="json")):
-            if not isinstance(last_by_session, dict):
-                self._overlay_last_interim_text_by_session = {}
-                last_by_session = self._overlay_last_interim_text_by_session
-            last_by_session[session_id] = normalized
+        await self._event_sink(websocket).emit(InterimTextEvent(session_id=session_id, text=text))
 
     async def _emit_session_ended(
         self,
@@ -927,19 +893,9 @@ class DaemonServer:
         *,
         reason: SessionEndReason,
     ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        message = SessionEndedMessage(session_id=session_id, reason=reason)
-        await self._send_overlay_message(
-            websocket,
-            session_id,
-            message.model_dump(mode="json"),
-            allow_terminal=True,
-            next_state="ended",
+        await self._event_sink(websocket).emit(
+            SessionEndedEvent(session_id=session_id, reason=reason)
         )
-        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if isinstance(overlay_last_text, dict):
-            overlay_last_text.pop(session_id, None)
 
     async def _emit_session_warning(
         self,
@@ -949,24 +905,13 @@ class DaemonServer:
     ) -> None:
         remaining = self._session_remaining_seconds(session)
         limit = self._effective_session_limit_seconds()
-        logger.info(
-            "Session {} warning: {:.0f}s remaining of {:.0f}s limit",
-            session_id,
-            remaining,
-            limit,
+        await self._event_sink(websocket).emit(
+            SessionWarningEvent(
+                session_id=session_id,
+                remaining_seconds=remaining,
+                limit_seconds=limit,
+            )
         )
-        message = SessionWarningMessage(
-            session_id=session_id,
-            warning="approaching_limit",
-            remaining_seconds=round(remaining, 1),
-            limit_seconds=limit,
-        )
-        # Session warning is sent on the main websocket, not the overlay channel,
-        # so the client can forward it to the overlay.
-        try:
-            await self._send_message(websocket, message.model_dump(mode="json"))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to send session warning for {}: {}", session_id, exc)
 
     async def _emit_live_interim_from_chunk(
         self,
