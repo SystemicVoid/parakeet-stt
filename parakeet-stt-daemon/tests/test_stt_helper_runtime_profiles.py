@@ -8,6 +8,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
 
@@ -187,3 +189,89 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
         "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
         "overlay_events_enabled": "true",
     }
+
+
+def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -> None:
+    payload_path = tmp_path / "status.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "device": "cuda",
+                "effective_device": "cpu",
+                "streaming_enabled": True,
+                "stream_helper_active": False,
+                "stream_helper_scope": "live_session_only",
+                "stream_fallback_reason": None,
+                "chunk_secs": "2.4000",
+                "finalization_mode": "offline_seal",
+                "final_audio_source": "canonical_session_audio",
+                "tail_trim_mode": "rms",
+                "vad_enabled": True,
+                "vad_active": False,
+                "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+                "overlay_events_enabled": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    truth = _run_status_runtime_truth(payload_path)
+
+    assert truth["chunk_secs"] == "2.4"
+
+
+def test_daemon_status_runtime_truth_rejects_non_finite_numeric_string(tmp_path: Path) -> None:
+    payload_path = tmp_path / "status.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "device": "cuda",
+                "effective_device": "cpu",
+                "streaming_enabled": True,
+                "stream_helper_active": False,
+                "stream_helper_scope": "live_session_only",
+                "stream_fallback_reason": None,
+                "chunk_secs": "inf",
+                "finalization_mode": "offline_seal",
+                "final_audio_source": "canonical_session_audio",
+                "tail_trim_mode": "rms",
+                "vad_enabled": True,
+                "vad_active": False,
+                "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+                "overlay_events_enabled": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_status_runtime_truth(payload_path)
+
+
+def test_status_runtime_truth_rejects_non_finite_numeric_tokens(tmp_path: Path) -> None:
+    for index, chunk_secs in enumerate((float("inf"), float("-inf"), float("nan"))):
+        payload_path = tmp_path / f"status-{index}.json"
+        payload_path.write_text(
+            json.dumps(
+                {
+                    "device": "cuda",
+                    "effective_device": "cpu",
+                    "streaming_enabled": True,
+                    "stream_helper_active": False,
+                    "stream_helper_scope": "live_session_only",
+                    "stream_fallback_reason": None,
+                    "chunk_secs": chunk_secs,
+                    "finalization_mode": "offline_seal",
+                    "final_audio_source": "canonical_session_audio",
+                    "tail_trim_mode": "rms",
+                    "vad_enabled": True,
+                    "vad_active": False,
+                    "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+                    "overlay_events_enabled": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(subprocess.CalledProcessError):
+            _run_status_runtime_truth(payload_path)
