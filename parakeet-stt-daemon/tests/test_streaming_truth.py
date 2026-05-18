@@ -214,6 +214,29 @@ def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> N
     assert truth.stream_fallback_reason == "streaming_transcriber_unavailable"
 
 
+def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
+    for chunk_secs in ("not-a-number", "nan", "inf", True):
+        orchestrator = SimpleNamespace(
+            settings=SimpleNamespace(
+                streaming_enabled=True,
+                chunk_secs=chunk_secs,
+                overlay_events_enabled=False,
+            ),
+            streaming_transcriber=None,
+        )
+
+        truth = snapshot(
+            orchestrator,
+            last_trim_outcome=SimpleNamespace(
+                tail_trim_mode="rms",
+                vad_active=False,
+                vad_fallback_reason=None,
+            ),
+        )
+
+        assert truth.chunk_secs is None
+
+
 def test_status_vad_enabled_pending_load_is_explicit() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
 
