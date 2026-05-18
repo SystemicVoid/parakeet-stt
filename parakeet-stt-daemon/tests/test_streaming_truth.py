@@ -193,11 +193,14 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
 
 
 def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> None:
-    orchestrator = SimpleNamespace(
-        settings=SimpleNamespace(
-            streaming_enabled=True, chunk_secs=None, overlay_events_enabled=False
+    orchestrator = cast(
+        SessionOrchestrator,
+        SimpleNamespace(
+            settings=SimpleNamespace(
+                streaming_enabled=True, chunk_secs=None, overlay_events_enabled=False
+            ),
+            streaming_transcriber=None,
         ),
-        streaming_transcriber=None,
     )
     truth = snapshot(
         orchestrator,
@@ -216,13 +219,16 @@ def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> N
 
 def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
     for chunk_secs in ("not-a-number", "nan", "inf", float("nan"), float("inf"), True):
-        orchestrator = SimpleNamespace(
-            settings=SimpleNamespace(
-                streaming_enabled=True,
-                chunk_secs=chunk_secs,
-                overlay_events_enabled=False,
+        orchestrator = cast(
+            SessionOrchestrator,
+            SimpleNamespace(
+                settings=SimpleNamespace(
+                    streaming_enabled=True,
+                    chunk_secs=chunk_secs,
+                    overlay_events_enabled=False,
+                ),
+                streaming_transcriber=None,
             ),
-            streaming_transcriber=None,
         )
 
         truth = snapshot(
