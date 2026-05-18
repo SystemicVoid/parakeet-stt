@@ -1,0 +1,514 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SystemicVoid/parakeet-stt/main/docs/protocol/schema/messages.schema.json",
+  "title": "Parakeet STT Daemon/Client WebSocket Message",
+  "description": "Canonical JSON Schema for known daemon/client WebSocket messages.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/client_message"
+    },
+    {
+      "$ref": "#/$defs/server_message"
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "nullable_uuid": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nullable_string": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullable_non_negative_integer": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "nullable_number": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "nullable_boolean": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "client_message": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StartSession"
+        },
+        {
+          "$ref": "#/$defs/StopSession"
+        },
+        {
+          "$ref": "#/$defs/AbortSession"
+        }
+      ]
+    },
+    "server_message": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SessionStarted"
+        },
+        {
+          "$ref": "#/$defs/FinalResult"
+        },
+        {
+          "$ref": "#/$defs/ErrorMessage"
+        },
+        {
+          "$ref": "#/$defs/StatusMessage"
+        },
+        {
+          "$ref": "#/$defs/InterimStateMessage"
+        },
+        {
+          "$ref": "#/$defs/InterimTextMessage"
+        },
+        {
+          "$ref": "#/$defs/AudioLevelMessage"
+        },
+        {
+          "$ref": "#/$defs/SessionEndedMessage"
+        },
+        {
+          "$ref": "#/$defs/SessionWarningMessage"
+        }
+      ]
+    },
+    "StartSession": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "mode",
+        "timestamp"
+      ],
+      "properties": {
+        "type": {
+          "const": "start_session"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "mode": {
+          "const": "push_to_talk"
+        },
+        "preferred_lang": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "StopSession": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "timestamp"
+      ],
+      "properties": {
+        "type": {
+          "const": "stop_session"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "AbortSession": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "reason",
+        "timestamp"
+      ],
+      "properties": {
+        "type": {
+          "const": "abort_session"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "reason": {
+          "enum": [
+            "timeout",
+            "user",
+            "error"
+          ]
+        },
+        "timestamp": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "SessionStarted": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "ts",
+        "mic_device",
+        "lang"
+      ],
+      "properties": {
+        "type": {
+          "const": "session_started"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "mic_device": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "lang": {
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "FinalResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "text",
+        "latency_ms",
+        "audio_ms"
+      ],
+      "properties": {
+        "type": {
+          "const": "final_result"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "text": {
+          "type": "string"
+        },
+        "latency_ms": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "audio_ms": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "lang": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/nullable_number"
+        }
+      }
+    },
+    "ErrorMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "session_id": {
+          "$ref": "#/$defs/nullable_uuid"
+        },
+        "code": {
+          "enum": [
+            "SESSION_BUSY",
+            "SESSION_NOT_FOUND",
+            "SESSION_ABORTED",
+            "AUDIO_DEVICE",
+            "MODEL",
+            "INVALID_REQUEST",
+            "UNEXPECTED"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "StatusMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "state",
+        "sessions_active"
+      ],
+      "properties": {
+        "type": {
+          "const": "status"
+        },
+        "state": {
+          "enum": [
+            "idle",
+            "listening",
+            "processing"
+          ]
+        },
+        "sessions_active": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "gpu_mem_mb": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "device": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "effective_device": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "streaming_enabled": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "stream_helper_active": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "stream_helper_scope": {
+          "enum": [
+            "live_session_only",
+            null
+          ]
+        },
+        "stream_fallback_reason": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "finalization_mode": {
+          "enum": [
+            "offline_seal",
+            null
+          ]
+        },
+        "final_audio_source": {
+          "enum": [
+            "canonical_session_audio",
+            null
+          ]
+        },
+        "tail_trim_mode": {
+          "enum": [
+            "rms",
+            "vad",
+            null
+          ]
+        },
+        "vad_enabled": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "vad_active": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "vad_fallback_reason": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "overlay_events_enabled": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "overlay_events_emitted": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "overlay_events_dropped": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "chunk_secs": {
+          "$ref": "#/$defs/nullable_number"
+        },
+        "active_session_age_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "audio_stop_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "finalize_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "infer_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "send_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "last_audio_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "last_infer_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "last_send_ms": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        }
+      }
+    },
+    "InterimStateMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "seq",
+        "state"
+      ],
+      "properties": {
+        "type": {
+          "const": "interim_state"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "seq": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "state": {
+          "enum": [
+            "listening",
+            "processing",
+            "interim",
+            "finalizing"
+          ]
+        }
+      }
+    },
+    "InterimTextMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "seq",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "interim_text"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "seq": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "AudioLevelMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "level_db"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio_level"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "level_db": {
+          "type": "number"
+        }
+      }
+    },
+    "SessionEndedMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "session_ended"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "reason": {
+          "enum": [
+            "final",
+            "abort",
+            "error",
+            null
+          ]
+        }
+      }
+    },
+    "SessionWarningMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "session_id",
+        "warning",
+        "remaining_seconds",
+        "limit_seconds"
+      ],
+      "properties": {
+        "type": {
+          "const": "session_warning"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "warning": {
+          "const": "approaching_limit"
+        },
+        "remaining_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "limit_seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

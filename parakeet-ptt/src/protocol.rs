@@ -26,6 +26,7 @@ pub enum ClientMessage {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Keep serde's wire shape direct; Status is the only large payload.
 pub enum ServerMessage {
     SessionStarted {
         session_id: Uuid,
@@ -54,7 +55,17 @@ pub enum ServerMessage {
         effective_device: Option<String>,
         streaming_enabled: Option<bool>,
         stream_helper_active: Option<bool>,
+        stream_helper_scope: Option<String>,
         stream_fallback_reason: Option<String>,
+        finalization_mode: Option<String>,
+        final_audio_source: Option<String>,
+        tail_trim_mode: Option<String>,
+        vad_enabled: Option<bool>,
+        vad_active: Option<bool>,
+        vad_fallback_reason: Option<String>,
+        overlay_events_enabled: Option<bool>,
+        overlay_events_emitted: Option<u64>,
+        overlay_events_dropped: Option<u64>,
         chunk_secs: Option<f64>,
         active_session_age_ms: Option<u64>,
         audio_stop_ms: Option<u64>,
@@ -187,7 +198,17 @@ mod tests {
                 effective_device,
                 streaming_enabled,
                 stream_helper_active,
+                stream_helper_scope,
                 stream_fallback_reason,
+                finalization_mode,
+                final_audio_source,
+                tail_trim_mode,
+                vad_enabled,
+                vad_active,
+                vad_fallback_reason,
+                overlay_events_enabled,
+                overlay_events_emitted,
+                overlay_events_dropped,
                 chunk_secs,
                 active_session_age_ms,
                 audio_stop_ms,
@@ -205,7 +226,17 @@ mod tests {
                 assert_eq!(effective_device, None);
                 assert_eq!(streaming_enabled, None);
                 assert_eq!(stream_helper_active, None);
+                assert_eq!(stream_helper_scope, None);
                 assert_eq!(stream_fallback_reason, None);
+                assert_eq!(finalization_mode, None);
+                assert_eq!(final_audio_source, None);
+                assert_eq!(tail_trim_mode, None);
+                assert_eq!(vad_enabled, None);
+                assert_eq!(vad_active, None);
+                assert_eq!(vad_fallback_reason, None);
+                assert_eq!(overlay_events_enabled, None);
+                assert_eq!(overlay_events_emitted, None);
+                assert_eq!(overlay_events_dropped, None);
                 assert_eq!(chunk_secs, None);
                 assert_eq!(active_session_age_ms, None);
                 assert_eq!(audio_stop_ms, None);
@@ -346,7 +377,17 @@ mod tests {
                 effective_device: Some("cpu".to_string()),
                 streaming_enabled: Some(false),
                 stream_helper_active: Some(false),
+                stream_helper_scope: Some("live_session_only".to_string()),
                 stream_fallback_reason: None,
+                finalization_mode: Some("offline_seal".to_string()),
+                final_audio_source: Some("canonical_session_audio".to_string()),
+                tail_trim_mode: Some("rms".to_string()),
+                vad_enabled: Some(false),
+                vad_active: Some(false),
+                vad_fallback_reason: None,
+                overlay_events_enabled: Some(false),
+                overlay_events_emitted: Some(0),
+                overlay_events_dropped: Some(0),
                 chunk_secs: None,
                 active_session_age_ms: None,
                 audio_stop_ms: None,

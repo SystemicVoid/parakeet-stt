@@ -140,6 +140,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 ## 4. WebSocket Protocol (v1)
 
 All messages are JSON objects with a `type` string.
+The canonical machine-checkable contract and fixtures live under [`docs/protocol/`](protocol/).
 
 - **Client → Server**
   - `start_session`
@@ -209,7 +210,18 @@ All messages are JSON objects with a `type` string.
       "effective_device": "cuda",
       "streaming_enabled": true,
       "stream_helper_active": true,
+      "stream_helper_scope": "live_session_only",
       "stream_fallback_reason": null,
+      "finalization_mode": "offline_seal",
+      "final_audio_source": "canonical_session_audio",
+      "tail_trim_mode": "rms",
+      "vad_enabled": false,
+      "vad_active": false,
+      "vad_fallback_reason": null,
+      "overlay_events_enabled": true,
+      "overlay_events_emitted": 0,
+      "overlay_events_dropped": 0,
+      "chunk_secs": 2.4,
       "active_session_age_ms": 0,
       "audio_stop_ms": 12,
       "finalize_ms": 180,
