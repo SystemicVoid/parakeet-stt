@@ -4,6 +4,8 @@ mod client;
 mod config;
 mod hotkey;
 mod injector;
+mod injector_runtime;
+mod llm;
 mod overlay_process;
 mod protocol;
 mod routing;
@@ -278,7 +280,7 @@ async fn main() -> Result<()> {
 
     let llm_base_url = url::Url::parse(&cli.llm_base_url)
         .with_context(|| format!("invalid LLM base URL: {}", cli.llm_base_url))?;
-    let llm_config = app::LlmRuntimeConfig {
+    let llm_config = llm::LlmRuntimeConfig {
         base_url: llm_base_url,
         model: cli.llm_model.clone(),
         timeout: Duration::from_secs(cli.llm_timeout_seconds.max(1)),
@@ -290,7 +292,8 @@ async fn main() -> Result<()> {
 
     if cli.test_injection {
         let forced_shortcut = cli.test_injection_shortcut.clone().map(Into::into);
-        let injector = app::build_injector_with_shortcut_override(&config, None, forced_shortcut);
+        let injector =
+            injector_runtime::build_injector_with_shortcut_override(&config, None, forced_shortcut);
         let attempt_total = cli.test_injection_count.max(1);
         for attempt_index in 0..attempt_total {
             let payload = if attempt_total == 1 {
@@ -364,7 +367,7 @@ fn run_internal_inject_once(config: &ClientConfig) -> Result<()> {
                 None
             }
         });
-    app::build_injector_with_shortcut_override(config, context, None)
+    injector_runtime::build_injector_with_shortcut_override(config, context, None)
         .inject(&text)
         .context("internal injection failed")
 }
@@ -374,7 +377,7 @@ async fn run_client_app(
     audio_feedback: AudioFeedback,
     overlay_enabled_override: Option<bool>,
     overlay_adaptive_width_override: Option<bool>,
-    llm_config: app::LlmRuntimeConfig,
+    llm_config: llm::LlmRuntimeConfig,
     llm_pre_modifier_key_name: String,
 ) -> Result<()> {
     let overlay_capability = resolve_overlay_capability(overlay_enabled_override);
@@ -407,11 +410,11 @@ async fn run_client_app(
     let ports = app::ClientPorts::new(
         audio_feedback,
         Arc::new(app::WsDaemonConnector),
-        app::build_injection_runner(&config),
+        injector_runtime::build_injection_runner(&config),
         overlay_sink,
         focus_cache,
         Box::new(app::EvdevHotkeySource::new(llm_pre_modifier_key_name)),
-        Arc::new(app::HttpLlmAnswerer::new(llm_config)),
+        llm::build_http_llm_answerer(llm_config),
     );
     app::run(config, ports).await
 }
