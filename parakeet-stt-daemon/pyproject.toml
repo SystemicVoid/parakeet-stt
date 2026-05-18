@@ -59,10 +59,10 @@ extend-exclude = [".venv", ".uv"]
 select = ["E", "F", "I", "B", "W", "UP", "BLE"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["parakeet_stt_daemon"]
+known-first-party = ["check_model_lib", "parakeet_stt_daemon"]
 
 [tool.deptry]
-known_first_party = ["parakeet_stt_daemon"]
+known_first_party = ["check_model_lib", "parakeet_stt_daemon"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

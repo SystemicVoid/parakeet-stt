@@ -858,11 +858,6 @@ def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None
         _set_dynamic_attr(server, "transcriber", transcriber)
         _set_dynamic_attr(
             server,
-            "_trim_tail_silence",
-            lambda samples, _sample_rate, _window_ms=50: samples,
-        )
-        _set_dynamic_attr(
-            server,
             "_finalise_transcription",
             DaemonServer._finalise_transcription.__get__(server, DaemonServer),
         )
