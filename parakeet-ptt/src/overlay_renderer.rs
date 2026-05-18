@@ -1815,10 +1815,10 @@ impl OverlayBackend for WaylandOverlayBackend {
             }
             // Manage waveform lifecycle
             match intent.phase {
-                OverlayRenderPhase::Listening | OverlayRenderPhase::Interim => {
-                    if self.waveform.is_none() {
-                        self.waveform = Some(WaveformCanvas::new(now));
-                    }
+                OverlayRenderPhase::Listening | OverlayRenderPhase::Interim
+                    if self.waveform.is_none() =>
+                {
+                    self.waveform = Some(WaveformCanvas::new(now));
                 }
                 OverlayRenderPhase::Hidden => {
                     self.waveform = None;
