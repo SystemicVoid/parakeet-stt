@@ -4,9 +4,11 @@ Keep it short, stable, and biased toward source-of-truth locations. If something
 
 ## Repo Map
 - `README.md`: quickstart and top-level workflow.
+- `CONTEXT.md`: project glossary (domain language). Use these terms verbatim.
 - `docs/SPEC.md`: product/runtime intent and behavior.
 - `docs/stt-troubleshooting.md`: operator-facing runtime behavior and troubleshooting.
 - `docs/engineering/harness-engineering-playbook.md`: tooling policy, repo hygiene, and maintenance cadence.
+- `docs/adr/`: architectural decision records — read any ADR touching the area being changed.
 - `scripts/stt-helper.sh` `start_option_rows`: canonical source for helper start flags, defaults, and env wiring.
 
 ## Predictability Rules
