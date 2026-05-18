@@ -11,10 +11,10 @@ from typing import Any, cast
 
 import numpy as np
 
-from parakeet_stt_daemon import server as server_module
+from parakeet_stt_daemon import session_orchestrator as orchestrator_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.model import ParakeetTranscriber
-from parakeet_stt_daemon.server import DaemonServer
+from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer, TailTrimOutcome
 
 
@@ -118,7 +118,7 @@ def test_transcribe_samples_empty_audio_returns_empty_string_without_model_call(
 
 def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
     async def scenario() -> None:
-        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
         server.settings = ServerSettings(device="cpu", streaming_enabled=False)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
@@ -126,7 +126,7 @@ def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
         server._active_stream = None
 
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
-        typed_server = cast(DaemonServer, server)
+        typed_server = cast(SessionOrchestrator, server)
         text, infer_ms = await typed_server._finalise_transcription(samples)
 
         assert text == "offline text"
@@ -142,7 +142,7 @@ def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
 
 def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monkeypatch) -> None:
     async def scenario() -> None:
-        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
         server.settings = ServerSettings(device="cuda", streaming_enabled=False)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
@@ -163,13 +163,13 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monke
         released_devices: list[str] = []
 
         monkeypatch.setattr(
-            server_module,
+            orchestrator_module,
             "_release_cuda_cache",
             lambda device: released_devices.append(device),
         )
 
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
-        typed_server = cast(DaemonServer, server)
+        typed_server = cast(SessionOrchestrator, server)
         text, infer_ms = await typed_server._finalise_transcription(samples)
 
         assert text == ""
@@ -182,7 +182,7 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monke
 
 def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() -> None:
     async def scenario() -> None:
-        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
         server.settings = ServerSettings(device="cpu", streaming_enabled=True)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
@@ -191,7 +191,7 @@ def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() 
         server.tail_trimmer = _tail_trimmer_with_trim(_identity_tail_trim)
 
         samples = np.array([0.2, 0.1, 0.05, 0.4], dtype=np.float32)
-        typed_server = cast(DaemonServer, server)
+        typed_server = cast(SessionOrchestrator, server)
         text, infer_ms = await typed_server._finalise_transcription(samples)
 
         assert text == "offline text"
@@ -210,7 +210,7 @@ def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() 
 
 def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
     async def scenario() -> None:
-        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
         server.settings = ServerSettings(device="cpu", streaming_enabled=False)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
@@ -230,7 +230,7 @@ def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
             progress.set()
 
         finalize_task = asyncio.create_task(
-            cast(DaemonServer, server)._finalise_transcription(
+            cast(SessionOrchestrator, server)._finalise_transcription(
                 np.array([0.2, 0.1, 0.05], dtype=np.float32)
             )
         )
@@ -248,7 +248,7 @@ def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
 
 def test_server_finalize_releases_cuda_cache_after_model_call(monkeypatch) -> None:
     async def scenario() -> None:
-        server = cast(Any, DaemonServer.__new__(DaemonServer))
+        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
         server.settings = ServerSettings(device="cuda", streaming_enabled=False)
         server.audio = SimpleNamespace(sample_rate=16_000)
         server.transcriber = _RecordingTranscriber()
@@ -259,12 +259,12 @@ def test_server_finalize_releases_cuda_cache_after_model_call(monkeypatch) -> No
         released_devices: list[str] = []
 
         monkeypatch.setattr(
-            server_module,
+            orchestrator_module,
             "_release_cuda_cache",
             lambda device: released_devices.append(device),
         )
 
-        text, infer_ms = await cast(DaemonServer, server)._finalise_transcription(
+        text, infer_ms = await cast(SessionOrchestrator, server)._finalise_transcription(
             np.array([0.2, 0.1, 0.05], dtype=np.float32)
         )
 

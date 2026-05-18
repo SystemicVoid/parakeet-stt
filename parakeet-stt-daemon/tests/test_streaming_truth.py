@@ -9,8 +9,9 @@ from uuid import uuid4
 import numpy as np
 
 from parakeet_stt_daemon.config import ServerSettings
-from parakeet_stt_daemon.server import DaemonServer
+from parakeet_stt_daemon.messages import StatusMessage
 from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
@@ -65,55 +66,57 @@ def _build_server(
     streaming_enabled: bool = True,
     streaming_transcriber: Any = None,
     vad_enabled: bool = False,
-) -> DaemonServer:
-    server = cast(Any, DaemonServer.__new__(DaemonServer))
-    server.settings = ServerSettings(
+) -> SessionOrchestrator:
+    orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
+    orchestrator.settings = ServerSettings(
         device="cpu",
         status_enabled=True,
         streaming_enabled=streaming_enabled,
         vad_enabled=vad_enabled,
     )
-    server.sessions = SessionManager()
-    server.audio = FakeAudio()
-    server.model = object()
-    server.transcriber = object()
-    server._session_lock = asyncio.Lock()
-    server._inference_lock = asyncio.Lock()
-    server.streaming_transcriber = streaming_transcriber
-    server._active_stream = None
-    server._stream_drain_task = None
-    server._stream_drain_running = False
-    server._requested_device = "cpu"
-    server._effective_device = "cpu"
-    server._last_audio_ms = None
-    server._last_audio_stop_ms = None
-    server._last_finalize_ms = None
-    server._last_infer_ms = None
-    server._last_send_ms = None
-    server._live_interim_audio = np.zeros((0,), dtype=np.float32)
-    server._live_interim_failed = False
-    server._overlay_event_seq_by_session = {}
-    server._overlay_last_interim_text_by_session = {}
-    server._overlay_interim_transcript_by_session = {}
-    server._overlay_state_by_session = {}
-    server._overlay_events_emitted = 0
-    server._overlay_events_dropped = 0
-    server._websocket_send_locks = {}
-    server._vad_enabled = vad_enabled
-    server.tail_trimmer = SealPathTailTrimmer(
+    orchestrator.sessions = SessionManager()
+    orchestrator.audio = FakeAudio()
+    orchestrator.model = object()
+    orchestrator.transcriber = object()
+    orchestrator._session_lock = asyncio.Lock()
+    orchestrator._inference_lock = asyncio.Lock()
+    orchestrator.streaming_transcriber = streaming_transcriber
+    orchestrator._active_stream = None
+    orchestrator._stream_drain_task = None
+    orchestrator._stream_drain_running = False
+    orchestrator._requested_device = "cpu"
+    orchestrator._effective_device = "cpu"
+    orchestrator._last_audio_ms = None
+    orchestrator._last_audio_stop_ms = None
+    orchestrator._last_finalize_ms = None
+    orchestrator._last_infer_ms = None
+    orchestrator._last_send_ms = None
+    orchestrator._live_interim_audio = np.zeros((0,), dtype=np.float32)
+    orchestrator._live_interim_failed = False
+    orchestrator._overlay_interim_stabilizer_by_session = {}
+    orchestrator._vad_enabled = vad_enabled
+    orchestrator.tail_trimmer = SealPathTailTrimmer(
         vad_enabled=vad_enabled,
-        silence_floor_db=float(server.settings.silence_floor_db),
+        silence_floor_db=float(orchestrator.settings.silence_floor_db),
         vad_adapter=FakeVadAdapter(),
         warmup_sample_rate=FakeAudio.sample_rate,
     )
-    return cast(DaemonServer, server)
+    return cast(SessionOrchestrator, orchestrator)
+
+
+def _status(orchestrator: SessionOrchestrator) -> StatusMessage:
+    return orchestrator.status(
+        overlay_events_enabled=orchestrator.settings.overlay_events_enabled,
+        overlay_events_emitted=0,
+        overlay_events_dropped=0,
+    )
 
 
 def test_status_streaming_disabled_by_config() -> None:
     """When streaming is disabled by config, helper fields reflect that."""
     server = _build_server(streaming_enabled=False)
 
-    status = server.status()
+    status = _status(server)
 
     assert status.streaming_enabled is False
     assert status.stream_helper_active is False
@@ -136,7 +139,7 @@ def test_status_streaming_enabled_helper_active() -> None:
     )
     server = _build_server(streaming_transcriber=transcriber)
 
-    status = server.status()
+    status = _status(server)
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is True
@@ -150,7 +153,7 @@ def test_status_streaming_enabled_helper_active() -> None:
 def test_status_vad_enabled_pending_load_is_explicit() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
 
-    status = server.status()
+    status = _status(server)
 
     assert status.vad_enabled is True
     assert status.vad_active is False
@@ -162,7 +165,7 @@ def test_status_vad_enabled_and_loaded_is_active() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
     server.prepare_vad()
 
-    status = server.status()
+    status = _status(server)
 
     assert status.vad_enabled is True
     assert status.vad_active is True
@@ -195,7 +198,7 @@ def test_status_streaming_enabled_helper_inactive() -> None:
     )
     server = _build_server(streaming_transcriber=transcriber)
 
-    status = server.status()
+    status = _status(server)
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
@@ -209,7 +212,7 @@ def test_status_streaming_enabled_transcriber_none() -> None:
     """When streaming_transcriber is None despite enabled config."""
     server = _build_server(streaming_transcriber=None)
 
-    status = server.status()
+    status = _status(server)
 
     assert status.streaming_enabled is True
     assert status.stream_helper_active is False
@@ -254,7 +257,7 @@ def test_status_includes_active_session_age_when_session_active() -> None:
         session_id = uuid4()
         await server.sessions.start_session(session_id, owner_token=1)
 
-        status = server.status()
+        status = _status(server)
         assert status.active_session_age_ms is not None
         assert status.active_session_age_ms >= 0
 
@@ -265,7 +268,7 @@ def test_status_no_active_session_age_when_idle() -> None:
     """active_session_age_ms is None when no session is active."""
     server = _build_server(streaming_enabled=False)
 
-    status = server.status()
+    status = _status(server)
     assert status.active_session_age_ms is None
 
 
@@ -273,7 +276,7 @@ def test_status_last_timings_none_before_first_session() -> None:
     """Timing fields are None before any session completes."""
     server = _build_server(streaming_enabled=False)
 
-    status = server.status()
+    status = _status(server)
     assert status.audio_stop_ms is None
     assert status.finalize_ms is None
     assert status.infer_ms is None
@@ -292,7 +295,7 @@ def test_status_last_timings_populated_after_session() -> None:
     server._last_infer_ms = 120
     server._last_send_ms = 3
 
-    status = server.status()
+    status = _status(server)
     assert status.audio_stop_ms == 12
     assert status.finalize_ms == 180
     assert status.infer_ms == 120
