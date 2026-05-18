@@ -355,7 +355,10 @@ impl OverlayProcessManager {
                     self.latest_warning = Some(message.clone());
                 }
             }
-            OverlayIpcMessage::InjectionComplete { .. } => {
+            OverlayIpcMessage::InjectionComplete { session_id, .. } => {
+                if overlay_message_session_id(self.latest_message.as_ref()) == Some(*session_id) {
+                    self.latest_message = None;
+                }
                 self.latest_warning = None;
             }
             OverlayIpcMessage::OutputHint { .. } | OverlayIpcMessage::AudioLevel { .. } => {}
@@ -944,7 +947,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn manager_replay_ignores_injection_complete_as_latest_state() {
+    async fn manager_clears_replay_state_after_injection_complete() {
         let (tx_first, mut rx_first) = mpsc::unbounded_channel();
         let first_sink = OverlayProcessSink::from_sender_for_tests(
             tx_first,
@@ -993,13 +996,19 @@ mod tests {
 
         drop(rx_first);
 
-        manager.send(injection_complete_message);
+        let output_hint = OverlayIpcMessage::OutputHint {
+            output_name: "DP-1".to_string(),
+        };
+        manager.send(output_hint.clone());
 
-        let replayed = timeout(Duration::from_millis(100), rx_second.recv())
+        let forwarded = timeout(Duration::from_millis(100), rx_second.recv())
             .await
-            .expect("second sink should receive replay")
+            .expect("second sink should receive current non-session event")
             .expect("second sink should remain open");
-        assert_eq!(replayed, state_message);
+        assert_eq!(forwarded, output_hint);
+        assert!(timeout(Duration::from_millis(50), rx_second.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
