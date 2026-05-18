@@ -7,9 +7,11 @@ from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
+
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
 class FakeAudio:
@@ -43,6 +45,19 @@ class FakeStreamingTranscriber:
 
     def start_session(self, _sample_rate: int) -> object:
         return object()
+
+
+class FakeVadAdapter:
+    def __init__(self, *, prepare_error: Exception | None = None) -> None:
+        self.prepare_error = prepare_error
+
+    def prepare(self) -> None:
+        if self.prepare_error is not None:
+            raise self.prepare_error
+
+    def trim(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        del sample_rate
+        return samples.astype(np.float32, copy=False)
 
 
 def _build_server(
@@ -84,15 +99,14 @@ def _build_server(
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
     server._websocket_send_locks = {}
-    server._vad_model = None
-    server._vad_failure_reason = None
     server._vad_enabled = vad_enabled
-    server._vad_load_attempted = False
+    server.tail_trimmer = SealPathTailTrimmer(
+        vad_enabled=vad_enabled,
+        silence_floor_db=float(server.settings.silence_floor_db),
+        vad_adapter=FakeVadAdapter(),
+        warmup_sample_rate=FakeAudio.sample_rate,
+    )
     return cast(DaemonServer, server)
-
-
-def _set_dynamic_attr(target: object, name: str, value: object) -> None:
-    setattr(cast(Any, target), name, value)
 
 
 def test_status_streaming_disabled_by_config() -> None:
@@ -146,8 +160,7 @@ def test_status_vad_enabled_pending_load_is_explicit() -> None:
 
 def test_status_vad_enabled_and_loaded_is_active() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
-    server._vad_load_attempted = True
-    server._vad_model = object()
+    server.prepare_vad()
 
     status = server.status()
 
@@ -159,13 +172,14 @@ def test_status_vad_enabled_and_loaded_is_active() -> None:
 
 def test_prepare_vad_marks_missing_dependency_explicitly() -> None:
     server = _build_server(streaming_enabled=False, vad_enabled=True)
-
-    def fake_load_vad_model() -> object:
-        exc = ModuleNotFoundError("No module named 'onnxruntime'")
-        exc.name = "onnxruntime"
-        raise exc
-
-    _set_dynamic_attr(server, "_load_vad_model", fake_load_vad_model)
+    exc = ModuleNotFoundError("No module named 'onnxruntime'")
+    exc.name = "onnxruntime"
+    server.tail_trimmer = SealPathTailTrimmer(
+        vad_enabled=True,
+        silence_floor_db=float(server.settings.silence_floor_db),
+        vad_adapter=FakeVadAdapter(prepare_error=exc),
+        warmup_sample_rate=FakeAudio.sample_rate,
+    )
 
     server.prepare_vad()
 
@@ -286,53 +300,3 @@ def test_status_last_timings_populated_after_session() -> None:
     assert status.last_audio_ms == 2500
     assert status.last_infer_ms == 120
     assert status.last_send_ms == 3
-
-
-def test_trim_tail_silence_default_path_uses_rms() -> None:
-    import numpy as np
-
-    server = _build_server(streaming_enabled=False, vad_enabled=False)
-
-    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
-        return "rms"
-
-    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
-
-    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
-    assert result == "rms"
-
-
-def test_trim_tail_silence_vad_opt_in_uses_vad_when_available() -> None:
-    import numpy as np
-
-    server = _build_server(streaming_enabled=False, vad_enabled=True)
-
-    def fake_vad(_samples: Any, _sample_rate: int) -> Any:
-        return "vad"
-
-    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
-        return "rms"
-
-    _set_dynamic_attr(server, "_trim_tail_with_vad", fake_vad)
-    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
-
-    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
-    assert result == "vad"
-
-
-def test_trim_tail_silence_vad_opt_in_falls_back_to_rms() -> None:
-    import numpy as np
-
-    server = _build_server(streaming_enabled=False, vad_enabled=True)
-
-    def fake_vad(_samples: Any, _sample_rate: int) -> Any:
-        return None
-
-    def fake_rms(_samples: Any, _sample_rate: int, _window_ms: int = 50) -> Any:
-        return "rms"
-
-    _set_dynamic_attr(server, "_trim_tail_with_vad", fake_vad)
-    _set_dynamic_attr(server, "_trim_tail_with_rms", fake_rms)
-
-    result = server._trim_tail_silence(np.zeros((16,), dtype=np.float32), sample_rate=16_000)
-    assert result == "rms"

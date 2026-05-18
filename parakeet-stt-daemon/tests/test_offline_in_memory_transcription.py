@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+
 from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.model import ParakeetTranscriber
 from parakeet_stt_daemon.server import DaemonServer
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer, TailTrimOutcome
 
 
 class _ArrayModel:
@@ -57,6 +60,18 @@ class _ExplodingStreamSession:
     def finalize(self) -> str:
         self.finalize_called = True
         raise AssertionError("final transcript should not read from streaming mirror")
+
+
+def _tail_trimmer_with_trim(
+    trim: Callable[[np.ndarray, int], TailTrimOutcome],
+) -> SealPathTailTrimmer:
+    tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+    cast(Any, tail_trimmer).trim = trim
+    return tail_trimmer
+
+
+def _identity_tail_trim(samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
+    return TailTrimOutcome(samples, "rms", False, None)
 
 
 def test_transcribe_samples_uses_array_path_when_supported() -> None:
@@ -135,10 +150,16 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monke
         server._active_stream = None
         server._vad_enabled = False
         server._effective_device = "cuda"
-        server._trim_tail_silence = lambda _samples, _sample_rate: np.zeros(
-            (0,),
-            dtype=np.float32,
-        )
+
+        def trim_empty(_samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
+            return TailTrimOutcome(
+                np.zeros((0,), dtype=np.float32),
+                "rms",
+                False,
+                None,
+            )
+
+        server.tail_trimmer = _tail_trimmer_with_trim(trim_empty)
         released_devices: list[str] = []
 
         monkeypatch.setattr(
@@ -167,7 +188,7 @@ def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() 
         server.transcriber = _RecordingTranscriber()
         server.streaming_transcriber = object()
         server._active_stream = _ExplodingStreamSession()
-        server._trim_tail_silence = lambda samples, _sample_rate: samples
+        server.tail_trimmer = _tail_trimmer_with_trim(_identity_tail_trim)
 
         samples = np.array([0.2, 0.1, 0.05, 0.4], dtype=np.float32)
         typed_server = cast(DaemonServer, server)
@@ -196,11 +217,11 @@ def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
         server.streaming_transcriber = None
         server._active_stream = None
 
-        def slow_trim(samples: np.ndarray, _sample_rate: int) -> np.ndarray:
+        def slow_trim(samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
             time.sleep(0.12)
-            return samples
+            return TailTrimOutcome(samples, "rms", False, None)
 
-        server._trim_tail_silence = slow_trim
+        server.tail_trimmer = _tail_trimmer_with_trim(slow_trim)
 
         progress = asyncio.Event()
 
@@ -234,7 +255,7 @@ def test_server_finalize_releases_cuda_cache_after_model_call(monkeypatch) -> No
         server.streaming_transcriber = None
         server._active_stream = None
         server._effective_device = "cuda"
-        server._trim_tail_silence = lambda samples, _sample_rate: samples
+        server.tail_trimmer = _tail_trimmer_with_trim(_identity_tail_trim)
         released_devices: list[str] = []
 
         monkeypatch.setattr(

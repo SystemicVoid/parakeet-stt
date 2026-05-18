@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from loguru import logger
+
 from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import (
@@ -856,11 +857,6 @@ def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None
         server = _build_server(overlay_events_enabled=True)
         transcriber = SerializingTranscriber()
         _set_dynamic_attr(server, "transcriber", transcriber)
-        _set_dynamic_attr(
-            server,
-            "_trim_tail_silence",
-            lambda samples, _sample_rate, _window_ms=50: samples,
-        )
         _set_dynamic_attr(
             server,
             "_finalise_transcription",

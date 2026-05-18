@@ -6,12 +6,6 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from parakeet_stt_daemon.model import (
-    DEFAULT_MODEL_NAME,
-    ParakeetTranscriber,
-    load_parakeet_model,
-)
-
 from check_model_lib.constants import (
     BENCH_AUDIO_DIR,
     DEFAULT_BASELINE_OUTPUT,
@@ -27,6 +21,11 @@ from check_model_lib.constants import (
 )
 from check_model_lib.runner import run_offline_benchmark, run_streaming_probe
 from check_model_lib.runtime import generate_sine, write_wav
+from parakeet_stt_daemon.model import (
+    DEFAULT_MODEL_NAME,
+    ParakeetTranscriber,
+    load_parakeet_model,
+)
 
 
 def _apply_profile_defaults(args: argparse.Namespace) -> None:

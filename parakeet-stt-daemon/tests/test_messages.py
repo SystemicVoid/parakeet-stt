@@ -3,6 +3,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
+
 from parakeet_stt_daemon.messages import (
     InterimStateMessage,
     InterimStateValue,
@@ -12,7 +14,6 @@ from parakeet_stt_daemon.messages import (
     StatusMessage,
 )
 from parakeet_stt_daemon.session import SessionState
-from pydantic import ValidationError
 
 
 def test_interim_text_requires_text_field() -> None:

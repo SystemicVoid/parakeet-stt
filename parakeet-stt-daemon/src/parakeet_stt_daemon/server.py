@@ -48,6 +48,7 @@ from .model import (
     load_parakeet_model,
 )
 from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
+from .tail_trim import SealPathTailTrimmer
 
 ErrorCode = Literal[
     "SESSION_BUSY",
@@ -139,10 +140,12 @@ class DaemonServer:
         self._last_send_ms: int | None = None
         self._live_interim_audio = np.zeros((0,), dtype=np.float32)
         self._live_interim_failed = False
-        self._vad_model: object | None = None
         self._vad_enabled = bool(settings.vad_enabled)
-        self._vad_failure_reason: str | None = None
-        self._vad_load_attempted = False
+        self.tail_trimmer = SealPathTailTrimmer(
+            vad_enabled=self._vad_enabled,
+            silence_floor_db=float(settings.silence_floor_db),
+            warmup_sample_rate=sample_rate,
+        )
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
@@ -1279,94 +1282,27 @@ class DaemonServer:
         return "canonical_session_audio"
 
     def _tail_trim_mode(self) -> Literal["rms", "vad"]:
-        return "vad" if self._vad_active() else "rms"
+        return self._tail_trimmer_for_runtime().last_outcome.tail_trim_mode
 
     def _vad_active(self) -> bool:
-        if not bool(getattr(self, "_vad_enabled", False)):
-            return False
-        return getattr(self, "_vad_model", None) is not None and self._vad_fallback_reason() is None
+        return self._tail_trimmer_for_runtime().last_outcome.vad_active
 
     def _vad_fallback_reason(self) -> str | None:
-        if not bool(getattr(self, "_vad_enabled", False)):
-            return None
-        failure_reason = getattr(self, "_vad_failure_reason", None)
-        if failure_reason is not None:
-            return str(failure_reason)
-        if getattr(self, "_vad_model", None) is not None:
-            return None
-        if not bool(getattr(self, "_vad_load_attempted", False)):
-            return "load_not_attempted"
-        return "model_unavailable"
-
-    def _format_vad_failure_reason(
-        self,
-        stage: Literal["load_failed", "runtime_failed", "warmup_failed"],
-        exc: Exception,
-    ) -> str:
-        if isinstance(exc, ModuleNotFoundError):
-            missing_dependency = exc.name or "unknown"
-            return f"{stage}:missing_dependency:{missing_dependency}"
-        return f"{stage}:{exc.__class__.__name__}"
-
-    def _load_vad_model(self) -> object:
-        from silero_vad import load_silero_vad
-
-        return load_silero_vad(onnx=True)
-
-    def _ensure_vad_ready(self) -> bool:
-        if not self._vad_enabled:
-            return False
-        if (
-            getattr(self, "_vad_model", None) is not None
-            and getattr(self, "_vad_failure_reason", None) is None
-        ):
-            return True
-        if getattr(self, "_vad_failure_reason", None) is not None:
-            return False
-
-        self._vad_load_attempted = True
-        try:
-            self._vad_model = self._load_vad_model()
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            self._vad_failure_reason = self._format_vad_failure_reason("load_failed", exc)
-            logger.warning("Silero VAD unavailable; falling back to RMS trim: {}", exc)
-            return False
-        return True
-
-    def _run_vad_inference(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
-        import torch
-        from silero_vad import get_speech_timestamps
-
-        if self._vad_model is None:  # pragma: no cover - guarded by _ensure_vad_ready
-            raise RuntimeError("Silero VAD model not loaded")
-
-        audio = samples.astype(np.float32, copy=False)
-        waveform = torch.from_numpy(audio)
-        speech_spans = get_speech_timestamps(
-            waveform,
-            self._vad_model,
-            sampling_rate=sample_rate,
-        )
-        if not speech_spans:
-            return np.zeros((0,), dtype=np.float32)
-        end_sample = int(speech_spans[-1].get("end", 0))
-        end_sample = max(0, min(end_sample, audio.size))
-        return audio[:end_sample]
+        return self._tail_trimmer_for_runtime().last_outcome.vad_fallback_reason
 
     def prepare_vad(self) -> None:
-        if not self._vad_enabled:
-            return
-        if not self._ensure_vad_ready():
-            return
-        try:
-            _ = self._run_vad_inference(
-                np.zeros((self.audio.sample_rate,), dtype=np.float32),
-                self.audio.sample_rate,
+        self._tail_trimmer_for_runtime().prepare()
+
+    def _tail_trimmer_for_runtime(self) -> SealPathTailTrimmer:
+        tail_trimmer = getattr(self, "tail_trimmer", None)
+        if not isinstance(tail_trimmer, SealPathTailTrimmer):
+            tail_trimmer = SealPathTailTrimmer(
+                vad_enabled=bool(getattr(self, "_vad_enabled", False)),
+                silence_floor_db=float(getattr(self.settings, "silence_floor_db", -40.0)),
+                warmup_sample_rate=int(getattr(self.audio, "sample_rate", 16_000)),
             )
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            self._vad_failure_reason = self._format_vad_failure_reason("warmup_failed", exc)
-            self._vad_model = None
-            logger.warning("Silero VAD warmup failed; disabling VAD tail trim: {}", exc)
+            self.tail_trimmer = tail_trimmer
+        return tail_trimmer
 
     def _gpu_mem_mb(self) -> int | None:
         try:
@@ -1392,10 +1328,12 @@ class DaemonServer:
     async def _finalise_transcription(self, audio_samples: np.ndarray) -> tuple[str, int]:
         # The full capture buffer is the only authoritative source for final decode.
         loop = asyncio.get_running_loop()
-        trimmed = await loop.run_in_executor(
+        tail_trimmer = self._tail_trimmer_for_runtime()
+        trim_outcome = await loop.run_in_executor(
             None,
-            partial(self._trim_tail_silence, audio_samples, self.audio.sample_rate),
+            partial(tail_trimmer.trim, audio_samples, self.audio.sample_rate),
         )
+        trimmed = trim_outcome.samples
         effective_device = str(getattr(self, "_effective_device", self.settings.device))
         if trimmed.size == 0:
             logger.info("Skipping offline transcription: silence trimming removed all samples")
@@ -1447,50 +1385,6 @@ class DaemonServer:
                 "Stream drain loop stopped with {} during shutdown",
                 exc.__class__.__name__,
             )
-
-    def _trim_tail_silence(
-        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50
-    ) -> np.ndarray:
-        if samples.size == 0:
-            return samples
-        if bool(getattr(self, "_vad_enabled", False)):
-            trimmed = self._trim_tail_with_vad(samples, sample_rate)
-            if trimmed is not None:
-                return trimmed
-
-        return self._trim_tail_with_rms(samples, sample_rate, window_ms)
-
-    def _trim_tail_with_vad(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
-        if not bool(getattr(self, "_vad_enabled", False)):
-            return None
-        if not self._ensure_vad_ready():
-            return None
-
-        try:
-            return self._run_vad_inference(samples, sample_rate)
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            self._vad_failure_reason = self._format_vad_failure_reason("runtime_failed", exc)
-            self._vad_model = None
-            logger.warning("Silero VAD tail trim failed; falling back to RMS trim: {}", exc)
-            return None
-
-    def _trim_tail_with_rms(
-        self, samples: np.ndarray, sample_rate: int, window_ms: int = 50
-    ) -> np.ndarray:
-        window = max(1, int(sample_rate * window_ms / 1000))
-        # Clamp to mono array
-        audio = samples.astype(np.float32, copy=False)
-        idx = audio.size
-        floor_db = float(self.settings.silence_floor_db)
-        while idx > 0:
-            start = max(0, idx - window)
-            window_slice = audio[start:idx]
-            rms = np.sqrt(np.mean(window_slice**2))
-            db = 20 * np.log10(max(rms, 1e-6))
-            if db > floor_db:
-                break
-            idx = start
-        return audio[:idx]
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
