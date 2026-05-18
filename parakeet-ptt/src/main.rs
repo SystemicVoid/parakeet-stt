@@ -2340,11 +2340,7 @@ fn sanitize_model_answer(raw: &str) -> String {
 
 fn drain_sse_lines(buffer: &mut Vec<u8>, flush_partial: bool) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    loop {
-        let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') else {
-            break;
-        };
-
+    while let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
         let mut raw_line = buffer.drain(..=line_end).collect::<Vec<_>>();
         raw_line.pop();
         if raw_line.ends_with(b"\r") {
