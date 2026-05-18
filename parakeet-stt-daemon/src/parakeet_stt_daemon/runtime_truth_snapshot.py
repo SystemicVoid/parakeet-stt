@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -255,7 +256,15 @@ def _chunk_secs_or_none(settings: object) -> float | None:
     value = getattr(settings, "chunk_secs", None)
     if value is None:
         return None
-    return float(value)
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 class RuntimeTruthSnapshot:
