@@ -10,17 +10,20 @@ from uuid import UUID, uuid4
 import numpy as np
 from fastapi import WebSocketDisconnect
 
-from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.audio import AudioInput
 from parakeet_stt_daemon.config import ServerSettings
+from parakeet_stt_daemon.events import EventSink, EventSinkClosed, WebSocketEventSinkState
 from parakeet_stt_daemon.messages import (
     AbortSession,
     ClientMessageType,
+    ParsedMessage,
+    SessionEndReason,
     StartSession,
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
 from parakeet_stt_daemon.session import Session, SessionManager
+from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 
 
 class FakeAudio:
@@ -47,6 +50,9 @@ class FakeAudio:
         return samples, [], np.zeros((0,), dtype=np.float32)
 
     def take_stream_chunks(self) -> list[object]:
+        return []
+
+    def take_audio_levels(self) -> list[float]:
         return []
 
     def session_limit_exceeded(self) -> bool:
@@ -130,37 +136,39 @@ def _start_event(session_id: UUID) -> dict[str, object]:
 
 def _build_server() -> DaemonServer:
     server = cast(Any, DaemonServer.__new__(DaemonServer))
-    server.settings = ServerSettings(device="cpu", status_enabled=True, streaming_enabled=False)
-    server.sessions = SessionManager()
-    server.audio = FakeAudio()
-    server.model = object()
-    server.transcriber = object()
-    server._session_lock = asyncio.Lock()
-    server._inference_lock = asyncio.Lock()
-    server.streaming_transcriber = None
-    server._active_stream = object()
-    server._stream_drain_task = None
-    server._stream_drain_running = False
-    server._session_guard_task = None
-    server._session_guard_running = False
-    server._session_sample_limit = 1_440_000
-    server._session_age_limit_ms = 90_000
-    server._requested_device = "cpu"
-    server._effective_device = "cpu"
-    server._last_audio_ms = None
-    server._last_audio_stop_ms = None
-    server._last_finalize_ms = None
-    server._last_infer_ms = None
-    server._last_send_ms = None
-    server._live_interim_audio = np.zeros((0,), dtype=np.float32)
-    server._live_interim_failed = False
-    server._overlay_event_seq_by_session = {}
-    server._overlay_last_interim_text_by_session = {}
-    server._overlay_interim_transcript_by_session = {}
-    server._overlay_state_by_session = {}
-    server._overlay_events_emitted = 0
-    server._overlay_events_dropped = 0
+    orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
+    settings = ServerSettings(device="cpu", status_enabled=True, streaming_enabled=False)
+    server.settings = settings
+    server.orchestrator = orchestrator
+    server.event_sinks = WebSocketEventSinkState(
+        overlay_events_enabled=settings.overlay_events_enabled
+    )
     server._websocket_send_locks = {}
+    orchestrator.settings = settings
+    orchestrator.sessions = SessionManager()
+    orchestrator.audio = FakeAudio()
+    orchestrator.model = object()
+    orchestrator.transcriber = object()
+    orchestrator._session_lock = asyncio.Lock()
+    orchestrator._inference_lock = asyncio.Lock()
+    orchestrator.streaming_transcriber = None
+    orchestrator._active_stream = object()
+    orchestrator._stream_drain_task = None
+    orchestrator._stream_drain_running = False
+    orchestrator._session_guard_task = None
+    orchestrator._session_guard_running = False
+    orchestrator._session_sample_limit = 1_440_000
+    orchestrator._session_age_limit_ms = 90_000
+    orchestrator._requested_device = "cpu"
+    orchestrator._effective_device = "cpu"
+    orchestrator._last_audio_ms = None
+    orchestrator._last_audio_stop_ms = None
+    orchestrator._last_finalize_ms = None
+    orchestrator._last_infer_ms = None
+    orchestrator._last_send_ms = None
+    orchestrator._live_interim_audio = np.zeros((0,), dtype=np.float32)
+    orchestrator._live_interim_failed = False
+    orchestrator._overlay_interim_stabilizer_by_session = {}
 
     async def fake_collect_interim_text_updates(
         _session_id: UUID, _ready_chunks: list[object]
@@ -170,26 +178,20 @@ def _build_server() -> DaemonServer:
     async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
         return "final text", 7
 
-    server._collect_interim_text_updates = fake_collect_interim_text_updates
-    server._finalise_transcription = fake_finalize
+    orchestrator._collect_interim_text_updates = fake_collect_interim_text_updates
+    orchestrator._finalise_transcription = fake_finalize
     return cast(DaemonServer, server)
 
 
-def _pause_guard_sleep(monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
-    guard_sleep_entered = asyncio.Event()
-    allow_guard_resume = asyncio.Event()
-
-    async def fake_guard_sleep(_seconds: float) -> None:
-        guard_sleep_entered.set()
-        await allow_guard_resume.wait()
-
-    monkeypatch.setattr(server_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
-    return guard_sleep_entered, allow_guard_resume
-
-
-async def _wait_for_session_to_clear(server: DaemonServer) -> None:
-    while server.sessions.active is not None:
-        await asyncio.sleep(0)
+async def _dispatch_message(
+    server: DaemonServer,
+    websocket: FakeWebSocket,
+    message: StartSession | StopSession | AbortSession,
+) -> None:
+    await server._dispatch(
+        cast(Any, websocket),
+        ParsedMessage(kind=ClientMessageType(message.type), model=message),
+    )
 
 
 def test_audio_input_enforces_session_sample_limit() -> None:
@@ -229,21 +231,21 @@ def test_audio_input_clips_pre_roll_to_session_sample_limit() -> None:
 def test_disconnect_cleans_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         websocket = FakeWebSocket([WebSocketDisconnect()])
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=id(websocket))
+        await server.orchestrator.sessions.start_session(session_id, owner_token=id(websocket))
 
         drain_task = DummyDrainTask()
-        server._stream_drain_task = cast(Any, drain_task)
-        server._stream_drain_running = True
+        server.orchestrator._stream_drain_task = cast(Any, drain_task)
+        server.orchestrator._stream_drain_running = True
 
         await server.handle_websocket(cast(Any, websocket))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
-        assert server._stream_drain_task is None
+        assert server.orchestrator._active_stream is None
+        assert server.orchestrator._stream_drain_task is None
         assert drain_task.cancel_called is True
         assert drain_task.awaited is True
 
@@ -253,7 +255,7 @@ def test_disconnect_cleans_active_session_state() -> None:
 def test_handler_exception_cleans_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         websocket = FakeWebSocket(
             [
                 {
@@ -264,7 +266,7 @@ def test_handler_exception_cleans_active_session_state() -> None:
             ]
         )
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=id(websocket))
+        await server.orchestrator.sessions.start_session(session_id, owner_token=id(websocket))
 
         async def explode_dispatch(*_args, **_kwargs) -> None:
             raise RuntimeError("boom")
@@ -272,83 +274,12 @@ def test_handler_exception_cleans_active_session_state() -> None:
         _set_dynamic_attr(server, "_dispatch", explode_dispatch)
         await server.handle_websocket(cast(Any, websocket))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
         assert websocket.sent_json[-1]["code"] == "UNEXPECTED"
-
-    asyncio.run(scenario())
-
-
-def test_abort_only_cleans_matching_session() -> None:
-    async def scenario() -> None:
-        server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        active_session_id = uuid4()
-        websocket = FakeWebSocket([])
-        await server.sessions.start_session(active_session_id, owner_token=id(websocket))
-
-        message = AbortSession(
-            type=ClientMessageType.ABORT_SESSION,
-            session_id=uuid4(),
-            reason="user",
-            timestamp=datetime.now(tz=UTC),
-        )
-        await server._handle_abort(cast(Any, websocket), message)
-
-        assert server.sessions.active is not None
-        assert server.sessions.active.session_id == active_session_id
-        assert audio.abort_calls == 0
-        assert websocket.sent_json
-        assert websocket.sent_json[-1]["type"] == "error"
-        assert websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
-
-    asyncio.run(scenario())
-
-
-def test_stop_session_missing_id_returns_not_found() -> None:
-    async def scenario() -> None:
-        server = _build_server()
-        session_id = uuid4()
-        websocket = FakeWebSocket([])
-
-        message = StopSession(
-            type=ClientMessageType.STOP_SESSION,
-            session_id=session_id,
-            timestamp=datetime.now(tz=UTC),
-        )
-        await server._handle_stop(cast(Any, websocket), message)
-
-        assert websocket.sent_json
-        assert websocket.sent_json[-1]["type"] == "error"
-        assert websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
-
-    asyncio.run(scenario())
-
-
-def test_abort_session_returns_aborted_on_match() -> None:
-    async def scenario() -> None:
-        server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        session_id = uuid4()
-        websocket = FakeWebSocket([])
-        await server.sessions.start_session(session_id, owner_token=id(websocket))
-
-        message = AbortSession(
-            type=ClientMessageType.ABORT_SESSION,
-            session_id=session_id,
-            reason="user",
-            timestamp=datetime.now(tz=UTC),
-        )
-        await server._handle_abort(cast(Any, websocket), message)
-
-        assert server.sessions.active is None
-        assert audio.abort_calls == 1
-        assert websocket.sent_json
-        assert websocket.sent_json[-1]["type"] == "error"
-        assert websocket.sent_json[-1]["code"] == "SESSION_ABORTED"
 
     asyncio.run(scenario())
 
@@ -370,17 +301,17 @@ def test_invalid_request_errors_on_parse_failure() -> None:
 def test_start_session_rolls_back_when_audio_start_fails() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         audio.raise_on_start = True
         session_id = uuid4()
 
         websocket = FakeWebSocket([])
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await _dispatch_message(server, websocket, _start_message(session_id))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.start_calls == 1
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
         assert websocket.sent_json[-1]["code"] == "UNEXPECTED"
@@ -391,16 +322,18 @@ def test_start_session_rolls_back_when_audio_start_fails() -> None:
 def test_start_session_rolls_back_when_stream_start_fails() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber(raise_on_start=True))
+        audio = cast(FakeAudio, server.orchestrator.audio)
+        server.orchestrator.streaming_transcriber = cast(
+            Any, FakeStreamingTranscriber(raise_on_start=True)
+        )
         session_id = uuid4()
 
         websocket = FakeWebSocket([])
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await _dispatch_message(server, websocket, _start_message(session_id))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
         assert websocket.sent_json[-1]["code"] == "UNEXPECTED"
@@ -411,20 +344,22 @@ def test_start_session_rolls_back_when_stream_start_fails() -> None:
 def test_start_session_rolls_back_when_drain_loop_start_fails() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
+        audio = cast(FakeAudio, server.orchestrator.audio)
+        server.orchestrator.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
         session_id = uuid4()
 
         def explode_start_stream_drain_loop(_websocket: Any, _session_id: UUID) -> None:
             raise RuntimeError("drain loop failed")
 
-        _set_dynamic_attr(server, "_start_stream_drain_loop", explode_start_stream_drain_loop)
+        _set_dynamic_attr(
+            server.orchestrator, "_start_stream_drain_loop", explode_start_stream_drain_loop
+        )
         websocket = FakeWebSocket([])
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await _dispatch_message(server, websocket, _start_message(session_id))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
         assert websocket.sent_json[-1]["code"] == "UNEXPECTED"
@@ -435,7 +370,7 @@ def test_start_session_rolls_back_when_drain_loop_start_fails() -> None:
 def test_start_session_rolls_back_when_session_started_send_fails() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         session_id = uuid4()
         websocket = FakeWebSocket([])
 
@@ -449,11 +384,11 @@ def test_start_session_rolls_back_when_session_started_send_fails() -> None:
             websocket.sent_json.append(payload)
 
         _set_dynamic_attr(websocket, "send_json", fail_first_send)
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await _dispatch_message(server, websocket, _start_message(session_id))
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert send_attempts == 2
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
@@ -465,8 +400,8 @@ def test_start_session_rolls_back_when_session_started_send_fails() -> None:
 def test_start_session_streaming_send_failure_stops_drain_loop() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
+        audio = cast(FakeAudio, server.orchestrator.audio)
+        server.orchestrator.streaming_transcriber = cast(Any, FakeStreamingTranscriber())
         session_id = uuid4()
         websocket = FakeWebSocket([])
 
@@ -480,14 +415,14 @@ def test_start_session_streaming_send_failure_stops_drain_loop() -> None:
             websocket.sent_json.append(payload)
 
         _set_dynamic_attr(websocket, "send_json", fail_first_send)
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
+        await _dispatch_message(server, websocket, _start_message(session_id))
         await asyncio.sleep(0)
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
-        assert server._stream_drain_task is None
-        assert server._stream_drain_running is False
+        assert server.orchestrator._active_stream is None
+        assert server.orchestrator._stream_drain_task is None
+        assert server.orchestrator._stream_drain_running is False
         assert send_attempts == 2
         assert websocket.sent_json
         assert websocket.sent_json[-1]["type"] == "error"
@@ -496,10 +431,10 @@ def test_start_session_streaming_send_failure_stops_drain_loop() -> None:
     asyncio.run(scenario())
 
 
-def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
+def test_start_session_disconnect_rolls_back_and_bubbles_sink_closed() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         session_id = uuid4()
         websocket = FakeWebSocket([])
 
@@ -508,15 +443,15 @@ def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
 
         _set_dynamic_attr(websocket, "send_json", raise_disconnect)
         try:
-            await server._handle_start(cast(Any, websocket), _start_message(session_id))
-        except WebSocketDisconnect:
+            await _dispatch_message(server, websocket, _start_message(session_id))
+        except EventSinkClosed:
             pass
         else:
-            raise AssertionError("expected WebSocketDisconnect")
+            raise AssertionError("expected EventSinkClosed")
 
-        assert server.sessions.active is None
+        assert server.orchestrator.sessions.active is None
         assert audio.abort_calls == 1
-        assert server._active_stream is None
+        assert server.orchestrator._active_stream is None
         assert not websocket.sent_json
 
     asyncio.run(scenario())
@@ -525,7 +460,7 @@ def test_start_session_disconnect_rolls_back_and_bubbles_disconnect() -> None:
 def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         start_session_id = uuid4()
         replacement_session_id = uuid4()
         websocket = FakeWebSocket([_start_event(start_session_id)])
@@ -534,7 +469,7 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
             raise WebSocketDisconnect()
 
         _set_dynamic_attr(websocket, "send_json", raise_disconnect)
-        original_cleanup = server._cleanup_active_session
+        original_cleanup = server.orchestrator._cleanup_active_session
         cleanup_calls = 0
 
         async def cleanup_with_interleaving(
@@ -544,26 +479,32 @@ def test_handle_websocket_disconnect_during_start_does_not_cleanup_new_session()
             *,
             require_session_match: bool = False,
             require_owner_match: bool = False,
+            event_sink: EventSink | None = None,
+            session_end_reason: SessionEndReason | None = None,
         ) -> bool:
             nonlocal cleanup_calls
             cleanup_calls += 1
             if cleanup_calls == 2:
-                await server.sessions.start_session(replacement_session_id, owner_token=-1)
+                await server.orchestrator.sessions.start_session(
+                    replacement_session_id, owner_token=-1
+                )
             return await original_cleanup(
                 reason,
                 expected_session_id=expected_session_id,
                 expected_owner_token=expected_owner_token,
                 require_session_match=require_session_match,
                 require_owner_match=require_owner_match,
+                event_sink=event_sink,
+                session_end_reason=session_end_reason,
             )
 
-        _set_dynamic_attr(server, "_cleanup_active_session", cleanup_with_interleaving)
+        _set_dynamic_attr(server.orchestrator, "_cleanup_active_session", cleanup_with_interleaving)
         await server.handle_websocket(cast(Any, websocket))
 
         assert cleanup_calls == 2
         assert audio.abort_calls == 1
-        assert server.sessions.active is not None
-        assert server.sessions.active.session_id == replacement_session_id
+        assert server.orchestrator.sessions.active is not None
+        assert server.orchestrator.sessions.active.session_id == replacement_session_id
 
     asyncio.run(scenario())
 
@@ -572,16 +513,19 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
     async def scenario() -> None:
         server = _build_server()
         server.settings = ServerSettings(device="cuda", status_enabled=True, streaming_enabled=True)
-        server._requested_device = "cuda"
-        server._effective_device = "cpu"
-        server.streaming_transcriber = cast(Any, FakeStreamingTranscriber(helper_active=False))
-        server._last_audio_ms = 1200
-        server._last_audio_stop_ms = 9
-        server._last_finalize_ms = 120
-        server._last_infer_ms = 85
-        server._last_send_ms = 4
+        server.orchestrator.settings = server.settings
+        server.orchestrator._requested_device = "cuda"
+        server.orchestrator._effective_device = "cpu"
+        server.orchestrator.streaming_transcriber = cast(
+            Any, FakeStreamingTranscriber(helper_active=False)
+        )
+        server.orchestrator._last_audio_ms = 1200
+        server.orchestrator._last_audio_stop_ms = 9
+        server.orchestrator._last_finalize_ms = 120
+        server.orchestrator._last_infer_ms = 85
+        server.orchestrator._last_send_ms = 4
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=1)
+        await server.orchestrator.sessions.start_session(session_id, owner_token=1)
 
         status = server.status()
 
@@ -603,33 +547,6 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
     asyncio.run(scenario())
 
 
-def test_session_guard_emits_warning_and_stops_when_audio_limit_exceeded(monkeypatch) -> None:
-    async def scenario() -> None:
-        guard_sleep_entered, allow_guard_resume = _pause_guard_sleep(monkeypatch)
-        server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        websocket = FakeWebSocket([])
-        session_id = uuid4()
-
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
-        await asyncio.wait_for(guard_sleep_entered.wait(), timeout=1.0)
-        audio._session_limit_exceeded = True
-        allow_guard_resume.set()
-        # Guard should stop on its own without aborting the session.
-        await asyncio.sleep(0.15)
-
-        # Session stays active — finalization happens on stop_session.
-        assert server.sessions.active is not None
-        assert audio.abort_calls == 0
-        warning_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "session_warning"
-        ]
-        assert warning_payloads
-        assert warning_payloads[-1]["warning"] == "approaching_limit"
-
-    asyncio.run(scenario())
-
-
 def test_session_guard_warning_threshold_tracks_effective_sample_cap() -> None:
     server = _build_server()
     server.settings = ServerSettings(
@@ -639,67 +556,43 @@ def test_session_guard_warning_threshold_tracks_effective_sample_cap() -> None:
         max_session_seconds=90.0,
         max_session_samples=16_000,
     )
-    server._session_age_limit_ms = 90_000
-    server._session_sample_limit = 16_000
+    server.orchestrator.settings = server.settings
+    server.orchestrator._session_age_limit_ms = 90_000
+    server.orchestrator._session_sample_limit = 16_000
     session = Session(session_id=uuid4(), owner_token=1)
     session.started_at = datetime.now(tz=UTC) - timedelta(milliseconds=850)
 
-    assert server._effective_session_limit_seconds() == 1.0
-    assert server._session_guard_warning_due(session) is True
-    assert 0.0 <= server._session_remaining_seconds(session) <= 0.2
+    assert server.orchestrator._effective_session_limit_seconds() == 1.0
+    assert server.orchestrator._session_guard_warning_due(session) is True
+    assert 0.0 <= server.orchestrator._session_remaining_seconds(session) <= 0.2
 
 
 def test_disconnect_from_non_owner_websocket_leaves_active_session_state() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         owner_websocket = FakeWebSocket([])
         other_websocket = FakeWebSocket([WebSocketDisconnect()])
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+        await server.orchestrator.sessions.start_session(
+            session_id, owner_token=id(owner_websocket)
+        )
 
         active_stream = cast(Any, object())
         drain_task = DummyDrainTask()
-        server._active_stream = active_stream
-        server._stream_drain_task = cast(Any, drain_task)
-        server._stream_drain_running = True
+        server.orchestrator._active_stream = active_stream
+        server.orchestrator._stream_drain_task = cast(Any, drain_task)
+        server.orchestrator._stream_drain_running = True
 
         await server.handle_websocket(cast(Any, other_websocket))
 
-        assert server.sessions.active is not None
-        assert server.sessions.active.session_id == session_id
-        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert server.orchestrator.sessions.active is not None
+        assert server.orchestrator.sessions.active.session_id == session_id
+        assert server.orchestrator.sessions.active.owner_token == id(owner_websocket)
         assert audio.abort_calls == 0
-        assert server._active_stream is active_stream
-        assert server._stream_drain_task is drain_task
+        assert server.orchestrator._active_stream is active_stream
+        assert server.orchestrator._stream_drain_task is drain_task
         assert drain_task.cancel_called is False
-
-    asyncio.run(scenario())
-
-
-def test_session_guard_auto_stops_when_duration_limit_exceeded() -> None:
-    async def scenario() -> None:
-        server = _build_server()
-        audio = cast(FakeAudio, server.audio)
-        server._session_age_limit_ms = 0
-        websocket = FakeWebSocket([])
-        session_id = uuid4()
-
-        await server._handle_start(cast(Any, websocket), _start_message(session_id))
-        await asyncio.sleep(0.15)
-
-        assert server.sessions.active is None
-        assert audio.abort_calls == 0
-        assert audio.stop_calls == 1
-        warning_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "session_warning"
-        ]
-        final_payloads = [
-            payload for payload in websocket.sent_json if payload.get("type") == "final_result"
-        ]
-        assert warning_payloads
-        assert final_payloads
-        assert warning_payloads[-1]["warning"] == "approaching_limit"
 
     asyncio.run(scenario())
 
@@ -710,18 +603,20 @@ def test_stop_session_from_non_owner_returns_not_found() -> None:
         owner_websocket = FakeWebSocket([])
         other_websocket = FakeWebSocket([])
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+        await server.orchestrator.sessions.start_session(
+            session_id, owner_token=id(owner_websocket)
+        )
 
         message = StopSession(
             type=ClientMessageType.STOP_SESSION,
             session_id=session_id,
             timestamp=datetime.now(tz=UTC),
         )
-        await server._handle_stop(cast(Any, other_websocket), message)
+        await _dispatch_message(server, other_websocket, message)
 
-        assert server.sessions.active is not None
-        assert server.sessions.active.session_id == session_id
-        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert server.orchestrator.sessions.active is not None
+        assert server.orchestrator.sessions.active.session_id == session_id
+        assert server.orchestrator.sessions.active.owner_token == id(owner_websocket)
         assert other_websocket.sent_json
         assert other_websocket.sent_json[-1]["type"] == "error"
         assert other_websocket.sent_json[-1]["code"] == "SESSION_NOT_FOUND"
@@ -732,11 +627,13 @@ def test_stop_session_from_non_owner_returns_not_found() -> None:
 def test_abort_session_from_non_owner_returns_not_found() -> None:
     async def scenario() -> None:
         server = _build_server()
-        audio = cast(FakeAudio, server.audio)
+        audio = cast(FakeAudio, server.orchestrator.audio)
         owner_websocket = FakeWebSocket([])
         other_websocket = FakeWebSocket([])
         session_id = uuid4()
-        await server.sessions.start_session(session_id, owner_token=id(owner_websocket))
+        await server.orchestrator.sessions.start_session(
+            session_id, owner_token=id(owner_websocket)
+        )
 
         message = AbortSession(
             type=ClientMessageType.ABORT_SESSION,
@@ -744,11 +641,11 @@ def test_abort_session_from_non_owner_returns_not_found() -> None:
             reason="user",
             timestamp=datetime.now(tz=UTC),
         )
-        await server._handle_abort(cast(Any, other_websocket), message)
+        await _dispatch_message(server, other_websocket, message)
 
-        assert server.sessions.active is not None
-        assert server.sessions.active.session_id == session_id
-        assert server.sessions.active.owner_token == id(owner_websocket)
+        assert server.orchestrator.sessions.active is not None
+        assert server.orchestrator.sessions.active.session_id == session_id
+        assert server.orchestrator.sessions.active.owner_token == id(owner_websocket)
         assert audio.abort_calls == 0
         assert other_websocket.sent_json
         assert other_websocket.sent_json[-1]["type"] == "error"

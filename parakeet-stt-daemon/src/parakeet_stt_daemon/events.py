@@ -25,6 +25,8 @@ from .messages import (
     SessionWarningMessage,
 )
 
+OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
+
 ErrorCode: TypeAlias = Literal[
     "SESSION_BUSY",
     "SESSION_NOT_FOUND",
@@ -116,12 +118,96 @@ class EventSink(Protocol):
     async def emit(self, event: SessionEvent) -> None: ...
 
 
+class EventSinkClosed(RuntimeError):
+    """Raised when a transport-backed event sink is no longer writable."""
+
+
 @dataclass
 class RecordingEventSink:
     events: list[SessionEvent] = field(default_factory=list)
 
     async def emit(self, event: SessionEvent) -> None:
         self.events.append(event)
+
+
+class WebSocketEventSinkState:
+    """Own overlay wire sequencing and counters for WebSocket event sinks."""
+
+    def __init__(self, *, overlay_events_enabled: bool) -> None:
+        self.overlay_events_enabled = overlay_events_enabled
+        self._overlay_event_seq_by_session: dict[UUID, int] = {}
+        self._overlay_last_interim_text_by_session: dict[UUID, str] = {}
+        self._overlay_state_by_session: dict[UUID, str] = {}
+        self._overlay_events_emitted = 0
+        self._overlay_events_dropped = 0
+
+    @property
+    def overlay_events_emitted(self) -> int:
+        return self._overlay_events_emitted
+
+    @property
+    def overlay_events_dropped(self) -> int:
+        return self._overlay_events_dropped
+
+    def sink(
+        self,
+        *,
+        websocket: JsonWebSocket,
+        send_lock: Callable[[], asyncio.Lock],
+    ) -> WebSocketEventSink:
+        return WebSocketEventSink(
+            websocket=websocket,
+            send_lock=send_lock,
+            overlay_events_enabled=self.overlay_events_enabled,
+            next_overlay_seq=self._next_overlay_seq,
+            overlay_session_state=self._overlay_session_state,
+            set_overlay_session_state=self._set_overlay_session_state,
+            last_interim_text=self._overlay_last_interim_text,
+            record_interim_text=self._record_overlay_interim_text,
+            clear_interim_text=self._clear_overlay_interim_text,
+            increment_overlay_events_emitted=self._increment_overlay_events_emitted,
+            increment_overlay_events_dropped=self._increment_overlay_events_dropped,
+            clear_session_runtime=self._clear_overlay_session_runtime,
+            mark_session_terminal=self._mark_overlay_session_terminal,
+        )
+
+    def _next_overlay_seq(self, session_id: UUID) -> int:
+        current = self._overlay_event_seq_by_session.get(session_id, 0)
+        self._overlay_event_seq_by_session[session_id] = current + 1
+        return current
+
+    def _overlay_session_state(self, session_id: UUID) -> str | None:
+        return self._overlay_state_by_session.get(session_id)
+
+    def _set_overlay_session_state(self, session_id: UUID, state: str) -> None:
+        self._overlay_state_by_session.pop(session_id, None)
+        self._overlay_state_by_session[session_id] = state
+        while len(self._overlay_state_by_session) > OVERLAY_SESSION_STATE_CACHE_LIMIT:
+            oldest = next(iter(self._overlay_state_by_session))
+            self._overlay_state_by_session.pop(oldest)
+
+    def _clear_overlay_session_runtime(self, session_id: UUID) -> None:
+        self._overlay_event_seq_by_session.pop(session_id, None)
+        self._overlay_last_interim_text_by_session.pop(session_id, None)
+        self._set_overlay_session_state(session_id, "active")
+
+    def _mark_overlay_session_terminal(self, session_id: UUID) -> None:
+        self._set_overlay_session_state(session_id, "terminal")
+
+    def _overlay_last_interim_text(self, session_id: UUID) -> str | None:
+        return self._overlay_last_interim_text_by_session.get(session_id)
+
+    def _record_overlay_interim_text(self, session_id: UUID, text: str) -> None:
+        self._overlay_last_interim_text_by_session[session_id] = text
+
+    def _clear_overlay_interim_text(self, session_id: UUID) -> None:
+        self._overlay_last_interim_text_by_session.pop(session_id, None)
+
+    def _increment_overlay_events_emitted(self) -> None:
+        self._overlay_events_emitted += 1
+
+    def _increment_overlay_events_dropped(self) -> None:
+        self._overlay_events_dropped += 1
 
 
 class WebSocketEventSink:
@@ -141,6 +227,8 @@ class WebSocketEventSink:
         clear_interim_text: Callable[[UUID], None],
         increment_overlay_events_emitted: Callable[[], None],
         increment_overlay_events_dropped: Callable[[], None],
+        clear_session_runtime: Callable[[UUID], None] | None = None,
+        mark_session_terminal: Callable[[UUID], None] | None = None,
     ) -> None:
         self._websocket = websocket
         self._send_lock = send_lock
@@ -153,6 +241,8 @@ class WebSocketEventSink:
         self._clear_interim_text = clear_interim_text
         self._increment_overlay_events_emitted = increment_overlay_events_emitted
         self._increment_overlay_events_dropped = increment_overlay_events_dropped
+        self._clear_session_runtime = clear_session_runtime
+        self._mark_session_terminal = mark_session_terminal
 
     async def emit(self, event: SessionEvent) -> None:
         if isinstance(event, SessionStartedEvent):
@@ -173,8 +263,13 @@ class WebSocketEventSink:
             await self._emit_session_error(event)
 
     async def _send_direct(self, payload: dict[str, Any]) -> None:
-        async with self._send_lock():
-            await self._websocket.send_json(payload)
+        try:
+            async with self._send_lock():
+                await self._websocket.send_json(payload)
+        except Exception as exc:  # noqa: BLE001
+            if exc.__class__.__name__ == "WebSocketDisconnect":
+                raise EventSinkClosed("event sink transport disconnected") from exc
+            raise
 
     async def _send_overlay(
         self,
@@ -208,6 +303,8 @@ class WebSocketEventSink:
             return False
 
     async def _emit_session_started(self, event: SessionStartedEvent) -> None:
+        if self._clear_session_runtime is not None:
+            self._clear_session_runtime(event.session_id)
         message = SessionStarted(
             session_id=event.session_id,
             ts=event.ts,
@@ -254,6 +351,8 @@ class WebSocketEventSink:
         await self._send_overlay(event.session_id, message.model_dump(mode="json"))
 
     async def _emit_final_result(self, event: FinalResultEvent) -> None:
+        if self._mark_session_terminal is not None:
+            self._mark_session_terminal(event.session_id)
         message = FinalResult(
             session_id=event.session_id,
             text=event.text,
@@ -307,6 +406,7 @@ class WebSocketEventSink:
 __all__ = [
     "AudioLevelEvent",
     "ErrorCode",
+    "EventSinkClosed",
     "EventSink",
     "FinalResultEvent",
     "InterimStateEvent",
@@ -318,4 +418,5 @@ __all__ = [
     "SessionStartedEvent",
     "SessionWarningEvent",
     "WebSocketEventSink",
+    "WebSocketEventSinkState",
 ]

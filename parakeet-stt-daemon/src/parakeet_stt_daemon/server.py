@@ -1,39 +1,26 @@
-"""FastAPI-based WebSocket server wrapping the Parakeet audio pipeline."""
+"""FastAPI WebSocket adapter for the Parakeet Session orchestrator."""
 
 from __future__ import annotations
 
 import asyncio
-import math
-import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from functools import partial
-from typing import Literal
 from uuid import UUID
 
-import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from .audio import AudioInput
 from .config import ServerSettings
 from .events import (
-    AudioLevelEvent,
     ErrorCode,
-    FinalResultEvent,
-    InterimStateEvent,
-    InterimTextEvent,
-    SessionEndedEvent,
+    EventSinkClosed,
     SessionErrorEvent,
-    SessionStartedEvent,
-    SessionWarningEvent,
     WebSocketEventSink,
+    WebSocketEventSinkState,
 )
 from .messages import (
     AbortSession,
     ClientMessageType,
-    InterimStateValue,
     ParsedMessage,
     SessionEndReason,
     StartSession,
@@ -41,97 +28,24 @@ from .messages import (
     StopSession,
     parse_client_message,
 )
-from .model import (
-    ParakeetStreamingSession,
-    ParakeetStreamingTranscriber,
-    ParakeetTranscriber,
-    _release_cuda_cache,
-    load_parakeet_model,
+from .model import _release_cuda_cache
+from .session_orchestrator import (
+    AbortSessionIntent,
+    SessionOrchestrator,
+    StartSessionIntent,
+    StopSessionIntent,
 )
-from .overlay_interim import (
-    OverlayInterimTranscriptContext,
-    OverlayInterimTranscriptStabilizer,
-    append_overlay_interim_context,
-)
-from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
-from .tail_trim import SealPathTailTrimmer
-
-OVERLAY_SESSION_STATE_CACHE_LIMIT = 128
-SESSION_GUARD_POLL_SECS = 0.1
-SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
-_REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 class DaemonServer:
-    """Coordinate session state and translate WebSocket messages into actions."""
+    """Adapt WebSocket messages to the in-process SessionOrchestrator."""
 
     def __init__(self, settings: ServerSettings) -> None:
         self.settings = settings
-        self.sessions = SessionManager()
-        sample_rate = 16_000
-        duration_limit_samples = max(1, int(settings.max_session_seconds * sample_rate))
-        explicit_sample_limit = (
-            int(settings.max_session_samples)
-            if settings.max_session_samples is not None
-            else duration_limit_samples
+        self.orchestrator = SessionOrchestrator(settings)
+        self.event_sinks = WebSocketEventSinkState(
+            overlay_events_enabled=settings.overlay_events_enabled
         )
-        self._session_sample_limit = max(1, min(duration_limit_samples, explicit_sample_limit))
-        self._session_age_limit_ms = max(1, int(settings.max_session_seconds * 1000))
-        self.audio = AudioInput(
-            sample_rate=sample_rate,
-            channels=1,
-            dtype="float32",
-            device=settings.mic_device,
-            max_session_samples=self._session_sample_limit,
-        )
-        self.model = load_parakeet_model(device=settings.device)
-        self.transcriber = ParakeetTranscriber(self.model)
-        self._requested_device = str(settings.device)
-        self._effective_device = str(
-            getattr(self.model, "_parakeet_effective_device", self._requested_device)
-        )
-        self._session_lock = asyncio.Lock()
-        self._inference_lock = asyncio.Lock()
-        self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
-            ParakeetStreamingTranscriber(
-                self.model,
-                chunk_secs=settings.chunk_secs,
-                right_context_secs=settings.right_context_secs,
-                left_context_secs=settings.left_context_secs,
-                batch_size=settings.batch_size,
-            )
-            if settings.streaming_enabled
-            else None
-        )
-        self._active_stream: ParakeetStreamingSession | None = None
-        self._stream_drain_task: asyncio.Task | None = None
-        self._stream_drain_running = False
-        self._session_guard_task: asyncio.Task | None = None
-        self._session_guard_running = False
-        self._last_audio_ms: int | None = None
-        self._last_audio_stop_ms: int | None = None
-        self._last_finalize_ms: int | None = None
-        self._last_infer_ms: int | None = None
-        self._last_send_ms: int | None = None
-        self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-        self._live_interim_failed = False
-        self._vad_enabled = bool(settings.vad_enabled)
-        self.tail_trimmer = SealPathTailTrimmer(
-            vad_enabled=self._vad_enabled,
-            silence_floor_db=float(settings.silence_floor_db),
-            warmup_sample_rate=sample_rate,
-        )
-        if settings.streaming_enabled:
-            chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
-            self.audio.configure_stream_chunk_size(chunk_samples)
-        self._overlay_event_seq_by_session: dict[UUID, int] = {}
-        self._overlay_last_interim_text_by_session: dict[UUID, str] = {}
-        self._overlay_interim_stabilizer_by_session: dict[
-            UUID, OverlayInterimTranscriptStabilizer
-        ] = {}
-        self._overlay_state_by_session: dict[UUID, str] = {}
-        self._overlay_events_emitted = 0
-        self._overlay_events_dropped = 0
         self._websocket_send_locks: dict[int, asyncio.Lock] = {}
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
@@ -155,508 +69,86 @@ class DaemonServer:
                     continue
 
                 await self._dispatch(websocket, parsed)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, EventSinkClosed):
             logger.info("WebSocket client disconnected: {}", websocket.client)
-            active = self.sessions.active
+            active = self.orchestrator.sessions.active
             expected_session_id = active.session_id if active else None
-            await self._cleanup_active_session(
+            await self.orchestrator._cleanup_active_session(
                 "websocket disconnected",
                 expected_session_id=expected_session_id,
                 expected_owner_token=owner_token,
                 require_session_match=True,
                 require_owner_match=True,
+                event_sink=self._event_sink(websocket),
+                session_end_reason=SessionEndReason.ABORT,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error in WebSocket handler: {}", exc)
-            await self._cleanup_active_session(
+            await self.orchestrator._cleanup_active_session(
                 f"websocket handler exception: {exc.__class__.__name__}",
                 expected_owner_token=owner_token,
                 require_owner_match=True,
+                event_sink=self._event_sink(websocket),
+                session_end_reason=SessionEndReason.ABORT,
             )
             try:
                 await self._send_error(websocket, None, "UNEXPECTED", str(exc))
             except Exception as send_exc:  # noqa: BLE001
                 logger.debug("Failed to send error after websocket handler exception: {}", send_exc)
         finally:
-            websocket_send_locks = getattr(self, "_websocket_send_locks", None)
-            if isinstance(websocket_send_locks, dict):
-                websocket_send_locks.pop(id(websocket), None)
+            self._websocket_send_locks.pop(id(websocket), None)
 
     async def _dispatch(self, websocket: WebSocket, parsed: ParsedMessage) -> None:
+        owner_token = self._owner_token_for_websocket(websocket)
+        event_sink = self._event_sink(websocket)
         if parsed.kind is ClientMessageType.START_SESSION:
             assert isinstance(parsed.model, StartSession)
-            await self._handle_start(websocket, parsed.model)
+            await self.orchestrator.start(
+                StartSessionIntent(
+                    session_id=parsed.model.session_id,
+                    owner_token=owner_token,
+                    event_sink=event_sink,
+                    preferred_lang=parsed.model.preferred_lang,
+                )
+            )
         elif parsed.kind is ClientMessageType.STOP_SESSION:
             assert isinstance(parsed.model, StopSession)
-            await self._handle_stop(websocket, parsed.model)
+            await self.orchestrator.stop(
+                StopSessionIntent(
+                    session_id=parsed.model.session_id,
+                    owner_token=owner_token,
+                    event_sink=event_sink,
+                    post_roll_secs=0.25,
+                )
+            )
         elif parsed.kind is ClientMessageType.ABORT_SESSION:
             assert isinstance(parsed.model, AbortSession)
-            await self._handle_abort(websocket, parsed.model)
+            await self.orchestrator.abort(
+                AbortSessionIntent(
+                    session_id=parsed.model.session_id,
+                    owner_token=owner_token,
+                    event_sink=event_sink,
+                    reason=parsed.model.reason,
+                )
+            )
         else:  # pragma: no cover
             await self._send_error(websocket, None, "INVALID_REQUEST", "Unsupported message")
 
-    async def _handle_start(self, websocket: WebSocket, message: StartSession) -> None:
-        logger.debug("start_session received: {}", message)
-        owner_token = self._owner_token_for_websocket(websocket)
-        try:
-            session = await self.sessions.start_session(message.session_id, owner_token=owner_token)
-        except SessionBusyError:
-            await self._send_error(
-                websocket, message.session_id, "SESSION_BUSY", "A session is already active"
-            )
-            return
-        try:
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
-            self._clear_overlay_session_runtime(message.session_id)
-            self._set_overlay_session_state(message.session_id, "active")
-            self.audio.start_session()
-            if self.streaming_transcriber:
-                self._active_stream = self.streaming_transcriber.start_session(
-                    self.audio.sample_rate
-                )
-                self._start_stream_drain_loop(websocket, message.session_id)
-            self._start_session_guard_loop(websocket, message.session_id)
-
-            await self._event_sink(websocket).emit(
-                SessionStartedEvent(
-                    session_id=message.session_id,
-                    ts=datetime.now(tz=UTC),
-                    mic_device=str(self.settings.mic_device) if self.settings.mic_device else None,
-                    lang=message.preferred_lang,
-                )
-            )
-            await self._emit_interim_state(
-                websocket,
-                message.session_id,
-                state=InterimStateValue.LISTENING,
-            )
-        except WebSocketDisconnect:
-            await self._cleanup_active_session(
-                "start_session websocket disconnected",
-                expected_session_id=message.session_id,
-                expected_owner_token=owner_token,
-                require_session_match=True,
-                require_owner_match=True,
-            )
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to start session {}: {}", message.session_id, exc)
-            await self._cleanup_active_session(
-                f"start_session rollback: {exc.__class__.__name__}",
-                expected_session_id=message.session_id,
-                expected_owner_token=owner_token,
-                require_session_match=True,
-                require_owner_match=True,
-            )
-            try:
-                await self._send_error(
-                    websocket,
-                    message.session_id,
-                    "UNEXPECTED",
-                    "Failed to start session",
-                )
-            except Exception as send_exc:  # noqa: BLE001
-                logger.debug("Failed to send start_session error response: {}", send_exc)
-            return
-        logger.info("Session {} started", session.session_id)
-
-    async def _handle_stop(self, websocket: WebSocket, message: StopSession) -> None:
-        logger.debug("stop_session received: {}", message)
-        await self._stop_active_session(
-            websocket,
-            message.session_id,
-            owner_token=self._owner_token_for_websocket(websocket),
-            post_roll_secs=0.25,
-        )
-
-    async def _stop_active_session(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        *,
-        owner_token: int,
-        post_roll_secs: float,
-    ) -> None:
-        if post_roll_secs > 0:
-            await asyncio.sleep(post_roll_secs)  # brief post-roll to capture tail audio
-        async with self._session_lock_for_runtime():
-            try:
-                session = await self.sessions.stop_session(session_id, owner_token=owner_token)
-            except SessionNotFoundError:
-                await self._send_error(
-                    websocket, session_id, "SESSION_NOT_FOUND", "No matching active session"
-                )
-                return
-            self._stop_session_guard_loop()
-            await self._emit_interim_state(
-                websocket,
-                session.session_id,
-                state=InterimStateValue.PROCESSING,
-            )
-            audio_stop_started = time.perf_counter()
-            audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
-            await self._stop_stream_drain_loop()
-            # Final correctness must come from the capture layer's canonical buffer,
-            # not whatever the drain task managed to mirror into `_active_stream`.
-            self._active_stream = None
-            audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
-            audio_duration_raw = len(audio_samples) / self.audio.sample_rate
-            audio_ms = int(audio_duration_raw * 1000)
-
-            if audio_samples.size == 0:
-                self._set_overlay_session_state(session.session_id, "terminal")
-                await self._send_error(
-                    websocket,
-                    session.session_id,
-                    "AUDIO_DEVICE",
-                    "No audio captured for session",
-                )
-                await self._emit_session_ended(
-                    websocket, session.session_id, reason=SessionEndReason.ERROR
-                )
-                await self.sessions.clear(session.session_id, owner_token=owner_token)
-                self._clear_overlay_session_runtime(session.session_id)
-                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                self._live_interim_failed = False
-                return
-
-            finalize_ms: int | None = None
-            infer_ms: int | None = None
-            try:
-                interim_updates = await self._collect_interim_text_updates(
-                    session.session_id,
-                    ready_chunks,
-                )
-                flushed_interim = self._overlay_interim_stabilizer(
-                    session.session_id
-                ).flush_pending_tail()
-                if flushed_interim is not None:
-                    interim_updates.append(flushed_interim.text)
-                if interim_updates:
-                    await self._emit_interim_state(
-                        websocket,
-                        session.session_id,
-                        state=InterimStateValue.INTERIM,
-                    )
-                    for interim_text in interim_updates:
-                        await self._emit_interim_text(
-                            websocket,
-                            session.session_id,
-                            text=interim_text,
-                        )
-                await self._emit_interim_state(
-                    websocket,
-                    session.session_id,
-                    state=InterimStateValue.FINALIZING,
-                )
-                finalize_started = time.perf_counter()
-                text, infer_ms = await self._finalise_transcription(audio_samples)
-                finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
-                self._set_overlay_session_state(session.session_id, "terminal")
-                await self._send_error(
-                    websocket, session.session_id, "MODEL", "Transcription failed"
-                )
-                await self._emit_session_ended(
-                    websocket, session.session_id, reason=SessionEndReason.ERROR
-                )
-                await self.sessions.clear(session.session_id, owner_token=owner_token)
-                self._clear_overlay_session_runtime(session.session_id)
-                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                self._live_interim_failed = False
-                return
-
-            latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
-            self._set_overlay_session_state(session.session_id, "terminal")
-            send_started = datetime.now(tz=UTC)
-            await self._event_sink(websocket).emit(
-                FinalResultEvent(
-                    session_id=session.session_id,
-                    text=text,
-                    latency_ms=latency_ms,
-                    audio_ms=audio_ms,
-                    lang=self.settings.language,
-                    confidence=None,
-                    tail_trim_mode=self._tail_trim_mode(),
-                    vad_active=self._vad_active(),
-                    vad_fallback_reason=self._vad_fallback_reason(),
-                )
-            )
-            send_ms = int((datetime.now(tz=UTC) - send_started).total_seconds() * 1000)
-            await self._emit_session_ended(
-                websocket, session.session_id, reason=SessionEndReason.FINAL
-            )
-            await self.sessions.clear(session.session_id, owner_token=owner_token)
-            self._clear_overlay_session_runtime(session.session_id)
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
-            self._last_audio_ms = audio_ms
-            self._last_audio_stop_ms = audio_stop_ms
-            self._last_finalize_ms = finalize_ms
-            self._last_infer_ms = infer_ms
-            self._last_send_ms = send_ms
-
-            # Diagnostic logging for truncation investigation
-            text_len = len(text)
-            chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
-            logger.info(
-                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
-                "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
-                "chars_per_sec={:.1f}, live_session_helper_active={}, "
-                "live_session_helper_scope={}, stream_fallback_reason={}, "
-                "finalization_mode={}, final_audio_source={}, tail_trim_mode={}, "
-                "vad_enabled={}, vad_active={}, vad_fallback_reason={}",
-                session.session_id,
-                audio_duration_raw,
-                audio_ms,
-                audio_stop_ms,
-                latency_ms,
-                finalize_ms,
-                infer_ms,
-                send_ms,
-                text_len,
-                chars_per_sec,
-                self._stream_helper_active(),
-                self._stream_helper_scope(),
-                self._stream_fallback_reason(),
-                self._finalization_mode(),
-                self._final_audio_source(),
-                self._tail_trim_mode(),
-                bool(getattr(self, "_vad_enabled", False)),
-                self._vad_active(),
-                self._vad_fallback_reason(),
-            )
-
-    async def _handle_abort(self, websocket: WebSocket, message: AbortSession) -> None:
-        logger.debug("abort_session received: {}", message)
-        cleaned = await self._cleanup_active_session(
-            f"abort_session requested ({message.reason})",
-            expected_session_id=message.session_id,
-            expected_owner_token=self._owner_token_for_websocket(websocket),
-            require_session_match=True,
-            require_owner_match=True,
-        )
-        if cleaned:
-            await self._emit_session_ended(
-                websocket, message.session_id, reason=SessionEndReason.ABORT
-            )
-            code = "SESSION_ABORTED"
-            error_message = f"Session aborted: {message.reason}"
-        else:
-            code = "SESSION_NOT_FOUND"
-            error_message = "No matching active session"
-        await self._send_error(websocket, message.session_id, code, error_message)
-
-    async def _cleanup_active_session(
-        self,
-        reason: str,
-        expected_session_id: UUID | None = None,
-        expected_owner_token: int | None = None,
-        *,
-        require_session_match: bool = False,
-        require_owner_match: bool = False,
-    ) -> bool:
-        """Reset all runtime state tied to an active session."""
-        async with self._session_lock_for_runtime():
-            active = self.sessions.active
-            if require_session_match:
-                if expected_session_id is None and active is not None:
-                    logger.debug(
-                        "Skipping cleanup with no expected session (active session is {})",
-                        active.session_id,
-                    )
-                    return False
-                if expected_session_id is not None and (
-                    active is None or active.session_id != expected_session_id
-                ):
-                    logger.debug(
-                        "Skipping cleanup for session {} (active session is {})",
-                        expected_session_id,
-                        active.session_id if active else None,
-                    )
-                    return False
-            if require_owner_match:
-                if expected_owner_token is None and active is not None:
-                    logger.debug(
-                        "Skipping cleanup with no expected owner (active owner is {})",
-                        active.owner_token,
-                    )
-                    return False
-                if expected_owner_token is not None and (
-                    active is None or active.owner_token != expected_owner_token
-                ):
-                    logger.debug(
-                        "Skipping cleanup for owner {} (active owner is {})",
-                        expected_owner_token,
-                        active.owner_token if active else None,
-                    )
-                    return False
-            if (
-                active is not None
-                and expected_session_id is not None
-                and active.session_id != expected_session_id
-            ):
-                logger.debug(
-                    "Skipping cleanup for session {} (active session is {})",
-                    expected_session_id,
-                    active.session_id,
-                )
-                return False
-            if (
-                active is not None
-                and expected_owner_token is not None
-                and active.owner_token != expected_owner_token
-            ):
-                logger.debug(
-                    "Skipping cleanup for owner {} (active owner is {})",
-                    expected_owner_token,
-                    active.owner_token,
-                )
-                return False
-
-            active_session_id = active.session_id if active else None
-            active_owner_token = active.owner_token if active else None
-            if active_session_id is not None:
-                logger.warning("Cleaning up active session {} ({})", active_session_id, reason)
-                self._set_overlay_session_state(active_session_id, "terminal")
-            else:
-                logger.debug("Cleaning residual runtime state with no active session ({})", reason)
-            self.audio.abort_session()
-            await self._stop_stream_drain_loop()
-            self._stop_session_guard_loop()
-            if active_session_id is not None:
-                await self.sessions.clear(active_session_id, owner_token=active_owner_token)
-                self._clear_overlay_session_runtime(active_session_id)
-            self._active_stream = None
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
-            return active_session_id is not None
-
-    def _audio_session_limit_exceeded(self) -> bool:
-        checker = getattr(self.audio, "session_limit_exceeded", None)
-        if not callable(checker):
-            return False
-        try:
-            return bool(checker())
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed checking audio session limit state: {}", exc)
-            return False
-
-    def _session_guard_warning_due(self, session: Session) -> bool:
-        """Return True when session has reached the warning threshold (80% of limit)."""
-        effective_limit_ms = self._effective_session_limit_ms()
-        if effective_limit_ms is None:
-            return False
-        threshold_ms = int(effective_limit_ms * SESSION_GUARD_WARNING_FRACTION)
-        return session.audio_duration_ms >= threshold_ms
-
-    def _session_remaining_seconds(self, session: Session) -> float:
-        effective_limit_ms = self._effective_session_limit_ms()
-        if effective_limit_ms is None:
-            return 0.0
-        return max(0.0, (effective_limit_ms - session.audio_duration_ms) / 1000.0)
-
-    def _effective_session_limit_ms(self) -> int | None:
-        limits_ms: list[int] = []
-        session_age_limit_ms = getattr(self, "_session_age_limit_ms", None)
-        if session_age_limit_ms is not None:
-            limits_ms.append(max(1, int(session_age_limit_ms)))
-
-        explicit_sample_limit = getattr(self.settings, "max_session_samples", None)
-        sample_rate = int(getattr(self.audio, "sample_rate", 0))
-        session_sample_limit = getattr(self, "_session_sample_limit", None)
-        if (
-            explicit_sample_limit is not None
-            and session_sample_limit is not None
-            and sample_rate > 0
-        ):
-            sample_limit_ms = math.ceil((int(session_sample_limit) * 1000) / sample_rate)
-            limits_ms.append(max(1, sample_limit_ms))
-
-        return min(limits_ms) if limits_ms else None
-
-    def _effective_session_limit_seconds(self) -> float:
-        effective_limit_ms = self._effective_session_limit_ms()
-        if effective_limit_ms is None:
-            return 0.0
-        return effective_limit_ms / 1000.0
-
-    def _start_session_guard_loop(self, websocket: WebSocket, session_id: UUID) -> None:
-        if getattr(self, "_session_guard_task", None) is not None:
-            return
-        self._session_guard_running = True
-        self._session_guard_warning_emitted = False
-
-        async def _guard() -> None:
-            try:
-                while bool(getattr(self, "_session_guard_running", False)):
-                    active = self.sessions.active
-                    if active is None or active.session_id != session_id:
-                        break
-
-                    if self._audio_session_limit_exceeded():
-                        logger.info(
-                            "Session {} reached limit; guard stopping "
-                            "(finalization deferred to stop_session)",
-                            session_id,
-                        )
-                        if not self._session_guard_warning_emitted:
-                            self._session_guard_warning_emitted = True
-                            await self._emit_session_warning(websocket, session_id, active)
-                        break
-
-                    # The wall-clock guard remains a hard ceiling even if the audio
-                    # callback has not yet accumulated the equivalent sample cap.
-                    session_age_limit_ms = getattr(self, "_session_age_limit_ms", None)
-                    duration_limit_reached = session_age_limit_ms is not None and (
-                        active.audio_duration_ms >= int(session_age_limit_ms)
-                    )
-                    if duration_limit_reached:
-                        if not self._session_guard_warning_emitted:
-                            self._session_guard_warning_emitted = True
-                            await self._emit_session_warning(websocket, session_id, active)
-                        logger.info(
-                            "Session {} reached wall-clock limit; auto-stopping",
-                            session_id,
-                        )
-                        await self._stop_active_session(
-                            websocket,
-                            session_id,
-                            owner_token=self._owner_token_for_websocket(websocket),
-                            post_roll_secs=0.0,
-                        )
-                        break
-
-                    # At 80%: emit warning so overlay turns amber.
-                    if not self._session_guard_warning_emitted and self._session_guard_warning_due(
-                        active
-                    ):
-                        self._session_guard_warning_emitted = True
-                        await self._emit_session_warning(websocket, session_id, active)
-
-                    await _REAL_ASYNCIO_SLEEP(SESSION_GUARD_POLL_SECS)
-            except asyncio.CancelledError:
-                raise
-            finally:
-                if getattr(self, "_session_guard_task", None) is asyncio.current_task():
-                    self._session_guard_task = None
-                self._session_guard_running = False
-
-        self._session_guard_task = asyncio.create_task(_guard())
-
-    def _stop_session_guard_loop(self) -> None:
-        task = getattr(self, "_session_guard_task", None)
-        if task is None:
-            return
-        self._session_guard_running = False
-        self._session_guard_task = None
-        if not task.done() and task is not asyncio.current_task():
-            task.cancel()
-
     def _owner_token_for_websocket(self, websocket: WebSocket) -> int:
         return id(websocket)
+
+    def _send_lock_for_websocket(self, websocket: WebSocket) -> asyncio.Lock:
+        lock = self._websocket_send_locks.get(id(websocket))
+        if lock is None:
+            lock = asyncio.Lock()
+            self._websocket_send_locks[id(websocket)] = lock
+        return lock
+
+    def _event_sink(self, websocket: WebSocket) -> WebSocketEventSink:
+        return self.event_sinks.sink(
+            websocket=websocket,
+            send_lock=lambda: self._send_lock_for_websocket(websocket),
+        )
 
     async def _send_error(
         self, websocket: WebSocket, session_id: UUID | None, code: ErrorCode, message: str
@@ -665,461 +157,12 @@ class DaemonServer:
             SessionErrorEvent(session_id=session_id, code=code, message=message)
         )
 
-    def _send_lock_for_websocket(self, websocket: WebSocket) -> asyncio.Lock:
-        websocket_send_locks = getattr(self, "_websocket_send_locks", None)
-        if not isinstance(websocket_send_locks, dict):
-            websocket_send_locks = {}
-            self._websocket_send_locks = websocket_send_locks
-        lock = websocket_send_locks.get(id(websocket))
-        if lock is None:
-            lock = asyncio.Lock()
-            websocket_send_locks[id(websocket)] = lock
-        return lock
-
-    def _event_sink(self, websocket: WebSocket) -> WebSocketEventSink:
-        return WebSocketEventSink(
-            websocket=websocket,
-            send_lock=lambda: self._send_lock_for_websocket(websocket),
-            overlay_events_enabled=self.settings.overlay_events_enabled,
-            next_overlay_seq=self._next_overlay_seq,
-            overlay_session_state=self._overlay_session_state,
-            set_overlay_session_state=self._set_overlay_session_state,
-            last_interim_text=self._overlay_last_interim_text,
-            record_interim_text=self._record_overlay_interim_text,
-            clear_interim_text=self._clear_overlay_interim_text,
-            increment_overlay_events_emitted=self._increment_overlay_events_emitted,
-            increment_overlay_events_dropped=self._increment_overlay_events_dropped,
-        )
-
-    def _session_lock_for_runtime(self) -> asyncio.Lock:
-        lock = getattr(self, "_session_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_lock = lock
-        return lock
-
-    def _inference_lock_for_runtime(self) -> asyncio.Lock:
-        lock = getattr(self, "_inference_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._inference_lock = lock
-        return lock
-
-    async def _transcribe_samples_serialized(self, samples: np.ndarray) -> str:
-        loop = asyncio.get_running_loop()
-        async with self._inference_lock_for_runtime():
-            inference = loop.run_in_executor(
-                None,
-                partial(
-                    self.transcriber.transcribe_samples,
-                    samples,
-                    sample_rate=self.audio.sample_rate,
-                ),
-            )
-            try:
-                return await asyncio.shield(inference)
-            except asyncio.CancelledError:
-                try:
-                    await inference
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Cancelled inference finished with {} before releasing gate",
-                        exc.__class__.__name__,
-                    )
-                raise
-
-    def _set_overlay_session_state(self, session_id: UUID, state: str) -> None:
-        overlay_states = getattr(self, "_overlay_state_by_session", None)
-        if not isinstance(overlay_states, dict):
-            overlay_states = {}
-            self._overlay_state_by_session = overlay_states
-        overlay_states.pop(session_id, None)
-        overlay_states[session_id] = state
-        while len(overlay_states) > OVERLAY_SESSION_STATE_CACHE_LIMIT:
-            oldest = next(iter(overlay_states))
-            overlay_states.pop(oldest)
-
-    def _overlay_session_state(self, session_id: UUID) -> str | None:
-        overlay_states = getattr(self, "_overlay_state_by_session", None)
-        if not isinstance(overlay_states, dict):
-            return None
-        return overlay_states.get(session_id)
-
-    def _clear_overlay_session_runtime(self, session_id: UUID) -> None:
-        overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
-        if isinstance(overlay_seq_by_session, dict):
-            overlay_seq_by_session.pop(session_id, None)
-        self._clear_overlay_interim_text(session_id)
-        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
-        if isinstance(overlay_stabilizers, dict):
-            overlay_stabilizers.pop(session_id, None)
-
-    def _overlay_last_interim_text(self, session_id: UUID) -> str | None:
-        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if not isinstance(overlay_last_text, dict):
-            return None
-        return overlay_last_text.get(session_id)
-
-    def _record_overlay_interim_text(self, session_id: UUID, text: str) -> None:
-        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if not isinstance(overlay_last_text, dict):
-            overlay_last_text = {}
-            self._overlay_last_interim_text_by_session = overlay_last_text
-        overlay_last_text[session_id] = text
-
-    def _clear_overlay_interim_text(self, session_id: UUID) -> None:
-        overlay_last_text = getattr(self, "_overlay_last_interim_text_by_session", None)
-        if isinstance(overlay_last_text, dict):
-            overlay_last_text.pop(session_id, None)
-
-    def _overlay_interim_stabilizer(
-        self,
-        session_id: UUID,
-    ) -> OverlayInterimTranscriptStabilizer:
-        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
-        if not isinstance(overlay_stabilizers, dict):
-            overlay_stabilizers = {}
-            self._overlay_interim_stabilizer_by_session = overlay_stabilizers
-        stabilizer = overlay_stabilizers.get(session_id)
-        if stabilizer is None:
-            stabilizer = OverlayInterimTranscriptStabilizer()
-            overlay_stabilizers[session_id] = stabilizer
-        return stabilizer
-
-    def _overlay_interim_context(
-        self,
-        session_id: UUID,
-        context_samples: int,
-    ) -> OverlayInterimTranscriptContext:
-        return OverlayInterimTranscriptContext(
-            session_id=session_id,
-            context_samples=context_samples,
-            sample_rate=int(self.audio.sample_rate),
-        )
-
-    def _next_overlay_seq(self, session_id: UUID) -> int:
-        overlay_seq_by_session = getattr(self, "_overlay_event_seq_by_session", None)
-        if not isinstance(overlay_seq_by_session, dict):
-            overlay_seq_by_session = {}
-            self._overlay_event_seq_by_session = overlay_seq_by_session
-        current = overlay_seq_by_session.get(session_id, 0)
-        overlay_seq_by_session[session_id] = current + 1
-        return current
-
-    def _increment_overlay_events_emitted(self) -> None:
-        self._overlay_events_emitted = int(getattr(self, "_overlay_events_emitted", 0)) + 1
-
-    def _increment_overlay_events_dropped(self) -> None:
-        self._overlay_events_dropped = int(getattr(self, "_overlay_events_dropped", 0)) + 1
-
-    async def _emit_interim_state(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        *,
-        state: InterimStateValue,
-    ) -> None:
-        await self._event_sink(websocket).emit(
-            InterimStateEvent(session_id=session_id, state=state)
-        )
-
-    async def _emit_audio_level(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        rms: float,
-    ) -> None:
-        await self._event_sink(websocket).emit(AudioLevelEvent(session_id=session_id, rms=rms))
-
-    async def _collect_interim_text_updates(
-        self,
-        session_id: UUID,
-        ready_chunks: list[np.ndarray],
-    ) -> list[str]:
-        if not self.settings.overlay_events_enabled:
-            return []
-        if not ready_chunks:
-            return []
-
-        rolling_audio = np.zeros((0,), dtype=np.float32)
-        updates: list[str] = []
-
-        for chunk in ready_chunks:
-            chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
-            if chunk_audio.size == 0:
-                continue
-            rolling_audio = append_overlay_interim_context(rolling_audio, chunk_audio)
-            stabilizer = self._overlay_interim_stabilizer(session_id)
-            source_seq = stabilizer.next_source_seq("stop_replay")
-            context = self._overlay_interim_context(session_id, int(rolling_audio.size))
-            try:
-                candidate = await self._transcribe_samples_serialized(rolling_audio)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "Incremental interim source unavailable for this session: {}",
-                    exc.__class__.__name__,
-                )
-                stabilizer.record_skip(
-                    source="stop_replay",
-                    source_seq=source_seq,
-                    context=context,
-                    reason="transcribe_error",
-                    error_class=exc.__class__.__name__,
-                )
-                break
-            stabilized = stabilizer.accept(
-                "stop_replay",
-                source_seq,
-                candidate,
-                context,
-            )
-            if stabilized is not None:
-                updates.append(stabilized.text)
-        return updates
-
-    async def _emit_interim_text(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        *,
-        text: str,
-    ) -> None:
-        await self._event_sink(websocket).emit(InterimTextEvent(session_id=session_id, text=text))
-
-    async def _emit_session_ended(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        *,
-        reason: SessionEndReason,
-    ) -> None:
-        await self._event_sink(websocket).emit(
-            SessionEndedEvent(session_id=session_id, reason=reason)
-        )
-
-    async def _emit_session_warning(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        session: Session,
-    ) -> None:
-        remaining = self._session_remaining_seconds(session)
-        limit = self._effective_session_limit_seconds()
-        await self._event_sink(websocket).emit(
-            SessionWarningEvent(
-                session_id=session_id,
-                remaining_seconds=remaining,
-                limit_seconds=limit,
-            )
-        )
-
-    async def _emit_live_interim_from_chunk(
-        self,
-        websocket: WebSocket,
-        session_id: UUID,
-        chunk: np.ndarray,
-    ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        if self._live_interim_failed:
-            return
-        chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
-        if chunk_audio.size == 0:
-            return
-        self._live_interim_audio = append_overlay_interim_context(
-            self._live_interim_audio,
-            chunk_audio,
-        )
-        stabilizer = self._overlay_interim_stabilizer(session_id)
-        source_seq = stabilizer.next_source_seq("live")
-        context = self._overlay_interim_context(session_id, int(self._live_interim_audio.size))
-        try:
-            candidate = await self._transcribe_samples_serialized(self._live_interim_audio)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Live incremental interim source unavailable for this session: {}",
-                exc.__class__.__name__,
-            )
-            stabilizer.record_skip(
-                source="live",
-                source_seq=source_seq,
-                context=context,
-                reason="transcribe_error",
-                error_class=exc.__class__.__name__,
-            )
-            self._live_interim_failed = True
-            return
-        stabilized = stabilizer.accept(
-            "live",
-            source_seq,
-            candidate,
-            context,
-        )
-        if stabilized is not None:
-            await self._emit_interim_text(websocket, session_id, text=stabilized.text)
-
     def status(self) -> StatusMessage:
-        active = self.sessions.active
-        state = active.state if active else SessionState.IDLE
-        requested_device = getattr(self, "_requested_device", str(self.settings.device))
-        effective_device = getattr(self, "_effective_device", requested_device)
-        return StatusMessage(
-            state=state,
-            sessions_active=int(active is not None),
-            gpu_mem_mb=self._gpu_mem_mb(),
-            device=requested_device,
-            effective_device=effective_device,
-            streaming_enabled=self.settings.streaming_enabled,
-            stream_helper_active=self._stream_helper_active(),
-            stream_helper_scope=self._stream_helper_scope(),
-            stream_fallback_reason=self._stream_fallback_reason(),
-            finalization_mode=self._finalization_mode(),
-            final_audio_source=self._final_audio_source(),
-            tail_trim_mode=self._tail_trim_mode(),
-            vad_enabled=bool(getattr(self, "_vad_enabled", False)),
-            vad_active=self._vad_active(),
-            vad_fallback_reason=self._vad_fallback_reason(),
-            overlay_events_enabled=self.settings.overlay_events_enabled,
-            overlay_events_emitted=getattr(self, "_overlay_events_emitted", 0),
-            overlay_events_dropped=getattr(self, "_overlay_events_dropped", 0),
-            chunk_secs=self.settings.chunk_secs if self.settings.streaming_enabled else None,
-            active_session_age_ms=active.audio_duration_ms if active else None,
-            audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
-            finalize_ms=getattr(self, "_last_finalize_ms", None),
-            infer_ms=getattr(self, "_last_infer_ms", None),
-            send_ms=getattr(self, "_last_send_ms", None),
-            last_audio_ms=getattr(self, "_last_audio_ms", None),
-            last_infer_ms=getattr(self, "_last_infer_ms", None),
-            last_send_ms=getattr(self, "_last_send_ms", None),
+        return self.orchestrator.status(
+            overlay_events_enabled=self.event_sinks.overlay_events_enabled,
+            overlay_events_emitted=self.event_sinks.overlay_events_emitted,
+            overlay_events_dropped=self.event_sinks.overlay_events_dropped,
         )
-
-    def _stream_helper_active(self) -> bool:
-        if not self.settings.streaming_enabled:
-            return False
-        if self.streaming_transcriber is None:
-            return False
-        return self.streaming_transcriber.helper_active
-
-    def _stream_helper_scope(self) -> Literal["live_session_only"]:
-        return "live_session_only"
-
-    def _stream_fallback_reason(self) -> str | None:
-        if not self.settings.streaming_enabled:
-            return None
-        if self.streaming_transcriber is None:
-            return "streaming_transcriber_unavailable"
-        return self.streaming_transcriber.fallback_reason
-
-    def _finalization_mode(self) -> Literal["offline_seal"]:
-        return "offline_seal"
-
-    def _final_audio_source(self) -> Literal["canonical_session_audio"]:
-        return "canonical_session_audio"
-
-    def _tail_trim_mode(self) -> Literal["rms", "vad"]:
-        return self._tail_trimmer_for_runtime().last_outcome.tail_trim_mode
-
-    def _vad_active(self) -> bool:
-        return self._tail_trimmer_for_runtime().last_outcome.vad_active
-
-    def _vad_fallback_reason(self) -> str | None:
-        return self._tail_trimmer_for_runtime().last_outcome.vad_fallback_reason
-
-    def prepare_vad(self) -> None:
-        self._tail_trimmer_for_runtime().prepare()
-
-    def _tail_trimmer_for_runtime(self) -> SealPathTailTrimmer:
-        tail_trimmer = getattr(self, "tail_trimmer", None)
-        if not isinstance(tail_trimmer, SealPathTailTrimmer):
-            tail_trimmer = SealPathTailTrimmer(
-                vad_enabled=bool(getattr(self, "_vad_enabled", False)),
-                silence_floor_db=float(getattr(self.settings, "silence_floor_db", -40.0)),
-                warmup_sample_rate=int(getattr(self.audio, "sample_rate", 16_000)),
-            )
-            self.tail_trimmer = tail_trimmer
-        return tail_trimmer
-
-    def _gpu_mem_mb(self) -> int | None:
-        try:
-            import torch
-        except ImportError:  # pragma: no cover - inference extra not installed
-            return None
-
-        effective_device = str(getattr(self, "_effective_device", ""))
-        if not effective_device.startswith("cuda"):
-            return None
-        if not torch.cuda.is_available():
-            return None
-
-        device_index: int | None = None
-        if ":" in effective_device:
-            _, suffix = effective_device.split(":", 1)
-            if suffix.isdigit():
-                device_index = int(suffix)
-
-        reserved_bytes = torch.cuda.memory_reserved(device_index or 0)
-        return int(reserved_bytes / (1024 * 1024))
-
-    async def _finalise_transcription(self, audio_samples: np.ndarray) -> tuple[str, int]:
-        # The full capture buffer is the only authoritative source for final decode.
-        loop = asyncio.get_running_loop()
-        tail_trimmer = self._tail_trimmer_for_runtime()
-        trim_outcome = await loop.run_in_executor(
-            None,
-            partial(tail_trimmer.trim, audio_samples, self.audio.sample_rate),
-        )
-        trimmed = trim_outcome.samples
-        effective_device = str(getattr(self, "_effective_device", self.settings.device))
-        if trimmed.size == 0:
-            logger.info("Skipping offline transcription: silence trimming removed all samples")
-            _release_cuda_cache(effective_device)
-            return "", 0
-        infer_started = time.perf_counter()
-        try:
-            text = await self._transcribe_samples_serialized(trimmed)
-            infer_ms = int((time.perf_counter() - infer_started) * 1000)
-            return text, infer_ms
-        finally:
-            _release_cuda_cache(effective_device)
-
-    def _start_stream_drain_loop(self, websocket: WebSocket, session_id: UUID) -> None:
-        if self._stream_drain_task is not None:
-            return
-        self._stream_drain_running = True
-
-        async def _drain() -> None:
-            while self._stream_drain_running:
-                audio_levels = self.audio.take_audio_levels()
-                if audio_levels:
-                    await self._emit_audio_level(websocket, session_id, max(audio_levels))
-                chunks = self.audio.take_stream_chunks()
-                if self._active_stream:
-                    for chunk in chunks:
-                        self._active_stream.feed(chunk)
-                        await self._emit_live_interim_from_chunk(websocket, session_id, chunk)
-                await asyncio.sleep(0.05)
-
-        self._stream_drain_task = asyncio.create_task(_drain())
-
-    async def _stop_stream_drain_loop(self) -> None:
-        if self._stream_drain_task is None:
-            return
-        self._stream_drain_running = False
-        task = self._stream_drain_task
-        self._stream_drain_task = None
-        if task is asyncio.current_task():
-            return
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Stream drain loop stopped with {} during shutdown",
-                exc.__class__.__name__,
-            )
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
@@ -1127,19 +170,21 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        del app
+        orchestrator = server.orchestrator
         logger.info("Starting audio capture")
-        server.audio.start()
+        orchestrator.audio.start()
         logger.info("Warming Parakeet model on {}", settings.device)
         try:
-            await asyncio.to_thread(server.transcriber.warmup)
+            await asyncio.to_thread(orchestrator.transcriber.warmup)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Model warmup skipped: {}", exc)
         _release_cuda_cache(settings.device)
-        if server._vad_enabled:
-            await asyncio.to_thread(server.prepare_vad)
+        if orchestrator._vad_enabled:
+            await asyncio.to_thread(orchestrator.prepare_vad)
         runtime_degraded = (
-            server.settings.streaming_enabled and not server._stream_helper_active()
-        ) or (server._vad_enabled and not server._vad_active())
+            orchestrator.settings.streaming_enabled and not orchestrator._stream_helper_active()
+        ) or (orchestrator._vad_enabled and not orchestrator._vad_active())
         _log = logger.warning if runtime_degraded else logger.info
         _log(
             "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
@@ -1147,23 +192,23 @@ def create_app(settings: ServerSettings) -> FastAPI:
             "stream_fallback_reason={}, finalization_mode={}, final_audio_source={}, "
             "tail_trim_mode={}, vad_enabled={}, vad_active={}, vad_fallback_reason={}, "
             "overlay_events_enabled={}",
-            server._requested_device,
-            server._effective_device,
-            server.settings.streaming_enabled,
-            server._stream_helper_active(),
-            server._stream_helper_scope(),
-            server._stream_fallback_reason(),
-            server._finalization_mode(),
-            server._final_audio_source(),
-            server._tail_trim_mode(),
-            server._vad_enabled,
-            server._vad_active(),
-            server._vad_fallback_reason(),
-            server.settings.overlay_events_enabled,
+            orchestrator._requested_device,
+            orchestrator._effective_device,
+            orchestrator.settings.streaming_enabled,
+            orchestrator._stream_helper_active(),
+            orchestrator._stream_helper_scope(),
+            orchestrator._stream_fallback_reason(),
+            orchestrator._finalization_mode(),
+            orchestrator._final_audio_source(),
+            orchestrator._tail_trim_mode(),
+            orchestrator._vad_enabled,
+            orchestrator._vad_active(),
+            orchestrator._vad_fallback_reason(),
+            orchestrator.settings.overlay_events_enabled,
         )
         yield
         logger.info("Stopping audio capture")
-        server.audio.stop()
+        orchestrator.audio.stop()
 
     app = FastAPI(title="Parakeet STT Daemon", version="0.2.0", lifespan=lifespan)
 
@@ -1184,4 +229,4 @@ def create_app(settings: ServerSettings) -> FastAPI:
     return app
 
 
-__all__ = ["create_app", "DaemonServer"]
+__all__ = ["DaemonServer", "create_app"]

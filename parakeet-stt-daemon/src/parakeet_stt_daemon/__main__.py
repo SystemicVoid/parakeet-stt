@@ -165,20 +165,21 @@ def run_checks(settings: ServerSettings) -> None:
         logger.error("Failed to initialise server components: {}", exc)
         raise
 
+    orchestrator = server.orchestrator
     try:
-        server.audio.start()
+        orchestrator.audio.start()
         logger.info("Audio stream opened successfully (device={})", settings.mic_device)
-        server.audio.stop()
+        orchestrator.audio.stop()
     except Exception as exc:  # noqa: BLE001
         logger.error("Audio stream check failed: {}", exc)
 
     try:
-        server.transcriber.warmup()
+        orchestrator.transcriber.warmup()
         logger.info("Model warmup completed")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model warmup skipped/failed: {}", exc)
     if settings.vad_enabled:
-        server.prepare_vad()
+        orchestrator.prepare_vad()
 
     try:
         # sounddevice returns DeviceList; cast for static typing.
@@ -211,34 +212,34 @@ def run_checks(settings: ServerSettings) -> None:
         settings.max_session_samples,
     )
     if settings.streaming_enabled:
-        helper_active = server._stream_helper_active()
-        fallback_reason = server._stream_fallback_reason()
-        helper_class = getattr(server.streaming_transcriber, "_helper_class_name", None)
+        helper_active = orchestrator._stream_helper_active()
+        fallback_reason = orchestrator._stream_fallback_reason()
+        helper_class = getattr(orchestrator.streaming_transcriber, "_helper_class_name", None)
         if helper_active:
             logger.info(
                 "Live session helper: ACTIVE (class={}, scope={})",
                 helper_class,
-                server._stream_helper_scope(),
+                orchestrator._stream_helper_scope(),
             )
         else:
             logger.warning(
                 "Live session helper: INACTIVE (scope={}, reason={})",
-                server._stream_helper_scope(),
+                orchestrator._stream_helper_scope(),
                 fallback_reason,
             )
     logger.info(
         "Final transcript path: {} (audio_source={}, tail_trim_mode={})",
-        server._finalization_mode(),
-        server._final_audio_source(),
-        server._tail_trim_mode(),
+        orchestrator._finalization_mode(),
+        orchestrator._final_audio_source(),
+        orchestrator._tail_trim_mode(),
     )
     if settings.vad_enabled:
-        if server._vad_active():
+        if orchestrator._vad_active():
             logger.info("VAD trim: ACTIVE (backend=silero_onnx)")
         else:
             logger.warning(
                 "VAD trim: INACTIVE (reason={}). Tail trim will fall back to RMS.",
-                server._vad_fallback_reason(),
+                orchestrator._vad_fallback_reason(),
             )
     else:
         logger.info("VAD trim: DISABLED")
