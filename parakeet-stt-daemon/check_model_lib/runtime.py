@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
 
 from check_model_lib.constants import SAMPLE_RATE
+from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
 
 
 def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:

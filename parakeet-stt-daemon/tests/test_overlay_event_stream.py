@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from loguru import logger
+
 from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import (
@@ -172,8 +173,7 @@ def _build_server(
     server._live_interim_failed = False
     server._overlay_event_seq_by_session = {}
     server._overlay_last_interim_text_by_session = {}
-    server._overlay_interim_transcript_by_session = {}
-    server._overlay_interim_source_seq_by_session = {}
+    server._overlay_interim_stabilizer_by_session = {}
     server._overlay_state_by_session = {}
     server._overlay_events_emitted = 0
     server._overlay_events_dropped = 0
@@ -1056,8 +1056,6 @@ def test_phase6_daemon_reconnect_contract_recovers_with_fresh_session(monkeypatc
         )
         assert cleaned is True
         assert server.sessions.active is None
-        assert server._overlay_interim_transcript_by_session == {}
-
         await server._handle_start(cast(Any, second_socket), _start_message(second_session))
         await server._handle_stop(cast(Any, second_socket), _stop_message(second_session))
 

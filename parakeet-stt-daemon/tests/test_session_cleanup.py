@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from fastapi import WebSocketDisconnect
+
 from parakeet_stt_daemon import server as server_module
 from parakeet_stt_daemon.audio import AudioInput
 from parakeet_stt_daemon.config import ServerSettings
