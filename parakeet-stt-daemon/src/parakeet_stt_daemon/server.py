@@ -29,6 +29,7 @@ from .messages import (
     parse_client_message,
 )
 from .model import _release_cuda_cache
+from .runtime_truth_snapshot import format_log_record
 from .session_orchestrator import (
     AbortSessionIntent,
     SessionOrchestrator,
@@ -158,10 +159,15 @@ class DaemonServer:
         )
 
     def status(self) -> StatusMessage:
-        return self.orchestrator.status(
+        runtime_truth = self.orchestrator.runtime_truth(
             overlay_events_enabled=self.event_sinks.overlay_events_enabled,
-            overlay_events_emitted=self.event_sinks.overlay_events_emitted,
-            overlay_events_dropped=self.event_sinks.overlay_events_dropped,
+        )
+        return runtime_truth.to_status(
+            self.orchestrator.runtime_status_state(),
+            self.orchestrator.runtime_status_metrics(
+                overlay_events_emitted=self.event_sinks.overlay_events_emitted,
+                overlay_events_dropped=self.event_sinks.overlay_events_dropped,
+            ),
         )
 
 
@@ -182,29 +188,14 @@ def create_app(settings: ServerSettings) -> FastAPI:
         _release_cuda_cache(settings.device)
         if orchestrator._vad_enabled:
             await asyncio.to_thread(orchestrator.prepare_vad)
-        runtime_degraded = (
-            orchestrator.settings.streaming_enabled and not orchestrator._stream_helper_active()
-        ) or (orchestrator._vad_enabled and not orchestrator._vad_active())
+        runtime_truth = orchestrator.runtime_truth(
+            overlay_events_enabled=server.event_sinks.overlay_events_enabled
+        )
+        runtime_degraded = runtime_truth.degraded
         _log = logger.warning if runtime_degraded else logger.info
         _log(
-            "Runtime truth: device_requested={}, device_effective={}, streaming_enabled={}, "
-            "live_session_helper_active={}, live_session_helper_scope={}, "
-            "stream_fallback_reason={}, finalization_mode={}, final_audio_source={}, "
-            "tail_trim_mode={}, vad_enabled={}, vad_active={}, vad_fallback_reason={}, "
-            "overlay_events_enabled={}",
-            orchestrator._requested_device,
-            orchestrator._effective_device,
-            orchestrator.settings.streaming_enabled,
-            orchestrator._stream_helper_active(),
-            orchestrator._stream_helper_scope(),
-            orchestrator._stream_fallback_reason(),
-            orchestrator._finalization_mode(),
-            orchestrator._final_audio_source(),
-            orchestrator._tail_trim_mode(),
-            orchestrator._vad_enabled,
-            orchestrator._vad_active(),
-            orchestrator._vad_fallback_reason(),
-            orchestrator.settings.overlay_events_enabled,
+            "Runtime truth: {}",
+            format_log_record(runtime_truth.to_log_record()),
         )
         yield
         logger.info("Stopping audio capture")

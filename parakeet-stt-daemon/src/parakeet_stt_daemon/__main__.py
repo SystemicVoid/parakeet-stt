@@ -11,6 +11,7 @@ import uvicorn
 from loguru import logger
 
 from .config import ServerSettings
+from .runtime_truth_snapshot import format_log_record
 from .server import DaemonServer, create_app
 
 
@@ -211,35 +212,36 @@ def run_checks(settings: ServerSettings) -> None:
         settings.max_session_seconds,
         settings.max_session_samples,
     )
+    runtime_truth = orchestrator.runtime_truth(
+        overlay_events_enabled=settings.overlay_events_enabled
+    )
+    logger.info("Runtime truth: {}", format_log_record(runtime_truth.to_log_record()))
     if settings.streaming_enabled:
-        helper_active = orchestrator._stream_helper_active()
-        fallback_reason = orchestrator._stream_fallback_reason()
-        helper_class = getattr(orchestrator.streaming_transcriber, "_helper_class_name", None)
-        if helper_active:
+        if runtime_truth.stream_helper_active:
             logger.info(
                 "Live session helper: ACTIVE (class={}, scope={})",
-                helper_class,
-                orchestrator._stream_helper_scope(),
+                runtime_truth.stream_helper_class_name,
+                runtime_truth.stream_helper_scope,
             )
         else:
             logger.warning(
                 "Live session helper: INACTIVE (scope={}, reason={})",
-                orchestrator._stream_helper_scope(),
-                fallback_reason,
+                runtime_truth.stream_helper_scope,
+                runtime_truth.stream_fallback_reason,
             )
     logger.info(
         "Final transcript path: {} (audio_source={}, tail_trim_mode={})",
-        orchestrator._finalization_mode(),
-        orchestrator._final_audio_source(),
-        orchestrator._tail_trim_mode(),
+        runtime_truth.finalization_mode,
+        runtime_truth.final_audio_source,
+        runtime_truth.tail_trim_mode,
     )
     if settings.vad_enabled:
-        if orchestrator._vad_active():
+        if runtime_truth.vad_active:
             logger.info("VAD trim: ACTIVE (backend=silero_onnx)")
         else:
             logger.warning(
                 "VAD trim: INACTIVE (reason={}). Tail trim will fall back to RMS.",
-                orchestrator._vad_fallback_reason(),
+                runtime_truth.vad_fallback_reason,
             )
     else:
         logger.info("VAD trim: DISABLED")

@@ -55,6 +55,12 @@ Canonical-source policy:
 - `stt llm` manages a local `llama-server` in tmux session `parakeet-llm`, waits for `http://<host>:<port>/health`, then delegates to the normal `stt start` path.
 - Machine-local LLM overrides should stay in `PARAKEET_LLM_*` or `PARAKEET_LLM_SERVER_*` env vars from your shell or the ignored repo-local files; do not commit workstation-specific endpoints or launcher paths.
 
+Runtime truth for `/status` and daemon logs is produced by
+`parakeet_stt_daemon.runtime_truth_snapshot.RuntimeTruthSnapshot`. That module is
+the source of truth for effective device, Stream path helper state, Seal path
+finalization source, tail trim mode, VAD fallback, and overlay-event enablement;
+the Helper should read those fields from `/status` instead of re-deriving them.
+
 ## Historical notes (pre-2026 migration hardening)
 
 ## What works
