@@ -2339,6 +2339,7 @@ pub async fn run_demo(
     client.send(&stop_message(session_id)).await?;
     state.stop_listening();
 
+    let mut demo_injection_succeeded = false;
     while let Some(message) = client.next_message().await? {
         match message {
             ServerMessage::SessionStarted { session_id, .. } => {
@@ -2374,6 +2375,7 @@ pub async fn run_demo(
                 if let Some(error) = report.error {
                     return Err(anyhow!("demo injection failed: {error}"));
                 }
+                demo_injection_succeeded = true;
                 audio_feedback.play_completion();
                 state.reset();
                 break;
@@ -2391,12 +2393,21 @@ pub async fn run_demo(
                     "daemon error: {}",
                     message
                 );
-                break;
+                return Err(anyhow!(
+                    "demo failed: daemon returned error for session {:?}: {}: {}",
+                    session_id,
+                    code,
+                    message
+                ));
             }
             other => {
                 debug!(?other, "ignoring server message");
             }
         }
+    }
+
+    if !demo_injection_succeeded {
+        return Err(anyhow!("demo did not reach final injection"));
     }
 
     Ok(())
