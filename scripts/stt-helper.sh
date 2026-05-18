@@ -701,6 +701,7 @@ PY
 
         STATUS_JSON="$body" python3 - <<'PY'
 import json
+import math
 import os
 import sys
 
@@ -755,10 +756,12 @@ for key in fields:
             print(f"{key}={value}")
         elif isinstance(value, str):
             try:
-                float(value)
+                parsed = float(value)
             except ValueError:
                 sys.exit(1)
-            print(f"{key}={value}")
+            if not math.isfinite(parsed):
+                sys.exit(1)
+            print(f"{key}={parsed:g}")
         else:
             sys.exit(1)
     else:
