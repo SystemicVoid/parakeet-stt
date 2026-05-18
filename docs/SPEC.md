@@ -233,6 +233,25 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
     }
     ```
 
+### Status Runtime Fields
+
+| Field | JSON type | Values / units | Semantics |
+| --- | --- | --- | --- |
+| `stream_helper_scope` | string or null | `"live_session_only"` or `null` | Scope where the streaming helper is active. |
+| `stream_fallback_reason` | string or null | implementation-defined reason or `null` | Set when streaming is enabled but the helper is unavailable or degraded. |
+| `finalization_mode` | string or null | `"offline_seal"` or `null` | Final result path used to seal a session. |
+| `final_audio_source` | string or null | `"canonical_session_audio"` or `null` | Audio source used for final transcription. |
+| `tail_trim_mode` | string or null | `"rms"`, `"vad"`, or `null` | Tail trimming strategy used for the last seal path. |
+| `vad_enabled` | boolean or null | `true`, `false`, or `null` | Whether VAD is requested by configuration. |
+| `vad_active` | boolean or null | `true`, `false`, or `null` | Whether VAD was loaded and used by the runtime. |
+| `vad_fallback_reason` | string or null | implementation-defined reason or `null` | Set when `vad_enabled` is true and VAD is not active. |
+| `overlay_events_enabled` | boolean or null | `true`, `false`, or `null` | Whether the daemon publishes overlay event frames. |
+| `overlay_events_emitted` | integer or null | non-negative count or `null` | Delivered overlay events for the daemon event-sink lifetime. |
+| `overlay_events_dropped` | integer or null | non-negative count or `null` | Overlay events dropped because of queue pressure, backpressure, or disconnects for the daemon event-sink lifetime. |
+| `chunk_secs` | number or null | seconds, server setting range `0.1` to `10.0`, or `null` | Streaming chunk duration. Clients must accept any JSON number precision; current defaults commonly serialize with one decimal place. |
+
+Overlay event counters reset when the daemon process restarts.
+
 Future messages (like `partial_result`) must be backward compatible; clients should ignore unknown `type`s.
 Clients must also tolerate unknown error codes and unknown additional fields.
 Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
