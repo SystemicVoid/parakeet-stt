@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "session_id": null,
+  "code": "INVALID_REQUEST",
+  "message": "Unsupported message type: unknown"
+}

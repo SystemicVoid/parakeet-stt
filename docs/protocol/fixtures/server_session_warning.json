@@ -1,0 +1,7 @@
+{
+  "type": "session_warning",
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "warning": "approaching_limit",
+  "remaining_seconds": 119.5,
+  "limit_seconds": 600.5
+}

@@ -1,0 +1,6 @@
+{
+  "type": "abort_session",
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "reason": "user",
+  "timestamp": "2026-05-18T17:00:02Z"
+}
