@@ -133,7 +133,7 @@ struct Cli {
     completion_sound_path: Option<PathBuf>,
 
     /// Volume for completion sound (0-100).
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(0..=100))]
     completion_sound_volume: u8,
 
     /// Enable or disable overlay routing (CLI takes precedence over env).

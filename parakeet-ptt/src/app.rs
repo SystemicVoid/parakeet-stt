@@ -2217,6 +2217,17 @@ mod tests {
     }
 
     #[test]
+    fn cli_completion_sound_volume_rejects_values_above_documented_range() {
+        let cli = crate::Cli::parse_from(["parakeet-ptt", "--completion-sound-volume", "100"]);
+        assert_eq!(cli.completion_sound_volume, 100);
+
+        let error =
+            crate::Cli::try_parse_from(["parakeet-ptt", "--completion-sound-volume", "101"])
+                .expect_err("completion sound volume above 100 should be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn cli_overlay_enabled_defaults_to_none() {
         let cli = crate::Cli::parse_from(["parakeet-ptt"]);
         assert_eq!(cli.overlay_enabled, None);
