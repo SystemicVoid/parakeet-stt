@@ -40,3 +40,16 @@ Keep it short, stable, and biased toward source-of-truth locations. If something
 - Validation: run `bash -n scripts/stt-helper.sh`, `source scripts/stt-helper.sh && stt help start`, and `source scripts/stt-helper.sh && stt help llm` after helper flag/default/env changes.
 - Process-model contract: helper lifecycle checks must refresh `/tmp/parakeet-daemon.pid` from the bound port after startup/status probes instead of trusting the initial `uv run` launcher PID.
 - Multi-binary contract: any helper fallback using `cargo run` must pass `--bin parakeet-ptt`.
+
+## Agent skills
+
+Skills are activated per-repo via symlinks under `.agents/skills/` → `~/.config/forge/agents/.agents/skills-store/<name>`. Per-skill configuration lives in `docs/agents/`. Do not duplicate this configuration elsewhere.
+
+### Issue tracker
+GitHub issues in `SystemicVoid/parakeet-stt` via the `gh` CLI. See [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md).
+
+### Triage labels
+Canonical names used verbatim (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`); all five exist as GitHub labels. See [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md).
+
+### Domain docs
+Single-context layout: root [`CONTEXT.md`](CONTEXT.md) glossary + [`docs/adr/`](docs/adr/) decisions. See [`docs/agents/domain.md`](docs/agents/domain.md). Name domain concepts using `CONTEXT.md` terms; surface ADR conflicts explicitly.
