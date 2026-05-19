@@ -7,6 +7,7 @@ mod injector;
 mod injector_runtime;
 mod llm;
 mod overlay_process;
+mod overlay_router;
 mod protocol;
 mod routing;
 mod state;
@@ -402,7 +403,7 @@ async fn run_client_app(
     }
 
     let focus_cache = Some(WaylandFocusCache::new());
-    let overlay_sink = app::build_runtime_overlay_sink(
+    let overlay_sink = overlay_router::build_runtime_overlay_sink(
         overlay_capability.mode,
         overlay_adaptive_width,
         focus_cache.clone(),
