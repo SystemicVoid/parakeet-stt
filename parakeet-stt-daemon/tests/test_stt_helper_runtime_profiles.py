@@ -56,6 +56,68 @@ def _run_runtime_config(*args: str, extra_env: dict[str, str] | None = None) -> 
     return config
 
 
+def _run_get_stt_start_args(
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+    if extra_env:
+        env.update(extra_env)
+
+    command_line = " ".join(shlex.quote(arg) for arg in args)
+    command = [
+        "bash",
+        "-lc",
+        (
+            f"source {shlex.quote(str(HELPER_PATH))} && "
+            f"get_stt_start_args start_args {command_line} && "
+            "printf '%s\\0' \"${start_args[@]}\""
+        ),
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+    )
+    return [item.decode() for item in completed.stdout.split(b"\0") if item]
+
+
+def _run_get_stt_start_args_with_malformed_export() -> subprocess.CompletedProcess[str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        (
+            f"source {shlex.quote(str(HELPER_PATH))} && "
+            'stt() { printf "%s\\n" "unterminated\'"; } && '
+            "get_stt_start_args start_args"
+        ),
+    ]
+    return subprocess.run(
+        command,
+        check=False,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+
 def _run_runtime_match(*args: str) -> bool:
     env = {
         key: value
@@ -250,6 +312,37 @@ def test_helper_start_cli_llm_base_url_overrides_env() -> None:
 
     assert config["llm_base_url"] == "http://cli.local:8182/custom"
     assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
+
+
+def test_get_stt_start_args_preserves_multiline_text_with_scalar_option() -> None:
+    prompt = "\n".join(
+        [
+            "Return only final text.",
+            "--unknown-option should remain prompt text.",
+            "Keep shell-sensitive content: $HOME \"quoted\" 'single'.",
+        ]
+    )
+
+    args = _run_get_stt_start_args(
+        "streaming",
+        "--llm-system-prompt",
+        prompt,
+        "--uinput-dwell-ms",
+        "42",
+    )
+
+    prompt_index = args.index("--llm-system-prompt")
+    dwell_index = args.index("--uinput-dwell-ms")
+    assert args[prompt_index + 1] == prompt
+    assert args[dwell_index + 1] == "42"
+    assert "--unknown-option should remain prompt text." not in args
+
+
+def test_get_stt_start_args_fails_on_malformed_shell_export() -> None:
+    completed = _run_get_stt_start_args_with_malformed_export()
+
+    assert completed.returncode != 0
+    assert "get_stt_start_args: failed to parse __start-cli-args-shell output" in completed.stderr
 
 
 def test_runtime_match_accepts_cpu_fallback_for_accelerator_request() -> None:
