@@ -59,7 +59,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             info!(
                 session = %session_id,
                 origin = InjectionOrigin::RawFinalResult.as_str(),
-                latency_ms,
+                daemon_latency_ms = latency_ms,
                 audio_ms,
                 state_at_enqueue = state_label(state),
                 hotkey_up_elapsed_ms_at_enqueue,
@@ -252,7 +252,7 @@ mod tests {
     use crate::state::PttState;
     use anyhow::anyhow;
     use tokio::sync::mpsc;
-    use tokio::time::timeout;
+    use tokio::time::{timeout, Instant as TokioInstant};
     use uuid::Uuid;
 
     use super::handle_server_message;
@@ -363,6 +363,74 @@ mod tests {
                 .expect("recording lock should be available")
                 .as_slice(),
             &["direct final result".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn final_result_report_includes_user_visible_completion_latency() {
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingRunner {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+        let mut state = PttState::new();
+        let session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+        let mut parent_focus_by_session = HashMap::new();
+        let hotkey_up_at = TokioInstant::now() - Duration::from_millis(50);
+        let stop_message_at = TokioInstant::now() - Duration::from_millis(40);
+
+        handle_server_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "timed final result".to_string(),
+                latency_ms: 44,
+                audio_ms: 1200,
+                lang: Some("en".to_string()),
+                confidence: Some(0.92),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+            &mut parent_focus_by_session,
+            Some(hotkey_up_at),
+            Some((session_id, stop_message_at)),
+        )
+        .await
+        .expect("final result should enqueue");
+
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("injection report should arrive")
+            .expect("report channel should stay open");
+        assert!(report.error.is_none());
+        assert_eq!(report.daemon_latency_ms, 44);
+        assert_eq!(
+            report.enqueue_to_injection_complete_ms,
+            report.total_worker_ms
+        );
+        assert_eq!(
+            report.hotkey_up_elapsed_ms_at_completion,
+            report
+                .hotkey_up_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(report.enqueue_to_injection_complete_ms))
+        );
+        assert_eq!(
+            report.stop_message_elapsed_ms_at_completion,
+            report
+                .stop_message_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(report.enqueue_to_injection_complete_ms))
+        );
+        assert!(
+            report.hotkey_up_elapsed_ms_at_completion
+                >= report.hotkey_up_elapsed_ms_at_worker_start
+        );
+        assert!(
+            report.stop_message_elapsed_ms_at_completion
+                >= report.stop_message_elapsed_ms_at_worker_start
         );
     }
 

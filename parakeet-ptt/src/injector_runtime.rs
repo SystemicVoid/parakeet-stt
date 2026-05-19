@@ -115,10 +115,13 @@ pub(crate) struct InjectionReport {
     pub(crate) queue_wait_ms: u64,
     pub(crate) run_ms: u64,
     pub(crate) total_worker_ms: u64,
+    pub(crate) enqueue_to_injection_complete_ms: u64,
     pub(crate) hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
     pub(crate) stop_message_elapsed_ms_at_enqueue: Option<u64>,
     pub(crate) hotkey_up_elapsed_ms_at_worker_start: Option<u64>,
     pub(crate) stop_message_elapsed_ms_at_worker_start: Option<u64>,
+    pub(crate) hotkey_up_elapsed_ms_at_completion: Option<u64>,
+    pub(crate) stop_message_elapsed_ms_at_completion: Option<u64>,
     pub(crate) error_kind: Option<InjectionErrorKind>,
     pub(crate) error: Option<String>,
 }
@@ -1262,6 +1265,11 @@ pub(crate) fn spawn_injector_worker_with_capacity(
                 tokio::task::spawn_blocking(move || runner_for_job.run(&job_for_runner)).await;
             let run_ms = worker_started.elapsed().as_millis() as u64;
             let total_worker_ms = queue_wait_ms.saturating_add(run_ms);
+            let enqueue_to_injection_complete_ms = total_worker_ms;
+            let hotkey_up_elapsed_ms_at_completion = hotkey_up_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(enqueue_to_injection_complete_ms));
+            let stop_message_elapsed_ms_at_completion = stop_message_elapsed_ms_at_enqueue
+                .map(|elapsed| elapsed.saturating_add(enqueue_to_injection_complete_ms));
 
             let mut run_output: Option<InjectionRunOutput> = None;
             let (error_kind, error) = match result {
@@ -1294,10 +1302,13 @@ pub(crate) fn spawn_injector_worker_with_capacity(
                 queue_wait_ms,
                 run_ms,
                 total_worker_ms,
+                enqueue_to_injection_complete_ms,
                 hotkey_up_elapsed_ms_at_enqueue,
                 stop_message_elapsed_ms_at_enqueue,
                 hotkey_up_elapsed_ms_at_worker_start,
                 stop_message_elapsed_ms_at_worker_start,
+                hotkey_up_elapsed_ms_at_completion,
+                stop_message_elapsed_ms_at_completion,
                 error_kind,
                 error,
             };
