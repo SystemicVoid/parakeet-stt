@@ -119,6 +119,40 @@ def _model_stride_secs(model: ASRModel) -> float:
     return max(window_stride * max(1, subsampling), 0.001)
 
 
+def _model_sample_rate(model: ASRModel) -> int:
+    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
+    preprocessor_cfg = _get_cfg_value(cfg, "preprocessor")
+    raw_sample_rate = _get_cfg_value(cfg, "sample_rate")
+    if raw_sample_rate is None:
+        raw_sample_rate = _get_cfg_value(preprocessor_cfg, "sample_rate")
+    try:
+        sample_rate = int(raw_sample_rate or 16_000)
+    except (TypeError, ValueError):
+        sample_rate = 16_000
+    return sample_rate if sample_rate > 0 else 16_000
+
+
+def _validate_in_memory_sample_rate(model: ASRModel, sample_rate: int) -> int:
+    try:
+        provided_sample_rate = int(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"In-memory transcription sample rate must be a positive integer, got {sample_rate!r}"
+        ) from exc
+    if provided_sample_rate <= 0:
+        raise ValueError(
+            f"In-memory transcription sample rate must be a positive integer, got {sample_rate!r}"
+        )
+    expected_sample_rate = _model_sample_rate(model)
+    if provided_sample_rate != expected_sample_rate:
+        raise ValueError(
+            "In-memory transcription sample rate mismatch: "
+            f"received {provided_sample_rate} Hz but model expects {expected_sample_rate} Hz. "
+            "Resample audio before calling transcribe_samples."
+        )
+    return provided_sample_rate
+
+
 def _disable_cuda_graph_decoder_config(decoding_cfg: Any) -> bool:
     """Disable NeMo CUDA graph decoder flags before decoding objects are built."""
     changed = False
@@ -282,8 +316,7 @@ class ParakeetTranscriber:
 
     def warmup(self) -> None:
         """Run a trivial forward pass to pay the first-use cost."""
-        cfg = getattr(self.model, "_cfg", None)
-        sample_rate = getattr(cfg, "sample_rate", 16_000)
+        sample_rate = _model_sample_rate(self.model)
         silence = np.zeros((sample_rate,), dtype=np.float32)
         _ = self.transcribe_samples(silence, sample_rate=sample_rate)
 
@@ -305,6 +338,7 @@ class ParakeetTranscriber:
 
     def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
         """Transcribe in-memory audio and fall back to a temp wav on API mismatch."""
+        sample_rate = _validate_in_memory_sample_rate(self.model, sample_rate)
         audio = np.asarray(samples, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             logger.debug("Skipping transcription for empty audio buffer")
