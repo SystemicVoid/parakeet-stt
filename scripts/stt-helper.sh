@@ -785,6 +785,8 @@ bool_fields = {
 }
 numeric_fields = {
     "chunk_secs",
+}
+non_negative_int_fields = {
     "stream_chunks_processed",
 }
 for key in fields:
@@ -797,6 +799,21 @@ for key in fields:
         if not isinstance(value, bool):
             sys.exit(1)
         print(f"{key}={'true' if value else 'false'}")
+    elif key in non_negative_int_fields:
+        if value is None:
+            print(f"{key}=")
+        elif isinstance(value, bool):
+            sys.exit(1)
+        elif isinstance(value, int):
+            if value < 0:
+                sys.exit(1)
+            print(f"{key}={value}")
+        elif isinstance(value, str):
+            if not value.isdigit():
+                sys.exit(1)
+            print(f"{key}={int(value)}")
+        else:
+            sys.exit(1)
     elif key in numeric_fields:
         if value is None:
             print(f"{key}=")
