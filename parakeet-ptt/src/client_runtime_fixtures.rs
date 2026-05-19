@@ -19,6 +19,7 @@ use crate::overlay_router::{OverlayEvent, OverlaySink};
 use crate::protocol::{ClientMessage, ServerMessage};
 
 type TestBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type RecordedLlmRequests = Arc<Mutex<Vec<(Uuid, String)>>>;
 
 pub(crate) struct ClientRuntimeHarness {
     config: ClientConfig,
@@ -33,6 +34,7 @@ impl ClientRuntimeHarness {
         let (daemon_tx, daemon_rx) = mpsc::unbounded_channel();
         let (injection_runner, injections) = RecordingInjectionRunner::shared();
         let (overlay_sink, overlay_events) = RecordingOverlaySink::shared();
+        let (llm_answerer, llm_requests) = TestLlmAnswerer::shared();
         let ports = ClientPorts::new(
             AudioFeedback::new(false, None, 0),
             Arc::new(TestDaemonConnector::new(TestDaemonConnection {
@@ -43,7 +45,7 @@ impl ClientRuntimeHarness {
             Box::new(overlay_sink),
             None,
             Box::new(TestHotkeySource::new(hotkey_rx)),
-            Arc::new(TestLlmAnswerer),
+            llm_answerer,
         );
 
         Self {
@@ -54,7 +56,8 @@ impl ClientRuntimeHarness {
                 sent_rx,
                 injections,
                 overlay_events,
-                _daemon_tx: daemon_tx,
+                daemon_tx,
+                llm_requests,
             },
         }
     }
@@ -69,7 +72,8 @@ pub(crate) struct ClientRuntimeControls {
     sent_rx: mpsc::UnboundedReceiver<ClientMessage>,
     injections: Arc<Mutex<Vec<String>>>,
     overlay_events: Arc<Mutex<Vec<OverlayEvent>>>,
-    _daemon_tx: mpsc::UnboundedSender<ServerMessage>,
+    daemon_tx: mpsc::UnboundedSender<ServerMessage>,
+    llm_requests: RecordedLlmRequests,
 }
 
 impl ClientRuntimeControls {
@@ -77,6 +81,18 @@ impl ClientRuntimeControls {
         self.hotkey_tx
             .send(HotkeyEvent::Down { intent })
             .expect("test hotkey event should send");
+    }
+
+    pub(crate) fn send_hotkey_up(&self) {
+        self.hotkey_tx
+            .send(HotkeyEvent::Up)
+            .expect("test hotkey event should send");
+    }
+
+    pub(crate) fn send_daemon_message(&self, message: ServerMessage) {
+        self.daemon_tx
+            .send(message)
+            .expect("test daemon message should send");
     }
 
     pub(crate) async fn next_sent_message(&mut self, wait: Duration) -> ClientMessage {
@@ -97,6 +113,13 @@ impl ClientRuntimeControls {
         self.overlay_events
             .lock()
             .expect("recorded overlay lock should be available")
+            .clone()
+    }
+
+    pub(crate) fn recorded_llm_requests(&self) -> Vec<(Uuid, String)> {
+        self.llm_requests
+            .lock()
+            .expect("recorded LLM request lock should be available")
             .clone()
     }
 }
@@ -222,7 +245,21 @@ impl DaemonConnection for TestDaemonConnection {
     }
 }
 
-struct TestLlmAnswerer;
+struct TestLlmAnswerer {
+    requests: RecordedLlmRequests,
+}
+
+impl TestLlmAnswerer {
+    fn shared() -> (Arc<Self>, RecordedLlmRequests) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                requests: Arc::clone(&requests),
+            }),
+            requests,
+        )
+    }
+}
 
 impl LlmAnswerer for TestLlmAnswerer {
     fn label(&self) -> String {
@@ -241,10 +278,16 @@ impl LlmAnswerer for TestLlmAnswerer {
 
     fn answer<'a>(
         &'a self,
-        _session_id: Uuid,
-        _transcript: String,
+        session_id: Uuid,
+        transcript: String,
         _progress_tx: mpsc::UnboundedSender<LlmProgress>,
     ) -> TestBoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async { Ok("test answer".to_string()) })
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("recorded LLM request lock should be available")
+                .push((session_id, transcript));
+            Ok("test answer".to_string())
+        })
     }
 }

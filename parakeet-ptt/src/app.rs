@@ -22,8 +22,9 @@ use uuid::Uuid;
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
-    classify_error_code, elapsed_ms_since, handle_server_message, session_id_from_state,
-    state_label, take_parent_focus_for_enqueue, CapturedParentFocus,
+    classify_error_code, elapsed_ms_since, final_result_belongs_to_active_session,
+    handle_server_message, log_rejected_final_result, session_id_from_state, state_label,
+    take_parent_focus_for_enqueue, CapturedParentFocus,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
@@ -364,6 +365,11 @@ pub async fn run_demo(
                 audio_ms,
                 ..
             } => {
+                if !final_result_belongs_to_active_session(&state, session_id) {
+                    log_rejected_final_result(session_id, &state, InjectionOrigin::Demo);
+                    continue;
+                }
+
                 let to_inject = override_text.as_deref().unwrap_or(&text).to_string();
                 info!(
                     session = %session_id,
@@ -578,6 +584,20 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 "deferring daemon session_ended until llm answer injection"
                                             );
                                             continue;
+                                        }
+
+                                        if let ServerMessage::FinalResult { session_id, .. } = &message {
+                                            if !final_result_belongs_to_active_session(&state, *session_id) {
+                                                log_rejected_final_result(
+                                                    *session_id,
+                                                    &state,
+                                                    match active_intent {
+                                                        Some(SessionIntent::LlmQuery) => InjectionOrigin::LlmAnswer,
+                                                        _ => InjectionOrigin::RawFinalResult,
+                                                    },
+                                                );
+                                                continue;
+                                            }
                                         }
 
                                         match message {
@@ -1382,6 +1402,70 @@ mod tests {
             }
             other => panic!("expected start_session, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_llm_query_ignores_stale_final_before_answer_generation() {
+        let (config, ports, mut runtime) =
+            ClientRuntimeHarness::new(test_app_config()).into_parts();
+
+        let app_task = tokio::spawn(run(config, ports));
+        runtime.send_hotkey_down(HotkeyIntent::LlmQuery);
+        let start = runtime.next_sent_message(Duration::from_millis(250)).await;
+        let active_session_id = match start {
+            ClientMessage::StartSession { session_id, .. } => session_id,
+            other => panic!("expected start_session, got {other:?}"),
+        };
+        runtime.send_hotkey_up();
+        let stop = runtime.next_sent_message(Duration::from_millis(250)).await;
+        match stop {
+            ClientMessage::StopSession { session_id, .. } => {
+                assert_eq!(session_id, active_session_id);
+            }
+            other => panic!("expected stop_session, got {other:?}"),
+        }
+
+        runtime.send_daemon_message(ServerMessage::FinalResult {
+            session_id: Uuid::new_v4(),
+            text: "stale private transcript".to_string(),
+            latency_ms: 44,
+            audio_ms: 1200,
+            lang: Some("en".to_string()),
+            confidence: Some(0.92),
+        });
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        assert!(runtime.recorded_llm_requests().is_empty());
+        assert!(runtime.recorded_injections().is_empty());
+
+        runtime.send_daemon_message(ServerMessage::FinalResult {
+            session_id: active_session_id,
+            text: "current private transcript".to_string(),
+            latency_ms: 55,
+            audio_ms: 1500,
+            lang: Some("en".to_string()),
+            confidence: Some(0.95),
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !runtime.recorded_injections().is_empty() {
+                    break;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("valid final result should produce an LLM answer injection");
+        app_task.abort();
+
+        assert_eq!(
+            runtime.recorded_llm_requests(),
+            vec![(active_session_id, "current private transcript".to_string())]
+        );
+        assert_eq!(
+            runtime.recorded_injections(),
+            vec!["test answer".to_string()]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
