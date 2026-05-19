@@ -178,28 +178,31 @@ def create_app(settings: ServerSettings) -> FastAPI:
     async def lifespan(app: FastAPI):
         del app
         orchestrator = server.orchestrator
-        logger.info("Starting audio capture")
-        orchestrator.audio.start()
-        logger.info("Warming Parakeet model on {}", settings.device)
+        audio_started = False
         try:
+            logger.info("Starting audio capture")
+            orchestrator.audio.start()
+            audio_started = True
+            logger.info("Warming Parakeet model on {}", settings.device)
             await asyncio.to_thread(orchestrator.transcriber.warmup)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Model warmup skipped: {}", exc)
-        _release_cuda_cache(settings.device)
-        if orchestrator._vad_enabled:
-            await asyncio.to_thread(orchestrator.prepare_vad)
-        runtime_truth = orchestrator.runtime_truth(
-            overlay_events_enabled=server.event_sinks.overlay_events_enabled
-        )
-        runtime_degraded = runtime_truth.degraded
-        _log = logger.warning if runtime_degraded else logger.info
-        _log(
-            "Runtime truth: {}",
-            format_log_record(runtime_truth.to_log_record()),
-        )
-        yield
-        logger.info("Stopping audio capture")
-        orchestrator.audio.stop()
+            logger.info("Model warmup completed")
+            _release_cuda_cache(settings.device)
+            if orchestrator._vad_enabled:
+                await asyncio.to_thread(orchestrator.prepare_vad)
+            runtime_truth = orchestrator.runtime_truth(
+                overlay_events_enabled=server.event_sinks.overlay_events_enabled
+            )
+            runtime_degraded = runtime_truth.degraded
+            _log = logger.warning if runtime_degraded else logger.info
+            _log(
+                "Runtime truth: {}",
+                format_log_record(runtime_truth.to_log_record()),
+            )
+            yield
+        finally:
+            if audio_started:
+                logger.info("Stopping audio capture")
+                orchestrator.audio.stop()
 
     app = FastAPI(title="Parakeet STT Daemon", version="0.2.0", lifespan=lifespan)
 

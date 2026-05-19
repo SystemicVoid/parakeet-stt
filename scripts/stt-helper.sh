@@ -73,6 +73,7 @@ stt() {
     local DEFAULT_DAEMON_PORT="8765"
     local DAEMON_WS_PATH="/ws"
     local DAEMON_STATUS_PATH="/status"
+    local DAEMON_HEALTH_PATH="/healthz"
     local DEFAULT_LLM_SERVER_HOST="127.0.0.1"
     local DEFAULT_LLM_SERVER_PORT="8080"
     local LLM_API_PATH="/v1"
@@ -92,6 +93,10 @@ stt() {
 
     _daemon_status_url() {
         _endpoint_url "http" "$HOST" "$PORT" "$DAEMON_STATUS_PATH"
+    }
+
+    _daemon_health_url() {
+        _endpoint_url "http" "$HOST" "$PORT" "$DAEMON_HEALTH_PATH"
     }
 
     _daemon_ws_endpoint_from_authority() {
@@ -545,23 +550,6 @@ PY
         return $?
     }
 
-    _wait_for_socket() {
-        local pid_file="$1"
-        local tries="${2:-60}" # 30s with 0.5s sleep
-        local ready=0
-        for _ in $(seq 1 "$tries"); do
-            if _socket_ready_once; then
-                ready=1
-                break
-            fi
-            if [ -n "$pid_file" ] && [ -f "$pid_file" ] && ! ps -p "$(cat "$pid_file")" >/dev/null 2>&1; then
-                break
-            fi
-            sleep 0.5
-        done
-        [ "$ready" -eq 1 ]
-    }
-
     _http_ok_once() {
         local url="$1"
         if command -v curl >/dev/null 2>&1; then
@@ -634,25 +622,47 @@ PY
         return 0
     }
 
+    _client_log_has_after_marker() {
+        local marker="$1"
+        local needle="$2"
+        [ -f "$LOG_CLIENT" ] || return 1
+
+        if [ -n "$marker" ]; then
+            awk -v marker="$marker" 'seen { print } index($0, marker) { seen = 1 }' "$LOG_CLIENT" | grep -Fq "$needle"
+            return $?
+        fi
+
+        grep -Fq "$needle" "$LOG_CLIENT"
+    }
+
+    _client_log_has_readiness_signal() {
+        local marker="$1"
+        _client_log_has_after_marker "$marker" "Hotkey listeners started" || return 1
+        _client_log_has_after_marker "$marker" "Connected to daemon" || return 1
+    }
+
+    _client_ready_once() {
+        local marker="$1"
+        local pid="${2:-}"
+        if [ -z "$pid" ]; then
+            pid=$(pgrep -n "[p]arakeet-ptt" || true)
+        fi
+
+        [ -n "$pid" ] || return 1
+        ps -p "$pid" >/dev/null 2>&1 || return 1
+        _client_log_has_readiness_signal "$marker" || return 1
+        echo "$pid" >| "$CLIENT_PID_FILE"
+    }
+
     _wait_for_client_ready() {
         local timeout_seconds="${1:-30}"
+        local readiness_marker="${2:-}"
         local started_at="$SECONDS"
         local max_wait="$timeout_seconds"
-        local pid
 
         while true; do
-            pid=$(pgrep -n "[p]arakeet-ptt" || true)
-            if [ -n "$pid" ]; then
-                echo "$pid" >| "$CLIENT_PID_FILE"
+            if _client_ready_once "$readiness_marker"; then
                 return 0
-            fi
-
-            if [ -f "$LOG_CLIENT" ] && grep -Eq "Starting hotkey loop; press Right Ctrl to talk|Hotkey listeners started for KEY_RIGHTCTRL|Connected to daemon" "$LOG_CLIENT"; then
-                pid=$(pgrep -n "[p]arakeet-ptt" || true)
-                if [ -n "$pid" ]; then
-                    echo "$pid" >| "$CLIENT_PID_FILE"
-                    return 0
-                fi
             fi
 
             if [ $((SECONDS - started_at)) -ge "$max_wait" ]; then
@@ -1258,6 +1268,7 @@ daemon_host=$HOST
 daemon_port=$PORT
 daemon_websocket_endpoint=$(_daemon_ws_endpoint)
 daemon_status_url=$(_daemon_status_url)
+daemon_health_url=$(_daemon_health_url)
 llm_base_url=$llm_base_url
 managed_llm_api_base_url=$(_llm_api_base_url)
 llm_health_url=$(_llm_health_url)
@@ -1282,6 +1293,20 @@ EOF
             fi
 
             _daemon_status_runtime_truth "$1"
+            ;;
+        __client-ready-once)
+            if [ "$#" -ne 4 ]; then
+                echo "usage: stt __client-ready-once <client-log> <pid-file> <readiness-marker> <pid>" >&2
+                return 2
+            fi
+
+            LOG_CLIENT="$1"
+            CLIENT_PID_FILE="$2"
+            if _client_ready_once "$3" "$4"; then
+                echo "ready=true"
+            else
+                echo "ready=false"
+            fi
             ;;
         start)
             local injection_mode paste_backend_failure_policy
@@ -1348,8 +1373,9 @@ EOF
             fi
 
             local daemon_reused=0
-            local daemon_status_url
+            local daemon_status_url daemon_health_url
             daemon_status_url="$(_daemon_status_url)"
+            daemon_health_url="$(_daemon_health_url)"
             if _socket_ready_once; then
                 local current_device=""
                 local current_effective_device=""
@@ -1358,40 +1384,48 @@ EOF
                 local runtime_truth
 
                 _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
-                runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url" 2>/dev/null)" || runtime_truth=""
+                if ! _http_ok_once "$daemon_health_url"; then
+                    echo "   - Existing daemon health check failed ($daemon_health_url); restarting."
+                    if ! _stop_running_daemon; then
+                        echo "   - Failed to stop the running daemon before relaunch."
+                        return 1
+                    fi
+                else
+                    runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url" 2>/dev/null)" || runtime_truth=""
 
-                echo "   - Requested daemon runtime: device=$daemon_device, streaming_enabled=$daemon_streaming_enabled, overlay_events_enabled=$daemon_overlay_events_enabled"
-                if [ -n "$runtime_truth" ]; then
-                    while IFS='=' read -r key value; do
-                        case "$key" in
-                            device) current_device="$value" ;;
-                            effective_device) current_effective_device="$value" ;;
-                            streaming_enabled) current_streaming_enabled="$value" ;;
-                            overlay_events_enabled) current_overlay_events_enabled="$value" ;;
-                        esac
-                    done <<< "$runtime_truth"
-                    echo "   - Existing daemon runtime: device=$current_device, effective_device=$current_effective_device, streaming_enabled=$current_streaming_enabled, overlay_events_enabled=$current_overlay_events_enabled"
-                    if _daemon_runtime_matches_request \
-                        "$daemon_device" \
-                        "$daemon_streaming_enabled" \
-                        "$daemon_overlay_events_enabled" \
-                        "$current_effective_device" \
-                        "$current_streaming_enabled" \
-                        "$current_overlay_events_enabled"; then
-                        echo "   - Reusing existing daemon (pid $(cat "$DAEMON_PID_FILE" 2>/dev/null))."
-                        daemon_reused=1
+                    echo "   - Requested daemon runtime: device=$daemon_device, streaming_enabled=$daemon_streaming_enabled, overlay_events_enabled=$daemon_overlay_events_enabled"
+                    if [ -n "$runtime_truth" ]; then
+                        while IFS='=' read -r key value; do
+                            case "$key" in
+                                device) current_device="$value" ;;
+                                effective_device) current_effective_device="$value" ;;
+                                streaming_enabled) current_streaming_enabled="$value" ;;
+                                overlay_events_enabled) current_overlay_events_enabled="$value" ;;
+                            esac
+                        done <<< "$runtime_truth"
+                        echo "   - Existing daemon runtime: device=$current_device, effective_device=$current_effective_device, streaming_enabled=$current_streaming_enabled, overlay_events_enabled=$current_overlay_events_enabled"
+                        if _daemon_runtime_matches_request \
+                            "$daemon_device" \
+                            "$daemon_streaming_enabled" \
+                            "$daemon_overlay_events_enabled" \
+                            "$current_effective_device" \
+                            "$current_streaming_enabled" \
+                            "$current_overlay_events_enabled"; then
+                            echo "   - Reusing existing daemon (pid $(cat "$DAEMON_PID_FILE" 2>/dev/null))."
+                            daemon_reused=1
+                        else
+                            echo "   - Existing daemon runtime does not match request; restarting."
+                            if ! _stop_running_daemon; then
+                                echo "   - Failed to stop the running daemon before relaunch."
+                                return 1
+                            fi
+                        fi
                     else
-                        echo "   - Existing daemon runtime does not match request; restarting."
+                        echo "   - Existing daemon status missing or unparseable; restarting to enforce requested runtime."
                         if ! _stop_running_daemon; then
                             echo "   - Failed to stop the running daemon before relaunch."
                             return 1
                         fi
-                    fi
-                else
-                    echo "   - Existing daemon status missing or unparseable; restarting to enforce requested runtime."
-                    if ! _stop_running_daemon; then
-                        echo "   - Failed to stop the running daemon before relaunch."
-                        return 1
                     fi
                 fi
             elif _pid_alive "$DAEMON_PID_FILE"; then
@@ -1417,14 +1451,15 @@ EOF
                 )
             fi
 
-            echo -n "   - Waiting for socket..."
-            if _wait_for_socket "$DAEMON_PID_FILE" 60; then
+            echo -n "   - Waiting for daemon health..."
+            if _wait_for_http "$daemon_health_url" "$DAEMON_PID_FILE" 120; then
                 _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
                 echo " OK"
                 echo "${HOST}:${PORT}" >| "$PORT_FILE"
             else
-                echo " not ready; last daemon log lines:"
+                echo " not healthy; last daemon log lines:"
                 tail -n 80 "$LOG_DAEMON"
+                echo "   - Daemon health URL: $daemon_health_url"
                 return 1
             fi
 
@@ -1439,7 +1474,10 @@ EOF
                 pkill -f "[p]arakeet-ptt" >/dev/null 2>&1 || true
             fi
 
+            local client_readiness_marker
+            client_readiness_marker="[helper] client readiness marker: $(date +%s)-$$-${RANDOM:-0}"
             echo "--- Session Start: $(date) ---" >> "$LOG_CLIENT"
+            echo "$client_readiness_marker" >> "$LOG_CLIENT"
             _log_client "start client in tmux (mode: $injection_mode)"
 
             _tmux_kill_session "$TMUX_SESSION"
@@ -1468,7 +1506,7 @@ EOF
                 tmux select-pane -t "$primary_pane"
             fi
 
-            if ! _wait_for_client_ready "$client_ready_timeout_seconds"; then
+            if ! _wait_for_client_ready "$client_ready_timeout_seconds" "$client_readiness_marker"; then
                 if _client_build_in_progress; then
                     echo "   - Client compile still in progress after timeout window; recent client log:"
                 else

@@ -111,6 +111,45 @@ def _run_status_runtime_truth(payload_path: Path) -> dict[str, str]:
     return truth
 
 
+def _run_client_ready_once(
+    log_path: Path,
+    pid_file: Path,
+    marker: str,
+    pid: int,
+) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && "
+        "stt __client-ready-once "
+        f"{shlex.quote(str(log_path))} "
+        f"{shlex.quote(str(pid_file))} "
+        f"{shlex.quote(marker)} "
+        f"{pid}",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    result: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, value = line.split("=", 1)
+        result[key] = value
+    return result
+
+
 def test_cpu_profile_resolves_offline_cpu_runtime() -> None:
     config = _run_runtime_config("cpu")
 
@@ -153,6 +192,7 @@ def test_helper_endpoint_defaults_match_daemon_settings() -> None:
     assert config["daemon_port"] == str(DEFAULT_DAEMON_PORT)
     assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint()
     assert config["daemon_status_url"] == daemon_status_url()
+    assert config["daemon_health_url"] == "http://127.0.0.1:8765/healthz"
     assert config["llm_base_url"] == "http://127.0.0.1:8080/v1"
     assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
     assert config["llm_health_url"] == "http://127.0.0.1:8080/health"
@@ -172,6 +212,7 @@ def test_helper_endpoint_env_overrides_resolve_consistently() -> None:
     assert config["daemon_port"] == "9001"
     assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint("0.0.0.0", 9001)
     assert config["daemon_status_url"] == daemon_status_url("0.0.0.0", 9001)
+    assert config["daemon_health_url"] == "http://0.0.0.0:9001/healthz"
     assert config["llm_base_url"] == "http://llm.local:8181/v1"
     assert config["managed_llm_api_base_url"] == "http://llm.local:8181/v1"
     assert config["llm_health_url"] == "http://llm.local:8181/health"
@@ -194,6 +235,54 @@ def test_runtime_match_accepts_cpu_fallback_for_accelerator_request() -> None:
 
 def test_runtime_match_rejects_accelerator_when_cpu_requested() -> None:
     assert _run_runtime_match("cpu", "false", "false", "cuda", "false", "false") is False
+
+
+def test_client_ready_once_rejects_pid_without_current_readiness_logs(tmp_path: Path) -> None:
+    marker = "current-client-start"
+    log_path = tmp_path / "client.log"
+    pid_file = tmp_path / "client.pid"
+    log_path.write_text(f"{marker}\n", encoding="utf-8")
+
+    result = _run_client_ready_once(log_path, pid_file, marker, os.getpid())
+
+    assert result == {"ready": "false"}
+    assert not pid_file.exists()
+
+
+def test_client_ready_once_requires_current_hotkey_and_connection_logs(tmp_path: Path) -> None:
+    marker = "current-client-start"
+    log_path = tmp_path / "client.log"
+    pid_file = tmp_path / "client.pid"
+    log_path.write_text(
+        "\n".join(
+            [
+                "Hotkey listeners started",
+                "Connected to daemon",
+                marker,
+                "Hotkey listeners started",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    stale_result = _run_client_ready_once(log_path, pid_file, marker, os.getpid())
+    assert stale_result == {"ready": "false"}
+
+    log_path.write_text(
+        "\n".join(
+            [
+                marker,
+                "Hotkey listeners started",
+                "Connected to daemon",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ready_result = _run_client_ready_once(log_path, pid_file, marker, os.getpid())
+
+    assert ready_result == {"ready": "true"}
+    assert pid_file.read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
 def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Path) -> None:
