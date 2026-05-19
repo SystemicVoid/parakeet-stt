@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import pytest
 
 from parakeet_stt_daemon import session_orchestrator as orchestrator_module
 from parakeet_stt_daemon.config import ServerSettings
@@ -19,8 +20,9 @@ from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer, TailTrimOutcome
 
 
 class _ArrayModel:
-    def __init__(self) -> None:
+    def __init__(self, sample_rate: int = 16_000) -> None:
         self.calls: list[object] = []
+        self.cfg = SimpleNamespace(sample_rate=sample_rate)
 
     def transcribe(self, audio, **_kwargs):  # noqa: ANN001, ANN003
         self.calls.append(audio)
@@ -86,6 +88,28 @@ def test_transcribe_samples_uses_array_path_when_supported() -> None:
     first_call = model.calls[0]
     assert isinstance(first_call, list)
     assert isinstance(first_call[0], np.ndarray)
+
+
+def test_transcribe_samples_rejects_sample_rate_mismatch_without_model_call() -> None:
+    model = _ArrayModel()
+    transcriber = ParakeetTranscriber(model=cast(Any, model))
+    samples = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"sample rate.*8000.*16000"):
+        transcriber.transcribe_samples(samples, sample_rate=8_000)
+
+    assert model.calls == []
+
+
+def test_transcribe_samples_accepts_configured_model_sample_rate() -> None:
+    model = _ArrayModel(sample_rate=8_000)
+    transcriber = ParakeetTranscriber(model=cast(Any, model))
+    samples = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+
+    result = transcriber.transcribe_samples(samples, sample_rate=8_000)
+
+    assert result == "in memory text"
+    assert len(model.calls) == 1
 
 
 def test_transcribe_samples_falls_back_to_file_when_array_path_fails(monkeypatch) -> None:
