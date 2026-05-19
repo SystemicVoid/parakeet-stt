@@ -32,8 +32,14 @@ from parakeet_stt_daemon.session_orchestrator import (
 class FakeAudio:
     sample_rate = 16_000
 
-    def __init__(self, *, samples: np.ndarray | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        samples: np.ndarray | None = None,
+        stream_chunks: list[np.ndarray] | None = None,
+    ) -> None:
         self.samples = samples if samples is not None else np.ones((1_600,), dtype=np.float32)
+        self.stream_chunks = list(stream_chunks or [])
         self.abort_calls = 0
         self.limit_exceeded = False
         self.start_calls = 0
@@ -53,24 +59,41 @@ class FakeAudio:
         return []
 
     def take_stream_chunks(self) -> list[np.ndarray]:
-        return []
+        chunks = self.stream_chunks
+        self.stream_chunks = []
+        return chunks
 
     def session_limit_exceeded(self) -> bool:
         return self.limit_exceeded
+
+
+class FakeStreamSession:
+    def __init__(self, feed_results: list[bool] | None = None) -> None:
+        self.feed_calls = 0
+        self.feed_results = list(feed_results or [True])
+        self.stream_fallback_reason: str | None = None
+
+    def feed(self, _chunk: np.ndarray) -> bool:
+        self.feed_calls += 1
+        result = self.feed_results.pop(0) if self.feed_results else True
+        if not result:
+            self.stream_fallback_reason = "stream_chunk_failed:RuntimeError"
+        return result
 
 
 class FakeStreamingTranscriber:
     helper_active = True
     fallback_reason: str | None = None
 
-    def start_session(self, _sample_rate: int) -> object:
-        return object()
+    def start_session(self, _sample_rate: int) -> FakeStreamSession:
+        return FakeStreamSession()
 
 
 def _build_orchestrator(
     *,
     streaming_enabled: bool = False,
     max_session_seconds: float = 90.0,
+    stream_chunks: list[np.ndarray] | None = None,
 ) -> SessionOrchestrator:
     orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
     settings = ServerSettings(
@@ -81,7 +104,7 @@ def _build_orchestrator(
     )
     orchestrator.settings = settings
     orchestrator.sessions = SessionManager()
-    orchestrator.audio = FakeAudio()
+    orchestrator.audio = FakeAudio(stream_chunks=stream_chunks)
     orchestrator.model = object()
     orchestrator.transcriber = object()
     orchestrator._session_lock = asyncio.Lock()
@@ -90,6 +113,11 @@ def _build_orchestrator(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
+    orchestrator._current_stream_chunks_processed = 0
+    orchestrator._current_stream_fallback_reason = None
+    orchestrator._last_stream_path_executed = False
+    orchestrator._last_stream_chunks_processed = 0
+    orchestrator._last_stream_fallback_reason = None
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
     orchestrator._session_sample_limit = int(max_session_seconds * FakeAudio.sample_rate)
@@ -156,6 +184,97 @@ def test_start_while_busy_emits_session_busy() -> None:
         errors = _events_of_type(sink, SessionErrorEvent)
         assert errors
         assert errors[-1].code == "SESSION_BUSY"
+
+    asyncio.run(scenario())
+
+
+def test_stop_records_stream_fallback_when_helper_ready_but_no_chunks_ran() -> None:
+    async def scenario() -> None:
+        orchestrator = _build_orchestrator(streaming_enabled=True)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+        await _start(orchestrator, sink, session_id)
+
+        await orchestrator.stop(
+            StopSessionIntent(
+                session_id=session_id,
+                owner_token=1,
+                event_sink=sink,
+                post_roll_secs=0.0,
+            )
+        )
+
+        truth = orchestrator.runtime_truth(overlay_events_enabled=True)
+        assert truth.stream_helper_active is True
+        assert truth.stream_path_executed is False
+        assert truth.stream_chunks_processed == 0
+        assert truth.stream_fallback_reason == "stream_path_not_exercised:no_chunks"
+
+    asyncio.run(scenario())
+
+
+def test_stop_records_stream_path_execution_when_chunks_are_processed() -> None:
+    async def scenario() -> None:
+        orchestrator = _build_orchestrator(streaming_enabled=True)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+        await _start(orchestrator, sink, session_id)
+
+        active_stream = cast(FakeStreamSession, orchestrator._active_stream)
+        await orchestrator._feed_stream_chunk(
+            cast(Any, active_stream),
+            np.array([0.1, 0.2], dtype=np.float32),
+        )
+        await orchestrator.stop(
+            StopSessionIntent(
+                session_id=session_id,
+                owner_token=1,
+                event_sink=sink,
+                post_roll_secs=0.0,
+            )
+        )
+
+        truth = orchestrator.runtime_truth(overlay_events_enabled=True)
+        assert active_stream.feed_calls == 1
+        assert truth.stream_path_executed is True
+        assert truth.stream_chunks_processed == 1
+        assert truth.stream_fallback_reason is None
+
+    asyncio.run(scenario())
+
+
+def test_stop_preserves_stream_fallback_after_successful_chunk() -> None:
+    async def scenario() -> None:
+        orchestrator = _build_orchestrator(streaming_enabled=True)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+        await _start(orchestrator, sink, session_id)
+
+        active_stream = FakeStreamSession(feed_results=[True, False])
+        orchestrator._active_stream = cast(Any, active_stream)
+        await orchestrator._feed_stream_chunk(
+            cast(Any, active_stream),
+            np.array([0.1], dtype=np.float32),
+        )
+        await orchestrator._feed_stream_chunk(
+            cast(Any, active_stream),
+            np.array([0.2], dtype=np.float32),
+        )
+        await orchestrator.stop(
+            StopSessionIntent(
+                session_id=session_id,
+                owner_token=1,
+                event_sink=sink,
+                post_roll_secs=0.0,
+            )
+        )
+
+        truth = orchestrator.runtime_truth(overlay_events_enabled=True)
+        assert active_stream.feed_calls == 2
+        assert truth.stream_path_executed is True
+        assert truth.stream_chunks_processed == 1
+        assert truth.stream_fallback_reason == "stream_chunk_failed:RuntimeError"
+        assert truth.degraded is True
 
     asyncio.run(scenario())
 

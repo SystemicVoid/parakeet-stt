@@ -6,6 +6,7 @@ start the daemon for protocol testing.
 
 from __future__ import annotations
 
+import math
 import tempfile
 import wave
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -97,6 +98,25 @@ def _set_cfg_value(cfg: Any, key: str, value: Any) -> bool:
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return False
     return False
+
+
+def _model_stride_secs(model: ASRModel) -> float:
+    cfg = getattr(model, "_cfg", None) or getattr(model, "cfg", None)
+    preprocessor_cfg = _get_cfg_value(cfg, "preprocessor")
+    try:
+        window_stride = float(_get_cfg_value(preprocessor_cfg, "window_stride") or 0.01)
+    except (TypeError, ValueError):
+        window_stride = 0.01
+    encoder = getattr(model, "encoder", None)
+    subsampling_factor = getattr(encoder, "subsampling_factor", None)
+    if subsampling_factor is None:
+        encoder_cfg = getattr(encoder, "cfg", None) or getattr(encoder, "_cfg", None)
+        subsampling_factor = _get_cfg_value(encoder_cfg, "subsampling_factor")
+    try:
+        subsampling = int(subsampling_factor or 8)
+    except (TypeError, ValueError):
+        subsampling = 8
+    return max(window_stride * max(1, subsampling), 0.001)
 
 
 def _disable_cuda_graph_decoder_config(decoding_cfg: Any) -> bool:
@@ -315,9 +335,32 @@ class ParakeetStreamingSession:
         self._parent = parent
         self.sample_rate = sample_rate
         self._chunks: list[np.ndarray] = []
+        self.stream_chunks_processed = 0
+        self.stream_fallback_reason: str | None = None
 
-    def feed(self, chunk: np.ndarray) -> None:
-        self._chunks.append(np.array(chunk, dtype=np.float32, copy=True))
+    @property
+    def stream_path_executed(self) -> bool:
+        return self.stream_chunks_processed > 0
+
+    def feed(self, chunk: np.ndarray) -> bool:
+        audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return False
+        self._chunks.append(np.array(audio, dtype=np.float32, copy=True))
+        if self.stream_fallback_reason is not None:
+            return False
+        try:
+            self._parent.process_stream_chunk(audio, self.sample_rate)
+        except Exception as exc:  # noqa: BLE001 - session should fall back to Seal path
+            reason = f"stream_chunk_failed:{exc.__class__.__name__}"
+            self.stream_fallback_reason = reason
+            mark_fallback = getattr(self._parent, "mark_stream_fallback", None)
+            if callable(mark_fallback):
+                mark_fallback(reason)
+            logger.warning("Stream path chunk processing failed; using Seal path only: {}", exc)
+            return False
+        self.stream_chunks_processed += 1
+        return True
 
     def finalize(self) -> str:
         if not self._chunks:
@@ -353,6 +396,48 @@ class ParakeetStreamingTranscriber:
     @property
     def helper_active(self) -> bool:
         return self.chunk_helper is not None
+
+    def mark_stream_fallback(self, reason: str) -> None:
+        self.chunk_helper = None
+        self.fallback_reason = reason
+
+    def process_stream_chunk(self, samples: np.ndarray, sample_rate: int) -> object:
+        helper = self.chunk_helper
+        if helper is None:
+            raise RuntimeError(self.fallback_reason or "streaming_helper_unavailable")
+        cfg = getattr(self.model, "_cfg", None) or getattr(self.model, "cfg", None)
+        model_sample_rate = int(_get_cfg_value(cfg, "sample_rate") or sample_rate)
+        if sample_rate != model_sample_rate:
+            raise ValueError("stream_sample_rate_mismatch")
+
+        from nemo.collections.asr.parts.utils.streaming_utils import AudioFeatureIterator
+
+        preprocessor = getattr(helper, "raw_preprocessor", None)
+        if preprocessor is None:
+            raise RuntimeError("streaming_preprocessor_unavailable")
+        frame_reader = AudioFeatureIterator(
+            samples,
+            self.chunk_secs,
+            preprocessor,
+            self.model.device,
+            pad_to_frame_len=False,
+        )
+        helper_class_name = self._helper_class_name or type(helper).__name__
+        if helper_class_name == "BatchedFrameASRTDT":
+            tokens_per_chunk, delay = self._tdt_streaming_params()
+            helper.set_frame_reader(frame_reader, 0)
+            return helper.transcribe(tokens_per_chunk, delay)
+        helper.set_frame_reader(frame_reader)
+        return helper.transcribe()
+
+    def _tdt_streaming_params(self) -> tuple[int, int]:
+        model_stride_secs = _model_stride_secs(self.model)
+        total_buffer_secs = self.chunk_secs + self.right_context_secs
+        tokens_per_chunk = math.ceil(self.chunk_secs / model_stride_secs)
+        delay = math.ceil(
+            (self.chunk_secs + (total_buffer_secs - self.chunk_secs) / 2) / model_stride_secs
+        )
+        return max(1, tokens_per_chunk), max(0, delay)
 
     def _init_helper(self) -> None:
         try:
@@ -490,8 +575,7 @@ class ParakeetStreamingTranscriber:
                 self.chunk_helper.reset()
             except Exception as exc:  # noqa: BLE001 - reset failures should not break sessions
                 logger.debug("Streaming helper reset failed, falling back to offline: {}", exc)
-                self.chunk_helper = None
-                self.fallback_reason = f"reset_failed:{exc.__class__.__name__}"
+                self.mark_stream_fallback(f"reset_failed:{exc.__class__.__name__}")
         return ParakeetStreamingSession(self, sample_rate)
 
     def _transcribe_offline(self, samples: np.ndarray, sample_rate: int) -> str:

@@ -57,6 +57,8 @@ pub enum ServerMessage {
         stream_helper_active: Option<bool>,
         stream_helper_scope: Option<String>,
         stream_fallback_reason: Option<String>,
+        stream_path_executed: Option<bool>,
+        stream_chunks_processed: Option<u64>,
         finalization_mode: Option<String>,
         final_audio_source: Option<String>,
         tail_trim_mode: Option<String>,
@@ -200,6 +202,8 @@ mod tests {
                 stream_helper_active,
                 stream_helper_scope,
                 stream_fallback_reason,
+                stream_path_executed,
+                stream_chunks_processed,
                 finalization_mode,
                 final_audio_source,
                 tail_trim_mode,
@@ -228,6 +232,8 @@ mod tests {
                 assert_eq!(stream_helper_active, None);
                 assert_eq!(stream_helper_scope, None);
                 assert_eq!(stream_fallback_reason, None);
+                assert_eq!(stream_path_executed, None);
+                assert_eq!(stream_chunks_processed, None);
                 assert_eq!(finalization_mode, None);
                 assert_eq!(final_audio_source, None);
                 assert_eq!(tail_trim_mode, None);
@@ -379,6 +385,8 @@ mod tests {
                 stream_helper_active: Some(false),
                 stream_helper_scope: Some("live_session_only".to_string()),
                 stream_fallback_reason: None,
+                stream_path_executed: Some(false),
+                stream_chunks_processed: Some(0),
                 finalization_mode: Some("offline_seal".to_string()),
                 final_audio_source: Some("canonical_session_audio".to_string()),
                 tail_trim_mode: Some("rms".to_string()),

@@ -41,6 +41,8 @@ class _FakeRuntimeTruth:
     stream_helper_class_name = "FakeStreamingHelper"
     stream_helper_scope = "live_session_only"
     stream_fallback_reason = None
+    stream_path_executed = False
+    stream_chunks_processed = 0
     finalization_mode = "offline_seal"
     final_audio_source = "canonical_session_audio"
     tail_trim_mode = "rms"
