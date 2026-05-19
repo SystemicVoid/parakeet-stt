@@ -3,7 +3,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // Keep wire-level message names aligned with protocol spec.
 pub enum ClientMessage {
