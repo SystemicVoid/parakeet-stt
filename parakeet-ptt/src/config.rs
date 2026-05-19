@@ -181,12 +181,14 @@ fn probe_overlay_capability_with_inputs(
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
     {
-        if let Some(capability) = parse_overlay_mode_override(raw_override) {
-            return capability;
+        if !raw_override.eq_ignore_ascii_case("auto") {
+            if let Some(capability) = parse_overlay_mode_override(raw_override) {
+                return capability;
+            }
+            return OverlayCapability::disabled(format!(
+                "overlay_mode_override_invalid:{raw_override}"
+            ));
         }
-        return OverlayCapability::disabled(format!(
-            "overlay_mode_override_invalid:{raw_override}"
-        ));
     }
 
     match probe_signals {
@@ -559,11 +561,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_overlay_capability_treats_empty_mode_env_as_auto() {
+    fn resolve_overlay_capability_treats_explicit_auto_mode_env_as_probe() {
         let capability = resolve_overlay_capability_with_inputs(
             Some(true),
             None,
-            Some(" "),
+            Some("auto"),
+            Ok(OverlayProbeSignals {
+                has_layer_shell: true,
+                has_wl_compositor: true,
+                has_xdg_wm_base: true,
+            }),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::LayerShell);
+        assert_eq!(capability.reason, "zwlr_layer_shell_v1_available");
+    }
+
+    #[test]
+    fn resolve_overlay_capability_treats_unset_mode_env_as_auto() {
+        let capability = resolve_overlay_capability_with_inputs(
+            Some(true),
+            None,
+            None,
             Ok(OverlayProbeSignals {
                 has_layer_shell: false,
                 has_wl_compositor: true,
@@ -576,6 +595,74 @@ mod tests {
             capability.reason,
             "zwlr_layer_shell_v1_unavailable_using_xdg_toplevel_fallback"
         );
+    }
+
+    #[test]
+    fn resolve_overlay_capability_treats_empty_mode_env_as_auto() {
+        let capability = resolve_overlay_capability_with_inputs(
+            Some(true),
+            None,
+            Some(""),
+            Ok(OverlayProbeSignals {
+                has_layer_shell: false,
+                has_wl_compositor: true,
+                has_xdg_wm_base: true,
+            }),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::FallbackWindow);
+        assert_eq!(
+            capability.reason,
+            "zwlr_layer_shell_v1_unavailable_using_xdg_toplevel_fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_capability_honors_forced_mode_env_values() {
+        for (raw_mode, expected_mode, expected_reason) in [
+            (
+                "layer-shell",
+                OverlayMode::LayerShell,
+                "overlay_mode_override:layer_shell",
+            ),
+            (
+                "fallback_window",
+                OverlayMode::FallbackWindow,
+                "overlay_mode_override:fallback_window",
+            ),
+            (
+                "disabled",
+                OverlayMode::Disabled,
+                "overlay_mode_override:disabled",
+            ),
+        ] {
+            let capability = resolve_overlay_capability_with_inputs(
+                Some(true),
+                None,
+                Some(raw_mode),
+                Err("probe should not run when mode override is forced".to_string()),
+            );
+
+            assert_eq!(capability.mode, expected_mode);
+            assert_eq!(capability.reason, expected_reason);
+        }
+    }
+
+    #[test]
+    fn resolve_overlay_capability_disables_invalid_non_empty_mode_env() {
+        let capability = resolve_overlay_capability_with_inputs(
+            Some(true),
+            None,
+            Some("bad-value"),
+            Ok(OverlayProbeSignals {
+                has_layer_shell: true,
+                has_wl_compositor: true,
+                has_xdg_wm_base: true,
+            }),
+        );
+
+        assert_eq!(capability.mode, OverlayMode::Disabled);
+        assert_eq!(capability.reason, "overlay_mode_override_invalid:bad-value");
     }
 
     #[test]

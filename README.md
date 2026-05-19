@@ -82,7 +82,7 @@ Default `stt` / `stt start` profile:
 
 Overlay backend mode override (both profiles):
 
-- `PARAKEET_OVERLAY_MODE=auto|layer-shell|fallback-window|disabled`
+- `PARAKEET_OVERLAY_MODE=auto|layer-shell|fallback-window|disabled` (`auto` probes Wayland overlay capability)
 
 Local LLM query mode overrides:
 

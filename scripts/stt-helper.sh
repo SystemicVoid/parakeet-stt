@@ -1123,7 +1123,7 @@ Other environment overrides:
   PARAKEET_PTT_RUSTFLAGS="$default_ptt_rustflags"
   PARAKEET_PTT_RUNNER_PREFERENCE=$default_ptt_runner_preference
   PARAKEET_OVERLAY_ENABLED=<true|false>
-  PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled>
+  PARAKEET_OVERLAY_MODE=<auto|layer-shell|fallback-window|disabled> (auto probes Wayland overlay capability)
 EOF
     }
 
