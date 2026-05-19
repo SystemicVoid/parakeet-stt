@@ -48,6 +48,7 @@ stt() {
         LOCAL_ENV_FILE="$REPO_ROOT/.parakeet-stt.local.env"
         if [ -f "$LOCAL_ENV_FILE" ]; then
             set -a
+            # shellcheck source=/dev/null
             . "$LOCAL_ENV_FILE" || {
                 local rc=$?
                 set +a
@@ -59,6 +60,7 @@ stt() {
 
         LOCAL_SHELL_FILE="$REPO_ROOT/.parakeet-stt.local.sh"
         if [ -f "$LOCAL_SHELL_FILE" ]; then
+            # shellcheck source=/dev/null
             . "$LOCAL_SHELL_FILE" || {
                 local rc=$?
                 echo "stt helper: failed to load $LOCAL_SHELL_FILE"
@@ -167,6 +169,11 @@ stt() {
         "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|"
         "llm-overlay-stream|llm_overlay_stream|default_llm_overlay_stream|PARAKEET_LLM_OVERLAY_STREAM|Stable controls|<v>|true|always|true"
     )
+    : "$default_injection_mode" "$default_paste_backend_failure_policy" "$default_uinput_dwell_ms"
+    : "$default_paste_seat" "$default_paste_write_primary" "$default_completion_sound"
+    : "$default_completion_sound_path" "$default_completion_sound_volume"
+    : "$default_llm_pre_modifier_key" "$default_llm_timeout_seconds" "$default_llm_max_tokens"
+    : "$default_llm_temperature" "$default_llm_system_prompt" "$default_llm_overlay_stream"
 
     export RUST_LOG="${RUST_LOG:-info}"
 
@@ -197,6 +204,7 @@ stt() {
             if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
                 default_overlay_adaptive_width="false"
             fi
+            : "$default_overlay_enabled" "$default_overlay_adaptive_width"
             return 0
         fi
 
@@ -220,6 +228,7 @@ stt() {
                 default_overlay_adaptive_width="false"
             fi
         fi
+        : "$default_overlay_enabled" "$default_overlay_adaptive_width"
     }
 
     _start_option_exists() {
@@ -281,36 +290,36 @@ stt() {
     }
 
     _build_ptt_args() {
-        local -n out_ref="$1"
+        local -n ptt_args_ref="$1"
         local include_endpoint="${2:-yes}"
         local row opt_name var_name include_policy
-        out_ref=()
+        ptt_args_ref=()
         if [ "$include_endpoint" = "yes" ]; then
-            out_ref+=(--endpoint "$DEFAULT_ENDPOINT")
+            ptt_args_ref+=(--endpoint "$DEFAULT_ENDPOINT")
         fi
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
                 continue
             fi
-            out_ref+=("--$opt_name" "${!var_name}")
+            ptt_args_ref+=("--$opt_name" "${!var_name}")
         done
     }
 
     _build_start_cli_args() {
-        local -n out_ref="$1"
+        local -n start_cli_args_ref="$1"
         local launch_profile="$2"
         local row opt_name var_name include_policy
-        out_ref=()
+        start_cli_args_ref=()
         case "$launch_profile" in
             offline)
-                out_ref+=(offline)
+                start_cli_args_ref+=(offline)
                 ;;
             cpu)
-                out_ref+=(cpu)
+                start_cli_args_ref+=(cpu)
                 ;;
             *)
-                out_ref+=(streaming)
+                start_cli_args_ref+=(streaming)
                 ;;
         esac
         for row in "${start_option_rows[@]}"; do
@@ -318,7 +327,7 @@ stt() {
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
                 continue
             fi
-            out_ref+=("--$opt_name" "${!var_name}")
+            start_cli_args_ref+=("--$opt_name" "${!var_name}")
         done
     }
 
@@ -425,19 +434,20 @@ stt() {
     }
 
     _resolve_start_launch_profile() {
-        local -n out_ref="$1"
+        local -n launch_profile_ref="$1"
         local candidate="${2:-}"
-        out_ref="stream-seal"
+        launch_profile_ref="stream-seal"
         case "$candidate" in
             stream|streaming|on)
                 return 0
                 ;;
             offline|off)
-                out_ref="offline"
+                launch_profile_ref="offline"
                 return 0
                 ;;
             cpu)
-                out_ref="cpu"
+                launch_profile_ref="cpu"
+                : "$launch_profile_ref"
                 return 0
                 ;;
             *)
@@ -605,18 +615,6 @@ PY
         [ "$ready" -eq 1 ]
     }
 
-    _wait_pid_alive() {
-        local pid_file="$1"
-        local tries="${2:-8}"
-        for _ in $(seq 1 "$tries"); do
-            if _pid_alive "$pid_file"; then
-                return 0
-            fi
-            sleep 0.5
-        done
-        return 1
-    }
-
     _wait_for_socket_gone() {
         local tries="${1:-20}"
         for _ in $(seq 1 "$tries"); do
@@ -631,7 +629,7 @@ PY
     _client_build_in_progress() {
         [ -f "$LOG_CLIENT" ] || return 1
         grep -Fq "[helper] running cargo run --release --bin parakeet-ptt" "$LOG_CLIENT" || return 1
-        grep -Eq 'Compiling |Finished `release` profile' "$LOG_CLIENT" || return 1
+        grep -Eq "Compiling |Finished \`release\` profile" "$LOG_CLIENT" || return 1
         grep -Fq 'Running `target/release/parakeet-ptt' "$LOG_CLIENT" && return 1
         return 0
     }
@@ -864,29 +862,29 @@ PY
     }
 
     _build_llm_server_args() {
-        local -n out_ref="$1"
-        out_ref=("$default_llm_server_bin")
+        local -n llm_server_args_ref="$1"
+        llm_server_args_ref=("$default_llm_server_bin")
         if [ -n "$default_llm_server_model_path" ]; then
-            out_ref+=(-m "$default_llm_server_model_path")
+            llm_server_args_ref+=(-m "$default_llm_server_model_path")
         fi
         if [ -n "$default_llm_server_model_alias" ]; then
-            out_ref+=(--alias "$default_llm_server_model_alias")
+            llm_server_args_ref+=(--alias "$default_llm_server_model_alias")
         fi
-        out_ref+=(
+        llm_server_args_ref+=(
             --host "$default_llm_server_host"
             --port "$default_llm_server_port"
             --ctx-size "$default_llm_server_ctx_size"
             --parallel "$default_llm_server_parallel"
         )
         if [ -n "$default_llm_server_gpu_layers" ]; then
-            out_ref+=(--gpu-layers "$default_llm_server_gpu_layers")
+            llm_server_args_ref+=(--gpu-layers "$default_llm_server_gpu_layers")
         fi
         if [ "$default_llm_server_metrics" = "true" ]; then
-            out_ref+=(--metrics)
+            llm_server_args_ref+=(--metrics)
         fi
         if [ -n "$default_llm_server_extra_args" ]; then
             eval "set -- $default_llm_server_extra_args"
-            out_ref+=("$@")
+            llm_server_args_ref+=("$@")
         fi
     }
 
@@ -917,7 +915,7 @@ PY
     }
 
     _ensure_llm_server() {
-        local llm_health_url owner
+        local llm_health_url owner llm_tmux_cmd_shell
         local -a llm_cmd llm_tmux_cmd
 
         if ! _llm_validate_server_config; then
@@ -953,16 +951,18 @@ PY
 
         llm_tmux_cmd=(
             env "LOG_LLM=$LOG_LLM" bash -lc
-            'echo "[helper] exec $*" >> "$LOG_LLM"; exec "$@" >> "$LOG_LLM" 2>&1'
+            "echo \"[helper] exec \$*\" >> \"\$LOG_LLM\"; exec \"\$@\" >> \"\$LOG_LLM\" 2>&1"
             _
             "${llm_cmd[@]}"
         )
+        printf -v llm_tmux_cmd_shell "%q " "${llm_tmux_cmd[@]}"
+        llm_tmux_cmd_shell="${llm_tmux_cmd_shell% }"
 
         echo "--- LLM session start: $(date -Is) ---" >> "$LOG_LLM"
         echo "[$(date -Is)] [helper] managed llama-server start" >> "$LOG_LLM"
 
         tmux new-session -d -s "$LLM_TMUX_SESSION" -n "$LLM_TMUX_WINDOW" -c "$REPO_ROOT" \
-            "$(_args_to_shell_words llm_tmux_cmd)"
+            "$llm_tmux_cmd_shell"
 
         echo -n "   - Waiting for llama-server health..."
         if _wait_for_http "$llm_health_url" "$LLM_PID_FILE" 120; then
@@ -1134,15 +1134,6 @@ Notes:
   - Keep workstation-specific llama settings in the ignored repo-local files.
   - 'stt llm' refuses mismatched LLM_BASE_URL vs managed host/port to avoid split-brain config.
 EOF
-    }
-
-    _declare_start_vars() {
-        # Declare all start option local variables at once.
-        local row var_name
-        for row in "${start_option_rows[@]}"; do
-            IFS='|' read -r _ var_name _ <<<"$row"
-            local "$var_name"
-        done
     }
 
     _build_client_cmd() {
@@ -1742,24 +1733,8 @@ EOF
                 echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
             fi
 
-            local client_cmd='
-                set -e
-                runner_bin=""
-                if [ "${RUNNER_MODE:-cargo}" = "release" ] && [ -x ./target/release/parakeet-ptt ]; then
-                    runner_bin="./target/release/parakeet-ptt"
-                else
-                    echo "[helper] running cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
-                fi
-
-                eval "set -- $PTT_ARGS_SHELL"
-                args=("$@")
-
-                if [ -n "$runner_bin" ]; then
-                    "$runner_bin" "${args[@]}" >> "$LOG_CLIENT" 2>&1
-                else
-                    RUSTFLAGS="${PTT_RUSTFLAGS}" cargo run --release --bin parakeet-ptt -- "${args[@]}" >> "$LOG_CLIENT" 2>&1
-                fi
-            '
+            local client_cmd
+            client_cmd="$(_build_client_cmd)"
 
             tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
             tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
@@ -1889,6 +1864,7 @@ EOF
                     local -a diag_args
 
                     _load_start_vars_from_defaults
+                    : "$llm_system_prompt"
                     injection_mode="paste"
                     _build_ptt_args ptt_args no
 
@@ -1932,12 +1908,12 @@ get_stt_start_args() {
     fi
     local out_name="$1"
     shift
-    local -n out_ref="$out_name"
-    out_ref=()
+    local -n start_args_out_ref="$out_name"
+    start_args_out_ref=()
     local output
     output="$(stt __start-cli-args "$@")" || return $?
     local arg
     while IFS= read -r arg; do
-        out_ref+=("$arg")
+        start_args_out_ref+=("$arg")
     done <<<"$output"
 }
