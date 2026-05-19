@@ -1998,7 +1998,10 @@ get_stt_start_args() {
     # __start-cli-args-shell emits one printf-%q encoded vector; eval rebuilds
     # the original array without treating embedded newlines as separators.
     local -a parsed_start_args
-    eval "parsed_start_args=($output)"
+    if ! eval "parsed_start_args=($output)"; then
+        echo "get_stt_start_args: failed to parse __start-cli-args-shell output" >&2
+        return 1
+    fi
     local arg
     for arg in "${parsed_start_args[@]}"; do
         start_args_out_ref+=("$arg")
