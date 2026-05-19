@@ -151,7 +151,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             settings.batch_size,
         )
     if args.check:
-        run_checks(settings)
+        try:
+            run_checks(settings)
+        except Exception as exc:  # noqa: BLE001 - CLI check should fail without traceback noise
+            logger.error("Startup checks failed: {}", exc)
+            raise SystemExit(1) from None
         return
 
     app = create_app(settings)
@@ -160,6 +164,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 def run_checks(settings: ServerSettings) -> None:
     logger.info("Running startup checks with settings: {}", settings)
+    failures: list[str] = []
     try:
         server = DaemonServer(settings)
     except Exception as exc:  # noqa: BLE001
@@ -173,12 +178,14 @@ def run_checks(settings: ServerSettings) -> None:
         orchestrator.audio.stop()
     except Exception as exc:  # noqa: BLE001
         logger.error("Audio stream check failed: {}", exc)
+        failures.append(f"audio stream check failed: {exc}")
 
     try:
         orchestrator.transcriber.warmup()
         logger.info("Model warmup completed")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Model warmup skipped/failed: {}", exc)
+        logger.error("Model warmup check failed: {}", exc)
+        failures.append(f"model warmup check failed: {exc}")
     if settings.vad_enabled:
         orchestrator.prepare_vad()
 
@@ -245,6 +252,9 @@ def run_checks(settings: ServerSettings) -> None:
             )
     else:
         logger.info("VAD trim: DISABLED")
+
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 if __name__ == "__main__":
