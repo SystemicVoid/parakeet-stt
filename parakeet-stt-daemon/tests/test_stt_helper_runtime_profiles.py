@@ -175,6 +175,9 @@ def _run_status_runtime_truth(payload_path: Path) -> dict[str, str]:
 
 def _status_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
+        "type": "status",
+        "state": "idle",
+        "sessions_active": 0,
         "device": "cuda",
         "effective_device": "cpu",
         "streaming_enabled": True,
@@ -353,6 +356,14 @@ def test_runtime_match_rejects_accelerator_when_cpu_requested() -> None:
     assert _run_runtime_match("cpu", "false", "false", "cuda", "false", "false") is False
 
 
+def test_runtime_match_accepts_missing_optional_overlay_truth() -> None:
+    assert _run_runtime_match("cuda", "true", "true", "cuda", "true", "") is True
+
+
+def test_runtime_match_rejects_present_overlay_mismatch() -> None:
+    assert _run_runtime_match("cuda", "true", "true", "cuda", "true", "false") is False
+
+
 def test_client_ready_once_rejects_pid_without_current_readiness_logs(tmp_path: Path) -> None:
     marker = "current-client-start"
     log_path = tmp_path / "client.log"
@@ -404,26 +415,7 @@ def test_client_ready_once_requires_current_hotkey_and_connection_logs(tmp_path:
 def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Path) -> None:
     payload_path = tmp_path / "status.json"
     payload_path.write_text(
-        json.dumps(
-            {
-                "device": "cuda",
-                "effective_device": "cpu",
-                "streaming_enabled": True,
-                "stream_helper_active": False,
-                "stream_helper_scope": "live_session_only",
-                "stream_fallback_reason": None,
-                "stream_path_executed": False,
-                "stream_chunks_processed": 0,
-                "chunk_secs": 2.4,
-                "finalization_mode": "offline_seal",
-                "final_audio_source": "canonical_session_audio",
-                "tail_trim_mode": "rms",
-                "vad_enabled": True,
-                "vad_active": False,
-                "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
-                "overlay_events_enabled": True,
-            }
-        ),
+        json.dumps(_status_payload()),
         encoding="utf-8",
     )
 
@@ -449,29 +441,41 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
     }
 
 
+def test_daemon_status_runtime_truth_accepts_minimal_protocol_status(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "status.json"
+    payload_path.write_text(
+        json.dumps({"type": "status", "state": "idle", "sessions_active": 0}),
+        encoding="utf-8",
+    )
+
+    truth = _run_status_runtime_truth(payload_path)
+
+    assert truth == {
+        "device": "",
+        "effective_device": "",
+        "streaming_enabled": "",
+        "stream_helper_active": "",
+        "stream_helper_scope": "",
+        "stream_fallback_reason": "",
+        "stream_path_executed": "",
+        "stream_chunks_processed": "",
+        "chunk_secs": "",
+        "finalization_mode": "",
+        "final_audio_source": "",
+        "tail_trim_mode": "",
+        "vad_enabled": "",
+        "vad_active": "",
+        "vad_fallback_reason": "",
+        "overlay_events_enabled": "",
+    }
+
+
 def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -> None:
     payload_path = tmp_path / "status.json"
     payload_path.write_text(
-        json.dumps(
-            {
-                "device": "cuda",
-                "effective_device": "cpu",
-                "streaming_enabled": True,
-                "stream_helper_active": False,
-                "stream_helper_scope": "live_session_only",
-                "stream_fallback_reason": None,
-                "stream_path_executed": False,
-                "stream_chunks_processed": 0,
-                "chunk_secs": "2.4000",
-                "finalization_mode": "offline_seal",
-                "final_audio_source": "canonical_session_audio",
-                "tail_trim_mode": "rms",
-                "vad_enabled": True,
-                "vad_active": False,
-                "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
-                "overlay_events_enabled": True,
-            }
-        ),
+        json.dumps(_status_payload(chunk_secs="2.4000")),
         encoding="utf-8",
     )
 
@@ -512,26 +516,7 @@ def test_daemon_status_runtime_truth_rejects_invalid_stream_chunk_count(
 def test_daemon_status_runtime_truth_rejects_non_finite_numeric_string(tmp_path: Path) -> None:
     payload_path = tmp_path / "status.json"
     payload_path.write_text(
-        json.dumps(
-            {
-                "device": "cuda",
-                "effective_device": "cpu",
-                "streaming_enabled": True,
-                "stream_helper_active": False,
-                "stream_helper_scope": "live_session_only",
-                "stream_fallback_reason": None,
-                "stream_path_executed": False,
-                "stream_chunks_processed": 0,
-                "chunk_secs": "inf",
-                "finalization_mode": "offline_seal",
-                "final_audio_source": "canonical_session_audio",
-                "tail_trim_mode": "rms",
-                "vad_enabled": True,
-                "vad_active": False,
-                "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
-                "overlay_events_enabled": True,
-            }
-        ),
+        json.dumps(_status_payload(chunk_secs="inf")),
         encoding="utf-8",
     )
 
@@ -543,26 +528,7 @@ def test_status_runtime_truth_rejects_non_finite_numeric_tokens(tmp_path: Path) 
     for index, chunk_secs in enumerate((float("inf"), float("-inf"), float("nan"))):
         payload_path = tmp_path / f"status-{index}.json"
         payload_path.write_text(
-            json.dumps(
-                {
-                    "device": "cuda",
-                    "effective_device": "cpu",
-                    "streaming_enabled": True,
-                    "stream_helper_active": False,
-                    "stream_helper_scope": "live_session_only",
-                    "stream_fallback_reason": None,
-                    "stream_path_executed": False,
-                    "stream_chunks_processed": 0,
-                    "chunk_secs": chunk_secs,
-                    "finalization_mode": "offline_seal",
-                    "final_audio_source": "canonical_session_audio",
-                    "tail_trim_mode": "rms",
-                    "vad_enabled": True,
-                    "vad_active": False,
-                    "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
-                    "overlay_events_enabled": True,
-                }
-            ),
+            json.dumps(_status_payload(chunk_secs=chunk_secs)),
             encoding="utf-8",
         )
 
