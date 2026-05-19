@@ -750,6 +750,20 @@ impl ClipboardInjector {
         }
     }
 
+    fn log_injection_start(&self, trace_id: u64, text: &str, requested_fingerprint: &str) {
+        info!(
+            trace_id,
+            mode = if self.copy_only { "copy-only" } else { "paste" },
+            key_backend = ?self.options.key_backend,
+            post_chord_hold_ms = self.options.post_chord_hold_ms,
+            seat = ?self.options.seat,
+            write_primary = self.options.write_primary,
+            len = text.len(),
+            fingerprint = %requested_fingerprint,
+            "starting clipboard injection"
+        );
+    }
+
     fn get_clipboard(options: &ClipboardOptions, primary: bool) -> Result<String> {
         injector_metrics()
             .wl_paste_spawn_total
@@ -1422,18 +1436,7 @@ impl TextInjector for ClipboardInjector {
             });
         };
 
-        info!(
-            trace_id,
-            mode = if self.copy_only { "copy-only" } else { "paste" },
-            key_backend = ?self.options.key_backend,
-            post_chord_hold_ms = self.options.post_chord_hold_ms,
-            seat = ?self.options.seat,
-            write_primary = self.options.write_primary,
-            len = text.len(),
-            fingerprint = %requested_fingerprint,
-            preview = %preview(text),
-            "starting clipboard injection"
-        );
+        self.log_injection_start(trace_id, text, &requested_fingerprint);
 
         // 1. Save existing clipboard(s) — kept for diagnostic logging only.
         let _original_clipboard = match Self::get_clipboard(&self.options, false) {
@@ -1855,23 +1858,6 @@ fn fingerprint(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn preview(text: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    let mut chars = text.chars();
-    let mut out = String::new();
-    for _ in 0..MAX_CHARS {
-        let Some(ch) = chars.next() else {
-            return out;
-        };
-        out.push(ch);
-    }
-
-    if chars.next().is_some() {
-        out.push_str("...");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1888,6 +1874,8 @@ mod tests {
     use std::io::Read;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
 
     fn test_options() -> ClipboardOptions {
@@ -1898,6 +1886,79 @@ mod tests {
             seat: None,
             write_primary: false,
         }
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedLogBuffer {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogBuffer {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl std::io::Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock should be available")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn injection_start_log_omits_transcript_preview_by_default() {
+        let injector = ClipboardInjector {
+            sender: PasteKeySender::Disabled,
+            options: test_options(),
+            copy_only: false,
+            wayland_focus_cache: None,
+            context: None,
+            forced_shortcut: None,
+        };
+        let transcript = "secret dictated text that must not enter logs";
+        let transcript_fingerprint = super::fingerprint(transcript);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(SharedLogWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            injector.log_injection_start(7, transcript, &transcript_fingerprint);
+        });
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .expect("log buffer lock should be available")
+                .clone(),
+        )
+        .expect("captured logs should be UTF-8");
+        assert!(logs.contains("starting clipboard injection"));
+        assert!(logs.contains(&format!("len={}", transcript.len())));
+        assert!(logs.contains(&format!("fingerprint={transcript_fingerprint}")));
+        assert!(!logs.contains(transcript));
+        assert!(!logs.contains("preview="));
     }
 
     #[test]
