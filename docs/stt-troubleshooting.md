@@ -79,7 +79,9 @@ the Helper should read those fields from `/status` instead of re-deriving them.
 - Successful runs show `/tmp/parakeet-ptt.log` entries like:
   - “Starting hotkey loop; press Right Ctrl to talk”
   - “Connected to daemon”
-  - Session start/stop and “final result received … latency_ms=xx”
+  - Session start/stop and “final result received … daemon_latency_ms=xx”
+  - Injector completion lines with `enqueue_to_injection_complete_ms`, `hotkey_up_elapsed_ms_at_completion`,
+    and `stop_message_elapsed_ms_at_completion`
 - The daemon log `/tmp/parakeet-daemon.log` consistently shows a healthy startup on `cuda`, audio capture starting, websocket accepted, and session start/stop pairs with reasonable inference times.
 - On failing runs, the client log was empty or missing; the helper reported a rebuild failure. No daemon errors were present during these failures.
 

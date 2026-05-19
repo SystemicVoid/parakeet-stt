@@ -373,7 +373,7 @@ pub async fn run_demo(
                 let to_inject = override_text.as_deref().unwrap_or(&text).to_string();
                 info!(
                     session = %session_id,
-                    latency_ms,
+                    daemon_latency_ms = latency_ms,
                     audio_ms,
                     "final result received"
                 );
@@ -610,7 +610,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             } if active_intent == Some(SessionIntent::LlmQuery) => {
                                                 info!(
                                                     session = %session_id,
-                                                    latency_ms,
+                                                    daemon_latency_ms = latency_ms,
                                                     audio_ms,
                                                     "final result received in llm_query mode"
                                                 );
@@ -870,10 +870,13 @@ fn handle_injection_report(
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
                 hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
                 stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
                 hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
                 stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
+                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
+                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
                 error = %error,
                 "injector worker reported failure"
             );
@@ -887,10 +890,13 @@ fn handle_injection_report(
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
                 hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
                 stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
                 hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
                 stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
+                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
+                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
                 "injector worker completed job"
             );
             audio_feedback.play_completion();
@@ -905,10 +911,13 @@ fn handle_injection_report(
                 queue_wait_ms = report.queue_wait_ms,
                 run_ms = report.run_ms,
                 total_worker_ms = report.total_worker_ms,
+                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
                 hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
                 stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
                 hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
                 stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
+                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
+                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
                 error = ?error,
                 "injector worker reported inconsistent error classification"
             );
@@ -1491,10 +1500,13 @@ mod tests {
                 queue_wait_ms: 1,
                 run_ms: 2,
                 total_worker_ms: 3,
+                enqueue_to_injection_complete_ms: 3,
                 hotkey_up_elapsed_ms_at_enqueue: None,
                 stop_message_elapsed_ms_at_enqueue: None,
                 hotkey_up_elapsed_ms_at_worker_start: None,
                 stop_message_elapsed_ms_at_worker_start: None,
+                hotkey_up_elapsed_ms_at_completion: None,
+                stop_message_elapsed_ms_at_completion: None,
                 error_kind: Some(InjectionErrorKind::BackendFailure),
                 error: Some("stage=backend synthetic failure".to_string()),
             },
