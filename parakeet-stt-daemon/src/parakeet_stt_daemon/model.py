@@ -262,13 +262,10 @@ class ParakeetTranscriber:
 
     def warmup(self) -> None:
         """Run a trivial forward pass to pay the first-use cost."""
-        try:
-            cfg = getattr(self.model, "_cfg", None)
-            sample_rate = getattr(cfg, "sample_rate", 16_000)
-            silence = np.zeros((sample_rate,), dtype=np.float32)
-            _ = self.transcribe_samples(silence, sample_rate=sample_rate)
-        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:  # pragma: no cover
-            logger.debug("Warmup skipped: {}", exc)
+        cfg = getattr(self.model, "_cfg", None)
+        sample_rate = getattr(cfg, "sample_rate", 16_000)
+        silence = np.zeros((sample_rate,), dtype=np.float32)
+        _ = self.transcribe_samples(silence, sample_rate=sample_rate)
 
     def transcribe_files(self, paths: Sequence[str], *, timestamps: bool = False) -> list[str]:
         if not paths:
