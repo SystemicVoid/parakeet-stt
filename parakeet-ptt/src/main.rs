@@ -1,6 +1,7 @@
 mod app;
 mod audio_feedback;
 mod client;
+mod client_session;
 mod config;
 mod hotkey;
 mod injector;
