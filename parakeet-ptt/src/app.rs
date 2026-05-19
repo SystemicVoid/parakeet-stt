@@ -94,6 +94,20 @@ pub struct HotkeyRuntime {
     _tasks: Option<HotkeyTasks>,
 }
 
+#[cfg(test)]
+impl HotkeyRuntime {
+    pub(crate) fn new_for_tests(events: mpsc::UnboundedReceiver<HotkeyEvent>) -> Self {
+        Self {
+            events,
+            listener_count: 1,
+            talk_key: evdev::Key::KEY_RIGHTCTRL,
+            llm_pre_modifier_keys: Vec::new(),
+            llm_pre_modifier_key_name: "KEY_SHIFT".to_string(),
+            _tasks: None,
+        }
+    }
+}
+
 pub trait HotkeySource: Send {
     fn start(&mut self, config: &ClientConfig) -> Result<HotkeyRuntime>;
 }
@@ -1070,24 +1084,25 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    use anyhow::anyhow;
     use clap::Parser;
-    use tokio::sync::mpsc;
     use tokio::task::yield_now;
     use tokio::time::timeout;
     use uuid::Uuid;
 
     use crate::audio_feedback::AudioFeedback;
+    use crate::client_runtime_fixtures::{
+        ClientRuntimeHarness, RecordingInjectionRunner, RecordingOverlaySink,
+    };
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
         PasteKeyBackend, PasteShortcut,
     };
-    use crate::hotkey::{HotkeyEvent, HotkeyIntent};
+    use crate::hotkey::HotkeyIntent;
     use crate::injector::{
         FailInjector, InjectorContext, ParentFocusCapture, PasteChordSender, PasteKeySender,
         TextInjector,
     };
-    use crate::overlay_router::{NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink};
+    use crate::overlay_router::{OverlayEvent, OverlayRouter};
     use crate::protocol::{ClientMessage, ServerMessage};
     use crate::state::PttState;
 
@@ -1098,12 +1113,11 @@ mod tests {
         InjectionJobRunner, InjectionOrigin, InjectionReport, InjectionRunError,
         InjectionRunOutput, InjectorSubprocessRunner, UinputSenderState,
     };
-    use crate::llm::{drain_sse_lines, sanitize_model_answer, LlmAnswerer, LlmProgress};
+    use crate::llm::{drain_sse_lines, sanitize_model_answer};
 
     use super::{
         clear_transient_session_state, handle_injection_report, maybe_defer_llm_session_end, run,
-        BoxFuture, CapturedParentFocus, ClientPorts, DaemonConnection, DaemonConnector,
-        HotkeyIntentDiagnostics, HotkeyRuntime, HotkeySource, SessionIntent, TransientSessionState,
+        CapturedParentFocus, HotkeyIntentDiagnostics, SessionIntent, TransientSessionState,
     };
 
     #[test]
@@ -1164,23 +1178,6 @@ mod tests {
         ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
-            Ok(InjectionRunOutput::default())
-        }
-    }
-
-    struct RecordingRunner {
-        seen: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl InjectionJobRunner for RecordingRunner {
-        fn run(
-            &self,
-            job: &InjectionJob,
-        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
-            self.seen
-                .lock()
-                .expect("recording lock should be available")
-                .push(job.text.to_string());
             Ok(InjectionRunOutput::default())
         }
     }
@@ -1334,126 +1331,6 @@ mod tests {
         path
     }
 
-    struct RecordingOverlaySink {
-        seen: Arc<Mutex<Vec<OverlayEvent>>>,
-    }
-
-    impl OverlaySink for RecordingOverlaySink {
-        fn on_overlay_event(&mut self, event: OverlayEvent) {
-            self.seen
-                .lock()
-                .expect("overlay recording lock should be available")
-                .push(event);
-        }
-    }
-
-    struct FakeHotkeySource {
-        events: Option<mpsc::UnboundedReceiver<HotkeyEvent>>,
-    }
-
-    impl FakeHotkeySource {
-        fn new(events: mpsc::UnboundedReceiver<HotkeyEvent>) -> Self {
-            Self {
-                events: Some(events),
-            }
-        }
-    }
-
-    impl HotkeySource for FakeHotkeySource {
-        fn start(&mut self, _config: &ClientConfig) -> anyhow::Result<HotkeyRuntime> {
-            Ok(HotkeyRuntime {
-                events: self
-                    .events
-                    .take()
-                    .expect("fake hotkey source should only be started once"),
-                listener_count: 1,
-                talk_key: evdev::Key::KEY_RIGHTCTRL,
-                llm_pre_modifier_keys: Vec::new(),
-                llm_pre_modifier_key_name: "KEY_SHIFT".to_string(),
-                _tasks: None,
-            })
-        }
-    }
-
-    struct FakeDaemonConnector {
-        connection: Mutex<Option<FakeDaemonConnection>>,
-    }
-
-    impl FakeDaemonConnector {
-        fn new(connection: FakeDaemonConnection) -> Self {
-            Self {
-                connection: Mutex::new(Some(connection)),
-            }
-        }
-    }
-
-    impl DaemonConnector for FakeDaemonConnector {
-        fn connect<'a>(
-            &'a self,
-            _config: &'a ClientConfig,
-        ) -> BoxFuture<'a, anyhow::Result<Box<dyn DaemonConnection>>> {
-            Box::pin(async move {
-                let connection = self
-                    .connection
-                    .lock()
-                    .expect("fake connection lock should be available")
-                    .take()
-                    .expect("fake connector should only be connected once");
-                Ok(Box::new(connection) as Box<dyn DaemonConnection>)
-            })
-        }
-    }
-
-    struct FakeDaemonConnection {
-        sent: mpsc::UnboundedSender<ClientMessage>,
-        incoming: mpsc::UnboundedReceiver<ServerMessage>,
-    }
-
-    impl DaemonConnection for FakeDaemonConnection {
-        fn send<'a>(&'a mut self, message: &'a ClientMessage) -> BoxFuture<'a, anyhow::Result<()>> {
-            Box::pin(async move {
-                let payload =
-                    serde_json::to_string(message).expect("client message should serialize");
-                let cloned = serde_json::from_str::<ClientMessage>(&payload)
-                    .expect("client message should deserialize");
-                self.sent
-                    .send(cloned)
-                    .map_err(|_| anyhow!("fake sent-message receiver dropped"))
-            })
-        }
-
-        fn next_message<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<Option<ServerMessage>>> {
-            Box::pin(async move { Ok(self.incoming.recv().await) })
-        }
-    }
-
-    struct FakeLlmAnswerer;
-
-    impl LlmAnswerer for FakeLlmAnswerer {
-        fn label(&self) -> String {
-            "fake-llm".to_string()
-        }
-
-        fn stream_answer<'a>(&'a self, _prompt: &'a str) -> crate::llm::LlmDeltaStream<'a> {
-            Box::pin(futures::stream::iter([Ok(crate::llm::LlmDelta {
-                content: "fake answer".to_string(),
-            })]))
-        }
-
-        fn health<'a>(&'a self) -> BoxFuture<'a, bool> {
-            Box::pin(async { false })
-        }
-
-        fn answer<'a>(
-            &'a self,
-            _session_id: Uuid,
-            _transcript: String,
-            _progress_tx: mpsc::UnboundedSender<LlmProgress>,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            Box::pin(async { Ok("fake answer".to_string()) })
-        }
-    }
-
     fn test_app_config() -> ClientConfig {
         ClientConfig::new(
             "test://daemon/ws",
@@ -1477,35 +1354,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn app_hotkey_press_sends_start_session_message() {
-        let config = test_app_config();
-        let (hotkey_tx, hotkey_rx) = mpsc::unbounded_channel();
-        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
-        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let ports = ClientPorts::new(
-            AudioFeedback::new(false, None, 0),
-            Arc::new(FakeDaemonConnector::new(FakeDaemonConnection {
-                sent: sent_tx,
-                incoming: incoming_rx,
-            })),
-            Arc::new(RecordingRunner {
-                seen: Arc::new(Mutex::new(Vec::new())),
-            }),
-            Box::new(NoopOverlaySink),
-            None,
-            Box::new(FakeHotkeySource::new(hotkey_rx)),
-            Arc::new(FakeLlmAnswerer),
-        );
+        let (config, ports, mut runtime) =
+            ClientRuntimeHarness::new(test_app_config()).into_parts();
 
         let app_task = tokio::spawn(run(config, ports));
-        hotkey_tx
-            .send(HotkeyEvent::Down {
-                intent: HotkeyIntent::Dictate,
-            })
-            .expect("fake hotkey event should send");
-        let sent = timeout(Duration::from_millis(250), sent_rx.recv())
-            .await
-            .expect("start_session should be sent")
-            .expect("sent-message channel should stay open");
+        runtime.send_hotkey_down(HotkeyIntent::Dictate);
+        let sent = runtime.next_sent_message(Duration::from_millis(250)).await;
         app_task.abort();
 
         match sent {
@@ -1523,18 +1377,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn app_injection_report_error_routes_failure_classification() {
-        let injector = Arc::new(RecordingRunner {
-            seen: Arc::new(Mutex::new(Vec::new())),
-        });
+        let (injector, _seen) = RecordingInjectionRunner::shared();
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
         let session_id = Uuid::new_v4();
-        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(
-            RecordingOverlaySink {
-                seen: Arc::clone(&seen_overlay_events),
-            },
-            None,
-        );
+        let (overlay_sink, seen_overlay_events) = RecordingOverlaySink::shared();
+        let mut overlay_router = OverlayRouter::new(overlay_sink, None);
 
         handle_injection_report(
             &worker,
@@ -2065,10 +1912,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn injector_worker_preserves_fifo_order() {
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let injector = Arc::new(RecordingRunner {
-            seen: Arc::clone(&seen),
-        });
+        let (injector, seen) = RecordingInjectionRunner::shared();
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
         worker
