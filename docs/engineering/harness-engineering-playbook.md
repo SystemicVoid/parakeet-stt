@@ -1,6 +1,6 @@
 # Harness Engineering Playbook
 
-_Last updated: 2026-02-27_
+_Last updated: 2026-05-19_
 
 ## Purpose
 
@@ -52,6 +52,19 @@ From "Harness engineering: leveraging Codex in an agent-first world" (OpenAI, 20
 - Dead code: Clippy in pre-push (`-D warnings`).
 - Dependency bloat: `cargo-udeps` in maintenance audits (not on every push).
 
+### Code-shape audit
+
+- `scripts/harness-maintenance.sh code-shape` reports oversized/mixed-responsibility risk surfaces.
+- The audit is warn-only: findings guide follow-up issue planning and do not fail the maintenance run.
+- Each finding includes file, LOC, category, threshold, and suggested owner/action.
+- Categories and current thresholds:
+  - `production-rust`: 900 LOC.
+  - `production-python`: 700 LOC.
+  - `shell`: 800 LOC.
+  - `tests`: 700 LOC.
+- Excluded paths: `.git/`, virtualenvs such as `.venv/` and `venv/`, `target/`, `node_modules/`, Python/Rust/tool caches such as `__pycache__/`, `.ruff_cache/`, `.pytest_cache/`, `.mypy_cache/`, `.ty/`, `.cache/`, vendor directories, and `docs/archive/`.
+- Actions are intentionally architectural rather than mechanical: apply the deletion test, deepen Module/Interface seams, improve Locality and test setup, and avoid arbitrary file splitting.
+
 ### Vulture policy
 
 - Vulture is one-off cleanup tooling only (not persistent in hooks).
@@ -65,6 +78,8 @@ From "Harness engineering: leveraging Codex in an agent-first world" (OpenAI, 20
 - Hook reminder: pre-commit runs `scripts/harness-maintenance.sh check --threshold 10`.
 - Full audit command:
   - `scripts/harness-maintenance.sh run`
+- Code-shape-only report:
+  - `scripts/harness-maintenance.sh code-shape`
 - State marker:
   - `.git/harness-maintenance.state` (local-only, untracked)
 
@@ -84,6 +99,7 @@ cargo +nightly udeps --manifest-path parakeet-ptt/Cargo.toml --all-targets
 
 # Maintenance loop
 scripts/harness-maintenance.sh check --threshold 10
+scripts/harness-maintenance.sh code-shape
 scripts/harness-maintenance.sh run
 scripts/harness-maintenance.sh mark
 ```

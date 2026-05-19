@@ -12,12 +12,15 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/harness-maintenance.sh check [--threshold N]
+  scripts/harness-maintenance.sh code-shape
   scripts/harness-maintenance.sh run
   scripts/harness-maintenance.sh mark
 
 Commands:
   check     Warn when maintenance audits are due (non-blocking, exits 0).
-  run       Run maintenance audits (deptry + cargo-udeps), then record current HEAD.
+  code-shape
+            Report oversized/mixed-responsibility surfaces (warn-only).
+  run       Run maintenance audits (code-shape + deptry + cargo-udeps), then record current HEAD.
   mark      Record current HEAD as audited without running checks.
 EOF
 }
@@ -79,8 +82,139 @@ parse_threshold_arg() {
     printf '%s\n' "${threshold}"
 }
 
+code_shape_find_files() {
+    find "${REPO_ROOT}" \
+        \( \
+            -type d \( \
+                -name ".git" -o \
+                -name ".venv" -o \
+                -name "venv" -o \
+                -name "target" -o \
+                -name ".ruff_cache" -o \
+                -name ".pytest_cache" -o \
+                -name ".mypy_cache" -o \
+                -name ".ty" -o \
+                -name "node_modules" -o \
+                -name "__pycache__" -o \
+                -name ".cache" -o \
+                -name "vendor" \
+            \) -o \
+            -path "${REPO_ROOT}/docs/archive" \
+        \) -prune -o \
+        -type f \( -name "*.rs" -o -name "*.py" -o -name "*.sh" \) -print
+}
+
+code_shape_category() {
+    local relative_path="$1"
+
+    case "${relative_path}" in
+        */tests/*|tests/*|test_*.py|*_test.py|*_test.rs|*/test_*.py)
+            printf '%s|%s\n' "tests" "700"
+            ;;
+        scripts/*.sh)
+            printf '%s|%s\n' "shell" "800"
+            ;;
+        parakeet-ptt/src/*.rs)
+            printf '%s|%s\n' "production-rust" "900"
+            ;;
+        parakeet-stt-daemon/src/*.py|parakeet-stt-daemon/check_model.py|parakeet-stt-daemon/check_model_lib/*.py|parakeet-stt-daemon/scripts/*.py)
+            printf '%s|%s\n' "production-python" "700"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+code_shape_action() {
+    local relative_path="$1"
+    local category="$2"
+
+    case "${relative_path}" in
+        parakeet-ptt/src/app.rs)
+            echo "Client runtime owner: keep extracting deep Session/Overlay/Injection policy Modules with focused tests."
+            ;;
+        parakeet-ptt/src/overlay_renderer.rs)
+            echo "Overlay owner: prefer pure/data-only layout, glyph, animation, or frame-math extractions before Wayland runtime work."
+            ;;
+        parakeet-ptt/src/injector.rs|parakeet-ptt/src/injector_runtime.rs)
+            echo "Injection owner: isolate report, telemetry, subprocess, uinput, or route policy seams without changing #26 timeout policy."
+            ;;
+        scripts/stt-helper.sh)
+            echo "Helper owner: validate source-of-truth rows and env wiring before any split."
+            ;;
+        parakeet-stt-daemon/src/parakeet_stt_daemon/session_orchestrator.py)
+            echo "Daemon owner: extract finalization or Runtime truth seams only when tests need narrower setup."
+            ;;
+        *)
+            case "${category}" in
+                production-rust)
+                    echo "Rust owner: apply the deletion test; deepen Module/Interface seams before splitting by LOC."
+                    ;;
+                production-python)
+                    echo "Python owner: extract cohesive policy seams only when they improve Locality or test setup."
+                    ;;
+                shell)
+                    echo "Shell owner: audit validation/source-of-truth boundaries before splitting functions."
+                    ;;
+                tests)
+                    echo "Test owner: move reusable fixtures/helpers out before splitting scenario coverage."
+                    ;;
+                *)
+                    echo "Owner: inspect for mixed responsibilities and add a focused follow-up before refactoring."
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+code_shape_findings() {
+    local file
+    while IFS= read -r file; do
+        local relative_path="${file#"${REPO_ROOT}/"}"
+        local category_line
+        if ! category_line="$(code_shape_category "${relative_path}")"; then
+            continue
+        fi
+
+        local category
+        local threshold
+        IFS="|" read -r category threshold <<<"${category_line}"
+
+        local loc
+        loc="$(wc -l <"${file}")"
+        loc="${loc//[[:space:]]/}"
+        if (( loc < threshold )); then
+            continue
+        fi
+
+        local action
+        action="$(code_shape_action "${relative_path}" "${category}")"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${category}" "${loc}" "${threshold}" "${relative_path}" "${action}"
+    done < <(code_shape_find_files)
+}
+
+run_code_shape_audit() {
+    echo "Running code-shape audit (warn-only)..."
+    echo "Category | LOC | Threshold | File | Suggested owner/action"
+    echo "--- | ---: | ---: | --- | ---"
+
+    local finding_count=0
+    while IFS=$'\t' read -r category loc threshold relative_path action; do
+        printf '%s | %s | %s | %s | %s\n' "${category}" "${loc}" "${threshold}" "${relative_path}" "${action}"
+        finding_count=$((finding_count + 1))
+    done < <(code_shape_findings | sort -t $'\t' -k1,1 -k2,2nr -k4,4)
+
+    if (( finding_count == 0 )); then
+        echo "No code-shape findings exceeded current warn-only thresholds."
+    fi
+
+    log_line "code-shape audit completed: findings=${finding_count}"
+}
+
 run_checks() {
     echo "Running harness maintenance audits..."
+    run_code_shape_audit
     (
         cd "${REPO_ROOT}/parakeet-stt-daemon"
         uv run deptry .
@@ -135,6 +269,13 @@ main() {
             local threshold
             threshold="$(parse_threshold_arg "$@")"
             check_due "${threshold}"
+            ;;
+        code-shape)
+            if [[ $# -gt 0 ]]; then
+                echo "Unexpected arguments for 'code-shape': $*" >&2
+                exit 2
+            fi
+            run_code_shape_audit
             ;;
         run)
             if [[ $# -gt 0 ]]; then
