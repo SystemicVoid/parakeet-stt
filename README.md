@@ -210,9 +210,10 @@ Hook stages are split for speed:
 Maintenance audits (warned every 10 commits, non-blocking):
 ```bash
 scripts/harness-maintenance.sh check --threshold 10
+scripts/harness-maintenance.sh code-shape
 scripts/harness-maintenance.sh run
 ```
-`run` executes `deptry` and `cargo +nightly udeps`; install `cargo-udeps` first with `cargo install cargo-udeps`.
+`code-shape` reports oversized/mixed-responsibility surfaces and exits 0. `run` executes the warn-only code-shape audit, `deptry`, and `cargo +nightly udeps`; install `cargo-udeps` first with `cargo install cargo-udeps`.
 
 Manual injector validation:
 ```bash
