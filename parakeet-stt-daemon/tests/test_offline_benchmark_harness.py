@@ -8,9 +8,12 @@ import importlib.util
 import sys
 import wave
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
+
+from parakeet_stt_daemon.model import ParakeetTranscriber
 
 _CHECK_MODEL_PATH = Path(__file__).resolve().parents[1] / "check_model.py"
 _SPEC = importlib.util.spec_from_file_location("check_model", _CHECK_MODEL_PATH)
@@ -21,15 +24,18 @@ sys.modules[_SPEC.name] = _CHECK_MODEL
 _SPEC.loader.exec_module(_CHECK_MODEL)
 
 _CONSTANTS = importlib.import_module("check_model_lib.constants")
+_CORPUS = importlib.import_module("check_model_lib.corpus")
 _RUNNER = importlib.import_module("check_model_lib.runner")
 _RUNTIME = importlib.import_module("check_model_lib.runtime")
 
+BenchmarkCase = _CORPUS.BenchmarkCase
 PROBE_STREAM_BATCH_SIZE = _CONSTANTS.PROBE_STREAM_BATCH_SIZE
 PROBE_STREAM_CHUNK_SECS = _CONSTANTS.PROBE_STREAM_CHUNK_SECS
 PROBE_STREAM_LEFT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_LEFT_CONTEXT_SECS
 PROBE_STREAM_RIGHT_CONTEXT_SECS = _CONSTANTS.PROBE_STREAM_RIGHT_CONTEXT_SECS
 SAMPLE_RATE = _CONSTANTS.SAMPLE_RATE
 read_wav_samples = _RUNTIME._read_wav_samples
+run_benchmark_once = _RUNNER._run_benchmark_once
 run_streaming_probe = _RUNNER.run_streaming_probe
 split_chunks = _RUNTIME.split_chunks
 write_wav = _RUNTIME.write_wav
@@ -583,6 +589,43 @@ def test_read_wav_samples_falls_back_on_expected_soundfile_read_errors(
 
     assert sample_rate == SAMPLE_RATE
     np.testing.assert_allclose(samples, np.array([0.0, 0.5], dtype=np.float32))
+
+
+def test_offline_benchmark_surfaces_non_16khz_transcribe_error(tmp_path: Path, monkeypatch) -> None:
+    class _ArrayOnlyModel:
+        def __init__(self) -> None:
+            self.cfg = argparse.Namespace(sample_rate=SAMPLE_RATE)
+
+        def transcribe(self, audio, **_kwargs):  # noqa: ANN001, ANN003
+            if isinstance(audio, list) and audio and isinstance(audio[0], np.ndarray):
+                return ["ok"]
+            raise AssertionError("unexpected benchmark transcription input")
+
+    audio_path = tmp_path / "sample_01.wav"
+    audio_path.write_bytes(b"not used because read is patched")
+    monkeypatch.setattr(
+        _RUNNER,
+        "_read_wav_samples",
+        lambda _path: (np.array([0.1, 0.2, 0.3], dtype=np.float32), 8_000),
+    )
+
+    with pytest.raises(ValueError, match=r"sample rate.*8000.*16000"):
+        run_benchmark_once(
+            cases=[
+                BenchmarkCase(
+                    sample_id="sample_01",
+                    audio_path=audio_path,
+                    reference="ok",
+                )
+            ],
+            transcriber=ParakeetTranscriber(model=cast(Any, _ArrayOnlyModel())),
+            streaming_transcriber=None,
+            bench_runtime="offline",
+            stream_silence_floor_db=-40.0,
+            stream_max_tail_trim_secs=0.35,
+            warmup_samples=0,
+            run_index=0,
+        )
 
 
 def test_split_chunks_rejects_non_positive_chunk_size() -> None:
