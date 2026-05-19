@@ -15,7 +15,7 @@ use crate::injector_runtime::{
     InjectionJob, InjectionJobRunner, InjectionRunError, InjectionRunOutput,
 };
 use crate::llm::{LlmAnswerer, LlmDelta, LlmDeltaStream, LlmProgress};
-use crate::overlay_router::{NoopOverlaySink, OverlayEvent, OverlaySink};
+use crate::overlay_router::{OverlayEvent, OverlaySink};
 use crate::protocol::{ClientMessage, ServerMessage};
 
 type TestBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -31,7 +31,8 @@ impl ClientRuntimeHarness {
         let (hotkey_tx, hotkey_rx) = mpsc::unbounded_channel();
         let (sent_tx, sent_rx) = mpsc::unbounded_channel();
         let (daemon_tx, daemon_rx) = mpsc::unbounded_channel();
-        let (injection_runner, _seen_injections) = RecordingInjectionRunner::shared();
+        let (injection_runner, injections) = RecordingInjectionRunner::shared();
+        let (overlay_sink, overlay_events) = RecordingOverlaySink::shared();
         let ports = ClientPorts::new(
             AudioFeedback::new(false, None, 0),
             Arc::new(TestDaemonConnector::new(TestDaemonConnection {
@@ -39,7 +40,7 @@ impl ClientRuntimeHarness {
                 incoming: daemon_rx,
             })),
             injection_runner,
-            Box::new(NoopOverlaySink),
+            Box::new(overlay_sink),
             None,
             Box::new(TestHotkeySource::new(hotkey_rx)),
             Arc::new(TestLlmAnswerer),
@@ -51,6 +52,8 @@ impl ClientRuntimeHarness {
             controls: ClientRuntimeControls {
                 hotkey_tx,
                 sent_rx,
+                injections,
+                overlay_events,
                 _daemon_tx: daemon_tx,
             },
         }
@@ -64,6 +67,8 @@ impl ClientRuntimeHarness {
 pub(crate) struct ClientRuntimeControls {
     hotkey_tx: mpsc::UnboundedSender<HotkeyEvent>,
     sent_rx: mpsc::UnboundedReceiver<ClientMessage>,
+    injections: Arc<Mutex<Vec<String>>>,
+    overlay_events: Arc<Mutex<Vec<OverlayEvent>>>,
     _daemon_tx: mpsc::UnboundedSender<ServerMessage>,
 }
 
@@ -79,6 +84,20 @@ impl ClientRuntimeControls {
             .await
             .expect("client message should be sent before timeout")
             .expect("sent-message channel should stay open")
+    }
+
+    pub(crate) fn recorded_injections(&self) -> Vec<String> {
+        self.injections
+            .lock()
+            .expect("recorded injection lock should be available")
+            .clone()
+    }
+
+    pub(crate) fn recorded_overlay_events(&self) -> Vec<OverlayEvent> {
+        self.overlay_events
+            .lock()
+            .expect("recorded overlay lock should be available")
+            .clone()
     }
 }
 
@@ -192,11 +211,8 @@ struct TestDaemonConnection {
 impl DaemonConnection for TestDaemonConnection {
     fn send<'a>(&'a mut self, message: &'a ClientMessage) -> TestBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            let payload = serde_json::to_string(message).expect("client message should serialize");
-            let cloned = serde_json::from_str::<ClientMessage>(&payload)
-                .expect("client message should deserialize");
             self.sent
-                .send(cloned)
+                .send(message.clone())
                 .map_err(|_| anyhow!("test sent-message receiver dropped"))
         })
     }

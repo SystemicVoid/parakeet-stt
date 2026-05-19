@@ -1319,10 +1319,10 @@ mod tests {
         file.as_file()
             .sync_all()
             .expect("test script should sync before execution");
-        let path = file
-            .into_temp_path()
+        let (persisted_file, path) = file
             .keep()
             .expect("test script path should persist until test cleanup");
+        drop(persisted_file);
         let mut perms = fs::metadata(&path)
             .expect("test script should exist")
             .permissions();
@@ -1361,6 +1361,15 @@ mod tests {
         runtime.send_hotkey_down(HotkeyIntent::Dictate);
         let sent = runtime.next_sent_message(Duration::from_millis(250)).await;
         app_task.abort();
+
+        assert!(
+            runtime.recorded_injections().is_empty(),
+            "start-session hotkey path should not enqueue Injection"
+        );
+        assert!(
+            runtime.recorded_overlay_events().is_empty(),
+            "start-session hotkey path should not emit Overlay events before Daemon response"
+        );
 
         match sent {
             ClientMessage::StartSession {
