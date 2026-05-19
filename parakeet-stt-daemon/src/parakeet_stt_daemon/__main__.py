@@ -226,9 +226,10 @@ def run_checks(settings: ServerSettings) -> None:
     if settings.streaming_enabled:
         if runtime_truth.stream_helper_active:
             logger.info(
-                "Live session helper: ACTIVE (class={}, scope={})",
+                "Live session helper: READY (class={}, scope={}, stream_path_executed={})",
                 runtime_truth.stream_helper_class_name,
                 runtime_truth.stream_helper_scope,
+                runtime_truth.stream_path_executed,
             )
         else:
             logger.warning(

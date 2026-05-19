@@ -1032,6 +1032,8 @@ struct StatusInfo {
     streaming_enabled: Option<bool>,
     stream_helper_active: Option<bool>,
     stream_fallback_reason: Option<String>,
+    stream_path_executed: Option<bool>,
+    stream_chunks_processed: Option<u64>,
     chunk_secs: Option<f64>,
     active_session_age_ms: Option<u64>,
     audio_stop_ms: Option<u64>,
@@ -1058,7 +1060,8 @@ async fn fetch_status_once(config: &ClientConfig) {
             Ok(status) => {
                 info!(
                     "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
-streaming={:?}, helper_active={:?}, fallback={:?}, chunk_secs={:?}, active_age_ms={:?}, \
+streaming={:?}, helper_active={:?}, stream_path_executed={:?}, stream_chunks_processed={:?}, \
+fallback={:?}, chunk_secs={:?}, active_age_ms={:?}, \
 audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, send_ms={:?}, last_audio_ms={:?}, \
 last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
                     status.state,
@@ -1067,6 +1070,8 @@ last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
                     status.effective_device,
                     status.streaming_enabled,
                     status.stream_helper_active,
+                    status.stream_path_executed,
+                    status.stream_chunks_processed,
                     status.stream_fallback_reason,
                     status.chunk_secs,
                     status.active_session_age_ms,

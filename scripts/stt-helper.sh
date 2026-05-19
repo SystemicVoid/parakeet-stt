@@ -764,6 +764,8 @@ fields = (
     "stream_helper_active",
     "stream_helper_scope",
     "stream_fallback_reason",
+    "stream_path_executed",
+    "stream_chunks_processed",
     "chunk_secs",
     "finalization_mode",
     "final_audio_source",
@@ -776,12 +778,14 @@ fields = (
 bool_fields = {
     "streaming_enabled",
     "stream_helper_active",
+    "stream_path_executed",
     "vad_enabled",
     "vad_active",
     "overlay_events_enabled",
 }
 numeric_fields = {
     "chunk_secs",
+    "stream_chunks_processed",
 }
 for key in fields:
     if key not in payload:

@@ -135,6 +135,11 @@ class SessionOrchestrator:
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
+        self._current_stream_chunks_processed = 0
+        self._current_stream_fallback_reason: str | None = None
+        self._last_stream_path_executed = False
+        self._last_stream_chunks_processed = 0
+        self._last_stream_fallback_reason: str | None = None
         self._session_guard_task: asyncio.Task | None = None
         self._session_guard_running = False
         self._last_audio_ms: int | None = None
@@ -180,13 +185,15 @@ class SessionOrchestrator:
         try:
             self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
+            self._reset_current_stream_runtime()
             self._clear_overlay_session_runtime(message.session_id)
             self.audio.start_session()
-            if self.streaming_transcriber:
-                self._active_stream = self.streaming_transcriber.start_session(
-                    self.audio.sample_rate
-                )
+            streaming_transcriber = self.streaming_transcriber
+            if self._streaming_helper_available() and streaming_transcriber is not None:
+                self._active_stream = streaming_transcriber.start_session(self.audio.sample_rate)
                 self._start_stream_drain_loop(event_sink, message.session_id)
+            else:
+                self._current_stream_fallback_reason = self._stream_fallback_reason_from_runtime()
             self._start_session_guard_loop(event_sink, message.session_id, owner_token=owner_token)
 
             await event_sink.emit(
@@ -268,6 +275,7 @@ class SessionOrchestrator:
             audio_stop_started = time.perf_counter()
             audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
             await self._stop_stream_drain_loop()
+            self._record_stream_runtime_result()
             # Final correctness must come from the capture layer's canonical buffer,
             # not whatever the drain task managed to mirror into `_active_stream`.
             self._active_stream = None
@@ -491,6 +499,7 @@ class SessionOrchestrator:
                 await self.sessions.clear(active_session_id, owner_token=active_owner_token)
                 self._clear_overlay_session_runtime(active_session_id)
             self._active_stream = None
+            self._reset_current_stream_runtime()
             self._live_interim_audio = np.zeros((0,), dtype=np.float32)
             self._live_interim_failed = False
             if active_session_id is not None and event_sink is not None and session_end_reason:
@@ -936,6 +945,54 @@ class SessionOrchestrator:
         finally:
             _release_cuda_cache(effective_device)
 
+    def _reset_current_stream_runtime(self) -> None:
+        self._current_stream_chunks_processed = 0
+        self._current_stream_fallback_reason = None
+
+    def _streaming_helper_available(self) -> bool:
+        transcriber = getattr(self, "streaming_transcriber", None)
+        return transcriber is not None and bool(getattr(transcriber, "helper_active", False))
+
+    def _stream_fallback_reason_from_runtime(self) -> str | None:
+        if not bool(getattr(self.settings, "streaming_enabled", False)):
+            return None
+        transcriber = getattr(self, "streaming_transcriber", None)
+        if transcriber is None:
+            return "streaming_transcriber_unavailable"
+        fallback_reason = getattr(transcriber, "fallback_reason", None)
+        if fallback_reason is not None:
+            return fallback_reason
+        if not bool(getattr(transcriber, "helper_active", False)):
+            return "streaming_helper_inactive"
+        return None
+
+    def _record_stream_runtime_result(self) -> None:
+        chunks_processed = int(getattr(self, "_current_stream_chunks_processed", 0))
+        fallback_reason = getattr(self, "_current_stream_fallback_reason", None)
+        active_stream = getattr(self, "_active_stream", None)
+        if active_stream is not None and fallback_reason is None:
+            fallback_reason = getattr(active_stream, "stream_fallback_reason", None)
+        if bool(getattr(self.settings, "streaming_enabled", False)):
+            if fallback_reason is None:
+                fallback_reason = self._stream_fallback_reason_from_runtime()
+            if chunks_processed <= 0 and fallback_reason is None:
+                fallback_reason = "stream_path_not_exercised:no_chunks"
+        else:
+            fallback_reason = None
+        self._last_stream_chunks_processed = chunks_processed
+        self._last_stream_path_executed = chunks_processed > 0
+        self._last_stream_fallback_reason = fallback_reason
+
+    async def _feed_stream_chunk(self, stream: ParakeetStreamingSession, chunk: np.ndarray) -> None:
+        async with self._inference_lock_for_runtime():
+            processed = await asyncio.to_thread(stream.feed, chunk)
+        if processed:
+            self._current_stream_chunks_processed += 1
+            return
+        reason = getattr(stream, "stream_fallback_reason", None)
+        if reason is not None:
+            self._current_stream_fallback_reason = reason
+
     def _start_stream_drain_loop(self, event_sink: EventSink, session_id: UUID) -> None:
         if self._stream_drain_task is not None:
             return
@@ -947,9 +1004,10 @@ class SessionOrchestrator:
                 if audio_levels:
                     await self._emit_audio_level(event_sink, session_id, max(audio_levels))
                 chunks = self.audio.take_stream_chunks()
-                if self._active_stream:
+                active_stream = self._active_stream
+                if active_stream is not None:
                     for chunk in chunks:
-                        self._active_stream.feed(chunk)
+                        await self._feed_stream_chunk(active_stream, chunk)
                         await self._emit_live_interim_from_chunk(event_sink, session_id, chunk)
                 await asyncio.sleep(0.05)
 
