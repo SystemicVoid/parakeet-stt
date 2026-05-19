@@ -28,15 +28,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::audio_feedback::AudioFeedback;
 use crate::config::{
-    resolve_overlay_adaptive_width, resolve_overlay_capability, ClientConfig, ClipboardOptions,
-    InjectionConfig, OverlayMode, DEFAULT_ENDPOINT,
+    default_daemon_websocket_endpoint, resolve_overlay_adaptive_width, resolve_overlay_capability,
+    ClientConfig, ClipboardOptions, InjectionConfig, OverlayMode,
 };
 use crate::injector::{InjectorContext, INJECTOR_CONTEXT_ENV};
 use crate::surface_focus::WaylandFocusCache;
 use parakeet_ptt::overlay_renderer::INTERNAL_OVERLAY_MODE_ARG;
 
 const DEFAULT_LLM_PRE_MODIFIER_KEY: &str = "KEY_SHIFT";
-const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_LLM_MODEL: &str = "local";
 const DEFAULT_LLM_SYSTEM_PROMPT: &str =
     "You are a concise assistant. Return only the final answer text for direct insertion.";
@@ -49,7 +48,7 @@ const DEFAULT_LLM_SYSTEM_PROMPT: &str =
 )]
 struct Cli {
     /// WebSocket endpoint exposed by parakeet-stt-daemon
-    #[arg(long, default_value = DEFAULT_ENDPOINT)]
+    #[arg(long, default_value_t = default_daemon_websocket_endpoint())]
     endpoint: String,
 
     /// Optional shared secret to send as x-parakeet-secret
@@ -149,7 +148,7 @@ struct Cli {
     overlay_adaptive_width: Option<bool>,
 
     /// Base URL for llama-server OpenAI-compatible API.
-    #[arg(long, default_value = DEFAULT_LLM_BASE_URL)]
+    #[arg(long, default_value_t = llm::default_llm_base_url())]
     llm_base_url: String,
 
     /// Model name passed to llama-server.
@@ -426,4 +425,77 @@ async fn run_client_app(
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::process::Command;
+
+    fn helper_runtime_config() -> BTreeMap<String, String> {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("manifest dir should have repo parent");
+        let helper_path = repo_root.join("scripts/stt-helper.sh");
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg("source \"$1\" && stt __start-runtime-config")
+            .arg("bash")
+            .arg(helper_path)
+            .current_dir(repo_root)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("PARAKEET_ROOT", repo_root)
+            .env("_STT_SKIP_LOCAL_OVERRIDES", "1");
+
+        let output = command
+            .output()
+            .expect("helper runtime config command should run");
+        assert!(
+            output.status.success(),
+            "helper runtime config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8(output.stdout)
+            .expect("helper output should be UTF-8")
+            .lines()
+            .map(|line| {
+                let (key, value) = line
+                    .split_once('=')
+                    .expect("helper runtime config lines should be key=value");
+                (key.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn client_endpoint_defaults_match_helper_runtime_config() {
+        let cli = Cli::try_parse_from(["parakeet-ptt"]).expect("default CLI should parse");
+        let helper = helper_runtime_config();
+        let default_status_url = crate::config::default_daemon_status_url();
+        let default_llm_health_url = llm::default_managed_llm_health_url();
+
+        assert_eq!(cli.endpoint, default_daemon_websocket_endpoint());
+        assert_eq!(
+            helper.get("daemon_websocket_endpoint").map(String::as_str),
+            Some(cli.endpoint.as_str())
+        );
+        assert_eq!(
+            helper.get("daemon_status_url").map(String::as_str),
+            Some(default_status_url.as_str())
+        );
+        assert_eq!(cli.llm_base_url, llm::default_llm_base_url());
+        assert_eq!(
+            helper.get("llm_base_url").map(String::as_str),
+            Some(cli.llm_base_url.as_str())
+        );
+        assert_eq!(
+            helper.get("llm_health_url").map(String::as_str),
+            Some(default_llm_health_url.as_str())
+        );
+    }
 }

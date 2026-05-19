@@ -99,7 +99,7 @@ This document is the single source of truth for the local, push-to-talk Parakeet
   - Quick smoke (from any directory):
     - `repo=/path/to/parakeet-stt`
     - `(cd "$repo/parakeet-stt-daemon" && uv run parakeet-stt-daemon --check)`
-    - `(cd "$repo/parakeet-stt-daemon" && uv run parakeet-stt-daemon --host 127.0.0.1 --port 8765)`  # requires inference extra
+    - `(cd "$repo/parakeet-stt-daemon" && uv run parakeet-stt-daemon)`  # requires inference extra
     - In another shell: `(cd "$repo/parakeet-ptt" && cargo run --release)` (or `cargo run --manifest-path "$repo/parakeet-ptt/Cargo.toml" --release`)
     - Watch logs for `start_session`/`final_result`.
 

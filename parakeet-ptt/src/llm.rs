@@ -15,6 +15,12 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub(crate) const DEFAULT_LLM_HOST: &str = "127.0.0.1";
+pub(crate) const DEFAULT_LLM_PORT: u16 = 8080;
+const LLM_API_PATH: &str = "/v1";
+#[cfg(test)]
+const MANAGED_LLM_HEALTH_PATH: &str = "/health";
+
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[allow(dead_code)]
 pub type LlmDeltaStream<'a> = BoxStream<'a, Result<LlmDelta>>;
@@ -134,6 +140,19 @@ pub enum LlmProgress {
 
 pub fn build_http_llm_answerer(config: LlmRuntimeConfig) -> Arc<dyn LlmAnswerer> {
     Arc::new(HttpLlmAnswerer::new(config))
+}
+
+pub(crate) fn llm_api_base_url(host: &str, port: u16) -> String {
+    format!("http://{host}:{port}{LLM_API_PATH}")
+}
+
+pub(crate) fn default_llm_base_url() -> String {
+    llm_api_base_url(DEFAULT_LLM_HOST, DEFAULT_LLM_PORT)
+}
+
+#[cfg(test)]
+pub(crate) fn default_managed_llm_health_url() -> String {
+    format!("http://{DEFAULT_LLM_HOST}:{DEFAULT_LLM_PORT}{MANAGED_LLM_HEALTH_PATH}")
 }
 
 fn receiver_delta_stream(
@@ -455,6 +474,15 @@ mod tests {
                 .expect("health URL should build")
                 .as_str(),
             "http://127.0.0.1:8080/api/v1/health"
+        );
+    }
+
+    #[test]
+    fn managed_llm_endpoint_defaults_are_derived_from_named_parts() {
+        assert_eq!(default_llm_base_url(), "http://127.0.0.1:8080/v1");
+        assert_eq!(
+            default_managed_llm_health_url(),
+            "http://127.0.0.1:8080/health"
         );
     }
 

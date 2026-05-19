@@ -8,10 +8,26 @@ use url::Url;
 use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-pub const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8765/ws";
+pub(crate) const DEFAULT_DAEMON_HOST: &str = "127.0.0.1";
+pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
+const DAEMON_WS_PATH: &str = "/ws";
+const DAEMON_STATUS_PATH: &str = "/status";
 const OVERLAY_ENABLED_ENV: &str = "PARAKEET_OVERLAY_ENABLED";
 const OVERLAY_MODE_ENV: &str = "PARAKEET_OVERLAY_MODE";
 const OVERLAY_ADAPTIVE_WIDTH_ENV: &str = "PARAKEET_OVERLAY_ADAPTIVE_WIDTH";
+
+pub(crate) fn daemon_websocket_endpoint(host: &str, port: u16) -> String {
+    format!("ws://{host}:{port}{DAEMON_WS_PATH}")
+}
+
+pub(crate) fn default_daemon_websocket_endpoint() -> String {
+    daemon_websocket_endpoint(DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT)
+}
+
+#[cfg(test)]
+pub(crate) fn default_daemon_status_url() -> String {
+    format!("http://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}{DAEMON_STATUS_PATH}")
+}
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum OverlayMode {
@@ -342,8 +358,7 @@ impl ClientConfig {
             "http" | "https" => {}
             _ => return None,
         }
-        // Replace path with /status
-        url.set_path("/status");
+        url.set_path(DAEMON_STATUS_PATH);
         Some(url)
     }
 
@@ -369,8 +384,54 @@ mod tests {
     use super::{
         classify_overlay_capability, parse_overlay_enabled_override, parse_overlay_mode_override,
         resolve_overlay_adaptive_width_with_env, resolve_overlay_capability_with_inputs,
-        resolve_overlay_enable_gate, OverlayEnableGate, OverlayMode, OverlayProbeSignals,
+        resolve_overlay_enable_gate, ClientConfig, ClipboardOptions, InjectionConfig,
+        InjectionMode, OverlayEnableGate, OverlayMode, OverlayProbeSignals,
+        PasteBackendFailurePolicy, PasteKeyBackend,
     };
+    use std::time::Duration;
+
+    fn minimal_injection_config() -> InjectionConfig {
+        InjectionConfig {
+            uinput_dwell_ms: 18,
+            injection_mode: InjectionMode::Paste,
+            clipboard: ClipboardOptions {
+                key_backend: PasteKeyBackend::Uinput,
+                backend_failure_policy: PasteBackendFailurePolicy::CopyOnly,
+                post_chord_hold_ms: 700,
+                seat: None,
+                write_primary: false,
+            },
+        }
+    }
+
+    #[test]
+    fn daemon_endpoint_defaults_are_derived_from_named_parts() {
+        assert_eq!(
+            super::default_daemon_websocket_endpoint(),
+            "ws://127.0.0.1:8765/ws"
+        );
+        assert_eq!(
+            super::default_daemon_status_url(),
+            "http://127.0.0.1:8765/status"
+        );
+
+        let config = ClientConfig::new(
+            &super::default_daemon_websocket_endpoint(),
+            None,
+            "KEY_RIGHTCTRL".to_string(),
+            minimal_injection_config(),
+            Duration::from_secs(5),
+        )
+        .expect("default endpoint should parse");
+
+        assert_eq!(
+            config
+                .status_url()
+                .expect("default endpoint should have status URL")
+                .as_str(),
+            super::default_daemon_status_url()
+        );
+    }
 
     #[test]
     fn classify_overlay_prefers_layer_shell_when_available() {
