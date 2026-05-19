@@ -111,6 +111,29 @@ def _run_status_runtime_truth(payload_path: Path) -> dict[str, str]:
     return truth
 
 
+def _status_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "device": "cuda",
+        "effective_device": "cpu",
+        "streaming_enabled": True,
+        "stream_helper_active": False,
+        "stream_helper_scope": "live_session_only",
+        "stream_fallback_reason": None,
+        "stream_path_executed": False,
+        "stream_chunks_processed": 0,
+        "chunk_secs": 2.4,
+        "finalization_mode": "offline_seal",
+        "final_audio_source": "canonical_session_audio",
+        "tail_trim_mode": "rms",
+        "vad_enabled": True,
+        "vad_active": False,
+        "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+        "overlay_events_enabled": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _run_client_ready_once(
     log_path: Path,
     pid_file: Path,
@@ -296,6 +319,8 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
                 "stream_helper_active": False,
                 "stream_helper_scope": "live_session_only",
                 "stream_fallback_reason": None,
+                "stream_path_executed": False,
+                "stream_chunks_processed": 0,
                 "chunk_secs": 2.4,
                 "finalization_mode": "offline_seal",
                 "final_audio_source": "canonical_session_audio",
@@ -318,6 +343,8 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
         "stream_helper_active": "false",
         "stream_helper_scope": "live_session_only",
         "stream_fallback_reason": "",
+        "stream_path_executed": "false",
+        "stream_chunks_processed": "0",
         "chunk_secs": "2.4",
         "finalization_mode": "offline_seal",
         "final_audio_source": "canonical_session_audio",
@@ -340,6 +367,8 @@ def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -
                 "stream_helper_active": False,
                 "stream_helper_scope": "live_session_only",
                 "stream_fallback_reason": None,
+                "stream_path_executed": False,
+                "stream_chunks_processed": 0,
                 "chunk_secs": "2.4000",
                 "finalization_mode": "offline_seal",
                 "final_audio_source": "canonical_session_audio",
@@ -358,6 +387,35 @@ def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -
     assert truth["chunk_secs"] == "2.4"
 
 
+def test_daemon_status_runtime_truth_accepts_stream_chunk_count_string(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "status.json"
+    payload_path.write_text(
+        json.dumps(_status_payload(stream_chunks_processed="2")),
+        encoding="utf-8",
+    )
+
+    truth = _run_status_runtime_truth(payload_path)
+
+    assert truth["stream_chunks_processed"] == "2"
+
+
+@pytest.mark.parametrize("value", [-1, -1.0, 1.5, "1.5", "-1", True, "nan"])
+def test_daemon_status_runtime_truth_rejects_invalid_stream_chunk_count(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    payload_path = tmp_path / "status.json"
+    payload_path.write_text(
+        json.dumps(_status_payload(stream_chunks_processed=value)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_status_runtime_truth(payload_path)
+
+
 def test_daemon_status_runtime_truth_rejects_non_finite_numeric_string(tmp_path: Path) -> None:
     payload_path = tmp_path / "status.json"
     payload_path.write_text(
@@ -369,6 +427,8 @@ def test_daemon_status_runtime_truth_rejects_non_finite_numeric_string(tmp_path:
                 "stream_helper_active": False,
                 "stream_helper_scope": "live_session_only",
                 "stream_fallback_reason": None,
+                "stream_path_executed": False,
+                "stream_chunks_processed": 0,
                 "chunk_secs": "inf",
                 "finalization_mode": "offline_seal",
                 "final_audio_source": "canonical_session_audio",
@@ -398,6 +458,8 @@ def test_status_runtime_truth_rejects_non_finite_numeric_tokens(tmp_path: Path) 
                     "stream_helper_active": False,
                     "stream_helper_scope": "live_session_only",
                     "stream_fallback_reason": None,
+                    "stream_path_executed": False,
+                    "stream_chunks_processed": 0,
                     "chunk_secs": chunk_secs,
                     "finalization_mode": "offline_seal",
                     "final_audio_source": "canonical_session_audio",

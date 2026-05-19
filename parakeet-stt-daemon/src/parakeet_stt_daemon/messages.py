@@ -134,6 +134,8 @@ class StatusMessage(BaseModel):
     stream_helper_active: bool | None = None
     stream_helper_scope: Literal["live_session_only"] | None = None
     stream_fallback_reason: str | None = None
+    stream_path_executed: bool | None = None
+    stream_chunks_processed: int | None = Field(default=None, ge=0)
     finalization_mode: Literal["offline_seal"] | None = None
     final_audio_source: Literal["canonical_session_audio"] | None = None
     tail_trim_mode: Literal["rms", "vad"] | None = None

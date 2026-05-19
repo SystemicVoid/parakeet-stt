@@ -9,6 +9,8 @@
   "stream_helper_active": false,
   "stream_helper_scope": "live_session_only",
   "stream_fallback_reason": null,
+  "stream_path_executed": false,
+  "stream_chunks_processed": 0,
   "finalization_mode": "offline_seal",
   "final_audio_source": "canonical_session_audio",
   "tail_trim_mode": "rms",
