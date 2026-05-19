@@ -8,12 +8,33 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_DAEMON_HOST = "127.0.0.1"
+DEFAULT_DAEMON_PORT = 8765
+DAEMON_WS_PATH = "/ws"
+DAEMON_STATUS_PATH = "/status"
+
+
+def daemon_websocket_endpoint(
+    host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT
+) -> str:
+    """Return the Client WebSocket endpoint for a Daemon host/port pair."""
+
+    return f"ws://{host}:{port}{DAEMON_WS_PATH}"
+
+
+def daemon_status_url(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> str:
+    """Return the Daemon status endpoint for a host/port pair."""
+
+    return f"http://{host}:{port}{DAEMON_STATUS_PATH}"
+
 
 class ServerSettings(BaseSettings):
     """Runtime settings loaded from env vars or CLI overrides."""
 
-    host: str = Field(default="127.0.0.1", description="Host the WebSocket/HTTP server binds to")
-    port: int = Field(default=8765, ge=1, le=65535)
+    host: str = Field(
+        default=DEFAULT_DAEMON_HOST, description="Host the WebSocket/HTTP server binds to"
+    )
+    port: int = Field(default=DEFAULT_DAEMON_PORT, ge=1, le=65535)
     shared_secret: str | None = Field(
         default=None,
         description="Optional shared secret required on the WebSocket connection.",
@@ -96,4 +117,12 @@ class ServerSettings(BaseSettings):
     )
 
 
-__all__ = ["ServerSettings"]
+__all__ = [
+    "DAEMON_STATUS_PATH",
+    "DAEMON_WS_PATH",
+    "DEFAULT_DAEMON_HOST",
+    "DEFAULT_DAEMON_PORT",
+    "ServerSettings",
+    "daemon_status_url",
+    "daemon_websocket_endpoint",
+]
