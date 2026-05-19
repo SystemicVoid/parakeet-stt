@@ -212,6 +212,8 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
       "stream_helper_active": true,
       "stream_helper_scope": "live_session_only",
       "stream_fallback_reason": null,
+      "stream_path_executed": true,
+      "stream_chunks_processed": 2,
       "finalization_mode": "offline_seal",
       "final_audio_source": "canonical_session_audio",
       "tail_trim_mode": "rms",
@@ -239,6 +241,8 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 | --- | --- | --- | --- |
 | `stream_helper_scope` | string or null | `"live_session_only"` or `null` | Scope where the streaming helper is active. |
 | `stream_fallback_reason` | string or null | implementation-defined reason or `null` | Set when streaming is enabled but the helper is unavailable or degraded. |
+| `stream_path_executed` | boolean or null | `true`, `false`, or `null` | Whether the current or last Session actually exercised chunked Stream path work. |
+| `stream_chunks_processed` | integer or null | non-negative count or `null` | Number of Stream path chunks processed for the current or last Session. |
 | `finalization_mode` | string or null | `"offline_seal"` or `null` | Final result path used to seal a session. |
 | `final_audio_source` | string or null | `"canonical_session_audio"` or `null` | Audio source used for final transcription. |
 | `tail_trim_mode` | string or null | `"rms"`, `"vad"`, or `null` | Tail trimming strategy used for the last seal path. |

@@ -29,6 +29,8 @@ class StreamPathFacts:
     helper_class_name: str | None
     fallback_reason: str | None
     chunk_secs: float | None
+    path_executed: bool
+    chunks_processed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,8 @@ class RuntimeTruth:
     stream_helper_scope: StreamHelperScope
     stream_helper_class_name: str | None
     stream_fallback_reason: str | None
+    stream_path_executed: bool
+    stream_chunks_processed: int
     finalization_mode: FinalizationMode
     final_audio_source: FinalAudioSource
     tail_trim_mode: TailTrimMode
@@ -85,9 +89,10 @@ class RuntimeTruth:
 
     @property
     def degraded(self) -> bool:
-        return (self.streaming_enabled and not self.stream_helper_active) or (
-            self.vad_enabled and not self.vad_active
+        stream_degraded = self.streaming_enabled and (
+            not self.stream_helper_active or self.stream_fallback_reason is not None
         )
+        return stream_degraded or (self.vad_enabled and not self.vad_active)
 
     def to_status(self, state: RuntimeTruthState, metrics: RuntimeTruthMetrics) -> StatusMessage:
         return StatusMessage(
@@ -100,6 +105,8 @@ class RuntimeTruth:
             stream_helper_active=self.stream_helper_active,
             stream_helper_scope=self.stream_helper_scope,
             stream_fallback_reason=self.stream_fallback_reason,
+            stream_path_executed=self.stream_path_executed,
+            stream_chunks_processed=self.stream_chunks_processed,
             finalization_mode=self.finalization_mode,
             final_audio_source=self.final_audio_source,
             tail_trim_mode=self.tail_trim_mode,
@@ -129,6 +136,8 @@ class RuntimeTruth:
             "live_session_helper_scope": self.stream_helper_scope,
             "live_session_helper_class": self.stream_helper_class_name,
             "stream_fallback_reason": self.stream_fallback_reason,
+            "stream_path_executed": self.stream_path_executed,
+            "stream_chunks_processed": self.stream_chunks_processed,
             "finalization_mode": self.finalization_mode,
             "final_audio_source": self.final_audio_source,
             "tail_trim_mode": self.tail_trim_mode,
@@ -161,6 +170,8 @@ def snapshot(
         stream_helper_scope=stream_path.helper_scope,
         stream_helper_class_name=stream_path.helper_class_name,
         stream_fallback_reason=stream_path.fallback_reason,
+        stream_path_executed=stream_path.path_executed,
+        stream_chunks_processed=stream_path.chunks_processed,
         finalization_mode=seal_path.finalization_mode,
         final_audio_source=seal_path.final_audio_source,
         tail_trim_mode=tail_trim.tail_trim_mode,
@@ -202,6 +213,8 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
             helper_class_name=None,
             fallback_reason=None,
             chunk_secs=None,
+            path_executed=False,
+            chunks_processed=0,
         )
     if streaming_transcriber is None:
         return StreamPathFacts(
@@ -211,7 +224,33 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
             helper_class_name=None,
             fallback_reason="streaming_transcriber_unavailable",
             chunk_secs=chunk_secs,
+            path_executed=False,
+            chunks_processed=0,
         )
+    sessions = getattr(orchestrator, "sessions", None)
+    active_session = getattr(sessions, "active", None)
+    if active_session is not None:
+        chunks_processed = _non_negative_int(
+            getattr(orchestrator, "_current_stream_chunks_processed", 0)
+        )
+        path_executed = chunks_processed > 0
+        current_fallback_reason = getattr(orchestrator, "_current_stream_fallback_reason", None)
+    else:
+        path_executed = bool(getattr(orchestrator, "_last_stream_path_executed", False))
+        chunks_processed = _non_negative_int(
+            getattr(orchestrator, "_last_stream_chunks_processed", 0)
+        )
+        current_fallback_reason = None
+    fallback_reason = getattr(streaming_transcriber, "fallback_reason", None)
+    last_fallback_reason = (
+        getattr(orchestrator, "_last_stream_fallback_reason", None)
+        if active_session is None
+        else None
+    )
+    if current_fallback_reason is not None:
+        fallback_reason = current_fallback_reason
+    elif last_fallback_reason is not None:
+        fallback_reason = last_fallback_reason
     return StreamPathFacts(
         streaming_enabled=True,
         helper_active=bool(getattr(streaming_transcriber, "helper_active", False)),
@@ -219,8 +258,10 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
         helper_class_name=_string_or_none(
             getattr(streaming_transcriber, "_helper_class_name", None)
         ),
-        fallback_reason=getattr(streaming_transcriber, "fallback_reason", None),
+        fallback_reason=fallback_reason,
         chunk_secs=chunk_secs,
+        path_executed=path_executed,
+        chunks_processed=chunks_processed,
     )
 
 
@@ -250,6 +291,25 @@ def _string_or_none(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _non_negative_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            return 0
+        parsed = int(value)
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return 0
+    else:
+        return 0
+    return max(0, parsed)
 
 
 def _chunk_secs_or_none(settings: object) -> float | None:

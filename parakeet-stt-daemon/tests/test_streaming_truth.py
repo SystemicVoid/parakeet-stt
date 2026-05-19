@@ -12,7 +12,7 @@ import numpy as np
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import StatusMessage
 from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
-from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session import Session, SessionManager
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
@@ -86,6 +86,11 @@ def _build_server(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
+    orchestrator._current_stream_chunks_processed = 0
+    orchestrator._current_stream_fallback_reason = None
+    orchestrator._last_stream_path_executed = False
+    orchestrator._last_stream_chunks_processed = 0
+    orchestrator._last_stream_fallback_reason = None
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._last_audio_ms = None
@@ -135,6 +140,8 @@ def test_status_streaming_disabled_by_config() -> None:
     assert status.stream_helper_active is False
     assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason is None
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
     assert status.finalization_mode == "offline_seal"
     assert status.final_audio_source == "canonical_session_audio"
     assert status.tail_trim_mode == "rms"
@@ -158,6 +165,8 @@ def test_status_streaming_enabled_helper_active() -> None:
     assert status.stream_helper_active is True
     assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason is None
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
     assert status.finalization_mode == "offline_seal"
     assert status.final_audio_source == "canonical_session_audio"
     assert status.tail_trim_mode == "rms"
@@ -178,6 +187,8 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
         "stream_helper_active": True,
         "stream_helper_scope": "live_session_only",
         "stream_fallback_reason": None,
+        "stream_path_executed": False,
+        "stream_chunks_processed": 0,
         "finalization_mode": "offline_seal",
         "final_audio_source": "canonical_session_audio",
         "tail_trim_mode": "rms",
@@ -188,6 +199,8 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
     }
     assert log_record["live_session_helper_active"] is True
     assert log_record["live_session_helper_class"] == "FakeHelper"
+    assert log_record["stream_path_executed"] is False
+    assert log_record["stream_chunks_processed"] == 0
     assert log_record["finalization_mode"] == "offline_seal"
     assert log_record["tail_trim_mode"] == "rms"
 
@@ -298,6 +311,8 @@ def test_status_streaming_enabled_helper_inactive() -> None:
     assert status.stream_helper_active is False
     assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason == "import_failed:ImportError"
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
     assert status.finalization_mode == "offline_seal"
     assert status.final_audio_source == "canonical_session_audio"
 
@@ -312,6 +327,8 @@ def test_status_streaming_enabled_transcriber_none() -> None:
     assert status.stream_helper_active is False
     assert status.stream_helper_scope == "live_session_only"
     assert status.stream_fallback_reason == "streaming_transcriber_unavailable"
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
 
 
 def test_stream_helper_active_reflects_transcriber_state() -> None:
@@ -341,6 +358,71 @@ def test_stream_fallback_reason_none_when_active() -> None:
     server = _build_server(streaming_transcriber=transcriber)
 
     assert _truth(server).stream_fallback_reason is None
+
+
+def test_status_reports_stream_path_execution_from_last_session() -> None:
+    transcriber = FakeStreamingTranscriber(helper_active=True)
+    server = _build_server(streaming_transcriber=transcriber)
+    server._last_stream_path_executed = True
+    server._last_stream_chunks_processed = 2
+
+    status = _status(server)
+    log_record = _truth(server).to_log_record()
+
+    assert status.streaming_enabled is True
+    assert status.stream_helper_active is True
+    assert status.stream_path_executed is True
+    assert status.stream_chunks_processed == 2
+    assert status.stream_fallback_reason is None
+    assert log_record["stream_path_executed"] is True
+    assert log_record["stream_chunks_processed"] == 2
+
+
+def test_status_reports_fallback_when_helper_exists_but_no_stream_work_ran() -> None:
+    transcriber = FakeStreamingTranscriber(helper_active=True)
+    server = _build_server(streaming_transcriber=transcriber)
+    server._last_stream_path_executed = False
+    server._last_stream_chunks_processed = 0
+    server._last_stream_fallback_reason = "stream_path_not_exercised:no_chunks"
+
+    status = _status(server)
+    log_record = _truth(server).to_log_record()
+
+    assert status.streaming_enabled is True
+    assert status.stream_helper_active is True
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
+    assert status.stream_fallback_reason == "stream_path_not_exercised:no_chunks"
+    assert log_record["stream_fallback_reason"] == "stream_path_not_exercised:no_chunks"
+
+
+def test_status_reports_fallback_even_after_stream_path_executed() -> None:
+    transcriber = FakeStreamingTranscriber(helper_active=True)
+    server = _build_server(streaming_transcriber=transcriber)
+    server._last_stream_path_executed = True
+    server._last_stream_chunks_processed = 1
+    server._last_stream_fallback_reason = "stream_chunk_failed:RuntimeError"
+
+    status = _status(server)
+    truth = _truth(server)
+
+    assert status.stream_path_executed is True
+    assert status.stream_chunks_processed == 1
+    assert status.stream_fallback_reason == "stream_chunk_failed:RuntimeError"
+    assert truth.degraded is True
+
+
+def test_active_session_does_not_inherit_previous_stream_fallback() -> None:
+    transcriber = FakeStreamingTranscriber(helper_active=True)
+    server = _build_server(streaming_transcriber=transcriber)
+    server._last_stream_fallback_reason = "stream_path_not_exercised:no_chunks"
+    cast(Any, server.sessions)._active = Session(session_id=uuid4(), owner_token=1)
+
+    status = _status(server)
+
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
+    assert status.stream_fallback_reason is None
 
 
 def test_status_includes_active_session_age_when_session_active() -> None:
@@ -407,6 +489,8 @@ def _helper_expected_status_fields() -> tuple[str, ...]:
         "stream_helper_active",
         "stream_helper_scope",
         "stream_fallback_reason",
+        "stream_path_executed",
+        "stream_chunks_processed",
         "finalization_mode",
         "final_audio_source",
         "tail_trim_mode",
