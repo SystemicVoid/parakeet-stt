@@ -46,6 +46,11 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             audio_ms,
             ..
         } => {
+            if !final_result_belongs_to_active_session(state, session_id) {
+                log_rejected_final_result(session_id, state, InjectionOrigin::RawFinalResult);
+                return Ok(());
+            }
+
             let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(last_hotkey_up_at);
             let stop_message_elapsed_ms_at_enqueue =
                 last_stop_message.and_then(|(stopped_session_id, instant)| {
@@ -182,6 +187,24 @@ pub(crate) fn session_id_from_state(state: &PttState) -> Option<Uuid> {
     }
 }
 
+pub(crate) fn final_result_belongs_to_active_session(state: &PttState, session_id: Uuid) -> bool {
+    session_id_from_state(state) == Some(session_id)
+}
+
+pub(crate) fn log_rejected_final_result(
+    session_id: Uuid,
+    state: &PttState,
+    origin: InjectionOrigin,
+) {
+    warn!(
+        session = %session_id,
+        active_session = ?session_id_from_state(state),
+        origin = origin.as_str(),
+        state_at_receive = state_label(state),
+        "ignoring final result for non-active session"
+    );
+}
+
 pub(crate) fn state_label(state: &PttState) -> &'static str {
     match state {
         PttState::Idle => "idle",
@@ -230,6 +253,7 @@ mod tests {
     use anyhow::anyhow;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+    use uuid::Uuid;
 
     use super::handle_server_message;
 
@@ -340,6 +364,50 @@ mod tests {
                 .as_slice(),
             &["direct final result".to_string()]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_final_result_does_not_enqueue_injection_job() {
+        let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
+        let injector = Arc::new(RecordingRunner {
+            seen: Arc::clone(&seen_injection),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+        let mut state = PttState::new();
+        let active_session_id = state
+            .begin_listening()
+            .expect("state should begin listening");
+        state.stop_listening();
+        let stale_session_id = Uuid::new_v4();
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+
+        handle_server_message_for_tests(
+            ServerMessage::FinalResult {
+                session_id: stale_session_id,
+                text: "stale private transcript".to_string(),
+                latency_ms: 44,
+                audio_ms: 1200,
+                lang: Some("en".to_string()),
+                confidence: Some(0.92),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+        )
+        .await
+        .expect("stale final result should be ignored without failing dispatch");
+
+        assert!(
+            matches!(state, PttState::WaitingResult { session_id } if session_id == active_session_id)
+        );
+        assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
+        assert!(seen_injection
+            .lock()
+            .expect("recording lock should be available")
+            .is_empty());
+        assert!(timeout(Duration::from_millis(100), reports.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
