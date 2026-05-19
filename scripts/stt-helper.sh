@@ -518,7 +518,9 @@ stt() {
 
         _daemon_effective_device_matches_request "$requested_device" "$current_effective_device" || return 1
         [ "$current_streaming_enabled" = "$requested_streaming_enabled" ] || return 1
-        [ "$current_overlay_events_enabled" = "$requested_overlay_events_enabled" ] || return 1
+        if [ -n "$current_overlay_events_enabled" ] && [ "$current_overlay_events_enabled" != "$requested_overlay_events_enabled" ]; then
+            return 1
+        fi
         return 0
     }
 
@@ -757,6 +759,19 @@ try:
 except Exception:
     sys.exit(1)
 
+if not isinstance(payload, dict):
+    sys.exit(1)
+
+if payload.get("type") != "status":
+    sys.exit(1)
+
+if payload.get("state") not in {"idle", "listening", "processing"}:
+    sys.exit(1)
+
+sessions_active = payload.get("sessions_active")
+if isinstance(sessions_active, bool) or not isinstance(sessions_active, int) or sessions_active < 0:
+    sys.exit(1)
+
 fields = (
     "device",
     "effective_device",
@@ -789,20 +804,19 @@ numeric_fields = {
 non_negative_int_fields = {
     "stream_chunks_processed",
 }
-for key in fields:
-    if key not in payload:
-        sys.exit(1)
 
 for key in fields:
-    value = payload[key]
+    value = payload.get(key)
+    if value is None:
+        print(f"{key}=")
+        continue
+
     if key in bool_fields:
         if not isinstance(value, bool):
             sys.exit(1)
         print(f"{key}={'true' if value else 'false'}")
     elif key in non_negative_int_fields:
-        if value is None:
-            print(f"{key}=")
-        elif isinstance(value, bool):
+        if isinstance(value, bool):
             sys.exit(1)
         elif isinstance(value, int):
             if value < 0:
@@ -815,9 +829,7 @@ for key in fields:
         else:
             sys.exit(1)
     elif key in numeric_fields:
-        if value is None:
-            print(f"{key}=")
-        elif isinstance(value, bool):
+        if isinstance(value, bool):
             sys.exit(1)
         elif isinstance(value, (int, float)):
             if not math.isfinite(float(value)):
@@ -834,12 +846,9 @@ for key in fields:
         else:
             sys.exit(1)
     else:
-        if value is not None and not isinstance(value, str):
+        if not isinstance(value, str):
             sys.exit(1)
-        if value is None:
-            print(f"{key}=")
-        else:
-            print(f"{key}={value}")
+        print(f"{key}={value}")
 PY
     }
 
@@ -1448,6 +1457,9 @@ EOF
                                 overlay_events_enabled) current_overlay_events_enabled="$value" ;;
                             esac
                         done <<< "$runtime_truth"
+                        if [ -z "$current_effective_device" ]; then
+                            current_effective_device="$current_device"
+                        fi
                         echo "   - Existing daemon runtime: device=$current_device, effective_device=$current_effective_device, streaming_enabled=$current_streaming_enabled, overlay_events_enabled=$current_overlay_events_enabled"
                         if _daemon_runtime_matches_request \
                             "$daemon_device" \
