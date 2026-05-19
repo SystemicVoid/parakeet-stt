@@ -456,6 +456,20 @@ pub struct UinputChordSender {
     dwell: Duration,
 }
 
+trait UinputKeyEmitter {
+    fn emit_key(&mut self, key: Key, value: i32) -> Result<()>;
+}
+
+struct VirtualDeviceKeyEmitter<'a> {
+    device: &'a mut VirtualDevice,
+}
+
+impl UinputKeyEmitter for VirtualDeviceKeyEmitter<'_> {
+    fn emit_key(&mut self, key: Key, value: i32) -> Result<()> {
+        UinputChordSender::emit_key(self.device, key, value)
+    }
+}
+
 impl std::fmt::Debug for UinputChordSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UinputChordSender")
@@ -507,26 +521,93 @@ impl UinputChordSender {
             })
     }
 
-    pub fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
+    fn send_shortcut_with_emitter(
+        emitter: &mut impl UinputKeyEmitter,
+        shortcut: PasteShortcut,
+        dwell: Duration,
+    ) -> Result<()> {
         let (modifiers, key) = Self::shortcut_plan(shortcut);
+        let mut pressed_modifiers = Vec::with_capacity(modifiers.len());
+        let mut key_pressed = false;
+
+        let result = (|| {
+            for modifier in modifiers {
+                emitter.emit_key(*modifier, 1)?;
+                pressed_modifiers.push(*modifier);
+            }
+
+            emitter.emit_key(key, 1)?;
+            key_pressed = true;
+            std::thread::sleep(dwell);
+            emitter.emit_key(key, 0)?;
+            key_pressed = false;
+
+            while let Some(modifier) = pressed_modifiers.last().copied() {
+                emitter.emit_key(modifier, 0)?;
+                pressed_modifiers.pop();
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            let original_error = format!("{err:#}");
+            if key_pressed {
+                Self::release_key_after_shortcut_failure(
+                    emitter,
+                    shortcut,
+                    key,
+                    "shortcut_key",
+                    &original_error,
+                );
+            }
+            while let Some(modifier) = pressed_modifiers.pop() {
+                Self::release_key_after_shortcut_failure(
+                    emitter,
+                    shortcut,
+                    modifier,
+                    "modifier",
+                    &original_error,
+                );
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn release_key_after_shortcut_failure(
+        emitter: &mut impl UinputKeyEmitter,
+        shortcut: PasteShortcut,
+        key: Key,
+        role: &'static str,
+        original_error: &str,
+    ) {
+        if let Err(cleanup_err) = emitter.emit_key(key, 0) {
+            warn!(
+                shortcut = ?shortcut,
+                key = ?key,
+                key_code = key.code(),
+                role,
+                error = %cleanup_err,
+                original_error,
+                "failed to release uinput key after shortcut failure"
+            );
+        }
+    }
+
+    pub fn send_shortcut(&self, shortcut: PasteShortcut) -> Result<()> {
         let mut device = self
             .device
             .lock()
             .map_err(|_| anyhow::anyhow!("uinput virtual keyboard lock poisoned"))?;
-
-        for modifier in modifiers {
-            Self::emit_key(&mut device, *modifier, 1)?;
-        }
-
-        Self::emit_key(&mut device, key, 1)?;
-        std::thread::sleep(self.dwell);
-        Self::emit_key(&mut device, key, 0)?;
-
-        for modifier in modifiers.iter().rev() {
-            Self::emit_key(&mut device, *modifier, 0)?;
-        }
-
-        Ok(())
+        Self::send_shortcut_with_emitter(
+            &mut VirtualDeviceKeyEmitter {
+                device: &mut device,
+            },
+            shortcut,
+            self.dwell,
+        )
     }
 
     pub fn dwell_ms(&self) -> u64 {
@@ -1863,7 +1944,7 @@ mod tests {
     use super::{
         configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
         InjectionOutcome, InjectorChildReport, ParentFocusCapture, PasteKeySender,
-        ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender,
+        ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender, UinputKeyEmitter,
     };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
@@ -1875,6 +1956,7 @@ mod tests {
     #[cfg(unix)]
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
 
@@ -1966,6 +2048,129 @@ mod tests {
         let (modifiers, key) = UinputChordSender::shortcut_plan(PasteShortcut::CtrlShiftV);
         assert_eq!(modifiers, [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT]);
         assert_eq!(key, Key::KEY_V);
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingKeyEmitter {
+        calls: usize,
+        fail_calls: Vec<usize>,
+        events: Vec<(Key, i32)>,
+    }
+
+    impl RecordingKeyEmitter {
+        fn fail_on(fail_calls: impl Into<Vec<usize>>) -> Self {
+            Self {
+                fail_calls: fail_calls.into(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl UinputKeyEmitter for RecordingKeyEmitter {
+        fn emit_key(&mut self, key: Key, value: i32) -> anyhow::Result<()> {
+            self.calls += 1;
+            self.events.push((key, value));
+            if self.fail_calls.contains(&self.calls) {
+                anyhow::bail!("synthetic emit failure at call {}", self.calls);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uinput_shortcut_emits_successful_sequence() {
+        let mut emitter = RecordingKeyEmitter::default();
+
+        UinputChordSender::send_shortcut_with_emitter(
+            &mut emitter,
+            PasteShortcut::CtrlShiftV,
+            Duration::ZERO,
+        )
+        .expect("successful shortcut should emit full chord");
+
+        assert_eq!(
+            emitter.events,
+            [
+                (Key::KEY_LEFTCTRL, 1),
+                (Key::KEY_LEFTSHIFT, 1),
+                (Key::KEY_V, 1),
+                (Key::KEY_V, 0),
+                (Key::KEY_LEFTSHIFT, 0),
+                (Key::KEY_LEFTCTRL, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_shortcut_releases_pressed_modifiers_after_mid_sequence_failure() {
+        let mut emitter = RecordingKeyEmitter::fail_on([3]);
+
+        let err = UinputChordSender::send_shortcut_with_emitter(
+            &mut emitter,
+            PasteShortcut::CtrlShiftV,
+            Duration::ZERO,
+        )
+        .expect_err("key press failure should fail the shortcut");
+
+        assert!(format!("{err:#}").contains("synthetic emit failure at call 3"));
+        assert_eq!(
+            emitter.events,
+            [
+                (Key::KEY_LEFTCTRL, 1),
+                (Key::KEY_LEFTSHIFT, 1),
+                (Key::KEY_V, 1),
+                (Key::KEY_LEFTSHIFT, 0),
+                (Key::KEY_LEFTCTRL, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_shortcut_cleanup_failure_logs_without_masking_original_error() {
+        let mut emitter = RecordingKeyEmitter::fail_on([3, 4]);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(SharedLogWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+
+        let err = tracing::subscriber::with_default(subscriber, || {
+            UinputChordSender::send_shortcut_with_emitter(
+                &mut emitter,
+                PasteShortcut::CtrlShiftV,
+                Duration::ZERO,
+            )
+            .expect_err("key press failure should fail the shortcut")
+        });
+
+        let message = format!("{err:#}");
+        assert!(message.contains("synthetic emit failure at call 3"));
+        assert!(!message.contains("synthetic emit failure at call 4"));
+        assert_eq!(
+            emitter.events,
+            [
+                (Key::KEY_LEFTCTRL, 1),
+                (Key::KEY_LEFTSHIFT, 1),
+                (Key::KEY_V, 1),
+                (Key::KEY_LEFTSHIFT, 0),
+                (Key::KEY_LEFTCTRL, 0),
+            ]
+        );
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .expect("log buffer lock should be available")
+                .clone(),
+        )
+        .expect("captured logs should be UTF-8");
+        assert!(logs.contains("failed to release uinput key after shortcut failure"));
+        assert!(logs.contains("synthetic emit failure at call 3"));
+        assert!(logs.contains("synthetic emit failure at call 4"));
     }
 
     #[test]
