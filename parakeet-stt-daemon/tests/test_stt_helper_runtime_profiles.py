@@ -10,6 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from parakeet_stt_daemon.config import (
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    daemon_status_url,
+    daemon_websocket_endpoint,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
 
@@ -137,6 +144,48 @@ def test_offline_profile_resolves_cuda_without_streaming() -> None:
     assert config["daemon_device"] == "cuda"
     assert config["daemon_streaming_enabled"] == "false"
     assert config["daemon_overlay_events_enabled"] == "false"
+
+
+def test_helper_endpoint_defaults_match_daemon_settings() -> None:
+    config = _run_runtime_config()
+
+    assert config["daemon_host"] == DEFAULT_DAEMON_HOST
+    assert config["daemon_port"] == str(DEFAULT_DAEMON_PORT)
+    assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint()
+    assert config["daemon_status_url"] == daemon_status_url()
+    assert config["llm_base_url"] == "http://127.0.0.1:8080/v1"
+    assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
+    assert config["llm_health_url"] == "http://127.0.0.1:8080/health"
+
+
+def test_helper_endpoint_env_overrides_resolve_consistently() -> None:
+    config = _run_runtime_config(
+        extra_env={
+            "PARAKEET_HOST": "0.0.0.0",
+            "PARAKEET_PORT": "9001",
+            "PARAKEET_LLM_SERVER_HOST": "llm.local",
+            "PARAKEET_LLM_SERVER_PORT": "8181",
+        }
+    )
+
+    assert config["daemon_host"] == "0.0.0.0"
+    assert config["daemon_port"] == "9001"
+    assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint("0.0.0.0", 9001)
+    assert config["daemon_status_url"] == daemon_status_url("0.0.0.0", 9001)
+    assert config["llm_base_url"] == "http://llm.local:8181/v1"
+    assert config["managed_llm_api_base_url"] == "http://llm.local:8181/v1"
+    assert config["llm_health_url"] == "http://llm.local:8181/health"
+
+
+def test_helper_start_cli_llm_base_url_overrides_env() -> None:
+    config = _run_runtime_config(
+        "--llm-base-url",
+        "http://cli.local:8182/custom",
+        extra_env={"PARAKEET_LLM_BASE_URL": "http://env.local:8181/v1"},
+    )
+
+    assert config["llm_base_url"] == "http://cli.local:8182/custom"
+    assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
 
 
 def test_runtime_match_accepts_cpu_fallback_for_accelerator_request() -> None:

@@ -57,9 +57,9 @@ PARAKEET_STREAMING_ENABLED=true uv run parakeet-stt-daemon
 
 # Terminal B
 cd parakeet-ptt
-cargo run --release -- --endpoint ws://127.0.0.1:8765/ws --overlay-enabled true
+cargo run --release -- --overlay-enabled true
 ```
-Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror `stt off`.
+The Client default endpoint matches the Daemon default; pass `--endpoint` only for a custom host/port. Use `PARAKEET_STREAMING_ENABLED=false` plus `--overlay-enabled false` to mirror `stt off`.
 
 ## Helper Profiles (`stt start` / `stt off`)
 
