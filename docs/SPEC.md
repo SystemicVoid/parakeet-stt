@@ -190,6 +190,8 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
       "confidence": 0.91
     }
     ```
+    `latency_ms` is daemon-side final-result latency for the Seal path. It does not include Client
+    queueing, clipboard writes, paste shortcuts, or other Injection work.
   - `error`
     ```json
     {
@@ -261,6 +263,9 @@ Clients must also tolerate unknown error codes and unknown additional fields.
 Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
 `audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms` represent the last completed session's stage
 durations. `last_*` fields are retained for compatibility and will be deprecated after client uptake.
+Client logs expose user-visible Injection completion timings separately with
+`enqueue_to_injection_complete_ms`, `hotkey_up_elapsed_ms_at_completion`, and
+`stop_message_elapsed_ms_at_completion`.
 `gpu_mem_mb` reports CUDA reserved memory for the daemon process when running on a CUDA device.
 
 ---
