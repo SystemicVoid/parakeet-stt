@@ -1257,6 +1257,30 @@ CLIENTCMD
             _build_start_cli_args start_cli_args "$launch_profile"
             printf "%s\n" "${start_cli_args[@]}"
             ;;
+        __start-cli-args-shell)
+            local injection_mode paste_backend_failure_policy
+            local uinput_dwell_ms paste_seat paste_write_primary
+            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
+            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
+            local daemon_device daemon_streaming_enabled daemon_chunk_secs daemon_right_context_secs daemon_left_context_secs daemon_batch_size daemon_overlay_events_enabled
+            local -a start_cli_args
+            local launch_profile
+            if _resolve_start_launch_profile launch_profile "${1:-}"; then
+                shift
+            fi
+
+            if ! _resolve_start_runtime_config "$launch_profile" "$@"; then
+                local resolve_status=$?
+                if [ "$resolve_status" -eq 2 ]; then
+                    return 0
+                fi
+                return "$resolve_status"
+            fi
+
+            _build_start_cli_args start_cli_args "$launch_profile"
+            _args_to_shell_words start_cli_args
+            printf "\n"
+            ;;
         __start-runtime-config)
             local injection_mode paste_backend_failure_policy
             local uinput_dwell_ms paste_seat paste_write_primary
@@ -1970,9 +1994,13 @@ get_stt_start_args() {
     local -n start_args_out_ref="$out_name"
     start_args_out_ref=()
     local output
-    output="$(stt __start-cli-args "$@")" || return $?
+    output="$(stt __start-cli-args-shell "$@")" || return $?
+    # __start-cli-args-shell emits one printf-%q encoded vector; eval rebuilds
+    # the original array without treating embedded newlines as separators.
+    local -a parsed_start_args
+    eval "parsed_start_args=($output)"
     local arg
-    while IFS= read -r arg; do
+    for arg in "${parsed_start_args[@]}"; do
         start_args_out_ref+=("$arg")
-    done <<<"$output"
+    done
 }
