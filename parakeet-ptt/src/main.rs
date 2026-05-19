@@ -1,6 +1,8 @@
 mod app;
 mod audio_feedback;
 mod client;
+#[cfg(test)]
+mod client_runtime_fixtures;
 mod client_session;
 mod config;
 mod hotkey;
