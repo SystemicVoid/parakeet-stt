@@ -44,6 +44,8 @@ class FakeAudio:
         self.limit_exceeded = False
         self.start_calls = 0
         self.stop_calls = 0
+        self.take_audio_levels_calls = 0
+        self.take_stream_chunks_calls = 0
 
     def start_session(self) -> None:
         self.start_calls += 1
@@ -56,9 +58,11 @@ class FakeAudio:
         return self.samples, [], np.zeros((0,), dtype=np.float32)
 
     def take_audio_levels(self) -> list[float]:
+        self.take_audio_levels_calls += 1
         return []
 
     def take_stream_chunks(self) -> list[np.ndarray]:
+        self.take_stream_chunks_calls += 1
         chunks = self.stream_chunks
         self.stream_chunks = []
         return chunks
@@ -82,8 +86,14 @@ class FakeStreamSession:
 
 
 class FakeStreamingTranscriber:
-    helper_active = True
-    fallback_reason: str | None = None
+    def __init__(
+        self,
+        *,
+        helper_active: bool = True,
+        fallback_reason: str | None = None,
+    ) -> None:
+        self.helper_active = helper_active
+        self.fallback_reason = fallback_reason
 
     def start_session(self, _sample_rate: int) -> FakeStreamSession:
         return FakeStreamSession()
@@ -184,6 +194,33 @@ def test_start_while_busy_emits_session_busy() -> None:
         errors = _events_of_type(sink, SessionErrorEvent)
         assert errors
         assert errors[-1].code == "SESSION_BUSY"
+
+    asyncio.run(scenario())
+
+
+def test_start_keeps_stream_drain_loop_when_helper_inactive() -> None:
+    async def scenario() -> None:
+        orchestrator = _build_orchestrator(
+            streaming_enabled=True,
+            stream_chunks=[np.array([0.1, 0.2], dtype=np.float32)],
+        )
+        cast(Any, orchestrator).streaming_transcriber = FakeStreamingTranscriber(
+            helper_active=False,
+            fallback_reason="init_failed:ImportError",
+        )
+        audio = cast(FakeAudio, orchestrator.audio)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+
+        await _start(orchestrator, sink, session_id)
+        await asyncio.sleep(0.06)
+        await orchestrator._stop_stream_drain_loop()
+        await orchestrator.sessions.clear(session_id, owner_token=1)
+
+        assert orchestrator._active_stream is None
+        assert orchestrator._current_stream_fallback_reason == "init_failed:ImportError"
+        assert audio.take_audio_levels_calls > 0
+        assert audio.take_stream_chunks_calls > 0
 
     asyncio.run(scenario())
 

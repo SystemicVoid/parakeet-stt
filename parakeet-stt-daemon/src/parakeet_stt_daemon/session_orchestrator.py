@@ -189,11 +189,18 @@ class SessionOrchestrator:
             self._clear_overlay_session_runtime(message.session_id)
             self.audio.start_session()
             streaming_transcriber = self.streaming_transcriber
-            if self._streaming_helper_available() and streaming_transcriber is not None:
-                self._active_stream = streaming_transcriber.start_session(self.audio.sample_rate)
+            if streaming_transcriber is not None or bool(
+                getattr(self.settings, "streaming_enabled", False)
+            ):
+                if self._streaming_helper_available() and streaming_transcriber is not None:
+                    self._active_stream = streaming_transcriber.start_session(
+                        self.audio.sample_rate
+                    )
+                else:
+                    self._current_stream_fallback_reason = (
+                        self._stream_fallback_reason_from_runtime()
+                    )
                 self._start_stream_drain_loop(event_sink, message.session_id)
-            else:
-                self._current_stream_fallback_reason = self._stream_fallback_reason_from_runtime()
             self._start_session_guard_loop(event_sink, message.session_id, owner_token=owner_token)
 
             await event_sink.emit(
@@ -1005,10 +1012,10 @@ class SessionOrchestrator:
                     await self._emit_audio_level(event_sink, session_id, max(audio_levels))
                 chunks = self.audio.take_stream_chunks()
                 active_stream = self._active_stream
-                if active_stream is not None:
-                    for chunk in chunks:
+                for chunk in chunks:
+                    if active_stream is not None:
                         await self._feed_stream_chunk(active_stream, chunk)
-                        await self._emit_live_interim_from_chunk(event_sink, session_id, chunk)
+                    await self._emit_live_interim_from_chunk(event_sink, session_id, chunk)
                 await asyncio.sleep(0.05)
 
         self._stream_drain_task = asyncio.create_task(_drain())
