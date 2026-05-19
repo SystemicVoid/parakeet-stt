@@ -67,9 +67,47 @@ stt() {
         fi
     fi
 
-    local HOST="${PARAKEET_HOST:-127.0.0.1}"
-    local PORT="${PARAKEET_PORT:-8765}"
-    local DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
+    local DEFAULT_DAEMON_HOST="127.0.0.1"
+    local DEFAULT_DAEMON_PORT="8765"
+    local DAEMON_WS_PATH="/ws"
+    local DAEMON_STATUS_PATH="/status"
+    local DEFAULT_LLM_SERVER_HOST="127.0.0.1"
+    local DEFAULT_LLM_SERVER_PORT="8080"
+    local LLM_API_PATH="/v1"
+    local LLM_HEALTH_PATH="/health"
+
+    _endpoint_url() {
+        local scheme="$1"
+        local host="$2"
+        local port="$3"
+        local path="$4"
+        printf "%s://%s:%s%s" "$scheme" "$host" "$port" "$path"
+    }
+
+    _daemon_ws_endpoint() {
+        _endpoint_url "ws" "$HOST" "$PORT" "$DAEMON_WS_PATH"
+    }
+
+    _daemon_status_url() {
+        _endpoint_url "http" "$HOST" "$PORT" "$DAEMON_STATUS_PATH"
+    }
+
+    _daemon_ws_endpoint_from_authority() {
+        printf "ws://%s%s" "$1" "$DAEMON_WS_PATH"
+    }
+
+    _llm_api_base_url() {
+        _endpoint_url "http" "$default_llm_server_host" "$default_llm_server_port" "$LLM_API_PATH"
+    }
+
+    _llm_health_url() {
+        _endpoint_url "http" "$default_llm_server_host" "$default_llm_server_port" "$LLM_HEALTH_PATH"
+    }
+
+    local HOST="${PARAKEET_HOST:-$DEFAULT_DAEMON_HOST}"
+    local PORT="${PARAKEET_PORT:-$DEFAULT_DAEMON_PORT}"
+    local DEFAULT_ENDPOINT
+    DEFAULT_ENDPOINT="$(_daemon_ws_endpoint)"
     local default_injection_mode="${PARAKEET_INJECTION_MODE:-paste}"
     local default_paste_backend_failure_policy="${PARAKEET_PASTE_BACKEND_FAILURE_POLICY:-copy-only}"
     local default_uinput_dwell_ms="${PARAKEET_UINPUT_DWELL_MS:-18}"
@@ -81,8 +119,8 @@ stt() {
     local default_overlay_enabled="${PARAKEET_OVERLAY_ENABLED:-false}"
     local default_overlay_adaptive_width="${PARAKEET_OVERLAY_ADAPTIVE_WIDTH:-true}"
     local default_llm_pre_modifier_key="${PARAKEET_LLM_PRE_MODIFIER_KEY:-KEY_SHIFT}"
-    local default_llm_server_host="${PARAKEET_LLM_SERVER_HOST:-127.0.0.1}"
-    local default_llm_server_port="${PARAKEET_LLM_SERVER_PORT:-8080}"
+    local default_llm_server_host="${PARAKEET_LLM_SERVER_HOST:-$DEFAULT_LLM_SERVER_HOST}"
+    local default_llm_server_port="${PARAKEET_LLM_SERVER_PORT:-$DEFAULT_LLM_SERVER_PORT}"
     local default_llm_server_bin="${PARAKEET_LLM_SERVER_BIN:-llama-server}"
     local default_llm_server_model_path="${PARAKEET_LLM_SERVER_MODEL_PATH:-}"
     local default_llm_server_model_alias="${PARAKEET_LLM_SERVER_MODEL_ALIAS:-${PARAKEET_LLM_MODEL:-local}}"
@@ -91,7 +129,7 @@ stt() {
     local default_llm_server_parallel="${PARAKEET_LLM_SERVER_PARALLEL:-2}"
     local default_llm_server_metrics="${PARAKEET_LLM_SERVER_METRICS:-true}"
     local default_llm_server_extra_args="${PARAKEET_LLM_SERVER_EXTRA_ARGS:-}"
-    local default_llm_base_url="${PARAKEET_LLM_BASE_URL:-http://${default_llm_server_host}:${default_llm_server_port}/v1}"
+    local default_llm_base_url="${PARAKEET_LLM_BASE_URL:-$(_llm_api_base_url)}"
     local default_llm_model="${PARAKEET_LLM_MODEL:-$default_llm_server_model_alias}"
     local default_llm_timeout_seconds="${PARAKEET_LLM_TIMEOUT_SECONDS:-20}"
     local default_llm_max_tokens="${PARAKEET_LLM_MAX_TOKENS:-512}"
@@ -121,7 +159,7 @@ stt() {
         "overlay-enabled|overlay_enabled|default_overlay_enabled|PARAKEET_OVERLAY_ENABLED|Stable controls|<v>|false|always|false"
         "overlay-adaptive-width|overlay_adaptive_width|default_overlay_adaptive_width|PARAKEET_OVERLAY_ADAPTIVE_WIDTH|Stable controls|<v>|true|always|true"
         "llm-pre-modifier-key|llm_pre_modifier_key|default_llm_pre_modifier_key|PARAKEET_LLM_PRE_MODIFIER_KEY|Stable controls|<key>|KEY_SHIFT|always|KEY_SHIFT"
-        "llm-base-url|llm_base_url|default_llm_base_url|PARAKEET_LLM_BASE_URL|Stable controls|<url>|http://127.0.0.1:8080/v1|always|http://127.0.0.1:8080/v1"
+        "llm-base-url|llm_base_url|default_llm_base_url|PARAKEET_LLM_BASE_URL|Stable controls|<url>|<managed LLM API base URL>|always|derived"
         "llm-model|llm_model|default_llm_model|PARAKEET_LLM_MODEL|Stable controls|<name>|local|always|local"
         "llm-timeout-seconds|llm_timeout_seconds|default_llm_timeout_seconds|PARAKEET_LLM_TIMEOUT_SECONDS|Stable controls|<n>|20|always|20"
         "llm-max-tokens|llm_max_tokens|default_llm_max_tokens|PARAKEET_LLM_MAX_TOKENS|Stable controls|<n>|512|always|512"
@@ -825,14 +863,6 @@ PY
         fi
     }
 
-    _llm_health_url() {
-        printf "http://%s:%s/health" "$default_llm_server_host" "$default_llm_server_port"
-    }
-
-    _llm_api_base_url() {
-        printf "http://%s:%s/v1" "$default_llm_server_host" "$default_llm_server_port"
-    }
-
     _build_llm_server_args() {
         local -n out_ref="$1"
         out_ref=("$default_llm_server_bin")
@@ -997,7 +1027,7 @@ PY
             echo "   - Port $PORT busy (owner: $owner); switching to $next_port."
             PORT="$next_port"
         fi
-        DEFAULT_ENDPOINT="ws://${HOST}:${PORT}/ws"
+        DEFAULT_ENDPOINT="$(_daemon_ws_endpoint)"
         export PARAKEET_HOST="$HOST"
         export PARAKEET_PORT="$PORT"
         return 0
@@ -1233,6 +1263,13 @@ daemon_chunk_secs=$daemon_chunk_secs
 daemon_right_context_secs=$daemon_right_context_secs
 daemon_left_context_secs=$daemon_left_context_secs
 daemon_batch_size=$daemon_batch_size
+daemon_host=$HOST
+daemon_port=$PORT
+daemon_websocket_endpoint=$(_daemon_ws_endpoint)
+daemon_status_url=$(_daemon_status_url)
+llm_base_url=$llm_base_url
+managed_llm_api_base_url=$(_llm_api_base_url)
+llm_health_url=$(_llm_health_url)
 EOF
             ;;
         __daemon-runtime-matches)
@@ -1320,7 +1357,8 @@ EOF
             fi
 
             local daemon_reused=0
-            local daemon_status_url="http://${HOST}:${PORT}/status"
+            local daemon_status_url
+            daemon_status_url="$(_daemon_status_url)"
             if _socket_ready_once; then
                 local current_device=""
                 local current_effective_device=""
@@ -1637,7 +1675,7 @@ EOF
                 echo "   - Client not running"
             fi
             if [ -f "$PORT_FILE" ]; then
-                echo "   - Endpoint: ws://$(cat "$PORT_FILE")/ws"
+                echo "   - Endpoint: $(_daemon_ws_endpoint_from_authority "$(cat "$PORT_FILE")")"
             else
                 echo "   - Endpoint: $DEFAULT_ENDPOINT"
             fi

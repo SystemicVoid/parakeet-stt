@@ -1519,7 +1519,7 @@ mod tests {
             cli.llm_pre_modifier_key,
             crate::DEFAULT_LLM_PRE_MODIFIER_KEY
         );
-        assert_eq!(cli.llm_base_url, crate::DEFAULT_LLM_BASE_URL);
+        assert_eq!(cli.llm_base_url, crate::llm::default_llm_base_url());
         assert_eq!(cli.llm_model, crate::DEFAULT_LLM_MODEL);
         assert!(cli.llm_overlay_stream);
     }
