@@ -1,4 +1,4 @@
-# STT helper status (updated 2026-03-05)
+# STT helper status (updated 2026-05-20)
 
 This document now has two parts:
 
@@ -61,6 +61,76 @@ the source of truth for effective device, Stream path helper state, Stream path
 execution evidence, Seal path finalization source, tail trim mode, VAD fallback,
 interim transcript source activity, and overlay-event enablement; the Helper should
 read those fields from `/status` instead of re-deriving them.
+
+Use `stt status` for Helper process health: Daemon PID, Client PID, endpoint,
+tmux session, and matching processes. Use the Daemon `/status` payload, the
+Client startup status log line, and Daemon session runtime truth logs for
+runtime truth. The Helper may parse `/status` to decide whether an existing
+Daemon matches the requested Profile, but shell logic should not infer Stream
+path, Seal path, interim transcript, or Overlay transport state from process
+names, flags, or logs alone.
+
+### Runtime truth field guide
+
+- Stream path: `streaming_enabled`, `stream_helper_active`,
+  `stream_helper_scope`, `stream_fallback_reason`, `stream_path_executed`, and
+  `stream_chunks_processed`.
+- Seal path: `finalization_mode`, `final_audio_source`, `tail_trim_mode`,
+  `vad_enabled`, `vad_active`, `vad_fallback_reason`, and finalization timing
+  fields such as `audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms`.
+- Daemon interim transcript sources: `interim_transcript_enabled`,
+  `interim_transcript_last_source`,
+  `interim_transcript_live_chunks_processed`,
+  `interim_transcript_stop_replay_chunks_processed`,
+  `interim_transcript_updates_emitted`,
+  `interim_transcript_live_updates_emitted`,
+  `interim_transcript_stop_replay_updates_emitted`,
+  `interim_transcript_live_failed`,
+  `interim_transcript_stop_replay_failed`, and
+  `interim_transcript_source_fallback_reason`.
+- Overlay event transport: `overlay_events_enabled`,
+  `overlay_events_emitted`, and `overlay_events_dropped`.
+- Client-side LLM answer deltas: generated and streamed by the Client in LLM
+  query mode. They can update the Overlay while the local LLM answers, but they
+  are not Daemon interim transcript fields and do not affect Stream path or Seal
+  path truth.
+- Renderer animation: local Overlay presentation only. Character fades,
+  listening/finalizing motion, width changes, and opacity transitions are not
+  inference, transport, or LLM progress evidence.
+
+### Live Overlay text with `stream_path_executed=false`
+
+This is not automatically a contradiction. The Stream path truth fields report
+whether the NeMo Stream path helper processed chunks. The Daemon interim
+transcript sources are a separate display-only path for Overlay text: the
+`live` source consumes arriving audio chunks during a Session, and the
+`stop_replay` source can replay ready chunks while stopping. A Session can
+therefore show live Overlay interim text while `/status` still reports
+`stream_path_executed=false`.
+
+When this happens, inspect the groups separately:
+
+1. Check `streaming_enabled`, `stream_helper_active`,
+   `stream_fallback_reason`, `stream_path_executed`, and
+   `stream_chunks_processed` to see whether the NeMo Stream path was requested,
+   available, and exercised.
+2. Check `interim_transcript_enabled`,
+   `interim_transcript_last_source`,
+   `interim_transcript_live_chunks_processed`,
+   `interim_transcript_live_updates_emitted`,
+   `interim_transcript_stop_replay_chunks_processed`,
+   `interim_transcript_stop_replay_updates_emitted`, and
+   `interim_transcript_source_fallback_reason` to see which Daemon interim
+   source produced visible text.
+3. Check `overlay_events_enabled`, `overlay_events_emitted`, and
+   `overlay_events_dropped` to confirm whether Overlay events were transported
+   or dropped.
+4. Check `finalization_mode`, `final_audio_source`, `tail_trim_mode`, and the
+   finalization timing fields to verify Seal path finalization for the result
+   that will be injected.
+5. If the Session used LLM query mode, distinguish Client-side LLM answer
+   deltas from Daemon interim transcript updates. LLM deltas are not evidence
+   that the Stream path executed.
 
 ## Historical notes (pre-2026 migration hardening)
 
