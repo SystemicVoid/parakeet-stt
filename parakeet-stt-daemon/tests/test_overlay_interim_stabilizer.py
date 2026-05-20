@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 from contextlib import contextmanager
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
 from loguru import logger
 
 from parakeet_stt_daemon.overlay_interim import (
     OverlayInterimTranscriptContext,
+    OverlayInterimTranscriptSession,
     OverlayInterimTranscriptStabilizer,
     StabilizedInterimText,
 )
@@ -119,3 +122,113 @@ def test_debug_log_records_skipped_transcription_source(monkeypatch) -> None:
     assert "source=stop_replay source_seq=0" in messages
     assert "reason=transcribe_error" in messages
     assert "error_class=RuntimeError" in messages
+
+
+def test_session_module_owns_live_and_stop_replay_updates() -> None:
+    async def scenario() -> None:
+        outputs = iter(["alpha", "alpha beta", "beta gamma"])
+        sample_sizes: list[int] = []
+
+        async def transcribe(samples: np.ndarray) -> str:
+            sample_sizes.append(int(samples.size))
+            return next(outputs)
+
+        session = OverlayInterimTranscriptSession(
+            session_id=uuid4(),
+            sample_rate=16_000,
+            enabled=True,
+        )
+
+        assert (
+            await session.accept_live_chunk(
+                np.full((400,), 0.1, dtype=np.float32),
+                transcribe,
+            )
+            == "alpha"
+        )
+        assert (
+            await session.accept_live_chunk(
+                np.full((400,), 0.2, dtype=np.float32),
+                transcribe,
+            )
+            == "alpha beta"
+        )
+        assert await session.collect_stop_replay_updates(
+            [np.full((400,), 0.3, dtype=np.float32)],
+            transcribe,
+        ) == ["alpha beta gamma", "alpha beta gamma"]
+
+        facts = session.runtime_facts
+        assert facts.enabled is True
+        assert facts.last_source == "stop_replay"
+        assert facts.live_chunks_processed == 2
+        assert facts.live_updates_emitted == 2
+        assert facts.stop_replay_chunks_processed == 1
+        assert facts.stop_replay_updates_emitted == 1
+        assert facts.source_fallback_reason is None
+        assert sample_sizes == [400, 800, 400]
+
+    asyncio.run(scenario())
+
+
+def test_session_module_records_source_failure_and_stops_that_source() -> None:
+    async def scenario() -> None:
+        calls = 0
+
+        async def transcribe(_samples: np.ndarray) -> str:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("source unavailable")
+
+        session = OverlayInterimTranscriptSession(
+            session_id=uuid4(),
+            sample_rate=16_000,
+            enabled=True,
+        )
+
+        assert (
+            await session.accept_live_chunk(
+                np.full((400,), 0.1, dtype=np.float32),
+                transcribe,
+            )
+            is None
+        )
+        assert (
+            await session.accept_live_chunk(
+                np.full((400,), 0.2, dtype=np.float32),
+                transcribe,
+            )
+            is None
+        )
+
+        facts = session.runtime_facts
+        assert calls == 1
+        assert facts.live_failed is True
+        assert facts.live_chunks_processed == 1
+        assert facts.live_updates_emitted == 0
+        assert facts.source_fallback_reason == "live_transcribe_error:RuntimeError"
+
+    asyncio.run(scenario())
+
+
+def test_session_module_flushes_pending_tail_without_stop_replay_chunks() -> None:
+    async def scenario() -> None:
+        async def transcribe(_samples: np.ndarray) -> str:
+            return "phase one"
+
+        session = OverlayInterimTranscriptSession(
+            session_id=uuid4(),
+            sample_rate=16_000,
+            enabled=True,
+        )
+
+        assert (
+            await session.accept_live_chunk(
+                np.full((400,), 0.1, dtype=np.float32),
+                transcribe,
+            )
+            == "phase one"
+        )
+        assert await session.collect_stop_replay_updates([], transcribe) == ["phase one"]
+
+    asyncio.run(scenario())
