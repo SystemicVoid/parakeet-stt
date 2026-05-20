@@ -183,9 +183,7 @@ def _build_server(
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator._live_interim_audio = np.zeros((0,), dtype=np.float32)
-    orchestrator._live_interim_failed = False
-    orchestrator._overlay_interim_stabilizer_by_session = {}
+    orchestrator._interim_transcript_by_session = {}
 
     async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
         return "overlay test text", 7

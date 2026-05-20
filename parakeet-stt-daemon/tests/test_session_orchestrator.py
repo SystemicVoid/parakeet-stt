@@ -139,9 +139,7 @@ def _build_orchestrator(
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator._live_interim_audio = np.zeros((0,), dtype=np.float32)
-    orchestrator._live_interim_failed = False
-    orchestrator._overlay_interim_stabilizer_by_session = {}
+    orchestrator._interim_transcript_by_session = {}
     orchestrator._vad_enabled = False
 
     async def fake_collect_interim_text_updates(
