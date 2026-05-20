@@ -142,6 +142,16 @@ class StatusMessage(BaseModel):
     vad_enabled: bool | None = None
     vad_active: bool | None = None
     vad_fallback_reason: str | None = None
+    interim_transcript_enabled: bool | None = None
+    interim_transcript_last_source: Literal["live", "stop_replay"] | None = None
+    interim_transcript_live_chunks_processed: int | None = Field(default=None, ge=0)
+    interim_transcript_stop_replay_chunks_processed: int | None = Field(default=None, ge=0)
+    interim_transcript_updates_emitted: int | None = Field(default=None, ge=0)
+    interim_transcript_live_updates_emitted: int | None = Field(default=None, ge=0)
+    interim_transcript_stop_replay_updates_emitted: int | None = Field(default=None, ge=0)
+    interim_transcript_live_failed: bool | None = None
+    interim_transcript_stop_replay_failed: bool | None = None
+    interim_transcript_source_fallback_reason: str | None = None
     overlay_events_enabled: bool | None = None
     overlay_events_emitted: int | None = None
     overlay_events_dropped: int | None = None

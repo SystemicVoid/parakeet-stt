@@ -80,6 +80,54 @@ def test_status_message_accepts_session_state_string() -> None:
         {"type": "status", "state": "listening", "sessions_active": 1}
     )
     assert msg.state == SessionState.LISTENING
+    assert msg.interim_transcript_enabled is None
+
+
+def test_status_message_accepts_optional_interim_transcript_truth() -> None:
+    msg = StatusMessage.model_validate(
+        {
+            "type": "status",
+            "state": "listening",
+            "sessions_active": 1,
+            "interim_transcript_enabled": True,
+            "interim_transcript_last_source": "live",
+            "interim_transcript_live_chunks_processed": 2,
+            "interim_transcript_stop_replay_chunks_processed": 1,
+            "interim_transcript_updates_emitted": 3,
+            "interim_transcript_live_updates_emitted": 2,
+            "interim_transcript_stop_replay_updates_emitted": 1,
+            "interim_transcript_live_failed": False,
+            "interim_transcript_stop_replay_failed": True,
+            "interim_transcript_source_fallback_reason": (
+                "stop_replay_transcribe_error:RuntimeError"
+            ),
+        }
+    )
+
+    assert msg.interim_transcript_enabled is True
+    assert msg.interim_transcript_last_source == "live"
+    assert msg.interim_transcript_live_chunks_processed == 2
+    assert msg.interim_transcript_stop_replay_chunks_processed == 1
+    assert msg.interim_transcript_updates_emitted == 3
+    assert msg.interim_transcript_live_updates_emitted == 2
+    assert msg.interim_transcript_stop_replay_updates_emitted == 1
+    assert msg.interim_transcript_live_failed is False
+    assert msg.interim_transcript_stop_replay_failed is True
+    assert (
+        msg.interim_transcript_source_fallback_reason == "stop_replay_transcribe_error:RuntimeError"
+    )
+
+
+def test_status_message_rejects_negative_interim_transcript_counts() -> None:
+    with pytest.raises(ValidationError):
+        StatusMessage.model_validate(
+            {
+                "type": "status",
+                "state": "listening",
+                "sessions_active": 1,
+                "interim_transcript_updates_emitted": -1,
+            }
+        )
 
 
 def test_status_message_rejects_invalid_state() -> None:
