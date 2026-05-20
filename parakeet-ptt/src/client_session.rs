@@ -124,7 +124,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             seq,
             state: interim_state,
         } => {
-            overlay_router.route_interim_state(
+            overlay_router.route_daemon_interim_state(
                 session_id_from_state(state),
                 session_id,
                 seq,
@@ -136,7 +136,12 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             seq,
             text,
         } => {
-            overlay_router.route_interim_text(session_id_from_state(state), session_id, seq, text);
+            overlay_router.route_daemon_interim_text(
+                session_id_from_state(state),
+                session_id,
+                seq,
+                text,
+            );
         }
         ServerMessage::AudioLevel {
             session_id,
@@ -246,7 +251,8 @@ mod tests {
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
     use crate::overlay_router::{
-        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, RuntimeOverlaySink,
+        NoopOverlaySink, OverlayEvent, OverlayRouter, OverlaySink, OverlayTextProducer,
+        RuntimeOverlaySink,
     };
     use crate::protocol::ServerMessage;
     use crate::state::PttState;
@@ -594,11 +600,13 @@ mod tests {
             overlay_events,
             vec![
                 OverlayEvent::InterimState {
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     session_id,
                     seq: 1,
                     state: "listening".to_string(),
                 },
                 OverlayEvent::InterimText {
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     session_id,
                     seq: 2,
                     text: "hello".to_string(),
@@ -958,6 +966,7 @@ mod tests {
             first_seen,
             parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
                 session_id,
+                producer: parakeet_ptt::overlay_ipc::OverlayTextProducer::DaemonSttInterim,
                 seq: 1,
                 text: "old-state".to_string(),
             }
@@ -986,6 +995,7 @@ mod tests {
             second_seen,
             parakeet_ptt::overlay_ipc::OverlayIpcMessage::InterimText {
                 session_id,
+                producer: parakeet_ptt::overlay_ipc::OverlayTextProducer::DaemonSttInterim,
                 seq: 2,
                 text: "current-state".to_string(),
             }
@@ -1037,7 +1047,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stale_interim_sequences_are_dropped_on_overlay_path_only() {
+    async fn daemon_interim_text_requires_active_session_and_fresh_sequence() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
         let mut overlay_router = OverlayRouter::new(
             RecordingOverlaySink {
@@ -1054,7 +1064,20 @@ mod tests {
         let session_id = state
             .begin_listening()
             .expect("state should begin listening");
+        let stale_session_id = Uuid::new_v4();
         state.stop_listening();
+        handle_server_message_for_tests(
+            ServerMessage::InterimText {
+                session_id: stale_session_id,
+                seq: 1,
+                text: "stale session".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+        )
+        .await
+        .expect("mismatched interim text should be dropped without failure");
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
@@ -1079,6 +1102,19 @@ mod tests {
         )
         .await
         .expect("stale interim text should be dropped without failure");
+        state.reset();
+        handle_server_message_for_tests(
+            ServerMessage::InterimText {
+                session_id,
+                seq: 11,
+                text: "late daemon after reset".to_string(),
+            },
+            &mut state,
+            &mut overlay_router,
+            &worker,
+        )
+        .await
+        .expect("late daemon interim text without active session should be dropped");
 
         assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
         let overlay_events = seen_overlay_events
@@ -1089,6 +1125,7 @@ mod tests {
         assert_eq!(
             overlay_events[0],
             OverlayEvent::InterimText {
+                producer: OverlayTextProducer::DaemonSttInterim,
                 session_id,
                 seq: 10,
                 text: "newest".to_string(),
