@@ -668,7 +668,7 @@ mod tests {
     use super::{
         OverlayLauncher, OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
-    use parakeet_ptt::overlay_ipc::OverlayIpcMessage;
+    use parakeet_ptt::overlay_ipc::{OverlayIpcMessage, OverlayTextProducer};
 
     fn queued_launcher(
         queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
@@ -728,6 +728,7 @@ mod tests {
 
         let message = OverlayIpcMessage::InterimText {
             session_id: Uuid::new_v4(),
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 10,
             text: "current".to_string(),
         };
@@ -784,6 +785,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let old_state = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             text: "old-state".to_string(),
         };
@@ -798,6 +800,7 @@ mod tests {
 
         let current_state = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "current-state".to_string(),
         };
@@ -842,6 +845,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let state_message = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "current-state".to_string(),
         };
@@ -901,6 +905,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let state_message = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "current-state".to_string(),
         };
@@ -975,6 +980,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let state_message = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "current-state".to_string(),
         };
@@ -1040,6 +1046,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let state_message = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "current-state".to_string(),
         };
@@ -1108,6 +1115,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let latest_state = OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 7,
             text: "latest-state".to_string(),
         };
@@ -1173,6 +1181,7 @@ mod tests {
 
         let state = OverlayIpcMessage::InterimText {
             session_id: Uuid::new_v4(),
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             text: "watchdog-fallback".to_string(),
         };
@@ -1233,6 +1242,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         manager.send(OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             text: "first fallback".to_string(),
         });
@@ -1242,6 +1252,7 @@ mod tests {
 
         manager.send(OverlayIpcMessage::InterimText {
             session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "second fallback".to_string(),
         });
@@ -1254,6 +1265,7 @@ mod tests {
             replayed,
             OverlayIpcMessage::InterimText {
                 session_id,
+                producer: OverlayTextProducer::DaemonSttInterim,
                 seq: 2,
                 text: "second fallback".to_string()
             }
@@ -1291,6 +1303,7 @@ mod tests {
 
         manager.send(OverlayIpcMessage::InterimText {
             session_id: Uuid::new_v4(),
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             text: "state survives missing binary".to_string(),
         });
@@ -1338,6 +1351,7 @@ mod tests {
 
         manager.send(OverlayIpcMessage::InterimText {
             session_id: Uuid::new_v4(),
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             text: "check adaptive width forwarding".to_string(),
         });
@@ -1384,6 +1398,7 @@ mod tests {
         let session_a = Uuid::new_v4();
         manager.send(OverlayIpcMessage::InterimState {
             session_id: session_a,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             state: "listening".to_string(),
         });
@@ -1392,6 +1407,7 @@ mod tests {
         });
         manager.send(OverlayIpcMessage::InterimText {
             session_id: session_a,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 2,
             text: "still session a".to_string(),
         });
@@ -1418,6 +1434,7 @@ mod tests {
             first_interim,
             OverlayIpcMessage::InterimState {
                 session_id,
+                producer: OverlayTextProducer::DaemonSttInterim,
                 seq: 1,
                 ..
             } if session_id == session_a
@@ -1441,6 +1458,7 @@ mod tests {
             first_text,
             OverlayIpcMessage::InterimText {
                 session_id,
+                producer: OverlayTextProducer::DaemonSttInterim,
                 seq: 2,
                 ..
             } if session_id == session_a
@@ -1458,6 +1476,7 @@ mod tests {
         let session_b = Uuid::new_v4();
         manager.send(OverlayIpcMessage::InterimState {
             session_id: session_b,
+            producer: OverlayTextProducer::DaemonSttInterim,
             seq: 1,
             state: "listening".to_string(),
         });
@@ -1470,6 +1489,7 @@ mod tests {
             retargeted_interim,
             OverlayIpcMessage::InterimState {
                 session_id,
+                producer: OverlayTextProducer::DaemonSttInterim,
                 seq: 1,
                 ..
             } if session_id == session_b

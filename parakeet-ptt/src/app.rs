@@ -509,8 +509,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         if llm_busy {
                                             warn!("ignoring hotkey down while LLM response is in progress");
                                             llm_busy_overlay_seq = llm_busy_overlay_seq.saturating_add(1);
-                                            overlay_router.route_interim_state(
-                                                None,
+                                            overlay_router.route_llm_answer_state(
                                                 llm_busy_overlay_session,
                                                 llm_busy_overlay_seq,
                                                 "LLM busy; wait for current answer".to_string(),
@@ -618,8 +617,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 llm_in_flight_session = Some(session_id);
                                                 let seq = llm_seq.entry(session_id).or_insert(0);
                                                 *seq = seq.saturating_add(1);
-                                                overlay_router.route_interim_state(
-                                                    None,
+                                                overlay_router.route_llm_answer_state(
                                                     session_id,
                                                     *seq,
                                                     "Generating answer...".to_string(),
@@ -695,7 +693,11 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         entry.push_str(&delta);
                                         let seq = llm_seq.entry(session_id).or_insert(0);
                                         *seq = seq.saturating_add(1);
-                                        overlay_router.route_interim_text(None, session_id, *seq, entry.clone());
+                                        overlay_router.route_llm_answer_delta(
+                                            session_id,
+                                            *seq,
+                                            entry.clone(),
+                                        );
                                     }
                                     LlmProgress::Finished {
                                         session_id,
@@ -1185,7 +1187,7 @@ mod tests {
         FailInjector, InjectorContext, ParentFocusCapture, PasteChordSender, PasteKeySender,
         TextInjector,
     };
-    use crate::overlay_router::{OverlayEvent, OverlayRouter};
+    use crate::overlay_router::{OverlayEvent, OverlayRouter, OverlayTextProducer};
     use crate::protocol::{ClientMessage, ServerMessage};
     use crate::state::PttState;
 
@@ -1631,6 +1633,116 @@ mod tests {
         assert_eq!(
             runtime.recorded_injections(),
             vec!["test answer".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_llm_answer_deltas_route_with_independent_overlay_producer() {
+        let (config, ports, mut runtime) = ClientRuntimeHarness::new_with_llm_deltas(
+            test_app_config(),
+            ["answer", " delta"],
+            "answer delta",
+        )
+        .into_parts();
+
+        let app_task = tokio::spawn(run(config, ports));
+        runtime.send_hotkey_down(HotkeyIntent::LlmQuery);
+        let start = runtime.next_sent_message(Duration::from_millis(250)).await;
+        let active_session_id = match start {
+            ClientMessage::StartSession { session_id, .. } => session_id,
+            other => panic!("expected start_session, got {other:?}"),
+        };
+        runtime.send_hotkey_up();
+        let stop = runtime.next_sent_message(Duration::from_millis(250)).await;
+        match stop {
+            ClientMessage::StopSession { session_id, .. } => {
+                assert_eq!(session_id, active_session_id);
+            }
+            other => panic!("expected stop_session, got {other:?}"),
+        }
+
+        runtime.send_daemon_message(ServerMessage::InterimText {
+            session_id: active_session_id,
+            seq: 10,
+            text: "daemon interim transcript".to_string(),
+        });
+        runtime.send_daemon_message(ServerMessage::FinalResult {
+            session_id: active_session_id,
+            text: "private prompt".to_string(),
+            latency_ms: 55,
+            audio_ms: 1500,
+            lang: Some("en".to_string()),
+            confidence: Some(0.95),
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let overlay_event_count = runtime
+                    .recorded_overlay_events()
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            OverlayEvent::InterimState { .. } | OverlayEvent::InterimText { .. }
+                        )
+                    })
+                    .count();
+                if overlay_event_count >= 4 && !runtime.recorded_injections().is_empty() {
+                    break;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("LLM deltas should route and final answer should inject");
+        app_task.abort();
+
+        assert_eq!(
+            runtime.recorded_llm_requests(),
+            vec![(active_session_id, "private prompt".to_string())]
+        );
+        assert_eq!(
+            runtime.recorded_injections(),
+            vec!["answer delta".to_string()]
+        );
+
+        let overlay_text_events: Vec<_> = runtime
+            .recorded_overlay_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    OverlayEvent::InterimState { .. } | OverlayEvent::InterimText { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            overlay_text_events,
+            vec![
+                OverlayEvent::InterimText {
+                    producer: OverlayTextProducer::DaemonSttInterim,
+                    session_id: active_session_id,
+                    seq: 10,
+                    text: "daemon interim transcript".to_string(),
+                },
+                OverlayEvent::InterimState {
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    session_id: active_session_id,
+                    seq: 1,
+                    state: "Generating answer...".to_string(),
+                },
+                OverlayEvent::InterimText {
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    session_id: active_session_id,
+                    seq: 2,
+                    text: "answer".to_string(),
+                },
+                OverlayEvent::InterimText {
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    session_id: active_session_id,
+                    seq: 3,
+                    text: "answer delta".to_string(),
+                },
+            ]
         );
     }
 
