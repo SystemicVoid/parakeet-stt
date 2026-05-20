@@ -43,6 +43,10 @@ stt status
 stt show
 stt logs both
 ```
+`stt status` reports Helper process health. Runtime truth for Stream path,
+Seal path, Daemon interim transcript sources, and Overlay event transport lives
+in the Daemon `/status` payload and the Client startup status log line. See
+[`docs/stt-troubleshooting.md`](docs/stt-troubleshooting.md) for the field guide.
 
 4. Stop:
 ```bash
