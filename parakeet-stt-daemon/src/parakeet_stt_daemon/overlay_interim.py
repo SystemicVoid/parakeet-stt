@@ -41,6 +41,10 @@ class InterimTranscriptRuntimeFacts:
     stop_replay_failed: bool
     source_fallback_reason: str | None
 
+    @property
+    def updates_emitted(self) -> int:
+        return self.live_updates_emitted + self.stop_replay_updates_emitted
+
 
 @dataclass(frozen=True)
 class StabilizedInterimText:

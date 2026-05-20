@@ -58,8 +58,9 @@ Canonical-source policy:
 Runtime truth for `/status` and daemon logs is produced by
 `parakeet_stt_daemon.runtime_truth_snapshot.RuntimeTruthSnapshot`. That module is
 the source of truth for effective device, Stream path helper state, Stream path
-execution evidence, Seal path finalization source, tail trim mode, VAD fallback, and overlay-event enablement;
-the Helper should read those fields from `/status` instead of re-deriving them.
+execution evidence, Seal path finalization source, tail trim mode, VAD fallback,
+interim transcript source activity, and overlay-event enablement; the Helper should
+read those fields from `/status` instead of re-deriving them.
 
 ## Historical notes (pre-2026 migration hardening)
 

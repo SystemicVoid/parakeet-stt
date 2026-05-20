@@ -351,6 +351,40 @@
         "vad_fallback_reason": {
           "$ref": "#/$defs/nullable_string"
         },
+        "interim_transcript_enabled": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "interim_transcript_last_source": {
+          "enum": [
+            "live",
+            "stop_replay",
+            null
+          ]
+        },
+        "interim_transcript_live_chunks_processed": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "interim_transcript_stop_replay_chunks_processed": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "interim_transcript_updates_emitted": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "interim_transcript_live_updates_emitted": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "interim_transcript_stop_replay_updates_emitted": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "interim_transcript_live_failed": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "interim_transcript_stop_replay_failed": {
+          "$ref": "#/$defs/nullable_boolean"
+        },
+        "interim_transcript_source_fallback_reason": {
+          "$ref": "#/$defs/nullable_string"
+        },
         "overlay_events_enabled": {
           "$ref": "#/$defs/nullable_boolean"
         },

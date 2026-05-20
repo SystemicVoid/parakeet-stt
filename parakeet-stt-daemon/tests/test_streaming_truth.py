@@ -67,6 +67,7 @@ def _build_server(
     *,
     streaming_enabled: bool = True,
     streaming_transcriber: Any = None,
+    overlay_events_enabled: bool = False,
     vad_enabled: bool = False,
 ) -> SessionOrchestrator:
     orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
@@ -74,6 +75,7 @@ def _build_server(
         device="cpu",
         status_enabled=True,
         streaming_enabled=streaming_enabled,
+        overlay_events_enabled=overlay_events_enabled,
         vad_enabled=vad_enabled,
     )
     orchestrator.sessions = SessionManager()
@@ -91,6 +93,7 @@ def _build_server(
     orchestrator._last_stream_path_executed = False
     orchestrator._last_stream_chunks_processed = 0
     orchestrator._last_stream_fallback_reason = None
+    orchestrator._last_interim_transcript_runtime_facts = None
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._last_audio_ms = None
@@ -193,6 +196,16 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
         "vad_enabled": False,
         "vad_active": False,
         "vad_fallback_reason": None,
+        "interim_transcript_enabled": False,
+        "interim_transcript_last_source": None,
+        "interim_transcript_live_chunks_processed": 0,
+        "interim_transcript_stop_replay_chunks_processed": 0,
+        "interim_transcript_updates_emitted": 0,
+        "interim_transcript_live_updates_emitted": 0,
+        "interim_transcript_stop_replay_updates_emitted": 0,
+        "interim_transcript_live_failed": False,
+        "interim_transcript_stop_replay_failed": False,
+        "interim_transcript_source_fallback_reason": None,
         "overlay_events_enabled": False,
     }
     assert log_record["live_session_helper_active"] is True
@@ -201,6 +214,8 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
     assert log_record["stream_chunks_processed"] == 0
     assert log_record["finalization_mode"] == "offline_seal"
     assert log_record["tail_trim_mode"] == "rms"
+    assert log_record["interim_transcript_enabled"] is False
+    assert log_record["interim_transcript_updates_emitted"] == 0
 
 
 def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> None:
@@ -410,6 +425,106 @@ def test_status_reports_fallback_even_after_stream_path_executed() -> None:
     assert truth.degraded is True
 
 
+def test_status_and_logs_split_interim_truth_from_stream_path_fallback() -> None:
+    async def scenario() -> None:
+        transcriber = FakeStreamingTranscriber(
+            helper_active=False,
+            fallback_reason="streaming_helper_inactive",
+        )
+        server = _build_server(
+            streaming_transcriber=transcriber,
+            overlay_events_enabled=True,
+        )
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=1)
+        server._reset_interim_transcript_session(session_id)
+
+        async def transcribe(_samples: np.ndarray) -> str:
+            return "visible interim text"
+
+        update = await server._interim_transcript_session(session_id).accept_live_chunk(
+            np.full((400,), 0.2, dtype=np.float32),
+            transcribe,
+        )
+        assert update == "visible interim text"
+
+        status = _status(server)
+        log_record = _truth(server).to_log_record()
+
+        assert status.streaming_enabled is True
+        assert status.stream_helper_active is False
+        assert status.stream_path_executed is False
+        assert status.stream_chunks_processed == 0
+        assert status.stream_fallback_reason == "streaming_helper_inactive"
+        assert status.overlay_events_emitted == 0
+        assert status.overlay_events_dropped == 0
+        assert status.interim_transcript_enabled is True
+        assert status.interim_transcript_last_source == "live"
+        assert status.interim_transcript_live_chunks_processed == 1
+        assert status.interim_transcript_stop_replay_chunks_processed == 0
+        assert status.interim_transcript_updates_emitted == 1
+        assert status.interim_transcript_live_updates_emitted == 1
+        assert status.interim_transcript_stop_replay_updates_emitted == 0
+        assert status.interim_transcript_source_fallback_reason is None
+        assert log_record["stream_path_executed"] is False
+        assert log_record["stream_chunks_processed"] == 0
+        assert log_record["stream_fallback_reason"] == "streaming_helper_inactive"
+        assert log_record["interim_transcript_enabled"] is True
+        assert log_record["interim_transcript_last_source"] == "live"
+        assert log_record["interim_transcript_updates_emitted"] == 1
+
+        server._record_last_interim_transcript_runtime(session_id)
+        await server.sessions.clear(session_id, owner_token=1)
+        server._clear_overlay_session_runtime(session_id)
+
+        idle_status = _status(server)
+        idle_log_record = _truth(server).to_log_record()
+
+        assert idle_status.interim_transcript_last_source == "live"
+        assert idle_status.interim_transcript_updates_emitted == 1
+        assert idle_log_record["interim_transcript_last_source"] == "live"
+        assert idle_log_record["interim_transcript_updates_emitted"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_status_reports_interim_source_fallback_reason() -> None:
+    async def scenario() -> None:
+        server = _build_server(streaming_enabled=False, overlay_events_enabled=True)
+        session_id = uuid4()
+        await server.sessions.start_session(session_id, owner_token=1)
+        server._reset_interim_transcript_session(session_id)
+
+        async def transcribe(_samples: np.ndarray) -> str:
+            raise RuntimeError("interim source failed")
+
+        update = await server._interim_transcript_session(session_id).accept_live_chunk(
+            np.full((400,), 0.2, dtype=np.float32),
+            transcribe,
+        )
+
+        assert update is None
+        status = _status(server)
+        log_record = _truth(server).to_log_record()
+
+        assert status.interim_transcript_enabled is True
+        assert status.interim_transcript_live_chunks_processed == 1
+        assert status.interim_transcript_updates_emitted == 0
+        assert status.interim_transcript_live_failed is True
+        assert status.interim_transcript_stop_replay_failed is False
+        assert (
+            status.interim_transcript_source_fallback_reason == "live_transcribe_error:RuntimeError"
+        )
+        assert log_record["interim_transcript_live_failed"] is True
+        assert log_record["interim_transcript_stop_replay_failed"] is False
+        assert (
+            log_record["interim_transcript_source_fallback_reason"]
+            == "live_transcribe_error:RuntimeError"
+        )
+
+    asyncio.run(scenario())
+
+
 def test_active_session_does_not_inherit_previous_stream_fallback() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
@@ -495,5 +610,15 @@ def _helper_expected_status_fields() -> tuple[str, ...]:
         "vad_enabled",
         "vad_active",
         "vad_fallback_reason",
+        "interim_transcript_enabled",
+        "interim_transcript_last_source",
+        "interim_transcript_live_chunks_processed",
+        "interim_transcript_stop_replay_chunks_processed",
+        "interim_transcript_updates_emitted",
+        "interim_transcript_live_updates_emitted",
+        "interim_transcript_stop_replay_updates_emitted",
+        "interim_transcript_live_failed",
+        "interim_transcript_stop_replay_failed",
+        "interim_transcript_source_fallback_reason",
         "overlay_events_enabled",
     )
