@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import UUID
 
 import numpy as np
 from loguru import logger
+
+InterimTranscriptSource = Literal["live", "stop_replay"]
+InterimTranscriber = Callable[[np.ndarray], Awaitable[str]]
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,19 @@ class OverlayInterimTranscriptContext:
     session_id: UUID
     context_samples: int
     sample_rate: int
+
+
+@dataclass(frozen=True)
+class InterimTranscriptRuntimeFacts:
+    enabled: bool
+    last_source: InterimTranscriptSource | None
+    live_chunks_processed: int
+    live_updates_emitted: int
+    live_failed: bool
+    stop_replay_chunks_processed: int
+    stop_replay_updates_emitted: int
+    stop_replay_failed: bool
+    source_fallback_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,15 @@ class StabilizedInterimText:
 class _OverlayInterimTranscriptState:
     committed_tokens: list[str] = field(default_factory=list)
     draft_tokens: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _InterimTranscriptSourceState:
+    rolling_audio: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.float32))
+    chunks_processed: int = 0
+    updates_emitted: int = 0
+    failed: bool = False
+    fallback_reason: str | None = None
 
 
 class OverlayInterimTranscriptStabilizer:
@@ -213,6 +240,142 @@ class OverlayInterimTranscriptStabilizer:
         )
 
 
+class OverlayInterimTranscriptSession:
+    """Own one Session's user-visible interim transcript production."""
+
+    def __init__(
+        self,
+        *,
+        session_id: UUID,
+        sample_rate: int,
+        enabled: bool,
+    ) -> None:
+        self._session_id = session_id
+        self._sample_rate = int(sample_rate)
+        self._enabled = bool(enabled)
+        self._stabilizer = OverlayInterimTranscriptStabilizer()
+        self._source_state: dict[InterimTranscriptSource, _InterimTranscriptSourceState] = {
+            "live": _InterimTranscriptSourceState(),
+            "stop_replay": _InterimTranscriptSourceState(),
+        }
+        self._last_source: InterimTranscriptSource | None = None
+        self._source_fallback_reason: str | None = None
+
+    @property
+    def runtime_facts(self) -> InterimTranscriptRuntimeFacts:
+        live = self._source_state["live"]
+        stop_replay = self._source_state["stop_replay"]
+        return InterimTranscriptRuntimeFacts(
+            enabled=self._enabled,
+            last_source=self._last_source,
+            live_chunks_processed=live.chunks_processed,
+            live_updates_emitted=live.updates_emitted,
+            live_failed=live.failed,
+            stop_replay_chunks_processed=stop_replay.chunks_processed,
+            stop_replay_updates_emitted=stop_replay.updates_emitted,
+            stop_replay_failed=stop_replay.failed,
+            source_fallback_reason=self._source_fallback_reason,
+        )
+
+    async def accept_live_chunk(
+        self,
+        chunk: np.ndarray,
+        transcribe: InterimTranscriber,
+    ) -> str | None:
+        """Return the next visible live interim text update for a chunk, if any."""
+        return await self._accept_source_chunk("live", chunk, transcribe)
+
+    async def collect_stop_replay_updates(
+        self,
+        ready_chunks: list[np.ndarray],
+        transcribe: InterimTranscriber,
+    ) -> list[str]:
+        """Return stop-replay interim updates plus the final pending-tail flush."""
+        updates: list[str] = []
+        state = self._source_state["stop_replay"]
+        for chunk in ready_chunks:
+            if state.failed:
+                break
+            update = await self._accept_source_chunk("stop_replay", chunk, transcribe)
+            if update is not None:
+                updates.append(update)
+        flushed = self.flush_pending_tail()
+        if flushed is not None:
+            updates.append(flushed)
+        return updates
+
+    def flush_pending_tail(self) -> str | None:
+        flushed = self._stabilizer.flush_pending_tail()
+        return flushed.text if flushed is not None else None
+
+    async def _accept_source_chunk(
+        self,
+        source: InterimTranscriptSource,
+        chunk: np.ndarray,
+        transcribe: InterimTranscriber,
+    ) -> str | None:
+        if not self._enabled:
+            return None
+
+        state = self._source_state[source]
+        if state.failed:
+            return None
+
+        chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if chunk_audio.size == 0:
+            return None
+
+        state.chunks_processed += 1
+        state.rolling_audio = append_overlay_interim_context(state.rolling_audio, chunk_audio)
+        source_seq = self._stabilizer.next_source_seq(source)
+        context = self._context(int(state.rolling_audio.size))
+        try:
+            candidate = await transcribe(state.rolling_audio)
+        except Exception as exc:  # noqa: BLE001
+            self._record_source_failure(source, source_seq, context, exc.__class__.__name__)
+            return None
+
+        stabilized = self._stabilizer.accept(source, source_seq, candidate, context)
+        if stabilized is None:
+            return None
+
+        state.updates_emitted += 1
+        self._last_source = source
+        return stabilized.text
+
+    def _context(self, context_samples: int) -> OverlayInterimTranscriptContext:
+        return OverlayInterimTranscriptContext(
+            session_id=self._session_id,
+            context_samples=context_samples,
+            sample_rate=self._sample_rate,
+        )
+
+    def _record_source_failure(
+        self,
+        source: InterimTranscriptSource,
+        source_seq: int,
+        context: OverlayInterimTranscriptContext,
+        error_class: str,
+    ) -> None:
+        state = self._source_state[source]
+        state.failed = True
+        state.fallback_reason = f"{source}_transcribe_error:{error_class}"
+        self._source_fallback_reason = state.fallback_reason
+        logger.debug(
+            "Interim transcript source {} unavailable for session {}: {}",
+            source,
+            self._session_id,
+            error_class,
+        )
+        self._stabilizer.record_skip(
+            source=source,
+            source_seq=source_seq,
+            context=context,
+            reason="transcribe_error",
+            error_class=error_class,
+        )
+
+
 def append_overlay_interim_context(existing: np.ndarray, chunk_audio: np.ndarray) -> np.ndarray:
     if existing.size == 0:
         return np.array(chunk_audio, copy=True)
@@ -236,7 +399,11 @@ def _longest_casefold_suffix_prefix_overlap(existing: list[str], current: list[s
 
 
 __all__ = [
+    "InterimTranscriptRuntimeFacts",
+    "InterimTranscriptSource",
+    "InterimTranscriber",
     "OverlayInterimTranscriptContext",
+    "OverlayInterimTranscriptSession",
     "OverlayInterimTranscriptStabilizer",
     "StabilizedInterimText",
     "append_overlay_interim_context",

@@ -46,9 +46,8 @@ from .model import (
     load_parakeet_model,
 )
 from .overlay_interim import (
-    OverlayInterimTranscriptContext,
-    OverlayInterimTranscriptStabilizer,
-    append_overlay_interim_context,
+    InterimTranscriptRuntimeFacts,
+    OverlayInterimTranscriptSession,
 )
 from .runtime_truth_snapshot import (
     RuntimeTruth,
@@ -147,8 +146,6 @@ class SessionOrchestrator:
         self._last_finalize_ms: int | None = None
         self._last_infer_ms: int | None = None
         self._last_send_ms: int | None = None
-        self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-        self._live_interim_failed = False
         self._vad_enabled = bool(settings.vad_enabled)
         self.tail_trimmer = SealPathTailTrimmer(
             vad_enabled=self._vad_enabled,
@@ -158,9 +155,7 @@ class SessionOrchestrator:
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
-        self._overlay_interim_stabilizer_by_session: dict[
-            UUID, OverlayInterimTranscriptStabilizer
-        ] = {}
+        self._interim_transcript_by_session: dict[UUID, OverlayInterimTranscriptSession] = {}
 
     async def start(self, intent: StartSessionIntent) -> None:
         await self._handle_start(intent)
@@ -183,10 +178,8 @@ class SessionOrchestrator:
             )
             return
         try:
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
+            self._reset_interim_transcript_session(message.session_id)
             self._reset_current_stream_runtime()
-            self._clear_overlay_session_runtime(message.session_id)
             self.audio.start_session()
             streaming_transcriber = self.streaming_transcriber
             if streaming_transcriber is not None or bool(
@@ -302,8 +295,6 @@ class SessionOrchestrator:
                 )
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
-                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                self._live_interim_failed = False
                 return
 
             finalize_ms: int | None = None
@@ -313,11 +304,6 @@ class SessionOrchestrator:
                     session.session_id,
                     ready_chunks,
                 )
-                flushed_interim = self._overlay_interim_stabilizer(
-                    session.session_id
-                ).flush_pending_tail()
-                if flushed_interim is not None:
-                    interim_updates.append(flushed_interim.text)
                 if interim_updates:
                     await self._emit_interim_state(
                         event_sink,
@@ -348,8 +334,6 @@ class SessionOrchestrator:
                 )
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
-                self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-                self._live_interim_failed = False
                 return
 
             latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
@@ -376,8 +360,6 @@ class SessionOrchestrator:
             )
             await self.sessions.clear(session.session_id, owner_token=owner_token)
             self._clear_overlay_session_runtime(session.session_id)
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
             self._last_audio_ms = audio_ms
             self._last_audio_stop_ms = audio_stop_ms
             self._last_finalize_ms = finalize_ms
@@ -507,8 +489,6 @@ class SessionOrchestrator:
                 self._clear_overlay_session_runtime(active_session_id)
             self._active_stream = None
             self._reset_current_stream_runtime()
-            self._live_interim_audio = np.zeros((0,), dtype=np.float32)
-            self._live_interim_failed = False
             if active_session_id is not None and event_sink is not None and session_end_reason:
                 await self._emit_session_ended(
                     event_sink, active_session_id, reason=session_end_reason
@@ -690,34 +670,44 @@ class SessionOrchestrator:
                 raise
 
     def _clear_overlay_session_runtime(self, session_id: UUID) -> None:
-        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
-        if isinstance(overlay_stabilizers, dict):
-            overlay_stabilizers.pop(session_id, None)
+        interim_sessions = getattr(self, "_interim_transcript_by_session", None)
+        if isinstance(interim_sessions, dict):
+            interim_sessions.pop(session_id, None)
 
-    def _overlay_interim_stabilizer(
-        self,
-        session_id: UUID,
-    ) -> OverlayInterimTranscriptStabilizer:
-        overlay_stabilizers = getattr(self, "_overlay_interim_stabilizer_by_session", None)
-        if not isinstance(overlay_stabilizers, dict):
-            overlay_stabilizers = {}
-            self._overlay_interim_stabilizer_by_session = overlay_stabilizers
-        stabilizer = overlay_stabilizers.get(session_id)
-        if stabilizer is None:
-            stabilizer = OverlayInterimTranscriptStabilizer()
-            overlay_stabilizers[session_id] = stabilizer
-        return stabilizer
-
-    def _overlay_interim_context(
-        self,
-        session_id: UUID,
-        context_samples: int,
-    ) -> OverlayInterimTranscriptContext:
-        return OverlayInterimTranscriptContext(
+    def _reset_interim_transcript_session(self, session_id: UUID) -> None:
+        interim_sessions = self._interim_transcript_sessions_for_runtime()
+        interim_sessions[session_id] = OverlayInterimTranscriptSession(
             session_id=session_id,
-            context_samples=context_samples,
             sample_rate=int(self.audio.sample_rate),
+            enabled=bool(self.settings.overlay_events_enabled),
         )
+
+    def _interim_transcript_sessions_for_runtime(
+        self,
+    ) -> dict[UUID, OverlayInterimTranscriptSession]:
+        interim_sessions = getattr(self, "_interim_transcript_by_session", None)
+        if not isinstance(interim_sessions, dict):
+            interim_sessions = {}
+            self._interim_transcript_by_session = interim_sessions
+        return interim_sessions
+
+    def _interim_transcript_session(self, session_id: UUID) -> OverlayInterimTranscriptSession:
+        interim_sessions = self._interim_transcript_sessions_for_runtime()
+        interim_session = interim_sessions.get(session_id)
+        if interim_session is None:
+            interim_session = OverlayInterimTranscriptSession(
+                session_id=session_id,
+                sample_rate=int(self.audio.sample_rate),
+                enabled=bool(self.settings.overlay_events_enabled),
+            )
+            interim_sessions[session_id] = interim_session
+        return interim_session
+
+    def interim_transcript_runtime_facts(
+        self,
+        session_id: UUID,
+    ) -> InterimTranscriptRuntimeFacts:
+        return self._interim_transcript_session(session_id).runtime_facts
 
     async def _emit_interim_state(
         self,
@@ -741,46 +731,10 @@ class SessionOrchestrator:
         session_id: UUID,
         ready_chunks: list[np.ndarray],
     ) -> list[str]:
-        if not self.settings.overlay_events_enabled:
-            return []
-        if not ready_chunks:
-            return []
-
-        rolling_audio = np.zeros((0,), dtype=np.float32)
-        updates: list[str] = []
-
-        for chunk in ready_chunks:
-            chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
-            if chunk_audio.size == 0:
-                continue
-            rolling_audio = append_overlay_interim_context(rolling_audio, chunk_audio)
-            stabilizer = self._overlay_interim_stabilizer(session_id)
-            source_seq = stabilizer.next_source_seq("stop_replay")
-            context = self._overlay_interim_context(session_id, int(rolling_audio.size))
-            try:
-                candidate = await self._transcribe_samples_serialized(rolling_audio)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "Incremental interim source unavailable for this session: {}",
-                    exc.__class__.__name__,
-                )
-                stabilizer.record_skip(
-                    source="stop_replay",
-                    source_seq=source_seq,
-                    context=context,
-                    reason="transcribe_error",
-                    error_class=exc.__class__.__name__,
-                )
-                break
-            stabilized = stabilizer.accept(
-                "stop_replay",
-                source_seq,
-                candidate,
-                context,
-            )
-            if stabilized is not None:
-                updates.append(stabilized.text)
-        return updates
+        return await self._interim_transcript_session(session_id).collect_stop_replay_updates(
+            ready_chunks,
+            self._transcribe_samples_serialized,
+        )
 
     async def _emit_interim_text(
         self,
@@ -822,44 +776,12 @@ class SessionOrchestrator:
         session_id: UUID,
         chunk: np.ndarray,
     ) -> None:
-        if not self.settings.overlay_events_enabled:
-            return
-        if self._live_interim_failed:
-            return
-        chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
-        if chunk_audio.size == 0:
-            return
-        self._live_interim_audio = append_overlay_interim_context(
-            self._live_interim_audio,
-            chunk_audio,
+        update = await self._interim_transcript_session(session_id).accept_live_chunk(
+            chunk,
+            self._transcribe_samples_serialized,
         )
-        stabilizer = self._overlay_interim_stabilizer(session_id)
-        source_seq = stabilizer.next_source_seq("live")
-        context = self._overlay_interim_context(session_id, int(self._live_interim_audio.size))
-        try:
-            candidate = await self._transcribe_samples_serialized(self._live_interim_audio)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Live incremental interim source unavailable for this session: {}",
-                exc.__class__.__name__,
-            )
-            stabilizer.record_skip(
-                source="live",
-                source_seq=source_seq,
-                context=context,
-                reason="transcribe_error",
-                error_class=exc.__class__.__name__,
-            )
-            self._live_interim_failed = True
-            return
-        stabilized = stabilizer.accept(
-            "live",
-            source_seq,
-            candidate,
-            context,
-        )
-        if stabilized is not None:
-            await self._emit_interim_text(event_sink, session_id, text=stabilized.text)
+        if update is not None:
+            await self._emit_interim_text(event_sink, session_id, text=update)
 
     def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
         return runtime_truth_snapshot(
