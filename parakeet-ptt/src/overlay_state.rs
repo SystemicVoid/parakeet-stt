@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::overlay_ipc::OverlayIpcMessage;
+use crate::overlay_ipc::{OverlayIpcMessage, OverlayTextProducer};
 
 pub const DEFAULT_AUTO_HIDE_AFTER_MS: u64 = 600;
 
@@ -102,7 +103,7 @@ pub enum ApplyOutcome {
 pub struct OverlayStateMachine {
     visibility: OverlayVisibility,
     active_session_id: Option<Uuid>,
-    last_seq: Option<u64>,
+    last_seq_by_producer: HashMap<OverlayTextProducer, u64>,
     finalize_deadline_ms: Option<u64>,
     auto_hide_after_ms: u64,
     warning_active: bool,
@@ -113,7 +114,7 @@ impl OverlayStateMachine {
         Self {
             visibility: OverlayVisibility::Hidden,
             active_session_id: None,
-            last_seq: None,
+            last_seq_by_producer: HashMap::new(),
             finalize_deadline_ms: None,
             auto_hide_after_ms: auto_hide_after.as_millis() as u64,
             warning_active: false,
@@ -133,10 +134,11 @@ impl OverlayStateMachine {
             OverlayIpcMessage::OutputHint { .. } => ApplyOutcome::Applied,
             OverlayIpcMessage::InterimState {
                 session_id,
+                producer,
                 seq,
                 state,
             } => {
-                if let Some(outcome) = self.apply_seq(session_id, seq) {
+                if let Some(outcome) = self.apply_seq(session_id, producer, seq) {
                     return outcome;
                 }
                 if state == "listening" {
@@ -152,10 +154,11 @@ impl OverlayStateMachine {
             }
             OverlayIpcMessage::InterimText {
                 session_id,
+                producer,
                 seq,
                 text,
             } => {
-                if let Some(outcome) = self.apply_seq(session_id, seq) {
+                if let Some(outcome) = self.apply_seq(session_id, producer, seq) {
                     return outcome;
                 }
                 self.visibility = OverlayVisibility::Interim { session_id, text };
@@ -178,7 +181,7 @@ impl OverlayStateMachine {
                 };
 
                 self.active_session_id = Some(session_id);
-                self.last_seq = None;
+                self.last_seq_by_producer.clear();
                 self.warning_active = false;
                 self.visibility = OverlayVisibility::Finalizing {
                     session_id,
@@ -205,7 +208,7 @@ impl OverlayStateMachine {
                 } if *finalizing_session == session_id => {
                     self.visibility = OverlayVisibility::Hidden;
                     self.active_session_id = None;
-                    self.last_seq = None;
+                    self.last_seq_by_producer.clear();
                     self.finalize_deadline_ms = None;
                     self.warning_active = false;
                     ApplyOutcome::Applied
@@ -220,7 +223,7 @@ impl OverlayStateMachine {
             if now_ms >= deadline_ms {
                 self.visibility = OverlayVisibility::Hidden;
                 self.active_session_id = None;
-                self.last_seq = None;
+                self.last_seq_by_producer.clear();
                 self.finalize_deadline_ms = None;
                 self.warning_active = false;
                 return true;
@@ -230,20 +233,25 @@ impl OverlayStateMachine {
         false
     }
 
-    fn apply_seq(&mut self, session_id: Uuid, seq: u64) -> Option<ApplyOutcome> {
+    fn apply_seq(
+        &mut self,
+        session_id: Uuid,
+        producer: OverlayTextProducer,
+        seq: u64,
+    ) -> Option<ApplyOutcome> {
         if self.active_session_id != Some(session_id) {
             self.active_session_id = Some(session_id);
-            self.last_seq = None;
+            self.last_seq_by_producer.clear();
             self.warning_active = false;
         }
 
-        if let Some(last_seq) = self.last_seq {
-            if seq <= last_seq {
+        if let Some(last_seq) = self.last_seq_by_producer.get(&producer) {
+            if seq <= *last_seq {
                 return Some(ApplyOutcome::DroppedStaleSeq);
             }
         }
 
-        self.last_seq = Some(seq);
+        self.last_seq_by_producer.insert(producer, seq);
         None
     }
 }
@@ -260,7 +268,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use crate::overlay_ipc::OverlayIpcMessage;
+    use crate::overlay_ipc::{OverlayIpcMessage, OverlayTextProducer};
 
     use super::{
         ApplyOutcome, OverlayRenderIntent, OverlayRenderPhase, OverlayStateMachine,
@@ -276,6 +284,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimState {
                     session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 1,
                     state: "listening".to_string(),
                 },
@@ -292,6 +301,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 2,
                     text: "hello".to_string(),
                 },
@@ -349,6 +359,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 10,
                     text: "newest".to_string(),
                 },
@@ -361,6 +372,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 9,
                     text: "stale".to_string(),
                 },
@@ -379,6 +391,85 @@ mod tests {
     }
 
     #[test]
+    fn state_machine_sequences_are_independent_by_text_producer() {
+        let mut machine = OverlayStateMachine::default();
+        let session_id = Uuid::new_v4();
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimText {
+                    session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
+                    seq: 10,
+                    text: "daemon interim".to_string(),
+                },
+                0
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimState {
+                    session_id,
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    seq: 1,
+                    state: "Generating answer...".to_string(),
+                },
+                1
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimText {
+                    session_id,
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    seq: 2,
+                    text: "answer".to_string(),
+                },
+                2
+            ),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimText {
+                    session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
+                    seq: 9,
+                    text: "stale daemon".to_string(),
+                },
+                3
+            ),
+            ApplyOutcome::DroppedStaleSeq
+        );
+
+        assert_eq!(
+            machine.apply_event(
+                OverlayIpcMessage::InterimText {
+                    session_id,
+                    producer: OverlayTextProducer::LlmAnswerDelta,
+                    seq: 2,
+                    text: "stale llm".to_string(),
+                },
+                4
+            ),
+            ApplyOutcome::DroppedStaleSeq
+        );
+
+        assert_eq!(
+            machine.visibility(),
+            &OverlayVisibility::Interim {
+                session_id,
+                text: "answer".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn session_ended_for_other_session_is_dropped() {
         let mut machine = OverlayStateMachine::default();
         let active_session = Uuid::new_v4();
@@ -388,6 +479,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimState {
                     session_id: active_session,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 1,
                     state: "listening".to_string(),
                 },
@@ -425,6 +517,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id: old_session,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 30,
                     text: "old".to_string(),
                 },
@@ -437,6 +530,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id: new_session,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 1,
                     text: "new".to_string(),
                 },
@@ -536,6 +630,7 @@ mod tests {
             machine.apply_event(
                 OverlayIpcMessage::InterimText {
                     session_id,
+                    producer: OverlayTextProducer::DaemonSttInterim,
                     seq: 1,
                     text: "hello".to_string(),
                 },

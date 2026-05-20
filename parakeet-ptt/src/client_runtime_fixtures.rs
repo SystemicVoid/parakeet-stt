@@ -29,12 +29,24 @@ pub(crate) struct ClientRuntimeHarness {
 
 impl ClientRuntimeHarness {
     pub(crate) fn new(config: ClientConfig) -> Self {
+        Self::new_with_llm_deltas(config, std::iter::empty::<String>(), "test answer")
+    }
+
+    pub(crate) fn new_with_llm_deltas<I, S>(
+        config: ClientConfig,
+        deltas: I,
+        answer: impl Into<String>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let (hotkey_tx, hotkey_rx) = mpsc::unbounded_channel();
         let (sent_tx, sent_rx) = mpsc::unbounded_channel();
         let (daemon_tx, daemon_rx) = mpsc::unbounded_channel();
         let (injection_runner, injections) = RecordingInjectionRunner::shared();
         let (overlay_sink, overlay_events) = RecordingOverlaySink::shared();
-        let (llm_answerer, llm_requests) = TestLlmAnswerer::shared();
+        let (llm_answerer, llm_requests) = TestLlmAnswerer::shared_with_deltas(deltas, answer);
         let ports = ClientPorts::new(
             AudioFeedback::new(false, None, 0),
             Arc::new(TestDaemonConnector::new(TestDaemonConnection {
@@ -247,14 +259,25 @@ impl DaemonConnection for TestDaemonConnection {
 
 struct TestLlmAnswerer {
     requests: RecordedLlmRequests,
+    progress_deltas: Vec<String>,
+    answer: String,
 }
 
 impl TestLlmAnswerer {
-    fn shared() -> (Arc<Self>, RecordedLlmRequests) {
+    fn shared_with_deltas<I, S>(
+        deltas: I,
+        answer: impl Into<String>,
+    ) -> (Arc<Self>, RecordedLlmRequests)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let requests = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
                 requests: Arc::clone(&requests),
+                progress_deltas: deltas.into_iter().map(Into::into).collect(),
+                answer: answer.into(),
             }),
             requests,
         )
@@ -280,14 +303,20 @@ impl LlmAnswerer for TestLlmAnswerer {
         &'a self,
         session_id: Uuid,
         transcript: String,
-        _progress_tx: mpsc::UnboundedSender<LlmProgress>,
+        progress_tx: mpsc::UnboundedSender<LlmProgress>,
     ) -> TestBoxFuture<'a, anyhow::Result<String>> {
         Box::pin(async move {
             self.requests
                 .lock()
                 .expect("recorded LLM request lock should be available")
                 .push((session_id, transcript));
-            Ok("test answer".to_string())
+            for delta in &self.progress_deltas {
+                let _ = progress_tx.send(LlmProgress::Delta {
+                    session_id,
+                    delta: delta.clone(),
+                });
+            }
+            Ok(self.answer.clone())
         })
     }
 }
