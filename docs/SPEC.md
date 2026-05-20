@@ -222,6 +222,16 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
       "vad_enabled": false,
       "vad_active": false,
       "vad_fallback_reason": null,
+      "interim_transcript_enabled": true,
+      "interim_transcript_last_source": "live",
+      "interim_transcript_live_chunks_processed": 2,
+      "interim_transcript_stop_replay_chunks_processed": 0,
+      "interim_transcript_updates_emitted": 2,
+      "interim_transcript_live_updates_emitted": 2,
+      "interim_transcript_stop_replay_updates_emitted": 0,
+      "interim_transcript_live_failed": false,
+      "interim_transcript_stop_replay_failed": false,
+      "interim_transcript_source_fallback_reason": null,
       "overlay_events_enabled": true,
       "overlay_events_emitted": 0,
       "overlay_events_dropped": 0,
@@ -251,6 +261,16 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 | `vad_enabled` | boolean or null | `true`, `false`, or `null` | Whether VAD is requested by configuration. |
 | `vad_active` | boolean or null | `true`, `false`, or `null` | Whether VAD was loaded and used by the runtime. |
 | `vad_fallback_reason` | string or null | implementation-defined reason or `null` | Set when `vad_enabled` is true and VAD is not active. |
+| `interim_transcript_enabled` | boolean or null | `true`, `false`, or `null` | Whether Overlay interim text production is enabled for the current runtime. |
+| `interim_transcript_last_source` | string or null | `"live"`, `"stop_replay"`, or `null` | Most recent interim transcript source that emitted visible text. |
+| `interim_transcript_live_chunks_processed` | integer or null | non-negative count or `null` | Live interim transcript source chunks processed for the current or last Session. |
+| `interim_transcript_stop_replay_chunks_processed` | integer or null | non-negative count or `null` | Stop-replay interim transcript source chunks processed for the current or last Session. |
+| `interim_transcript_updates_emitted` | integer or null | non-negative count or `null` | Total visible interim transcript text updates emitted by live and stop-replay sources. |
+| `interim_transcript_live_updates_emitted` | integer or null | non-negative count or `null` | Visible interim transcript text updates emitted by the live source. |
+| `interim_transcript_stop_replay_updates_emitted` | integer or null | non-negative count or `null` | Visible interim transcript text updates emitted by the stop-replay source. |
+| `interim_transcript_live_failed` | boolean or null | `true`, `false`, or `null` | Whether the live interim transcript source failed for the current or last Session. |
+| `interim_transcript_stop_replay_failed` | boolean or null | `true`, `false`, or `null` | Whether the stop-replay interim transcript source failed for the current or last Session. |
+| `interim_transcript_source_fallback_reason` | string or null | implementation-defined reason or `null` | Set when an interim transcript source failed or fell back. |
 | `overlay_events_enabled` | boolean or null | `true`, `false`, or `null` | Whether the daemon publishes overlay event frames. |
 | `overlay_events_emitted` | integer or null | non-negative count or `null` | Delivered overlay events for the daemon event-sink lifetime. |
 | `overlay_events_dropped` | integer or null | non-negative count or `null` | Overlay events dropped because of queue pressure, backpressure, or disconnects for the daemon event-sink lifetime. |

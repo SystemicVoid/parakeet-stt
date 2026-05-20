@@ -65,6 +65,16 @@ pub enum ServerMessage {
         vad_enabled: Option<bool>,
         vad_active: Option<bool>,
         vad_fallback_reason: Option<String>,
+        interim_transcript_enabled: Option<bool>,
+        interim_transcript_last_source: Option<String>,
+        interim_transcript_live_chunks_processed: Option<u64>,
+        interim_transcript_stop_replay_chunks_processed: Option<u64>,
+        interim_transcript_updates_emitted: Option<u64>,
+        interim_transcript_live_updates_emitted: Option<u64>,
+        interim_transcript_stop_replay_updates_emitted: Option<u64>,
+        interim_transcript_live_failed: Option<bool>,
+        interim_transcript_stop_replay_failed: Option<bool>,
+        interim_transcript_source_fallback_reason: Option<String>,
         overlay_events_enabled: Option<bool>,
         overlay_events_emitted: Option<u64>,
         overlay_events_dropped: Option<u64>,
@@ -210,6 +220,16 @@ mod tests {
                 vad_enabled,
                 vad_active,
                 vad_fallback_reason,
+                interim_transcript_enabled,
+                interim_transcript_last_source,
+                interim_transcript_live_chunks_processed,
+                interim_transcript_stop_replay_chunks_processed,
+                interim_transcript_updates_emitted,
+                interim_transcript_live_updates_emitted,
+                interim_transcript_stop_replay_updates_emitted,
+                interim_transcript_live_failed,
+                interim_transcript_stop_replay_failed,
+                interim_transcript_source_fallback_reason,
                 overlay_events_enabled,
                 overlay_events_emitted,
                 overlay_events_dropped,
@@ -240,6 +260,16 @@ mod tests {
                 assert_eq!(vad_enabled, None);
                 assert_eq!(vad_active, None);
                 assert_eq!(vad_fallback_reason, None);
+                assert_eq!(interim_transcript_enabled, None);
+                assert_eq!(interim_transcript_last_source, None);
+                assert_eq!(interim_transcript_live_chunks_processed, None);
+                assert_eq!(interim_transcript_stop_replay_chunks_processed, None);
+                assert_eq!(interim_transcript_updates_emitted, None);
+                assert_eq!(interim_transcript_live_updates_emitted, None);
+                assert_eq!(interim_transcript_stop_replay_updates_emitted, None);
+                assert_eq!(interim_transcript_live_failed, None);
+                assert_eq!(interim_transcript_stop_replay_failed, None);
+                assert_eq!(interim_transcript_source_fallback_reason, None);
                 assert_eq!(overlay_events_enabled, None);
                 assert_eq!(overlay_events_emitted, None);
                 assert_eq!(overlay_events_dropped, None);
@@ -393,6 +423,16 @@ mod tests {
                 vad_enabled: Some(false),
                 vad_active: Some(false),
                 vad_fallback_reason: None,
+                interim_transcript_enabled: Some(false),
+                interim_transcript_last_source: None,
+                interim_transcript_live_chunks_processed: Some(0),
+                interim_transcript_stop_replay_chunks_processed: Some(0),
+                interim_transcript_updates_emitted: Some(0),
+                interim_transcript_live_updates_emitted: Some(0),
+                interim_transcript_stop_replay_updates_emitted: Some(0),
+                interim_transcript_live_failed: Some(false),
+                interim_transcript_stop_replay_failed: Some(false),
+                interim_transcript_source_fallback_reason: None,
                 overlay_events_enabled: Some(false),
                 overlay_events_emitted: Some(0),
                 overlay_events_dropped: Some(0),
