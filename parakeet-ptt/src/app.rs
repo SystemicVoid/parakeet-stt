@@ -1040,9 +1040,29 @@ struct StatusInfo {
     effective_device: Option<String>,
     streaming_enabled: Option<bool>,
     stream_helper_active: Option<bool>,
+    stream_helper_scope: Option<String>,
     stream_fallback_reason: Option<String>,
     stream_path_executed: Option<bool>,
     stream_chunks_processed: Option<u64>,
+    finalization_mode: Option<String>,
+    final_audio_source: Option<String>,
+    tail_trim_mode: Option<String>,
+    vad_enabled: Option<bool>,
+    vad_active: Option<bool>,
+    vad_fallback_reason: Option<String>,
+    interim_transcript_enabled: Option<bool>,
+    interim_transcript_last_source: Option<String>,
+    interim_transcript_live_chunks_processed: Option<u64>,
+    interim_transcript_stop_replay_chunks_processed: Option<u64>,
+    interim_transcript_updates_emitted: Option<u64>,
+    interim_transcript_live_updates_emitted: Option<u64>,
+    interim_transcript_stop_replay_updates_emitted: Option<u64>,
+    interim_transcript_live_failed: Option<bool>,
+    interim_transcript_stop_replay_failed: Option<bool>,
+    interim_transcript_source_fallback_reason: Option<String>,
+    overlay_events_enabled: Option<bool>,
+    overlay_events_emitted: Option<u64>,
+    overlay_events_dropped: Option<u64>,
     chunk_secs: Option<f64>,
     active_session_age_ms: Option<u64>,
     audio_stop_ms: Option<u64>,
@@ -1052,6 +1072,60 @@ struct StatusInfo {
     last_audio_ms: Option<u64>,
     last_infer_ms: Option<u64>,
     last_send_ms: Option<u64>,
+}
+
+fn format_daemon_status(status: &StatusInfo) -> String {
+    format!(
+        "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
+streaming={:?}, helper_active={:?}, helper_scope={:?}, stream_path_executed={:?}, \
+stream_chunks_processed={:?}, stream_fallback={:?}, finalization_mode={:?}, \
+final_audio_source={:?}, tail_trim={:?}, vad_enabled={:?}, vad_active={:?}, \
+vad_fallback={:?}, interim_enabled={:?}, interim_source={:?}, interim_live_chunks={:?}, \
+interim_stop_replay_chunks={:?}, interim_updates={:?}, interim_live_updates={:?}, \
+interim_stop_replay_updates={:?}, interim_live_failed={:?}, interim_stop_replay_failed={:?}, \
+interim_fallback={:?}, overlay_enabled={:?}, overlay_emitted={:?}, overlay_dropped={:?}, \
+chunk_secs={:?}, active_age_ms={:?}, audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, \
+send_ms={:?}, last_audio_ms={:?}, last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
+        status.state,
+        status.sessions_active,
+        status.device,
+        status.effective_device,
+        status.streaming_enabled,
+        status.stream_helper_active,
+        status.stream_helper_scope,
+        status.stream_path_executed,
+        status.stream_chunks_processed,
+        status.stream_fallback_reason,
+        status.finalization_mode,
+        status.final_audio_source,
+        status.tail_trim_mode,
+        status.vad_enabled,
+        status.vad_active,
+        status.vad_fallback_reason,
+        status.interim_transcript_enabled,
+        status.interim_transcript_last_source,
+        status.interim_transcript_live_chunks_processed,
+        status.interim_transcript_stop_replay_chunks_processed,
+        status.interim_transcript_updates_emitted,
+        status.interim_transcript_live_updates_emitted,
+        status.interim_transcript_stop_replay_updates_emitted,
+        status.interim_transcript_live_failed,
+        status.interim_transcript_stop_replay_failed,
+        status.interim_transcript_source_fallback_reason,
+        status.overlay_events_enabled,
+        status.overlay_events_emitted,
+        status.overlay_events_dropped,
+        status.chunk_secs,
+        status.active_session_age_ms,
+        status.audio_stop_ms,
+        status.finalize_ms,
+        status.infer_ms,
+        status.send_ms,
+        status.last_audio_ms,
+        status.last_infer_ms,
+        status.last_send_ms,
+        status.gpu_mem_mb
+    )
 }
 
 async fn fetch_status_once(config: &ClientConfig) {
@@ -1067,32 +1141,7 @@ async fn fetch_status_once(config: &ClientConfig) {
     {
         Ok(response) => match response.json::<StatusInfo>().await {
             Ok(status) => {
-                info!(
-                    "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
-streaming={:?}, helper_active={:?}, stream_path_executed={:?}, stream_chunks_processed={:?}, \
-fallback={:?}, chunk_secs={:?}, active_age_ms={:?}, \
-audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, send_ms={:?}, last_audio_ms={:?}, \
-last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
-                    status.state,
-                    status.sessions_active,
-                    status.device,
-                    status.effective_device,
-                    status.streaming_enabled,
-                    status.stream_helper_active,
-                    status.stream_path_executed,
-                    status.stream_chunks_processed,
-                    status.stream_fallback_reason,
-                    status.chunk_secs,
-                    status.active_session_age_ms,
-                    status.audio_stop_ms,
-                    status.finalize_ms,
-                    status.infer_ms,
-                    status.send_ms,
-                    status.last_audio_ms,
-                    status.last_infer_ms,
-                    status.last_send_ms,
-                    status.gpu_mem_mb
-                );
+                info!("{}", format_daemon_status(&status));
             }
             Err(err) => {
                 warn!("Failed to decode daemon status from {}: {}", url, err);
@@ -1150,9 +1199,112 @@ mod tests {
     use crate::llm::{drain_sse_lines, sanitize_model_answer};
 
     use super::{
-        clear_transient_session_state, handle_injection_report, maybe_defer_llm_session_end, run,
-        CapturedParentFocus, HotkeyIntentDiagnostics, SessionIntent, TransientSessionState,
+        clear_transient_session_state, format_daemon_status, handle_injection_report,
+        maybe_defer_llm_session_end, run, CapturedParentFocus, HotkeyIntentDiagnostics,
+        SessionIntent, StatusInfo, TransientSessionState,
     };
+
+    #[test]
+    fn status_info_accepts_minimal_legacy_payload() {
+        let status: StatusInfo =
+            serde_json::from_str(r#"{"type":"status","state":"idle","sessions_active":0}"#)
+                .expect("minimal status payload should parse");
+
+        assert_eq!(status.state.as_deref(), Some("idle"));
+        assert_eq!(status.sessions_active, Some(0));
+        assert_eq!(status.stream_path_executed, None);
+        assert_eq!(status.finalization_mode, None);
+        assert_eq!(status.interim_transcript_enabled, None);
+        assert_eq!(status.interim_transcript_last_source, None);
+        assert_eq!(status.overlay_events_enabled, None);
+        assert_eq!(status.gpu_mem_mb, None);
+
+        let summary = format_daemon_status(&status);
+        assert!(summary.contains("stream_path_executed=None"));
+        assert!(summary.contains("finalization_mode=None"));
+        assert!(summary.contains("interim_enabled=None"));
+        assert!(summary.contains("gpu_mem_mb=None"));
+    }
+
+    #[test]
+    fn status_info_preserves_and_formats_interim_truth_fixture() {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/protocol/fixtures/status_stream_fallback.json");
+        let fixture = fs::read_to_string(fixture_path).expect("status fixture should be readable");
+        let status: StatusInfo =
+            serde_json::from_str(&fixture).expect("status fixture should parse");
+
+        assert_eq!(status.state.as_deref(), Some("idle"));
+        assert_eq!(status.sessions_active, Some(0));
+        assert_eq!(status.gpu_mem_mb, Some(1024));
+        assert_eq!(status.device.as_deref(), Some("cuda"));
+        assert_eq!(status.effective_device.as_deref(), Some("cuda"));
+        assert_eq!(status.streaming_enabled, Some(true));
+        assert_eq!(status.stream_helper_active, Some(false));
+        assert_eq!(
+            status.stream_helper_scope.as_deref(),
+            Some("live_session_only")
+        );
+        assert_eq!(
+            status.stream_fallback_reason.as_deref(),
+            Some("init_failed:RuntimeError")
+        );
+        assert_eq!(status.stream_path_executed, Some(false));
+        assert_eq!(status.stream_chunks_processed, Some(0));
+        assert_eq!(status.finalization_mode.as_deref(), Some("offline_seal"));
+        assert_eq!(
+            status.final_audio_source.as_deref(),
+            Some("canonical_session_audio")
+        );
+        assert_eq!(status.tail_trim_mode.as_deref(), Some("rms"));
+        assert_eq!(status.vad_enabled, Some(false));
+        assert_eq!(status.vad_active, Some(false));
+        assert_eq!(status.vad_fallback_reason, None);
+        assert_eq!(status.interim_transcript_enabled, Some(true));
+        assert_eq!(
+            status.interim_transcript_last_source.as_deref(),
+            Some("live")
+        );
+        assert_eq!(status.interim_transcript_live_chunks_processed, Some(1));
+        assert_eq!(
+            status.interim_transcript_stop_replay_chunks_processed,
+            Some(0)
+        );
+        assert_eq!(status.interim_transcript_updates_emitted, Some(1));
+        assert_eq!(status.interim_transcript_live_updates_emitted, Some(1));
+        assert_eq!(
+            status.interim_transcript_stop_replay_updates_emitted,
+            Some(0)
+        );
+        assert_eq!(status.interim_transcript_live_failed, Some(false));
+        assert_eq!(status.interim_transcript_stop_replay_failed, Some(false));
+        assert_eq!(status.interim_transcript_source_fallback_reason, None);
+        assert_eq!(status.overlay_events_enabled, Some(true));
+        assert_eq!(status.overlay_events_emitted, Some(3));
+        assert_eq!(status.overlay_events_dropped, Some(1));
+        assert_eq!(status.chunk_secs, Some(2.4));
+        assert_eq!(status.active_session_age_ms, None);
+        assert_eq!(status.audio_stop_ms, Some(0));
+        assert_eq!(status.finalize_ms, Some(4));
+        assert_eq!(status.infer_ms, Some(0));
+        assert_eq!(status.send_ms, Some(0));
+        assert_eq!(status.last_audio_ms, Some(2400));
+        assert_eq!(status.last_infer_ms, Some(0));
+        assert_eq!(status.last_send_ms, Some(0));
+
+        let summary = format_daemon_status(&status);
+        assert!(summary.contains("helper_scope=Some(\"live_session_only\")"));
+        assert!(summary.contains("stream_path_executed=Some(false)"));
+        assert!(summary.contains("stream_fallback=Some(\"init_failed:RuntimeError\")"));
+        assert!(summary.contains("finalization_mode=Some(\"offline_seal\")"));
+        assert!(summary.contains("final_audio_source=Some(\"canonical_session_audio\")"));
+        assert!(summary.contains("tail_trim=Some(\"rms\")"));
+        assert!(summary.contains("interim_enabled=Some(true)"));
+        assert!(summary.contains("interim_source=Some(\"live\")"));
+        assert!(summary.contains("interim_updates=Some(1)"));
+        assert!(summary.contains("overlay_emitted=Some(3)"));
+        assert!(summary.contains("gpu_mem_mb=Some(1024)"));
+    }
 
     #[test]
     fn clear_transient_session_state_resets_reconnect_caches() {
