@@ -35,6 +35,18 @@ class _FakeTDTLoss:
     pass
 
 
+class _FailingStreamParent(_FakeParent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.marked_fallback_reason: str | None = None
+
+    def process_stream_chunk(self, _samples: np.ndarray, _sample_rate: int) -> object:
+        raise RuntimeError("stream helper failed")
+
+    def mark_stream_fallback(self, reason: str) -> None:
+        self.marked_fallback_reason = reason
+
+
 def test_finalize_returns_empty_when_no_audio() -> None:
     from parakeet_stt_daemon.model import ParakeetStreamingSession
 
@@ -180,6 +192,131 @@ def test_tdt_streaming_helper_rebuilds_decoder_with_cuda_graphs_disabled(monkeyp
     assert transcriber._helper_class_name == "BatchedFrameASRTDT"
     assert model.change_decoding_flags == [(False, False)]
     assert rebuilt_decoder.disable_calls == 1
+
+
+def test_tdt_stream_chunk_pads_terminal_frame_and_records_execution(monkeypatch) -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
+
+    streaming_utils = ModuleType("nemo.collections.asr.parts.utils.streaming_utils")
+    captured: dict[str, Any] = {}
+
+    class _FakeAudioFeatureIterator:
+        def __init__(
+            self,
+            samples: np.ndarray,
+            frame_len: float,
+            preprocessor: object,
+            device: str,
+            *,
+            pad_to_frame_len: bool = True,
+        ) -> None:
+            self.samples = np.asarray(samples)
+            self.frame_len = frame_len
+            self.preprocessor = preprocessor
+            self.device = device
+            self.pad_to_frame_len = pad_to_frame_len
+            captured["frame_reader"] = self
+
+    class _FakeFrameBatchChunkedRNNT:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise AssertionError("TDT model should use BatchedFrameASRTDT")
+
+    class _FakeBatchedFrameASRTDT:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.raw_preprocessor = SimpleNamespace(_cfg={"window_stride": 0.01})
+            self.reader: _FakeAudioFeatureIterator | None = None
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+        def set_frame_reader(self, frame_reader: _FakeAudioFeatureIterator, idx: int) -> None:
+            self.reader = frame_reader
+            captured["set_frame_reader_idx"] = idx
+
+        def transcribe(self, tokens_per_chunk: int, delay: int) -> list[str]:
+            captured["tokens_per_chunk"] = tokens_per_chunk
+            captured["delay"] = delay
+            if self.reader is None:
+                raise AssertionError("missing frame reader")
+            if not self.reader.pad_to_frame_len:
+                raise ValueError("short terminal frame broadcast failure")
+            if self.reader.samples.shape[0] <= 1_600:
+                raise ValueError("missing TDT delay pad")
+            return ["partial text"]
+
+    streaming_utils_any = cast(Any, streaming_utils)
+    streaming_utils_any.AudioFeatureIterator = _FakeAudioFeatureIterator
+    streaming_utils_any.FrameBatchChunkedRNNT = _FakeFrameBatchChunkedRNNT
+    streaming_utils_any.BatchedFrameASRTDT = _FakeBatchedFrameASRTDT
+    for module_name in (
+        "nemo",
+        "nemo.collections",
+        "nemo.collections.asr",
+        "nemo.collections.asr.parts",
+        "nemo.collections.asr.parts.utils",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name))
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo.collections.asr.parts.utils.streaming_utils",
+        streaming_utils,
+    )
+    monkeypatch.setitem(sys.modules, "omegaconf", None)
+
+    model = SimpleNamespace(
+        _cfg=SimpleNamespace(
+            sample_rate=16_001,
+            preprocessor=SimpleNamespace(window_stride=0.01),
+            decoding={"greedy": {"max_symbols_per_step": 5}},
+        ),
+        device="cpu",
+        encoder=SimpleNamespace(subsampling_factor=8),
+        loss=SimpleNamespace(_loss=_FakeTDTLoss()),
+        decoding=SimpleNamespace(decoding=SimpleNamespace()),
+    )
+
+    transcriber = ParakeetStreamingTranscriber(
+        cast(Any, model),
+        chunk_secs=0.2,
+        right_context_secs=0.1,
+        batch_size=32,
+    )
+    session = transcriber.start_session(16_001)
+
+    processed = session.feed(np.ones((1_600,), dtype=np.float32))
+
+    frame_reader = captured["frame_reader"]
+    assert processed is True
+    assert session.stream_path_executed is True
+    assert session.stream_chunks_processed == 1
+    assert session.stream_fallback_reason is None
+    assert captured["set_frame_reader_idx"] == 0
+    assert captured["tokens_per_chunk"] == 3
+    assert captured["delay"] == 4
+    assert frame_reader.pad_to_frame_len is True
+    assert frame_reader.samples.dtype == np.float32
+    assert frame_reader.samples.shape == (6_721,)
+
+
+def test_streaming_session_falls_back_to_seal_path_after_helper_failure() -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingSession
+
+    parent = _FailingStreamParent()
+    session = ParakeetStreamingSession(cast(Any, parent), sample_rate=16_000)
+
+    processed = session.feed(np.array([0.1, 0.2], dtype=np.float32))
+    result = session.finalize()
+
+    assert processed is False
+    assert session.stream_path_executed is False
+    assert session.stream_chunks_processed == 0
+    assert session.stream_fallback_reason == "stream_chunk_failed:RuntimeError"
+    assert parent.marked_fallback_reason == "stream_chunk_failed:RuntimeError"
+    assert result == "offline text"
+    assert parent.offline_calls == 1
+    assert parent.last_samples is not None
+    np.testing.assert_allclose(parent.last_samples, np.array([0.1, 0.2], dtype=np.float32))
 
 
 def test_finalize_concatenates_stream_chunks_before_offline_seal() -> None:

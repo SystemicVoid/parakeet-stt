@@ -449,6 +449,24 @@ class ParakeetStreamingTranscriber:
         preprocessor = getattr(helper, "raw_preprocessor", None)
         if preprocessor is None:
             raise RuntimeError("streaming_preprocessor_unavailable")
+        helper_class_name = self._helper_class_name or type(helper).__name__
+        if helper_class_name == "BatchedFrameASRTDT":
+            tokens_per_chunk, delay = self._tdt_streaming_params()
+            delay_pad_samples = int(
+                math.ceil(delay * _model_stride_secs(self.model) * model_sample_rate)
+            )
+            stream_samples = samples
+            if delay_pad_samples > 0:
+                stream_samples = np.pad(stream_samples, (0, delay_pad_samples))
+            frame_reader = AudioFeatureIterator(
+                stream_samples.astype(np.float32, copy=False),
+                self.chunk_secs,
+                preprocessor,
+                self.model.device,
+                pad_to_frame_len=True,
+            )
+            helper.set_frame_reader(frame_reader, 0)
+            return helper.transcribe(tokens_per_chunk, delay)
         frame_reader = AudioFeatureIterator(
             samples,
             self.chunk_secs,
@@ -456,11 +474,6 @@ class ParakeetStreamingTranscriber:
             self.model.device,
             pad_to_frame_len=False,
         )
-        helper_class_name = self._helper_class_name or type(helper).__name__
-        if helper_class_name == "BatchedFrameASRTDT":
-            tokens_per_chunk, delay = self._tdt_streaming_params()
-            helper.set_frame_reader(frame_reader, 0)
-            return helper.transcribe(tokens_per_chunk, delay)
         helper.set_frame_reader(frame_reader)
         return helper.transcribe()
 
