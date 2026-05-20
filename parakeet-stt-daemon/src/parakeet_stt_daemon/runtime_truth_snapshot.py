@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .messages import StatusMessage
+from .overlay_interim import InterimTranscriptRuntimeFacts, InterimTranscriptSource
 from .session import SessionState
 from .tail_trim import TailTrimMode
 
@@ -84,6 +85,16 @@ class RuntimeTruth:
     vad_enabled: bool
     vad_active: bool
     vad_fallback_reason: str | None
+    interim_transcript_enabled: bool
+    interim_transcript_last_source: InterimTranscriptSource | None
+    interim_transcript_live_chunks_processed: int
+    interim_transcript_stop_replay_chunks_processed: int
+    interim_transcript_updates_emitted: int
+    interim_transcript_live_updates_emitted: int
+    interim_transcript_stop_replay_updates_emitted: int
+    interim_transcript_live_failed: bool
+    interim_transcript_stop_replay_failed: bool
+    interim_transcript_source_fallback_reason: str | None
     overlay_events_enabled: bool
     chunk_secs: float | None
 
@@ -113,6 +124,24 @@ class RuntimeTruth:
             vad_enabled=self.vad_enabled,
             vad_active=self.vad_active,
             vad_fallback_reason=self.vad_fallback_reason,
+            interim_transcript_enabled=self.interim_transcript_enabled,
+            interim_transcript_last_source=self.interim_transcript_last_source,
+            interim_transcript_live_chunks_processed=(
+                self.interim_transcript_live_chunks_processed
+            ),
+            interim_transcript_stop_replay_chunks_processed=(
+                self.interim_transcript_stop_replay_chunks_processed
+            ),
+            interim_transcript_updates_emitted=self.interim_transcript_updates_emitted,
+            interim_transcript_live_updates_emitted=(self.interim_transcript_live_updates_emitted),
+            interim_transcript_stop_replay_updates_emitted=(
+                self.interim_transcript_stop_replay_updates_emitted
+            ),
+            interim_transcript_live_failed=self.interim_transcript_live_failed,
+            interim_transcript_stop_replay_failed=self.interim_transcript_stop_replay_failed,
+            interim_transcript_source_fallback_reason=(
+                self.interim_transcript_source_fallback_reason
+            ),
             overlay_events_enabled=self.overlay_events_enabled,
             overlay_events_emitted=metrics.overlay_events_emitted,
             overlay_events_dropped=metrics.overlay_events_dropped,
@@ -144,6 +173,26 @@ class RuntimeTruth:
             "vad_enabled": self.vad_enabled,
             "vad_active": self.vad_active,
             "vad_fallback_reason": self.vad_fallback_reason,
+            "interim_transcript_enabled": self.interim_transcript_enabled,
+            "interim_transcript_last_source": self.interim_transcript_last_source,
+            "interim_transcript_live_chunks_processed": (
+                self.interim_transcript_live_chunks_processed
+            ),
+            "interim_transcript_stop_replay_chunks_processed": (
+                self.interim_transcript_stop_replay_chunks_processed
+            ),
+            "interim_transcript_updates_emitted": self.interim_transcript_updates_emitted,
+            "interim_transcript_live_updates_emitted": (
+                self.interim_transcript_live_updates_emitted
+            ),
+            "interim_transcript_stop_replay_updates_emitted": (
+                self.interim_transcript_stop_replay_updates_emitted
+            ),
+            "interim_transcript_live_failed": self.interim_transcript_live_failed,
+            "interim_transcript_stop_replay_failed": self.interim_transcript_stop_replay_failed,
+            "interim_transcript_source_fallback_reason": (
+                self.interim_transcript_source_fallback_reason
+            ),
             "overlay_events_enabled": self.overlay_events_enabled,
         }
 
@@ -162,6 +211,12 @@ def snapshot(
     seal_path = seal_path or SealPathFacts()
     tail_trim = _tail_trim_facts(orchestrator, last_trim_outcome)
     device_info = device_info or _device_info(orchestrator)
+    overlay_enabled = (
+        bool(getattr(settings, "overlay_events_enabled", False))
+        if overlay_events_enabled is None
+        else overlay_events_enabled
+    )
+    interim = _interim_transcript_facts(orchestrator, enabled=overlay_enabled)
     return RuntimeTruth(
         device=device_info.requested_device,
         effective_device=device_info.effective_device,
@@ -178,17 +233,54 @@ def snapshot(
         vad_enabled=bool(getattr(orchestrator, "_vad_enabled", False)),
         vad_active=tail_trim.vad_active,
         vad_fallback_reason=tail_trim.vad_fallback_reason,
-        overlay_events_enabled=(
-            bool(getattr(settings, "overlay_events_enabled", False))
-            if overlay_events_enabled is None
-            else overlay_events_enabled
-        ),
+        interim_transcript_enabled=interim.enabled,
+        interim_transcript_last_source=interim.last_source,
+        interim_transcript_live_chunks_processed=interim.live_chunks_processed,
+        interim_transcript_stop_replay_chunks_processed=interim.stop_replay_chunks_processed,
+        interim_transcript_updates_emitted=interim.updates_emitted,
+        interim_transcript_live_updates_emitted=interim.live_updates_emitted,
+        interim_transcript_stop_replay_updates_emitted=interim.stop_replay_updates_emitted,
+        interim_transcript_live_failed=interim.live_failed,
+        interim_transcript_stop_replay_failed=interim.stop_replay_failed,
+        interim_transcript_source_fallback_reason=interim.source_fallback_reason,
+        overlay_events_enabled=overlay_enabled,
         chunk_secs=stream_path.chunk_secs,
     )
 
 
 def format_log_record(record: dict[str, object]) -> str:
     return ", ".join(f"{key}={_format_log_value(value)}" for key, value in record.items())
+
+
+def _empty_interim_transcript_facts(*, enabled: bool) -> InterimTranscriptRuntimeFacts:
+    return InterimTranscriptRuntimeFacts(
+        enabled=enabled,
+        last_source=None,
+        live_chunks_processed=0,
+        live_updates_emitted=0,
+        live_failed=False,
+        stop_replay_chunks_processed=0,
+        stop_replay_updates_emitted=0,
+        stop_replay_failed=False,
+        source_fallback_reason=None,
+    )
+
+
+def _interim_transcript_facts(
+    orchestrator: Any,
+    *,
+    enabled: bool,
+) -> InterimTranscriptRuntimeFacts:
+    getter = getattr(orchestrator, "interim_transcript_runtime_facts_for_runtime", None)
+    if not callable(getter):
+        return _empty_interim_transcript_facts(enabled=enabled)
+    try:
+        facts = getter()
+    except Exception:  # noqa: BLE001
+        return _empty_interim_transcript_facts(enabled=enabled)
+    if isinstance(facts, InterimTranscriptRuntimeFacts):
+        return facts
+    return _empty_interim_transcript_facts(enabled=enabled)
 
 
 def _device_info(orchestrator: Any) -> DeviceInfo:

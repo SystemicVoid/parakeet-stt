@@ -156,6 +156,7 @@ class SessionOrchestrator:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
         self._interim_transcript_by_session: dict[UUID, OverlayInterimTranscriptSession] = {}
+        self._last_interim_transcript_runtime_facts: InterimTranscriptRuntimeFacts | None = None
 
     async def start(self, intent: StartSessionIntent) -> None:
         await self._handle_start(intent)
@@ -293,6 +294,7 @@ class SessionOrchestrator:
                 await self._emit_session_ended(
                     event_sink, session.session_id, reason=SessionEndReason.ERROR
                 )
+                self._record_last_interim_transcript_runtime(session.session_id)
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 return
@@ -332,6 +334,7 @@ class SessionOrchestrator:
                 await self._emit_session_ended(
                     event_sink, session.session_id, reason=SessionEndReason.ERROR
                 )
+                self._record_last_interim_transcript_runtime(session.session_id)
                 await self.sessions.clear(session.session_id, owner_token=owner_token)
                 self._clear_overlay_session_runtime(session.session_id)
                 return
@@ -358,6 +361,7 @@ class SessionOrchestrator:
             await self._emit_session_ended(
                 event_sink, session.session_id, reason=SessionEndReason.FINAL
             )
+            self._record_last_interim_transcript_runtime(session.session_id)
             await self.sessions.clear(session.session_id, owner_token=owner_token)
             self._clear_overlay_session_runtime(session.session_id)
             self._last_audio_ms = audio_ms
@@ -485,6 +489,7 @@ class SessionOrchestrator:
             await self._stop_stream_drain_loop()
             self._stop_session_guard_loop()
             if active_session_id is not None:
+                self._record_last_interim_transcript_runtime(active_session_id)
                 await self.sessions.clear(active_session_id, owner_token=active_owner_token)
                 self._clear_overlay_session_runtime(active_session_id)
             self._active_stream = None
@@ -708,6 +713,38 @@ class SessionOrchestrator:
         session_id: UUID,
     ) -> InterimTranscriptRuntimeFacts:
         return self._interim_transcript_session(session_id).runtime_facts
+
+    def interim_transcript_runtime_facts_for_runtime(self) -> InterimTranscriptRuntimeFacts:
+        active = self.sessions.active
+        if active is not None:
+            return self._interim_transcript_session(active.session_id).runtime_facts
+        last_facts = getattr(self, "_last_interim_transcript_runtime_facts", None)
+        if isinstance(last_facts, InterimTranscriptRuntimeFacts):
+            return last_facts
+        return self._empty_interim_transcript_runtime_facts()
+
+    def _record_last_interim_transcript_runtime(self, session_id: UUID) -> None:
+        interim_sessions = self._interim_transcript_sessions_for_runtime()
+        interim_session = interim_sessions.get(session_id)
+        if interim_session is None:
+            self._last_interim_transcript_runtime_facts = (
+                self._empty_interim_transcript_runtime_facts()
+            )
+            return
+        self._last_interim_transcript_runtime_facts = interim_session.runtime_facts
+
+    def _empty_interim_transcript_runtime_facts(self) -> InterimTranscriptRuntimeFacts:
+        return InterimTranscriptRuntimeFacts(
+            enabled=bool(self.settings.overlay_events_enabled),
+            last_source=None,
+            live_chunks_processed=0,
+            live_updates_emitted=0,
+            live_failed=False,
+            stop_replay_chunks_processed=0,
+            stop_replay_updates_emitted=0,
+            stop_replay_failed=False,
+            source_fallback_reason=None,
+        )
 
     async def _emit_interim_state(
         self,
