@@ -1,6 +1,6 @@
 # Parakeet STT – Canonical Specification (Living Document)
 
-_Last updated: 2026-03-06_
+_Last updated: 2026-05-20_
 
 This document is the single source of truth for the local, push-to-talk Parakeet speech-to-text solution on Pop!\_OS 24.04 (Wayland). Update it whenever significant design, implementation, or operational decisions are made so every agent and developer can stay in sync.
 
@@ -43,12 +43,23 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 
 - **Control flow**
   1. User presses Right Ctrl → `parakeet-ptt` sends `start_session` to daemon.
-  2. Daemon begins session capture; streaming engine activation is tracked as runtime truth for diagnostics.
+  2. Daemon begins session capture; NeMo Stream path execution, Daemon interim transcript sources, and Overlay event transport are tracked as separate runtime truth dimensions.
   3. User releases Right Ctrl → `parakeet-ptt` issues `stop_session`.
-  4. Daemon finalizes with the offline seal path and returns final transcription via WebSocket.
+  4. Daemon finalizes with the offline Seal path and returns final transcription via WebSocket.
   5. `parakeet-ptt` writes transcript text to the clipboard and executes configured injection behavior (`paste` or `copy-only`), with adaptive shortcut routing available in paste mode.
 
 - **Networking**: localhost WebSocket (JSON frames). No audio leaves the daemon process; control messages only.
+
+### Runtime Truth And User-Visible Text Surfaces
+
+The two-process architecture keeps inference and desktop presentation separate. When diagnosing visible text, treat these surfaces independently:
+
+- **NeMo Stream path execution**: daemon-side chunked ASR work for the Stream path. Runtime truth lives in `streaming_enabled`, `stream_helper_active`, `stream_helper_scope`, `stream_fallback_reason`, `stream_path_executed`, and `stream_chunks_processed`. `stream_path_executed=false` means the Stream path did not process chunks for the current or last Session; it does not prove no interim text was shown.
+- **Seal path finalization**: daemon-side offline final transcription after stop. Runtime truth lives in `finalization_mode`, `final_audio_source`, `tail_trim_mode`, `vad_*`, and finalization timing fields. This is the only path that produces `final_result` for Injection.
+- **Daemon interim transcript sources**: daemon-side display-only interim text production for the Overlay. The `live` source consumes arriving audio chunks during a Session; the `stop_replay` source replays ready chunks while stopping. Runtime truth lives in `interim_transcript_*` fields, including per-source chunks processed, updates emitted, failures, and fallback reason. These sources can emit Overlay text even when `stream_path_executed=false`.
+- **Overlay event transport**: daemon-to-Client display messages such as `interim_state`, `interim_text`, `audio_level`, and `session_ended`. Runtime truth lives in `overlay_events_enabled`, `overlay_events_emitted`, and `overlay_events_dropped`. Transport counters show whether display events were published or dropped; they do not identify which inference path produced text.
+- **Client-side LLM answer deltas**: in LLM query mode, the Client may stream local LLM answer deltas into the Overlay while answer generation is running. These deltas are Client-owned, are not Daemon interim transcript updates, and do not change Stream path or Seal path runtime truth.
+- **Renderer animation**: the Overlay renderer may animate listening text, interim text, finalizing state, width, opacity, or character transitions. Animation is local presentation only; it is not evidence of Stream path execution, Seal path progress, event delivery, or LLM generation.
 
 ---
 
@@ -76,9 +87,9 @@ This document is the single source of truth for the local, push-to-talk Parakeet
 - **Streaming inference**
   - Target documented NeMo streaming APIs for RNNT/conformer flows (cache-aware per-session stepping), not brittle internal helper imports.
   - On session start: allocate streaming state transactionally; if any downstream setup fails, rollback to idle.
-  - Feed chunked frames continuously while the session is active; preserve room for future partials without requiring protocol churn in v1.
+  - Feed chunked frames continuously while the session is active when the Stream path helper is available; record execution separately from Daemon interim transcript sources.
   - For `FrameBatchChunkedRNNT` finalization, build `AudioFeatureIterator(..., pad_to_frame_len=False)` to avoid synthetic padded tail frames that can perturb utterance-end decoding.
-  - On session stop: flush remaining frames and finalize via the offline seal path (final transcript quality anchor).
+  - On session stop: flush remaining frames and finalize via the offline Seal path (final transcript quality anchor).
   - Warm-up pass executed at daemon startup to eliminate first-use latency.
 
 - **API server**
@@ -257,7 +268,7 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 | `stream_chunks_processed` | integer or null | non-negative count or `null` | Number of Stream path chunks processed for the current or last Session. |
 | `finalization_mode` | string or null | `"offline_seal"` or `null` | Final result path used to seal a session. |
 | `final_audio_source` | string or null | `"canonical_session_audio"` or `null` | Audio source used for final transcription. |
-| `tail_trim_mode` | string or null | `"rms"`, `"vad"`, or `null` | Tail trimming strategy used for the last seal path. |
+| `tail_trim_mode` | string or null | `"rms"`, `"vad"`, or `null` | Tail trimming strategy used for the last Seal path. |
 | `vad_enabled` | boolean or null | `true`, `false`, or `null` | Whether VAD is requested by configuration. |
 | `vad_active` | boolean or null | `true`, `false`, or `null` | Whether VAD was loaded and used by the runtime. |
 | `vad_fallback_reason` | string or null | implementation-defined reason or `null` | Set when `vad_enabled` is true and VAD is not active. |
@@ -277,6 +288,8 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 | `chunk_secs` | number or null | seconds, server setting range `0.1` to `10.0`, or `null` | Streaming chunk duration. Clients must accept any JSON number precision; current defaults commonly serialize with one decimal place. |
 
 Overlay event counters reset when the daemon process restarts.
+
+Interpret `stream_path_*`, `interim_transcript_*`, and `overlay_events_*` as separate runtime truth groups. For example, `stream_path_executed=false` with `interim_transcript_updates_emitted>0` means live Overlay text came from the Daemon interim transcript path while the NeMo Stream path did not process chunks. `overlay_events_emitted>0` only proves transport activity, and renderer animation can continue without new inference output.
 
 Future messages (like `partial_result`) must be backward compatible; clients should ignore unknown `type`s.
 Clients must also tolerate unknown error codes and unknown additional fields.
