@@ -21,7 +21,6 @@ from parakeet_stt_daemon.events import (
 )
 from parakeet_stt_daemon.messages import SessionEndReason
 from parakeet_stt_daemon.session import (
-    InterimTranscriptRuntime,
     SessionManager,
     StreamPathRuntime,
 )
@@ -127,14 +126,6 @@ def _build_orchestrator(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
-    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
-        settings,
-        orchestrator.streaming_transcriber,
-    )
-    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
-        settings,
-        sample_rate=orchestrator.audio.sample_rate,
-    )
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
     orchestrator._session_sample_limit = int(max_session_seconds * FakeAudio.sample_rate)
@@ -159,6 +150,10 @@ def _build_orchestrator(
     orchestrator._collect_interim_text_updates = fake_collect_interim_text_updates
     orchestrator._finalise_transcription = fake_finalise
     return cast(SessionOrchestrator, orchestrator)
+
+
+def _stream_runtime(orchestrator: SessionOrchestrator) -> StreamPathRuntime:
+    return orchestrator._stream_path_runtime_for_runtime()
 
 
 T = TypeVar("T")
@@ -223,7 +218,7 @@ def test_start_keeps_stream_drain_loop_when_helper_inactive() -> None:
 
         assert orchestrator._active_stream is None
         assert (
-            orchestrator.stream_path_runtime.facts(active_session=True).fallback_reason
+            _stream_runtime(orchestrator).facts(active_session=True).fallback_reason
             == "init_failed:ImportError"
         )
         assert audio.take_audio_levels_calls > 0
