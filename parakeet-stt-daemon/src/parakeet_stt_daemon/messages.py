@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
 
@@ -48,6 +49,60 @@ class SessionEndReason(StrEnum):
     FINAL = "final"
     ABORT = "abort"
     ERROR = "error"
+
+
+STATUS_RUNTIME_TRUTH_FIELD_GROUPS: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "core": ("type", "state", "sessions_active"),
+        "device": ("gpu_mem_mb", "device", "effective_device"),
+        "stream_path": (
+            "streaming_enabled",
+            "stream_helper_active",
+            "stream_helper_scope",
+            "stream_fallback_reason",
+            "stream_path_executed",
+            "stream_chunks_processed",
+            "chunk_secs",
+        ),
+        "seal_path": ("finalization_mode", "final_audio_source"),
+        "tail_trim_vad": (
+            "tail_trim_mode",
+            "vad_enabled",
+            "vad_active",
+            "vad_fallback_reason",
+        ),
+        "interim_transcript": (
+            "interim_transcript_enabled",
+            "interim_transcript_last_source",
+            "interim_transcript_live_chunks_processed",
+            "interim_transcript_stop_replay_chunks_processed",
+            "interim_transcript_updates_emitted",
+            "interim_transcript_live_updates_emitted",
+            "interim_transcript_stop_replay_updates_emitted",
+            "interim_transcript_live_failed",
+            "interim_transcript_stop_replay_failed",
+            "interim_transcript_source_fallback_reason",
+        ),
+        "overlay_transport": (
+            "overlay_events_enabled",
+            "overlay_events_emitted",
+            "overlay_events_dropped",
+        ),
+        "timing": (
+            "active_session_age_ms",
+            "audio_stop_ms",
+            "finalize_ms",
+            "infer_ms",
+            "send_ms",
+            "last_audio_ms",
+            "last_infer_ms",
+            "last_send_ms",
+        ),
+    }
+)
+STATUS_RUNTIME_TRUTH_FIELDS = frozenset(
+    field for fields in STATUS_RUNTIME_TRUTH_FIELD_GROUPS.values() for field in fields
+)
 
 
 class StartSession(BaseModel):
@@ -253,6 +308,8 @@ __all__ = [
     "ServerMessageType",
     "InterimStateValue",
     "SessionEndReason",
+    "STATUS_RUNTIME_TRUTH_FIELDS",
+    "STATUS_RUNTIME_TRUTH_FIELD_GROUPS",
     "StartSession",
     "StopSession",
     "AbortSession",

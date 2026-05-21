@@ -9,6 +9,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel
 
 from parakeet_stt_daemon.messages import (
+    STATUS_RUNTIME_TRUTH_FIELD_GROUPS,
+    STATUS_RUNTIME_TRUTH_FIELDS,
     AbortSession,
     AudioLevelMessage,
     ErrorMessage,
@@ -135,6 +137,50 @@ def test_schema_properties_match_pydantic_model_fields(schema: dict[str, Any]) -
     for message_type, model in MODEL_BY_TYPE.items():
         schema_def = defs[SCHEMA_DEF_BY_TYPE[message_type]]
         assert set(schema_def["properties"]) == set(model.model_fields), message_type
+
+
+def test_status_schema_declares_runtime_truth_contract_groups(schema: dict[str, Any]) -> None:
+    status_def = schema["$defs"]["StatusMessage"]
+    schema_groups = status_def["x-runtime-truth-field-groups"]
+    expected_groups = {
+        group: list(fields) for group, fields in STATUS_RUNTIME_TRUTH_FIELD_GROUPS.items()
+    }
+
+    assert schema_groups == expected_groups
+    assert set().union(*(set(fields) for fields in schema_groups.values())) == set(
+        status_def["properties"]
+    )
+    assert set(status_def["properties"]) == STATUS_RUNTIME_TRUTH_FIELDS
+
+
+def test_status_fixtures_cover_complete_runtime_truth_contract() -> None:
+    for path in _fixture_paths():
+        fixture = _load_json(path)
+        if fixture["type"] != "status":
+            continue
+
+        assert set(fixture) == STATUS_RUNTIME_TRUTH_FIELDS, path.name
+
+
+def test_default_status_fixture_represents_current_runtime_truth_groups() -> None:
+    fixture = _load_json(FIXTURE_DIR / "status_default.json")
+
+    assert fixture["type"] == "status"
+    assert fixture["effective_device"] == "cuda"
+    assert fixture["streaming_enabled"] is True
+    assert fixture["stream_helper_active"] is True
+    assert fixture["stream_path_executed"] is True
+    assert fixture["stream_chunks_processed"] > 0
+    assert fixture["chunk_secs"] is not None
+    assert fixture["finalization_mode"] == "offline_seal"
+    assert fixture["final_audio_source"] == "canonical_session_audio"
+    assert fixture["interim_transcript_enabled"] is True
+    assert fixture["interim_transcript_updates_emitted"] > 0
+    assert fixture["overlay_events_enabled"] is True
+    assert fixture["overlay_events_emitted"] > 0
+    assert fixture["audio_stop_ms"] is not None
+    assert fixture["finalize_ms"] is not None
+    assert fixture["last_audio_ms"] is not None
 
 
 def test_known_message_models_tolerate_unknown_fields() -> None:

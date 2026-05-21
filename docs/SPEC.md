@@ -213,6 +213,9 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
     }
     ```
   - `status`
+    This is the Daemon `/status` Runtime Truth contract. The canonical schema
+    is `docs/protocol/schema/messages.schema.json`; the example below is a
+    representative complete payload, not a second schema.
     ```json
     {
       "type": "status",
@@ -260,8 +263,15 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 
 ### Status Runtime Fields
 
+The JSON schema's `StatusMessage.x-runtime-truth-field-groups` metadata names
+the current Runtime Truth groups. This table explains the operational meaning
+of those fields; it must not diverge into a separate schema.
+
 | Field | JSON type | Values / units | Semantics |
 | --- | --- | --- | --- |
+| `device` | string or null | configured device name or `null` | Device requested for Daemon inference. |
+| `effective_device` | string or null | effective device name or `null` | Device actually used by the Daemon runtime. |
+| `gpu_mem_mb` | integer or null | MiB or `null` | CUDA reserved memory for the Daemon process when available. |
 | `stream_helper_scope` | string or null | `"live_session_only"` or `null` | Scope where the streaming helper is active. |
 | `stream_fallback_reason` | string or null | implementation-defined reason or `null` | Set when streaming is enabled but the helper is unavailable or degraded. |
 | `stream_path_executed` | boolean or null | `true`, `false`, or `null` | Whether the current or last Session actually exercised chunked Stream path work. |
@@ -286,6 +296,11 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 | `overlay_events_emitted` | integer or null | non-negative count or `null` | Delivered overlay events for the daemon event-sink lifetime. |
 | `overlay_events_dropped` | integer or null | non-negative count or `null` | Overlay events dropped because of queue pressure, backpressure, or disconnects for the daemon event-sink lifetime. |
 | `chunk_secs` | number or null | seconds, server setting range `0.1` to `10.0`, or `null` | Streaming chunk duration. Clients must accept any JSON number precision; current defaults commonly serialize with one decimal place. |
+| `active_session_age_ms` | integer or null | milliseconds or `null` | Age of the active Session when `/status` is sampled. |
+| `audio_stop_ms` | integer or null | milliseconds or `null` | Last completed Session audio-stop stage duration. |
+| `finalize_ms` | integer or null | milliseconds or `null` | Last completed Session Seal path finalization duration. |
+| `infer_ms` | integer or null | milliseconds or `null` | Last completed Session inference duration. |
+| `send_ms` | integer or null | milliseconds or `null` | Last completed Session final-result send duration. |
 
 Overlay event counters reset when the daemon process restarts.
 
@@ -295,11 +310,10 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
 Clients must also tolerate unknown error codes and unknown additional fields.
 Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
 `audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms` represent the last completed session's stage
-durations. `last_*` fields are retained for compatibility and will be deprecated after client uptake.
+durations. `last_*` fields mirror the same runtime timings for compatibility and will be deprecated after client uptake.
 Client logs expose user-visible Injection completion timings separately with
 `enqueue_to_injection_complete_ms`, `hotkey_up_elapsed_ms_at_completion`, and
 `stop_message_elapsed_ms_at_completion`.
-`gpu_mem_mb` reports CUDA reserved memory for the daemon process when running on a CUDA device.
 
 ---
 
