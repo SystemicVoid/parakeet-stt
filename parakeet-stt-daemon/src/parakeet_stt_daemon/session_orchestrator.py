@@ -45,10 +45,6 @@ from .model import (
     _release_cuda_cache,
     load_parakeet_model,
 )
-from .overlay_interim import (
-    InterimTranscriptRuntimeFacts,
-    OverlayInterimTranscriptSession,
-)
 from .runtime_truth_snapshot import (
     RuntimeTruth,
     RuntimeTruthMetrics,
@@ -59,6 +55,8 @@ from .runtime_truth_snapshot import (
     snapshot as runtime_truth_snapshot,
 )
 from .session import (
+    InterimTranscriptRuntime,
+    InterimTranscriptRuntimeFacts,
     Session,
     SessionBusyError,
     SessionManager,
@@ -162,8 +160,10 @@ class SessionOrchestrator:
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
             self.audio.configure_stream_chunk_size(chunk_samples)
-        self._interim_transcript_by_session: dict[UUID, OverlayInterimTranscriptSession] = {}
-        self._last_interim_transcript_runtime_facts: InterimTranscriptRuntimeFacts | None = None
+        self.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+            settings,
+            sample_rate=self.audio.sample_rate,
+        )
 
     async def start(self, intent: StartSessionIntent) -> None:
         await self._handle_start(intent)
@@ -186,7 +186,7 @@ class SessionOrchestrator:
             )
             return
         try:
-            self._reset_interim_transcript_session(message.session_id)
+            self._interim_transcript_runtime_for_runtime().reset_session(message.session_id)
             self._stream_path_runtime_for_runtime().reset_current()
             self.audio.start_session()
             streaming_transcriber = self.streaming_transcriber
@@ -300,9 +300,10 @@ class SessionOrchestrator:
                 await self._emit_session_ended(
                     event_sink, session.session_id, reason=SessionEndReason.ERROR
                 )
-                self._record_last_interim_transcript_runtime(session.session_id)
-                await self.sessions.clear(session.session_id, owner_token=owner_token)
-                self._clear_overlay_session_runtime(session.session_id)
+                await self._record_last_and_clear_session_runtime(
+                    session.session_id,
+                    owner_token=owner_token,
+                )
                 return
 
             finalize_ms: int | None = None
@@ -340,9 +341,10 @@ class SessionOrchestrator:
                 await self._emit_session_ended(
                     event_sink, session.session_id, reason=SessionEndReason.ERROR
                 )
-                self._record_last_interim_transcript_runtime(session.session_id)
-                await self.sessions.clear(session.session_id, owner_token=owner_token)
-                self._clear_overlay_session_runtime(session.session_id)
+                await self._record_last_and_clear_session_runtime(
+                    session.session_id,
+                    owner_token=owner_token,
+                )
                 return
 
             latency_ms = int((datetime.now(tz=UTC) - session.last_updated).total_seconds() * 1000)
@@ -367,9 +369,10 @@ class SessionOrchestrator:
             await self._emit_session_ended(
                 event_sink, session.session_id, reason=SessionEndReason.FINAL
             )
-            self._record_last_interim_transcript_runtime(session.session_id)
-            await self.sessions.clear(session.session_id, owner_token=owner_token)
-            self._clear_overlay_session_runtime(session.session_id)
+            await self._record_last_and_clear_session_runtime(
+                session.session_id,
+                owner_token=owner_token,
+            )
             self._last_audio_ms = audio_ms
             self._last_audio_stop_ms = audio_stop_ms
             self._last_finalize_ms = finalize_ms
@@ -495,9 +498,10 @@ class SessionOrchestrator:
             await self._stop_stream_drain_loop()
             self._stop_session_guard_loop()
             if active_session_id is not None:
-                self._record_last_interim_transcript_runtime(active_session_id)
-                await self.sessions.clear(active_session_id, owner_token=active_owner_token)
-                self._clear_overlay_session_runtime(active_session_id)
+                await self._record_last_and_clear_session_runtime(
+                    active_session_id,
+                    owner_token=active_owner_token,
+                )
             self._active_stream = None
             self._stream_path_runtime_for_runtime().reset_current()
             if active_session_id is not None and event_sink is not None and session_end_reason:
@@ -680,76 +684,16 @@ class SessionOrchestrator:
                     )
                 raise
 
-    def _clear_overlay_session_runtime(self, session_id: UUID) -> None:
-        interim_sessions = getattr(self, "_interim_transcript_by_session", None)
-        if isinstance(interim_sessions, dict):
-            interim_sessions.pop(session_id, None)
-
-    def _reset_interim_transcript_session(self, session_id: UUID) -> None:
-        interim_sessions = self._interim_transcript_sessions_for_runtime()
-        interim_sessions[session_id] = OverlayInterimTranscriptSession(
-            session_id=session_id,
-            sample_rate=int(self.audio.sample_rate),
-            enabled=bool(self.settings.overlay_events_enabled),
-        )
-
-    def _interim_transcript_sessions_for_runtime(
-        self,
-    ) -> dict[UUID, OverlayInterimTranscriptSession]:
-        interim_sessions = getattr(self, "_interim_transcript_by_session", None)
-        if not isinstance(interim_sessions, dict):
-            interim_sessions = {}
-            self._interim_transcript_by_session = interim_sessions
-        return interim_sessions
-
-    def _interim_transcript_session(self, session_id: UUID) -> OverlayInterimTranscriptSession:
-        interim_sessions = self._interim_transcript_sessions_for_runtime()
-        interim_session = interim_sessions.get(session_id)
-        if interim_session is None:
-            interim_session = OverlayInterimTranscriptSession(
-                session_id=session_id,
-                sample_rate=int(self.audio.sample_rate),
-                enabled=bool(self.settings.overlay_events_enabled),
-            )
-            interim_sessions[session_id] = interim_session
-        return interim_session
-
     def interim_transcript_runtime_facts(
         self,
         session_id: UUID,
     ) -> InterimTranscriptRuntimeFacts:
-        return self._interim_transcript_session(session_id).runtime_facts
+        return self._interim_transcript_runtime_for_runtime().session_runtime_facts(session_id)
 
     def interim_transcript_runtime_facts_for_runtime(self) -> InterimTranscriptRuntimeFacts:
         active = self.sessions.active
-        if active is not None:
-            return self._interim_transcript_session(active.session_id).runtime_facts
-        last_facts = getattr(self, "_last_interim_transcript_runtime_facts", None)
-        if isinstance(last_facts, InterimTranscriptRuntimeFacts):
-            return last_facts
-        return self._empty_interim_transcript_runtime_facts()
-
-    def _record_last_interim_transcript_runtime(self, session_id: UUID) -> None:
-        interim_sessions = self._interim_transcript_sessions_for_runtime()
-        interim_session = interim_sessions.get(session_id)
-        if interim_session is None:
-            self._last_interim_transcript_runtime_facts = (
-                self._empty_interim_transcript_runtime_facts()
-            )
-            return
-        self._last_interim_transcript_runtime_facts = interim_session.runtime_facts
-
-    def _empty_interim_transcript_runtime_facts(self) -> InterimTranscriptRuntimeFacts:
-        return InterimTranscriptRuntimeFacts(
-            enabled=bool(self.settings.overlay_events_enabled),
-            last_source=None,
-            live_chunks_processed=0,
-            live_updates_emitted=0,
-            live_failed=False,
-            stop_replay_chunks_processed=0,
-            stop_replay_updates_emitted=0,
-            stop_replay_failed=False,
-            source_fallback_reason=None,
+        return self._interim_transcript_runtime_for_runtime().facts(
+            active_session_id=active.session_id if active is not None else None
         )
 
     async def _emit_interim_state(
@@ -774,7 +718,8 @@ class SessionOrchestrator:
         session_id: UUID,
         ready_chunks: list[np.ndarray],
     ) -> list[str]:
-        return await self._interim_transcript_session(session_id).collect_stop_replay_updates(
+        return await self._interim_transcript_runtime_for_runtime().collect_stop_replay_updates(
+            session_id,
             ready_chunks,
             self._transcribe_samples_serialized,
         )
@@ -819,12 +764,24 @@ class SessionOrchestrator:
         session_id: UUID,
         chunk: np.ndarray,
     ) -> None:
-        update = await self._interim_transcript_session(session_id).accept_live_chunk(
+        update = await self._interim_transcript_runtime_for_runtime().accept_live_chunk(
+            session_id,
             chunk,
             self._transcribe_samples_serialized,
         )
         if update is not None:
             await self._emit_interim_text(event_sink, session_id, text=update)
+
+    async def _record_last_and_clear_session_runtime(
+        self,
+        session_id: UUID,
+        *,
+        owner_token: int | None,
+    ) -> None:
+        interim_runtime = self._interim_transcript_runtime_for_runtime()
+        interim_runtime.record_last_session(session_id)
+        await self.sessions.clear(session_id, owner_token=owner_token)
+        interim_runtime.clear_session(session_id)
 
     def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
         return runtime_truth_snapshot(
@@ -990,6 +947,19 @@ class SessionOrchestrator:
                 settings=self.settings,
                 streaming_transcriber=getattr(self, "streaming_transcriber", None),
             )
+        return runtime
+
+    def _interim_transcript_runtime_for_runtime(self) -> InterimTranscriptRuntime:
+        runtime = getattr(self, "interim_transcript_runtime", None)
+        sample_rate = int(getattr(self.audio, "sample_rate", 16_000))
+        if not isinstance(runtime, InterimTranscriptRuntime):
+            runtime = InterimTranscriptRuntime.from_settings(
+                self.settings,
+                sample_rate=sample_rate,
+            )
+            self.interim_transcript_runtime = runtime
+        else:
+            runtime.sync_from_runtime(settings=self.settings, sample_rate=sample_rate)
         return runtime
 
 
