@@ -266,6 +266,8 @@ The canonical machine-checkable contract and fixtures live under [`docs/protocol
 The JSON schema's `StatusMessage.x-runtime-truth-field-groups` metadata names
 the current Runtime Truth groups. This table explains the operational meaning
 of those fields; it must not diverge into a separate schema.
+The schema-defined groups are `core`, `device`, `stream_path`, `seal_path`,
+`tail_trim_vad`, `interim_transcript`, `overlay_transport`, and `timing`.
 
 | Field | JSON type | Values / units | Semantics |
 | --- | --- | --- | --- |
