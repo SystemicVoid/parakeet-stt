@@ -24,7 +24,7 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session import InterimTranscriptRuntime, SessionManager
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 
 
@@ -183,7 +183,10 @@ def _build_server(
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator._interim_transcript_by_session = {}
+    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+        settings,
+        sample_rate=orchestrator.audio.sample_rate,
+    )
 
     async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
         return "overlay test text", 7

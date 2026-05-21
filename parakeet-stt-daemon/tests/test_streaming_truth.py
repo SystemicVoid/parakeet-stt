@@ -13,6 +13,8 @@ from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import StatusMessage
 from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
 from parakeet_stt_daemon.session import (
+    InterimTranscriptRuntime,
+    InterimTranscriptRuntimeFacts,
     Session,
     SessionManager,
     StreamPathRuntime,
@@ -68,11 +70,17 @@ class FakeVadAdapter:
         return samples.astype(np.float32, copy=False)
 
 
-class StreamPrivateFieldTrap(SimpleNamespace):
+class RuntimeTruthPrivateFieldTrap(SimpleNamespace):
     def __getattr__(self, name: str) -> Any:
         private_stream_prefixes = ("_current_" + "stream", "_last_" + "stream")
         if name.startswith(private_stream_prefixes):
             raise AssertionError(f"runtime truth probed old Stream path field {name}")
+        private_interim_fields = (
+            "_interim_transcript_by_session",
+            "_last_interim_transcript_runtime_facts",
+        )
+        if name in private_interim_fields:
+            raise AssertionError(f"runtime truth probed old interim transcript field {name}")
         raise AttributeError(name)
 
 
@@ -105,7 +113,10 @@ def _build_server(
         orchestrator.settings,
         streaming_transcriber,
     )
-    orchestrator._last_interim_transcript_runtime_facts = None
+    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+        orchestrator.settings,
+        sample_rate=orchestrator.audio.sample_rate,
+    )
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._last_audio_ms = None
@@ -113,7 +124,6 @@ def _build_server(
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator._interim_transcript_by_session = {}
     orchestrator._vad_enabled = vad_enabled
     orchestrator.tail_trimmer = SealPathTailTrimmer(
         vad_enabled=vad_enabled,
@@ -268,7 +278,7 @@ def test_runtime_truth_reads_stream_path_interface_instead_of_orchestrator_field
     )
     orchestrator = cast(
         SessionOrchestrator,
-        StreamPrivateFieldTrap(
+        RuntimeTruthPrivateFieldTrap(
             settings=SimpleNamespace(
                 streaming_enabled=True,
                 chunk_secs=9.99,
@@ -294,6 +304,70 @@ def test_runtime_truth_reads_stream_path_interface_instead_of_orchestrator_field
     assert truth.stream_chunks_processed == 3
     assert truth.stream_fallback_reason == "interface:fallback"
     assert truth.chunk_secs == 1.25
+
+
+def test_runtime_truth_reads_interim_interface_instead_of_orchestrator_fields() -> None:
+    interim_facts = InterimTranscriptRuntimeFacts(
+        enabled=True,
+        last_source="stop_replay",
+        live_chunks_processed=2,
+        live_updates_emitted=1,
+        live_failed=False,
+        stop_replay_chunks_processed=3,
+        stop_replay_updates_emitted=2,
+        stop_replay_failed=True,
+        source_fallback_reason="stop_replay_transcribe_error:RuntimeError",
+    )
+    orchestrator = cast(
+        SessionOrchestrator,
+        RuntimeTruthPrivateFieldTrap(
+            settings=SimpleNamespace(
+                streaming_enabled=False,
+                chunk_secs=None,
+                overlay_events_enabled=True,
+            ),
+            streaming_transcriber=None,
+            interim_transcript_runtime_facts_for_runtime=lambda: interim_facts,
+        ),
+    )
+
+    truth = snapshot(
+        orchestrator,
+        last_trim_outcome=SimpleNamespace(
+            tail_trim_mode="rms",
+            vad_active=False,
+            vad_fallback_reason=None,
+        ),
+    )
+
+    assert truth.interim_transcript_enabled is True
+    assert truth.interim_transcript_last_source == "stop_replay"
+    assert truth.interim_transcript_live_chunks_processed == 2
+    assert truth.interim_transcript_stop_replay_chunks_processed == 3
+    assert truth.interim_transcript_updates_emitted == 3
+    assert truth.interim_transcript_live_updates_emitted == 1
+    assert truth.interim_transcript_stop_replay_updates_emitted == 2
+    assert truth.interim_transcript_live_failed is False
+    assert truth.interim_transcript_stop_replay_failed is True
+    assert (
+        truth.interim_transcript_source_fallback_reason
+        == "stop_replay_transcribe_error:RuntimeError"
+    )
+
+
+def test_interim_runtime_syncs_cached_session_config() -> None:
+    runtime = InterimTranscriptRuntime(sample_rate=16_000, enabled=False)
+    session_id = uuid4()
+    runtime.reset_session(session_id)
+
+    assert runtime.session_runtime_facts(session_id).enabled is False
+
+    runtime.sync_from_runtime(
+        settings=SimpleNamespace(overlay_events_enabled=True),
+        sample_rate=8_000,
+    )
+
+    assert runtime.session_runtime_facts(session_id).enabled is True
 
 
 def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
@@ -489,12 +563,13 @@ def test_status_and_logs_split_interim_truth_from_stream_path_fallback() -> None
         )
         session_id = uuid4()
         await server.sessions.start_session(session_id, owner_token=1)
-        server._reset_interim_transcript_session(session_id)
+        server.interim_transcript_runtime.reset_session(session_id)
 
         async def transcribe(_samples: np.ndarray) -> str:
             return "visible interim text"
 
-        update = await server._interim_transcript_session(session_id).accept_live_chunk(
+        update = await server.interim_transcript_runtime.accept_live_chunk(
+            session_id,
             np.full((400,), 0.2, dtype=np.float32),
             transcribe,
         )
@@ -525,9 +600,9 @@ def test_status_and_logs_split_interim_truth_from_stream_path_fallback() -> None
         assert log_record["interim_transcript_last_source"] == "live"
         assert log_record["interim_transcript_updates_emitted"] == 1
 
-        server._record_last_interim_transcript_runtime(session_id)
+        server.interim_transcript_runtime.record_last_session(session_id)
         await server.sessions.clear(session_id, owner_token=1)
-        server._clear_overlay_session_runtime(session_id)
+        server.interim_transcript_runtime.clear_session(session_id)
 
         idle_status = _status(server)
         idle_log_record = _truth(server).to_log_record()
@@ -545,12 +620,13 @@ def test_status_reports_interim_source_fallback_reason() -> None:
         server = _build_server(streaming_enabled=False, overlay_events_enabled=True)
         session_id = uuid4()
         await server.sessions.start_session(session_id, owner_token=1)
-        server._reset_interim_transcript_session(session_id)
+        server.interim_transcript_runtime.reset_session(session_id)
 
         async def transcribe(_samples: np.ndarray) -> str:
             raise RuntimeError("interim source failed")
 
-        update = await server._interim_transcript_session(session_id).accept_live_chunk(
+        update = await server.interim_transcript_runtime.accept_live_chunk(
+            session_id,
             np.full((400,), 0.2, dtype=np.float32),
             transcribe,
         )
