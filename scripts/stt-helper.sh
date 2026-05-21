@@ -103,6 +103,21 @@ stt() {
         printf "ws://%s%s" "$1" "$DAEMON_WS_PATH"
     }
 
+    _daemon_status_url_from_authority() {
+        printf "http://%s%s" "$1" "$DAEMON_STATUS_PATH"
+    }
+
+    _port_from_authority() {
+        local authority="$1"
+        local port="${authority##*:}"
+        case "$port" in
+            ""|*[!0-9]*)
+                return 1
+                ;;
+        esac
+        printf "%s" "$port"
+    }
+
     _llm_api_base_url() {
         _endpoint_url "http" "$default_llm_server_host" "$default_llm_server_port" "$LLM_API_PATH"
     }
@@ -747,109 +762,163 @@ PY
         local body
         body="$(_http_get "$status_url")" || return 1
 
-        STATUS_JSON="$body" python3 - <<'PY'
+        STATUS_SCHEMA_PATH="$REPO_ROOT/docs/protocol/schema/messages.schema.json" STATUS_JSON="$body" python3 - <<'PY'
 import json
 import math
 import os
 import sys
 
+
+def fail(reason: str = "invalid daemon /status Runtime Truth payload") -> None:
+    print(reason, file=sys.stderr)
+    sys.exit(1)
+
+
 body = os.environ.get("STATUS_JSON", "")
 try:
     payload = json.loads(body)
-except Exception:
-    sys.exit(1)
+except json.JSONDecodeError as err:
+    fail(f"failed to parse daemon /status JSON: {err}")
 
 if not isinstance(payload, dict):
-    sys.exit(1)
+    fail("daemon /status JSON must be an object")
 
-if payload.get("type") != "status":
-    sys.exit(1)
+schema_path = os.environ.get("STATUS_SCHEMA_PATH", "")
+try:
+    with open(schema_path, encoding="utf-8") as schema_file:
+        schema = json.load(schema_file)
+except OSError as err:
+    fail(f"failed to read status schema '{schema_path}': {err}")
+except json.JSONDecodeError as err:
+    fail(f"failed to parse status schema '{schema_path}': {err}")
 
-if payload.get("state") not in {"idle", "listening", "processing"}:
-    sys.exit(1)
+try:
+    status_def = schema["$defs"]["StatusMessage"]
+    groups = status_def["x-runtime-truth-field-groups"]
+    properties = status_def["properties"]
+except (KeyError, TypeError):
+    fail("status schema missing StatusMessage Runtime Truth contract")
 
-sessions_active = payload.get("sessions_active")
-if isinstance(sessions_active, bool) or not isinstance(sessions_active, int) or sessions_active < 0:
-    sys.exit(1)
+if not isinstance(groups, dict) or not isinstance(properties, dict):
+    fail("status schema Runtime Truth contract has invalid shape")
 
-fields = (
-    "device",
-    "effective_device",
-    "streaming_enabled",
-    "stream_helper_active",
-    "stream_helper_scope",
-    "stream_fallback_reason",
-    "stream_path_executed",
-    "stream_chunks_processed",
-    "chunk_secs",
-    "finalization_mode",
-    "final_audio_source",
-    "tail_trim_mode",
-    "vad_enabled",
-    "vad_active",
-    "vad_fallback_reason",
-    "overlay_events_enabled",
-)
-bool_fields = {
-    "streaming_enabled",
-    "stream_helper_active",
-    "stream_path_executed",
-    "vad_enabled",
-    "vad_active",
-    "overlay_events_enabled",
-}
-numeric_fields = {
-    "chunk_secs",
-}
-non_negative_int_fields = {
-    "stream_chunks_processed",
-}
+required = set(status_def.get("required", ()))
+fields: list[str] = []
+for group_fields in groups.values():
+    if not isinstance(group_fields, list):
+        fail("status schema Runtime Truth group must be a list")
+    for field in group_fields:
+        if not isinstance(field, str) or field not in properties:
+            fail(f"status schema Runtime Truth field is not declared: {field!r}")
+        if field not in fields:
+            fields.append(field)
+
+def normalize_bool(value: object) -> str:
+    if not isinstance(value, bool):
+        fail()
+    return "true" if value else "false"
+
+
+def normalize_non_negative_integer(value: object) -> str:
+    if isinstance(value, bool):
+        fail()
+    if isinstance(value, int):
+        if value < 0:
+            fail()
+        return str(value)
+    if isinstance(value, str) and value.isdigit():
+        return str(int(value))
+    fail()
+
+
+def normalize_number(value: object) -> str:
+    if isinstance(value, bool):
+        fail()
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            fail()
+    else:
+        fail()
+    if not math.isfinite(parsed):
+        fail()
+    return f"{parsed:g}"
+
+
+def normalize_string(value: object) -> str:
+    if not isinstance(value, str):
+        fail()
+    return value
+
+
+def normalize_ref(ref: str, value: object) -> str:
+    if ref == "#/$defs/nullable_string":
+        return normalize_string(value)
+    if ref == "#/$defs/nullable_boolean":
+        return normalize_bool(value)
+    if ref in {"#/$defs/non_negative_integer", "#/$defs/nullable_non_negative_integer"}:
+        return normalize_non_negative_integer(value)
+    if ref == "#/$defs/nullable_number":
+        return normalize_number(value)
+    fail()
+
+
+def normalize_value(property_schema: dict[str, object], value: object) -> str:
+    if "const" in property_schema:
+        expected = property_schema["const"]
+        if value != expected:
+            fail()
+        return str(expected)
+    enum = property_schema.get("enum")
+    if isinstance(enum, list):
+        if value not in enum:
+            fail()
+        return normalize_string(value)
+    ref = property_schema.get("$ref")
+    if isinstance(ref, str):
+        return normalize_ref(ref, value)
+    type_spec = property_schema.get("type")
+    type_names = type_spec if isinstance(type_spec, list) else [type_spec]
+    if "number" in type_names:
+        normalized = normalize_number(value)
+        parsed = float(normalized)
+        minimum = property_schema.get("minimum")
+        maximum = property_schema.get("maximum")
+        if isinstance(minimum, (int, float)) and parsed < float(minimum):
+            fail()
+        if isinstance(maximum, (int, float)) and parsed > float(maximum):
+            fail()
+        return normalized
+    fail()
+
+
+missing = object()
 
 for key in fields:
-    value = payload.get(key)
-    if value is None:
+    value = payload.get(key, missing)
+    if value is missing or value is None:
+        if key in required:
+            fail()
         print(f"{key}=")
         continue
 
-    if key in bool_fields:
-        if not isinstance(value, bool):
-            sys.exit(1)
-        print(f"{key}={'true' if value else 'false'}")
-    elif key in non_negative_int_fields:
-        if isinstance(value, bool):
-            sys.exit(1)
-        elif isinstance(value, int):
-            if value < 0:
-                sys.exit(1)
-            print(f"{key}={value}")
-        elif isinstance(value, str):
-            if not value.isdigit():
-                sys.exit(1)
-            print(f"{key}={int(value)}")
-        else:
-            sys.exit(1)
-    elif key in numeric_fields:
-        if isinstance(value, bool):
-            sys.exit(1)
-        elif isinstance(value, (int, float)):
-            if not math.isfinite(float(value)):
-                sys.exit(1)
-            print(f"{key}={value}")
-        elif isinstance(value, str):
-            try:
-                parsed = float(value)
-            except ValueError:
-                sys.exit(1)
-            if not math.isfinite(parsed):
-                sys.exit(1)
-            print(f"{key}={parsed:g}")
-        else:
-            sys.exit(1)
-    else:
-        if not isinstance(value, str):
-            sys.exit(1)
-        print(f"{key}={value}")
+    property_schema = properties.get(key)
+    if not isinstance(property_schema, dict):
+        fail()
+    print(f"{key}={normalize_value(property_schema, value)}")
 PY
+    }
+
+    _print_daemon_runtime_truth() {
+        local runtime_truth="$1"
+        echo "   - Daemon runtime truth:"
+        while IFS='=' read -r key value; do
+            [ -n "$key" ] || continue
+            printf "     %s=%s\n" "$key" "$value"
+        done <<< "$runtime_truth"
     }
 
     _stop_running_daemon() {
@@ -1747,11 +1816,21 @@ EOF
             ;;
         status)
             echo ">>> Status:"
-            if _socket_ready_once && _refresh_daemon_pid_file_from_listener >/dev/null 2>&1; then
-                :
+            local daemon_authority=""
+            local daemon_listener_port="$PORT"
+            local daemon_status_url
+            if [ -s "$PORT_FILE" ]; then
+                daemon_authority="$(cat "$PORT_FILE")"
+                daemon_status_url="$(_daemon_status_url_from_authority "$daemon_authority")"
+                daemon_listener_port="$(_port_from_authority "$daemon_authority" || printf "%s" "$PORT")"
+            else
+                daemon_status_url="$(_daemon_status_url)"
             fi
+            _refresh_pid_file_from_listener "$daemon_listener_port" "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
+            local daemon_runtime_truth=""
             if _pid_alive "$DAEMON_PID_FILE"; then
                 echo "   - Daemon running (pid $(cat "$DAEMON_PID_FILE"))"
+                daemon_runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url")" || daemon_runtime_truth=""
             else
                 echo "   - Daemon not running"
             fi
@@ -1760,8 +1839,8 @@ EOF
             else
                 echo "   - Client not running"
             fi
-            if [ -f "$PORT_FILE" ]; then
-                echo "   - Endpoint: $(_daemon_ws_endpoint_from_authority "$(cat "$PORT_FILE")")"
+            if [ -n "$daemon_authority" ]; then
+                echo "   - Endpoint: $(_daemon_ws_endpoint_from_authority "$daemon_authority")"
             else
                 echo "   - Endpoint: $DEFAULT_ENDPOINT"
             fi
@@ -1771,6 +1850,11 @@ EOF
             fi
             if _tmux_has_session "$TMUX_SESSION"; then
                 echo "   - tmux session: $TMUX_SESSION"
+            fi
+            if [ -n "$daemon_runtime_truth" ]; then
+                _print_daemon_runtime_truth "$daemon_runtime_truth"
+            elif _pid_alive "$DAEMON_PID_FILE"; then
+                echo "   - Daemon runtime truth: unavailable from $daemon_status_url"
             fi
             ;;
         tmux)
