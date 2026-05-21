@@ -167,7 +167,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             );
             overlay_router.route_session_warning(session_id);
         }
-        ServerMessage::Status { .. } => {}
+        ServerMessage::Status(_) => {}
     }
     Ok(())
 }
