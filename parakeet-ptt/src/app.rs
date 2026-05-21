@@ -1033,57 +1033,16 @@ fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
 }
 
 fn format_daemon_status(status: &DaemonStatus) -> String {
-    format!(
-        "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
-streaming={:?}, helper_active={:?}, helper_scope={:?}, stream_path_executed={:?}, \
-stream_chunks_processed={:?}, stream_fallback={:?}, finalization_mode={:?}, \
-final_audio_source={:?}, tail_trim={:?}, vad_enabled={:?}, vad_active={:?}, \
-vad_fallback={:?}, interim_enabled={:?}, interim_source={:?}, interim_live_chunks={:?}, \
-interim_stop_replay_chunks={:?}, interim_updates={:?}, interim_live_updates={:?}, \
-interim_stop_replay_updates={:?}, interim_live_failed={:?}, interim_stop_replay_failed={:?}, \
-interim_fallback={:?}, overlay_enabled={:?}, overlay_emitted={:?}, overlay_dropped={:?}, \
-chunk_secs={:?}, active_age_ms={:?}, audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, \
-send_ms={:?}, last_audio_ms={:?}, last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
-        Some(status.state.as_str()),
-        Some(status.sessions_active),
-        status.device,
-        status.effective_device,
-        status.streaming_enabled,
-        status.stream_helper_active,
-        status.stream_helper_scope,
-        status.stream_path_executed,
-        status.stream_chunks_processed,
-        status.stream_fallback_reason,
-        status.finalization_mode,
-        status.final_audio_source,
-        status.tail_trim_mode,
-        status.vad_enabled,
-        status.vad_active,
-        status.vad_fallback_reason,
-        status.interim_transcript_enabled,
-        status.interim_transcript_last_source,
-        status.interim_transcript_live_chunks_processed,
-        status.interim_transcript_stop_replay_chunks_processed,
-        status.interim_transcript_updates_emitted,
-        status.interim_transcript_live_updates_emitted,
-        status.interim_transcript_stop_replay_updates_emitted,
-        status.interim_transcript_live_failed,
-        status.interim_transcript_stop_replay_failed,
-        status.interim_transcript_source_fallback_reason,
-        status.overlay_events_enabled,
-        status.overlay_events_emitted,
-        status.overlay_events_dropped,
-        status.chunk_secs,
-        status.active_session_age_ms,
-        status.audio_stop_ms,
-        status.finalize_ms,
-        status.infer_ms,
-        status.send_ms,
-        status.last_audio_ms,
-        status.last_infer_ms,
-        status.last_send_ms,
-        status.gpu_mem_mb
-    )
+    let payload = serde_json::to_value(ServerMessage::Status(status.clone()))
+        .expect("daemon status should serialize");
+    let fields = payload
+        .as_object()
+        .expect("daemon status should serialize to an object")
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Daemon status: {fields}")
 }
 
 async fn fetch_status_once(config: &ClientConfig) {
@@ -1119,7 +1078,7 @@ async fn fetch_status_once(config: &ClientConfig) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
@@ -1189,12 +1148,13 @@ mod tests {
         assert_eq!(status.gpu_mem_mb, None);
 
         let summary = format_daemon_status(&status);
-        assert!(summary.contains("state=Some(\"idle\")"));
-        assert!(summary.contains("sessions_active=Some(0)"));
-        assert!(summary.contains("stream_path_executed=None"));
-        assert!(summary.contains("finalization_mode=None"));
-        assert!(summary.contains("interim_enabled=None"));
-        assert!(summary.contains("gpu_mem_mb=None"));
+        assert!(summary.contains("type=\"status\""));
+        assert!(summary.contains("state=\"idle\""));
+        assert!(summary.contains("sessions_active=0"));
+        assert!(summary.contains("stream_path_executed=null"));
+        assert!(summary.contains("finalization_mode=null"));
+        assert!(summary.contains("interim_transcript_enabled=null"));
+        assert!(summary.contains("gpu_mem_mb=null"));
     }
 
     #[test]
@@ -1284,17 +1244,70 @@ mod tests {
         assert_eq!(status.last_send_ms, Some(0));
 
         let summary = format_daemon_status(&status);
-        assert!(summary.contains("helper_scope=Some(\"live_session_only\")"));
-        assert!(summary.contains("stream_path_executed=Some(false)"));
-        assert!(summary.contains("stream_fallback=Some(\"init_failed:RuntimeError\")"));
-        assert!(summary.contains("finalization_mode=Some(\"offline_seal\")"));
-        assert!(summary.contains("final_audio_source=Some(\"canonical_session_audio\")"));
-        assert!(summary.contains("tail_trim=Some(\"rms\")"));
-        assert!(summary.contains("interim_enabled=Some(true)"));
-        assert!(summary.contains("interim_source=Some(\"live\")"));
-        assert!(summary.contains("interim_updates=Some(1)"));
-        assert!(summary.contains("overlay_emitted=Some(3)"));
-        assert!(summary.contains("gpu_mem_mb=Some(1024)"));
+        assert!(summary.contains("stream_helper_scope=\"live_session_only\""));
+        assert!(summary.contains("stream_path_executed=false"));
+        assert!(summary.contains("stream_fallback_reason=\"init_failed:RuntimeError\""));
+        assert!(summary.contains("finalization_mode=\"offline_seal\""));
+        assert!(summary.contains("final_audio_source=\"canonical_session_audio\""));
+        assert!(summary.contains("tail_trim_mode=\"rms\""));
+        assert!(summary.contains("interim_transcript_enabled=true"));
+        assert!(summary.contains("interim_transcript_last_source=\"live\""));
+        assert!(summary.contains("interim_transcript_updates_emitted=1"));
+        assert!(summary.contains("overlay_events_emitted=3"));
+        assert!(summary.contains("gpu_mem_mb=1024"));
+    }
+
+    #[test]
+    fn daemon_status_format_mentions_current_runtime_truth_fields() {
+        let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/protocol/schema/messages.schema.json");
+        let schema: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(schema_path).expect("status schema should be readable"),
+        )
+        .expect("status schema should parse");
+        let fields = schema
+            .pointer("/$defs/StatusMessage/x-runtime-truth-field-groups")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema should declare Runtime Truth groups")
+            .values()
+            .flat_map(|group_fields| {
+                group_fields
+                    .as_array()
+                    .expect("Runtime Truth group should be an array")
+                    .iter()
+                    .map(|field| {
+                        field
+                            .as_str()
+                            .expect("Runtime Truth field should be a string")
+                            .to_string()
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/protocol/fixtures/status_stream_fallback.json");
+        let fixture = fs::read_to_string(fixture_path).expect("status fixture should be readable");
+        let status = match serde_json::from_str::<ServerMessage>(&fixture)
+            .expect("status fixture should parse")
+        {
+            ServerMessage::Status(status) => status,
+            other => panic!("expected status message, got {other:?}"),
+        };
+        let summary = format_daemon_status(&status);
+        let formatted_fields = summary
+            .strip_prefix("Daemon status: ")
+            .expect("formatted status should use expected prefix")
+            .split(", ")
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("formatted field should be key=value")
+                    .0
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(formatted_fields, fields);
     }
 
     #[test]

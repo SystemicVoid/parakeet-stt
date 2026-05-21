@@ -74,6 +74,10 @@ names, flags, or logs alone.
 
 ### Runtime truth field guide
 
+The schema-defined Runtime Truth groups are `core`, `device`, `stream_path`,
+`seal_path`, `tail_trim_vad`, `interim_transcript`, `overlay_transport`, and
+`timing`.
+
 - Device and status core: `state`, `sessions_active`, `device`,
   `effective_device`, and `gpu_mem_mb`.
 - Stream path: `streaming_enabled`, `stream_helper_active`,
