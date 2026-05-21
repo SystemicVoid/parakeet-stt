@@ -55,12 +55,13 @@ Canonical-source policy:
 - `stt llm` manages a local `llama-server` in tmux session `parakeet-llm`, waits for `http://<host>:<port>/health`, then delegates to the normal `stt start` path.
 - Machine-local LLM overrides should stay in `PARAKEET_LLM_*` or `PARAKEET_LLM_SERVER_*` env vars from your shell or the ignored repo-local files; do not commit workstation-specific endpoints or launcher paths.
 
-Runtime truth for `/status` and daemon logs is produced by
-`parakeet_stt_daemon.runtime_truth_snapshot.RuntimeTruthSnapshot`. That module is
-the source of truth for effective device, Stream path helper state, Stream path
-execution evidence, Seal path finalization source, tail trim mode, VAD fallback,
-interim transcript source activity, and overlay-event enablement; the Helper should
-read those fields from `/status` instead of re-deriving them.
+Runtime truth for `/status` and Daemon logs is produced by the
+`parakeet_stt_daemon.runtime_truth_snapshot` module and serialized through the
+protocol `StatusMessage` Runtime Truth contract. That contract is the source of
+truth for effective device, Stream path helper state, Stream path execution
+evidence, Seal path finalization source, tail trim mode, VAD fallback, interim
+transcript source activity, overlay-event transport, timing, and counter fields;
+the Helper should read those fields from `/status` instead of re-deriving them.
 
 Use `stt status` for Helper process health: Daemon PID, Client PID, endpoint,
 tmux session, and matching processes. Use the Daemon `/status` payload, the
@@ -72,9 +73,11 @@ names, flags, or logs alone.
 
 ### Runtime truth field guide
 
+- Device and status core: `state`, `sessions_active`, `device`,
+  `effective_device`, and `gpu_mem_mb`.
 - Stream path: `streaming_enabled`, `stream_helper_active`,
   `stream_helper_scope`, `stream_fallback_reason`, `stream_path_executed`, and
-  `stream_chunks_processed`.
+  `stream_chunks_processed`, and `chunk_secs`.
 - Seal path: `finalization_mode`, `final_audio_source`, `tail_trim_mode`,
   `vad_enabled`, `vad_active`, `vad_fallback_reason`, and finalization timing
   fields such as `audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms`.
@@ -90,6 +93,9 @@ names, flags, or logs alone.
   `interim_transcript_source_fallback_reason`.
 - Overlay event transport: `overlay_events_enabled`,
   `overlay_events_emitted`, and `overlay_events_dropped`.
+- Timing and counters: `active_session_age_ms`, `audio_stop_ms`,
+  `finalize_ms`, `infer_ms`, `send_ms`, `last_audio_ms`, `last_infer_ms`, and
+  `last_send_ms`.
 - Client-side LLM answer deltas: generated and streamed by the Client in LLM
   query mode. They can update the Overlay while the local LLM answers, but they
   are not Daemon interim transcript fields and do not affect Stream path or Seal
