@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::{
     sleep, timeout, Duration as TokioDuration, Instant as TokioInstant, MissedTickBehavior,
@@ -39,7 +38,7 @@ use crate::injector_runtime::{
 };
 use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
-use crate::protocol::{start_message, stop_message, ClientMessage, ServerMessage};
+use crate::protocol::{start_message, stop_message, ClientMessage, DaemonStatus, ServerMessage};
 use crate::state::PttState;
 use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 
@@ -1033,50 +1032,7 @@ fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct StatusInfo {
-    state: Option<String>,
-    sessions_active: Option<u32>,
-    gpu_mem_mb: Option<u64>,
-    device: Option<String>,
-    effective_device: Option<String>,
-    streaming_enabled: Option<bool>,
-    stream_helper_active: Option<bool>,
-    stream_helper_scope: Option<String>,
-    stream_fallback_reason: Option<String>,
-    stream_path_executed: Option<bool>,
-    stream_chunks_processed: Option<u64>,
-    finalization_mode: Option<String>,
-    final_audio_source: Option<String>,
-    tail_trim_mode: Option<String>,
-    vad_enabled: Option<bool>,
-    vad_active: Option<bool>,
-    vad_fallback_reason: Option<String>,
-    interim_transcript_enabled: Option<bool>,
-    interim_transcript_last_source: Option<String>,
-    interim_transcript_live_chunks_processed: Option<u64>,
-    interim_transcript_stop_replay_chunks_processed: Option<u64>,
-    interim_transcript_updates_emitted: Option<u64>,
-    interim_transcript_live_updates_emitted: Option<u64>,
-    interim_transcript_stop_replay_updates_emitted: Option<u64>,
-    interim_transcript_live_failed: Option<bool>,
-    interim_transcript_stop_replay_failed: Option<bool>,
-    interim_transcript_source_fallback_reason: Option<String>,
-    overlay_events_enabled: Option<bool>,
-    overlay_events_emitted: Option<u64>,
-    overlay_events_dropped: Option<u64>,
-    chunk_secs: Option<f64>,
-    active_session_age_ms: Option<u64>,
-    audio_stop_ms: Option<u64>,
-    finalize_ms: Option<u64>,
-    infer_ms: Option<u64>,
-    send_ms: Option<u64>,
-    last_audio_ms: Option<u64>,
-    last_infer_ms: Option<u64>,
-    last_send_ms: Option<u64>,
-}
-
-fn format_daemon_status(status: &StatusInfo) -> String {
+fn format_daemon_status(status: &DaemonStatus) -> String {
     format!(
         "Daemon status: state={:?}, sessions_active={:?}, device={:?}, effective_device={:?}, \
 streaming={:?}, helper_active={:?}, helper_scope={:?}, stream_path_executed={:?}, \
@@ -1088,8 +1044,8 @@ interim_stop_replay_updates={:?}, interim_live_failed={:?}, interim_stop_replay_
 interim_fallback={:?}, overlay_enabled={:?}, overlay_emitted={:?}, overlay_dropped={:?}, \
 chunk_secs={:?}, active_age_ms={:?}, audio_stop_ms={:?}, finalize_ms={:?}, infer_ms={:?}, \
 send_ms={:?}, last_audio_ms={:?}, last_infer_ms={:?}, last_send_ms={:?}, gpu_mem_mb={:?}",
-        status.state,
-        status.sessions_active,
+        Some(status.state.as_str()),
+        Some(status.sessions_active),
         status.device,
         status.effective_device,
         status.streaming_enabled,
@@ -1141,9 +1097,15 @@ async fn fetch_status_once(config: &ClientConfig) {
         .send()
         .await
     {
-        Ok(response) => match response.json::<StatusInfo>().await {
-            Ok(status) => {
+        Ok(response) => match response.json::<ServerMessage>().await {
+            Ok(ServerMessage::Status(status)) => {
                 info!("{}", format_daemon_status(&status));
+            }
+            Ok(other) => {
+                warn!(
+                    "Failed to decode daemon status from {}: expected status message, got {:?}",
+                    url, other
+                );
             }
             Err(err) => {
                 warn!("Failed to decode daemon status from {}: {}", url, err);
@@ -1188,7 +1150,7 @@ mod tests {
         TextInjector,
     };
     use crate::overlay_router::{OverlayEvent, OverlayRouter, OverlayTextProducer};
-    use crate::protocol::{ClientMessage, ServerMessage};
+    use crate::protocol::{ClientMessage, DaemonStatus, ServerMessage};
     use crate::state::PttState;
 
     use crate::injector::INJECTOR_JOB_TIMEOUT_MS;
@@ -1203,17 +1165,22 @@ mod tests {
     use super::{
         clear_transient_session_state, format_daemon_status, handle_injection_report,
         maybe_defer_llm_session_end, run, CapturedParentFocus, HotkeyIntentDiagnostics,
-        SessionIntent, StatusInfo, TransientSessionState,
+        SessionIntent, TransientSessionState,
     };
 
     #[test]
-    fn status_info_accepts_minimal_legacy_payload() {
-        let status: StatusInfo =
-            serde_json::from_str(r#"{"type":"status","state":"idle","sessions_active":0}"#)
-                .expect("minimal status payload should parse");
+    fn daemon_status_accepts_minimal_protocol_payload() {
+        let status = match serde_json::from_str::<ServerMessage>(
+            r#"{"type":"status","state":"idle","sessions_active":0}"#,
+        )
+        .expect("minimal status payload should parse")
+        {
+            ServerMessage::Status(status) => status,
+            other => panic!("expected status message, got {other:?}"),
+        };
 
-        assert_eq!(status.state.as_deref(), Some("idle"));
-        assert_eq!(status.sessions_active, Some(0));
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.sessions_active, 0);
         assert_eq!(status.stream_path_executed, None);
         assert_eq!(status.finalization_mode, None);
         assert_eq!(status.interim_transcript_enabled, None);
@@ -1222,6 +1189,8 @@ mod tests {
         assert_eq!(status.gpu_mem_mb, None);
 
         let summary = format_daemon_status(&status);
+        assert!(summary.contains("state=Some(\"idle\")"));
+        assert!(summary.contains("sessions_active=Some(0)"));
         assert!(summary.contains("stream_path_executed=None"));
         assert!(summary.contains("finalization_mode=None"));
         assert!(summary.contains("interim_enabled=None"));
@@ -1229,15 +1198,35 @@ mod tests {
     }
 
     #[test]
-    fn status_info_preserves_and_formats_interim_truth_fixture() {
+    fn daemon_status_standalone_type_accepts_status_payload() {
+        let status: DaemonStatus =
+            serde_json::from_str(r#"{"type":"status","state":"idle","sessions_active":0}"#)
+                .expect("minimal status payload should parse");
+
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.sessions_active, 0);
+        assert_eq!(status.stream_path_executed, None);
+        assert_eq!(status.finalization_mode, None);
+        assert_eq!(status.interim_transcript_enabled, None);
+        assert_eq!(status.interim_transcript_last_source, None);
+        assert_eq!(status.overlay_events_enabled, None);
+        assert_eq!(status.gpu_mem_mb, None);
+    }
+
+    #[test]
+    fn daemon_status_preserves_and_formats_interim_truth_fixture() {
         let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../docs/protocol/fixtures/status_stream_fallback.json");
         let fixture = fs::read_to_string(fixture_path).expect("status fixture should be readable");
-        let status: StatusInfo =
-            serde_json::from_str(&fixture).expect("status fixture should parse");
+        let status = match serde_json::from_str::<ServerMessage>(&fixture)
+            .expect("status fixture should parse")
+        {
+            ServerMessage::Status(status) => status,
+            other => panic!("expected status message, got {other:?}"),
+        };
 
-        assert_eq!(status.state.as_deref(), Some("idle"));
-        assert_eq!(status.sessions_active, Some(0));
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.sessions_active, 0);
         assert_eq!(status.gpu_mem_mb, Some(1024));
         assert_eq!(status.device.as_deref(), Some("cuda"));
         assert_eq!(status.effective_device.as_deref(), Some("cuda"));
