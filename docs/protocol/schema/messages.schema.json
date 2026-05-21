@@ -273,6 +273,66 @@
     },
     "StatusMessage": {
       "type": "object",
+      "title": "Runtime Truth Status",
+      "description": "Daemon /status payload and protocol-level Runtime Truth contract.",
+      "x-runtime-truth-field-groups": {
+        "core": [
+          "type",
+          "state",
+          "sessions_active"
+        ],
+        "device": [
+          "gpu_mem_mb",
+          "device",
+          "effective_device"
+        ],
+        "stream_path": [
+          "streaming_enabled",
+          "stream_helper_active",
+          "stream_helper_scope",
+          "stream_fallback_reason",
+          "stream_path_executed",
+          "stream_chunks_processed",
+          "chunk_secs"
+        ],
+        "seal_path": [
+          "finalization_mode",
+          "final_audio_source"
+        ],
+        "tail_trim_vad": [
+          "tail_trim_mode",
+          "vad_enabled",
+          "vad_active",
+          "vad_fallback_reason"
+        ],
+        "interim_transcript": [
+          "interim_transcript_enabled",
+          "interim_transcript_last_source",
+          "interim_transcript_live_chunks_processed",
+          "interim_transcript_stop_replay_chunks_processed",
+          "interim_transcript_updates_emitted",
+          "interim_transcript_live_updates_emitted",
+          "interim_transcript_stop_replay_updates_emitted",
+          "interim_transcript_live_failed",
+          "interim_transcript_stop_replay_failed",
+          "interim_transcript_source_fallback_reason"
+        ],
+        "overlay_transport": [
+          "overlay_events_enabled",
+          "overlay_events_emitted",
+          "overlay_events_dropped"
+        ],
+        "timing": [
+          "active_session_age_ms",
+          "audio_stop_ms",
+          "finalize_ms",
+          "infer_ms",
+          "send_ms",
+          "last_audio_ms",
+          "last_infer_ms",
+          "last_send_ms"
+        ]
+      },
       "additionalProperties": true,
       "required": [
         "type",

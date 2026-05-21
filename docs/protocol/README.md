@@ -7,14 +7,21 @@ The schema is the source of truth for known daemon/client message fields. The Py
 daemon and Rust client keep their hand-written codec APIs, but CI round-trips every
 fixture through both implementations so schema drift is visible.
 
+`StatusMessage` is also the protocol-level Runtime Truth contract for the
+Daemon `/status` payload. Its `x-runtime-truth-field-groups` metadata names the
+current contract groups used by Daemon tests and operator docs; do not create a
+second status schema in code, Helper diagnostics, or docs.
+
 ## Adding A Field
 
 1. Add the field to `docs/protocol/schema/messages.schema.json`.
 2. Update both codecs:
    - Python: `parakeet-stt-daemon/src/parakeet_stt_daemon/messages.py`
    - Rust: `parakeet-ptt/src/protocol.rs`
-3. Add or update a fixture in `docs/protocol/fixtures/` that carries the field.
-4. Run the conformance checks:
+3. If the field belongs to `StatusMessage`, add it to the Runtime Truth field
+   groups in the schema and Python message model.
+4. Add or update a fixture in `docs/protocol/fixtures/` that carries the field.
+5. Run the conformance checks:
    - `cd parakeet-stt-daemon && uv run pytest -q tests/test_protocol_conformance.py`
    - `cd parakeet-ptt && cargo test protocol_conformance`
 
