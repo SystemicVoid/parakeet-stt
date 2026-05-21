@@ -280,13 +280,14 @@ class SessionOrchestrator:
                 state=InterimStateValue.PROCESSING,
             )
             audio_stop_started = time.perf_counter()
-            audio_samples, ready_chunks, _tail = self.audio.stop_session_with_streaming()
+            capture_result = self.audio.stop_session_with_streaming()
             await self._stop_stream_drain_loop()
             self._record_stream_runtime_result()
             # Final correctness must come from the capture layer's canonical buffer,
             # not whatever the Stream path managed to mirror into its active stream.
             self._active_stream = None
             audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
+            audio_samples = capture_result.audio_samples
             audio_duration_raw = len(audio_samples) / self.audio.sample_rate
             audio_ms = int(audio_duration_raw * 1000)
 
@@ -311,7 +312,7 @@ class SessionOrchestrator:
             try:
                 interim_updates = await self._collect_interim_text_updates(
                     session.session_id,
-                    ready_chunks,
+                    capture_result.ready_chunks,
                 )
                 if interim_updates:
                     await self._emit_interim_state(
