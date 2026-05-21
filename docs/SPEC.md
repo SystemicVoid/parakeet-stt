@@ -310,7 +310,9 @@ Future messages (like `partial_result`) must be backward compatible; clients sho
 Clients must also tolerate unknown error codes and unknown additional fields.
 Fields beyond `state` and `sessions_active` in `status` should be treated as optional.
 `audio_stop_ms`, `finalize_ms`, `infer_ms`, and `send_ms` represent the last completed session's stage
-durations. `last_*` fields mirror the same runtime timings for compatibility and will be deprecated after client uptake.
+durations. `last_infer_ms` and `last_send_ms` mirror `infer_ms` and `send_ms`
+for compatibility. `last_audio_ms` is the last Session's total audio duration,
+not the audio-stop stage duration reported by `audio_stop_ms`.
 Client logs expose user-visible Injection completion timings separately with
 `enqueue_to_injection_complete_ms`, `hotkey_up_elapsed_ms_at_completion`, and
 `stop_message_elapsed_ms_at_completion`.
