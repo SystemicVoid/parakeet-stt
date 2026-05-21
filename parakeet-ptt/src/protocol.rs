@@ -24,6 +24,49 @@ pub enum ClientMessage {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonStatus {
+    pub state: String,
+    pub sessions_active: u32,
+    pub gpu_mem_mb: Option<u64>,
+    pub device: Option<String>,
+    pub effective_device: Option<String>,
+    pub streaming_enabled: Option<bool>,
+    pub stream_helper_active: Option<bool>,
+    pub stream_helper_scope: Option<String>,
+    pub stream_fallback_reason: Option<String>,
+    pub stream_path_executed: Option<bool>,
+    pub stream_chunks_processed: Option<u64>,
+    pub finalization_mode: Option<String>,
+    pub final_audio_source: Option<String>,
+    pub tail_trim_mode: Option<String>,
+    pub vad_enabled: Option<bool>,
+    pub vad_active: Option<bool>,
+    pub vad_fallback_reason: Option<String>,
+    pub interim_transcript_enabled: Option<bool>,
+    pub interim_transcript_last_source: Option<String>,
+    pub interim_transcript_live_chunks_processed: Option<u64>,
+    pub interim_transcript_stop_replay_chunks_processed: Option<u64>,
+    pub interim_transcript_updates_emitted: Option<u64>,
+    pub interim_transcript_live_updates_emitted: Option<u64>,
+    pub interim_transcript_stop_replay_updates_emitted: Option<u64>,
+    pub interim_transcript_live_failed: Option<bool>,
+    pub interim_transcript_stop_replay_failed: Option<bool>,
+    pub interim_transcript_source_fallback_reason: Option<String>,
+    pub overlay_events_enabled: Option<bool>,
+    pub overlay_events_emitted: Option<u64>,
+    pub overlay_events_dropped: Option<u64>,
+    pub chunk_secs: Option<f64>,
+    pub active_session_age_ms: Option<u64>,
+    pub audio_stop_ms: Option<u64>,
+    pub finalize_ms: Option<u64>,
+    pub infer_ms: Option<u64>,
+    pub send_ms: Option<u64>,
+    pub last_audio_ms: Option<u64>,
+    pub last_infer_ms: Option<u64>,
+    pub last_send_ms: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // Keep serde's wire shape direct; Status is the only large payload.
@@ -47,47 +90,7 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
-    Status {
-        state: String,
-        sessions_active: u32,
-        gpu_mem_mb: Option<u64>,
-        device: Option<String>,
-        effective_device: Option<String>,
-        streaming_enabled: Option<bool>,
-        stream_helper_active: Option<bool>,
-        stream_helper_scope: Option<String>,
-        stream_fallback_reason: Option<String>,
-        stream_path_executed: Option<bool>,
-        stream_chunks_processed: Option<u64>,
-        finalization_mode: Option<String>,
-        final_audio_source: Option<String>,
-        tail_trim_mode: Option<String>,
-        vad_enabled: Option<bool>,
-        vad_active: Option<bool>,
-        vad_fallback_reason: Option<String>,
-        interim_transcript_enabled: Option<bool>,
-        interim_transcript_last_source: Option<String>,
-        interim_transcript_live_chunks_processed: Option<u64>,
-        interim_transcript_stop_replay_chunks_processed: Option<u64>,
-        interim_transcript_updates_emitted: Option<u64>,
-        interim_transcript_live_updates_emitted: Option<u64>,
-        interim_transcript_stop_replay_updates_emitted: Option<u64>,
-        interim_transcript_live_failed: Option<bool>,
-        interim_transcript_stop_replay_failed: Option<bool>,
-        interim_transcript_source_fallback_reason: Option<String>,
-        overlay_events_enabled: Option<bool>,
-        overlay_events_emitted: Option<u64>,
-        overlay_events_dropped: Option<u64>,
-        chunk_secs: Option<f64>,
-        active_session_age_ms: Option<u64>,
-        audio_stop_ms: Option<u64>,
-        finalize_ms: Option<u64>,
-        infer_ms: Option<u64>,
-        send_ms: Option<u64>,
-        last_audio_ms: Option<u64>,
-        last_infer_ms: Option<u64>,
-        last_send_ms: Option<u64>,
-    },
+    Status(DaemonStatus),
     InterimState {
         session_id: Uuid,
         seq: u64,
@@ -191,9 +194,10 @@ pub fn abort_message(session_id: Uuid, reason: &str) -> ClientMessage {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use uuid::Uuid;
 
-    use super::{decode_server_message, DecodedServerMessage, ServerMessage};
+    use super::{decode_server_message, DaemonStatus, DecodedServerMessage, ServerMessage};
 
     #[test]
     fn status_deserializes_when_optional_fields_are_missing() {
@@ -202,89 +206,73 @@ mod tests {
             serde_json::from_str(raw).expect("status payload should deserialize");
 
         match msg {
-            ServerMessage::Status {
-                state,
-                sessions_active,
-                gpu_mem_mb,
-                device,
-                effective_device,
-                streaming_enabled,
-                stream_helper_active,
-                stream_helper_scope,
-                stream_fallback_reason,
-                stream_path_executed,
-                stream_chunks_processed,
-                finalization_mode,
-                final_audio_source,
-                tail_trim_mode,
-                vad_enabled,
-                vad_active,
-                vad_fallback_reason,
-                interim_transcript_enabled,
-                interim_transcript_last_source,
-                interim_transcript_live_chunks_processed,
-                interim_transcript_stop_replay_chunks_processed,
-                interim_transcript_updates_emitted,
-                interim_transcript_live_updates_emitted,
-                interim_transcript_stop_replay_updates_emitted,
-                interim_transcript_live_failed,
-                interim_transcript_stop_replay_failed,
-                interim_transcript_source_fallback_reason,
-                overlay_events_enabled,
-                overlay_events_emitted,
-                overlay_events_dropped,
-                chunk_secs,
-                active_session_age_ms,
-                audio_stop_ms,
-                finalize_ms,
-                infer_ms,
-                send_ms,
-                last_audio_ms,
-                last_infer_ms,
-                last_send_ms,
-            } => {
-                assert_eq!(state, "idle");
-                assert_eq!(sessions_active, 0);
-                assert_eq!(gpu_mem_mb, None);
-                assert_eq!(device, None);
-                assert_eq!(effective_device, None);
-                assert_eq!(streaming_enabled, None);
-                assert_eq!(stream_helper_active, None);
-                assert_eq!(stream_helper_scope, None);
-                assert_eq!(stream_fallback_reason, None);
-                assert_eq!(stream_path_executed, None);
-                assert_eq!(stream_chunks_processed, None);
-                assert_eq!(finalization_mode, None);
-                assert_eq!(final_audio_source, None);
-                assert_eq!(tail_trim_mode, None);
-                assert_eq!(vad_enabled, None);
-                assert_eq!(vad_active, None);
-                assert_eq!(vad_fallback_reason, None);
-                assert_eq!(interim_transcript_enabled, None);
-                assert_eq!(interim_transcript_last_source, None);
-                assert_eq!(interim_transcript_live_chunks_processed, None);
-                assert_eq!(interim_transcript_stop_replay_chunks_processed, None);
-                assert_eq!(interim_transcript_updates_emitted, None);
-                assert_eq!(interim_transcript_live_updates_emitted, None);
-                assert_eq!(interim_transcript_stop_replay_updates_emitted, None);
-                assert_eq!(interim_transcript_live_failed, None);
-                assert_eq!(interim_transcript_stop_replay_failed, None);
-                assert_eq!(interim_transcript_source_fallback_reason, None);
-                assert_eq!(overlay_events_enabled, None);
-                assert_eq!(overlay_events_emitted, None);
-                assert_eq!(overlay_events_dropped, None);
-                assert_eq!(chunk_secs, None);
-                assert_eq!(active_session_age_ms, None);
-                assert_eq!(audio_stop_ms, None);
-                assert_eq!(finalize_ms, None);
-                assert_eq!(infer_ms, None);
-                assert_eq!(send_ms, None);
-                assert_eq!(last_audio_ms, None);
-                assert_eq!(last_infer_ms, None);
-                assert_eq!(last_send_ms, None);
+            ServerMessage::Status(status) => {
+                assert_eq!(status.state, "idle");
+                assert_eq!(status.sessions_active, 0);
+                assert_eq!(status.gpu_mem_mb, None);
+                assert_eq!(status.device, None);
+                assert_eq!(status.effective_device, None);
+                assert_eq!(status.streaming_enabled, None);
+                assert_eq!(status.stream_helper_active, None);
+                assert_eq!(status.stream_helper_scope, None);
+                assert_eq!(status.stream_fallback_reason, None);
+                assert_eq!(status.stream_path_executed, None);
+                assert_eq!(status.stream_chunks_processed, None);
+                assert_eq!(status.finalization_mode, None);
+                assert_eq!(status.final_audio_source, None);
+                assert_eq!(status.tail_trim_mode, None);
+                assert_eq!(status.vad_enabled, None);
+                assert_eq!(status.vad_active, None);
+                assert_eq!(status.vad_fallback_reason, None);
+                assert_eq!(status.interim_transcript_enabled, None);
+                assert_eq!(status.interim_transcript_last_source, None);
+                assert_eq!(status.interim_transcript_live_chunks_processed, None);
+                assert_eq!(status.interim_transcript_stop_replay_chunks_processed, None);
+                assert_eq!(status.interim_transcript_updates_emitted, None);
+                assert_eq!(status.interim_transcript_live_updates_emitted, None);
+                assert_eq!(status.interim_transcript_stop_replay_updates_emitted, None);
+                assert_eq!(status.interim_transcript_live_failed, None);
+                assert_eq!(status.interim_transcript_stop_replay_failed, None);
+                assert_eq!(status.interim_transcript_source_fallback_reason, None);
+                assert_eq!(status.overlay_events_enabled, None);
+                assert_eq!(status.overlay_events_emitted, None);
+                assert_eq!(status.overlay_events_dropped, None);
+                assert_eq!(status.chunk_secs, None);
+                assert_eq!(status.active_session_age_ms, None);
+                assert_eq!(status.audio_stop_ms, None);
+                assert_eq!(status.finalize_ms, None);
+                assert_eq!(status.infer_ms, None);
+                assert_eq!(status.send_ms, None);
+                assert_eq!(status.last_audio_ms, None);
+                assert_eq!(status.last_infer_ms, None);
+                assert_eq!(status.last_send_ms, None);
             }
             other => panic!("expected status message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_payload_uses_shared_runtime_truth_type() {
+        let raw = r#"{"type":"status","state":"listening","sessions_active":1,"stream_path_executed":true,"chunk_secs":2.4}"#;
+        let status_from_http: DaemonStatus =
+            serde_json::from_str(raw).expect("status payload should decode by shared type");
+        let status_from_protocol = match serde_json::from_str::<ServerMessage>(raw)
+            .expect("status payload should decode as a server message")
+        {
+            ServerMessage::Status(status) => status,
+            other => panic!("expected status message, got {other:?}"),
+        };
+
+        assert_eq!(status_from_http, status_from_protocol);
+        assert_eq!(status_from_http.state, "listening");
+        assert_eq!(status_from_http.sessions_active, 1);
+        assert_eq!(status_from_http.stream_path_executed, Some(true));
+        assert_eq!(status_from_http.chunk_secs, Some(2.4));
+
+        let encoded = serde_json::to_value(ServerMessage::Status(status_from_http))
+            .expect("serialize status");
+        assert_eq!(encoded["type"], json!("status"));
+        assert_eq!(encoded["stream_path_executed"], json!(true));
     }
 
     #[test]
@@ -405,7 +393,7 @@ mod tests {
                 code: "SESSION_ABORTED".to_string(),
                 message: "aborted".to_string(),
             },
-            ServerMessage::Status {
+            ServerMessage::Status(DaemonStatus {
                 state: "idle".to_string(),
                 sessions_active: 0,
                 gpu_mem_mb: None,
@@ -445,7 +433,7 @@ mod tests {
                 last_audio_ms: None,
                 last_infer_ms: None,
                 last_send_ms: None,
-            },
+            }),
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
