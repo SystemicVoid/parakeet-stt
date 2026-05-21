@@ -265,6 +265,10 @@ class OverlayInterimTranscriptSession:
         self._last_source: InterimTranscriptSource | None = None
         self._source_fallback_reason: str | None = None
 
+    def sync_runtime_config(self, *, sample_rate: int, enabled: bool) -> None:
+        self._sample_rate = int(sample_rate)
+        self._enabled = bool(enabled)
+
     @property
     def runtime_facts(self) -> InterimTranscriptRuntimeFacts:
         live = self._source_state["live"]

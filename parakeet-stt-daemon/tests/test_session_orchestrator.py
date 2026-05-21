@@ -20,7 +20,11 @@ from parakeet_stt_daemon.events import (
     SessionWarningEvent,
 )
 from parakeet_stt_daemon.messages import SessionEndReason
-from parakeet_stt_daemon.session import SessionManager, StreamPathRuntime
+from parakeet_stt_daemon.session import (
+    InterimTranscriptRuntime,
+    SessionManager,
+    StreamPathRuntime,
+)
 from parakeet_stt_daemon.session_orchestrator import (
     AbortSessionIntent,
     SessionOrchestrator,
@@ -127,6 +131,10 @@ def _build_orchestrator(
         settings,
         orchestrator.streaming_transcriber,
     )
+    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+        settings,
+        sample_rate=orchestrator.audio.sample_rate,
+    )
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
     orchestrator._session_sample_limit = int(max_session_seconds * FakeAudio.sample_rate)
@@ -138,7 +146,6 @@ def _build_orchestrator(
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator._interim_transcript_by_session = {}
     orchestrator._vad_enabled = False
 
     async def fake_collect_interim_text_updates(
