@@ -11,6 +11,7 @@ import numpy as np
 from pytest import MonkeyPatch
 
 from parakeet_stt_daemon import session_orchestrator as orchestrator_module
+from parakeet_stt_daemon.audio import CaptureSessionResult
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.events import (
     FinalResultEvent,
@@ -56,9 +57,15 @@ class FakeAudio:
     def abort_session(self) -> None:
         self.abort_calls += 1
 
-    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    def stop_session_with_streaming(self) -> CaptureSessionResult:
         self.stop_calls += 1
-        return self.samples, [], np.zeros((0,), dtype=np.float32)
+        return CaptureSessionResult(
+            audio_samples=self.samples,
+            ready_chunks=[],
+            tail_buffer=np.zeros((0,), dtype=np.float32),
+            pre_roll_samples=0,
+            post_start_samples=int(self.samples.size),
+        )
 
     def take_audio_levels(self) -> list[float]:
         self.take_audio_levels_calls += 1
@@ -106,6 +113,7 @@ def _build_orchestrator(
     *,
     streaming_enabled: bool = False,
     max_session_seconds: float = 90.0,
+    samples: np.ndarray | None = None,
     stream_chunks: list[np.ndarray] | None = None,
 ) -> SessionOrchestrator:
     orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
@@ -117,7 +125,7 @@ def _build_orchestrator(
     )
     orchestrator.settings = settings
     orchestrator.sessions = SessionManager()
-    orchestrator.audio = FakeAudio(stream_chunks=stream_chunks)
+    orchestrator.audio = FakeAudio(samples=samples, stream_chunks=stream_chunks)
     orchestrator.model = object()
     orchestrator.transcriber = object()
     orchestrator._session_lock = asyncio.Lock()
@@ -341,6 +349,33 @@ def test_stop_without_start_emits_session_not_found() -> None:
                 message="No matching active session",
             )
         ]
+
+    asyncio.run(scenario())
+
+
+def test_stop_empty_capture_result_emits_audio_device_error() -> None:
+    async def scenario() -> None:
+        orchestrator = _build_orchestrator(samples=np.zeros((0,), dtype=np.float32))
+        sink = RecordingEventSink()
+        session_id = uuid4()
+        await _start(orchestrator, sink, session_id)
+
+        await orchestrator.stop(
+            StopSessionIntent(
+                session_id=session_id,
+                owner_token=1,
+                event_sink=sink,
+                post_roll_secs=0.0,
+            )
+        )
+
+        errors = _events_of_type(sink, SessionErrorEvent)
+        assert errors
+        assert errors[-1].code == "AUDIO_DEVICE"
+        ended = _events_of_type(sink, SessionEndedEvent)
+        assert ended
+        assert ended[-1].reason == SessionEndReason.ERROR
+        assert _events_of_type(sink, FinalResultEvent) == []
 
     asyncio.run(scenario())
 

@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import numpy as np
 from fastapi import WebSocketDisconnect
 
-from parakeet_stt_daemon.audio import AudioInput
+from parakeet_stt_daemon.audio import AudioInput, CaptureSessionResult
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.events import EventSink, EventSinkClosed, WebSocketEventSinkState
 from parakeet_stt_daemon.messages import (
@@ -44,10 +44,16 @@ class FakeAudio:
     def abort_session(self) -> None:
         self.abort_calls += 1
 
-    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    def stop_session_with_streaming(self) -> CaptureSessionResult:
         self.stop_calls += 1
         samples = np.ones((1_600,), dtype=np.float32)
-        return samples, [], np.zeros((0,), dtype=np.float32)
+        return CaptureSessionResult(
+            audio_samples=samples,
+            ready_chunks=[],
+            tail_buffer=np.zeros((0,), dtype=np.float32),
+            pre_roll_samples=0,
+            post_start_samples=int(samples.size),
+        )
 
     def take_stream_chunks(self) -> list[object]:
         return []
@@ -223,6 +229,42 @@ def test_audio_input_clips_pre_roll_to_session_sample_limit() -> None:
 
     assert captured.size == 3
     assert np.allclose(captured, np.array([0.2, 0.3, 0.4], dtype=np.float32))
+
+
+def test_audio_input_streaming_stop_returns_capture_session_result_facts() -> None:
+    audio = AudioInput(sample_rate=10, channels=1, pre_roll_seconds=1.0)
+    audio.configure_stream_chunk_size(4)
+    audio._callback(
+        np.array([[0.1], [0.2], [0.3]], dtype=np.float32),
+        frames=3,
+        time=None,
+        status=cast(Any, 0),
+    )
+    audio.start_session()
+    audio._callback(
+        np.array([[0.4], [0.5]], dtype=np.float32),
+        frames=2,
+        time=None,
+        status=cast(Any, 0),
+    )
+
+    result = audio.stop_session_with_streaming()
+
+    assert isinstance(result, CaptureSessionResult)
+    assert np.allclose(
+        result.audio_samples,
+        np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32),
+    )
+    assert result.captured_samples == 5
+    assert result.pre_roll_samples == 3
+    assert result.post_start_samples == 2
+    assert result.ready_chunk_count == 1
+    assert np.allclose(
+        result.ready_chunks[0],
+        np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+    )
+    assert np.allclose(result.tail_buffer, np.array([0.5], dtype=np.float32))
+    assert result.tail_samples == 1
 
 
 def test_disconnect_cleans_active_session_state() -> None:

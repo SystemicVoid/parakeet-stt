@@ -14,6 +14,7 @@ import numpy as np
 from loguru import logger
 
 from parakeet_stt_daemon import session_orchestrator as orchestrator_module
+from parakeet_stt_daemon.audio import CaptureSessionResult
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.events import WebSocketEventSinkState
 from parakeet_stt_daemon.messages import (
@@ -40,10 +41,16 @@ class FakeAudio:
     def start_session(self) -> None:
         return None
 
-    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    def stop_session_with_streaming(self) -> CaptureSessionResult:
         self.stop_calls += 1
         samples = np.ones((1600,), dtype=np.float32)
-        return samples, list(self.ready_chunks), np.zeros((0,), dtype=np.float32)
+        return CaptureSessionResult(
+            audio_samples=samples,
+            ready_chunks=list(self.ready_chunks),
+            tail_buffer=np.zeros((0,), dtype=np.float32),
+            pre_roll_samples=0,
+            post_start_samples=int(samples.size),
+        )
 
     def abort_session(self) -> None:
         self.abort_calls += 1
