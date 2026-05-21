@@ -109,14 +109,6 @@ def _build_server(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
-    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
-        orchestrator.settings,
-        streaming_transcriber,
-    )
-    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
-        orchestrator.settings,
-        sample_rate=orchestrator.audio.sample_rate,
-    )
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._last_audio_ms = None
@@ -132,6 +124,14 @@ def _build_server(
         warmup_sample_rate=FakeAudio.sample_rate,
     )
     return cast(SessionOrchestrator, orchestrator)
+
+
+def _stream_runtime(orchestrator: SessionOrchestrator) -> StreamPathRuntime:
+    return orchestrator._stream_path_runtime_for_runtime()
+
+
+def _interim_runtime(orchestrator: SessionOrchestrator) -> InterimTranscriptRuntime:
+    return orchestrator._interim_transcript_runtime_for_runtime()
 
 
 def _status(orchestrator: SessionOrchestrator) -> StatusMessage:
@@ -503,9 +503,10 @@ def test_stream_fallback_reason_none_when_active() -> None:
 def test_status_reports_stream_path_execution_from_last_session() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server.stream_path_runtime.record_chunk_processed()
-    server.stream_path_runtime.record_chunk_processed()
-    server.stream_path_runtime.record_session_result(active_stream=None)
+    stream_runtime = _stream_runtime(server)
+    stream_runtime.record_chunk_processed()
+    stream_runtime.record_chunk_processed()
+    stream_runtime.record_session_result(active_stream=None)
 
     status = _status(server)
     log_record = _truth(server).to_log_record()
@@ -522,7 +523,7 @@ def test_status_reports_stream_path_execution_from_last_session() -> None:
 def test_status_reports_fallback_when_helper_exists_but_no_stream_work_ran() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server.stream_path_runtime.record_session_result(active_stream=None)
+    _stream_runtime(server).record_session_result(active_stream=None)
 
     status = _status(server)
     log_record = _truth(server).to_log_record()
@@ -538,9 +539,10 @@ def test_status_reports_fallback_when_helper_exists_but_no_stream_work_ran() -> 
 def test_status_reports_fallback_even_after_stream_path_executed() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server.stream_path_runtime.record_chunk_processed()
-    server.stream_path_runtime.record_current_fallback("stream_chunk_failed:RuntimeError")
-    server.stream_path_runtime.record_session_result(active_stream=None)
+    stream_runtime = _stream_runtime(server)
+    stream_runtime.record_chunk_processed()
+    stream_runtime.record_current_fallback("stream_chunk_failed:RuntimeError")
+    stream_runtime.record_session_result(active_stream=None)
 
     status = _status(server)
     truth = _truth(server)
@@ -563,12 +565,13 @@ def test_status_and_logs_split_interim_truth_from_stream_path_fallback() -> None
         )
         session_id = uuid4()
         await server.sessions.start_session(session_id, owner_token=1)
-        server.interim_transcript_runtime.reset_session(session_id)
+        interim_runtime = _interim_runtime(server)
+        interim_runtime.reset_session(session_id)
 
         async def transcribe(_samples: np.ndarray) -> str:
             return "visible interim text"
 
-        update = await server.interim_transcript_runtime.accept_live_chunk(
+        update = await interim_runtime.accept_live_chunk(
             session_id,
             np.full((400,), 0.2, dtype=np.float32),
             transcribe,
@@ -600,9 +603,9 @@ def test_status_and_logs_split_interim_truth_from_stream_path_fallback() -> None
         assert log_record["interim_transcript_last_source"] == "live"
         assert log_record["interim_transcript_updates_emitted"] == 1
 
-        server.interim_transcript_runtime.record_last_session(session_id)
+        interim_runtime.record_last_session(session_id)
         await server.sessions.clear(session_id, owner_token=1)
-        server.interim_transcript_runtime.clear_session(session_id)
+        interim_runtime.clear_session(session_id)
 
         idle_status = _status(server)
         idle_log_record = _truth(server).to_log_record()
@@ -620,12 +623,13 @@ def test_status_reports_interim_source_fallback_reason() -> None:
         server = _build_server(streaming_enabled=False, overlay_events_enabled=True)
         session_id = uuid4()
         await server.sessions.start_session(session_id, owner_token=1)
-        server.interim_transcript_runtime.reset_session(session_id)
+        interim_runtime = _interim_runtime(server)
+        interim_runtime.reset_session(session_id)
 
         async def transcribe(_samples: np.ndarray) -> str:
             raise RuntimeError("interim source failed")
 
-        update = await server.interim_transcript_runtime.accept_live_chunk(
+        update = await interim_runtime.accept_live_chunk(
             session_id,
             np.full((400,), 0.2, dtype=np.float32),
             transcribe,
@@ -656,8 +660,9 @@ def test_status_reports_interim_source_fallback_reason() -> None:
 def test_active_session_does_not_inherit_previous_stream_fallback() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server.stream_path_runtime.record_session_result(active_stream=None)
-    server.stream_path_runtime.reset_current()
+    stream_runtime = _stream_runtime(server)
+    stream_runtime.record_session_result(active_stream=None)
+    stream_runtime.reset_current()
     cast(Any, server.sessions)._active = Session(session_id=uuid4(), owner_token=1)
 
     status = _status(server)
