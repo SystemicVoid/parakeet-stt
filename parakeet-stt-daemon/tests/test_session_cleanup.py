@@ -22,7 +22,7 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import InterimTranscriptRuntime, Session, SessionManager
+from parakeet_stt_daemon.session import Session, SessionManager
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 
 
@@ -166,10 +166,6 @@ def _build_server() -> DaemonServer:
     orchestrator._last_finalize_ms = None
     orchestrator._last_infer_ms = None
     orchestrator._last_send_ms = None
-    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
-        settings,
-        sample_rate=orchestrator.audio.sample_rate,
-    )
 
     async def fake_collect_interim_text_updates(
         _session_id: UUID, _ready_chunks: list[object]
