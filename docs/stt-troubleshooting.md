@@ -64,8 +64,9 @@ transcript source activity, overlay-event transport, timing, and counter fields;
 the Helper should read those fields from `/status` instead of re-deriving them.
 
 Use `stt status` for Helper process health: Daemon PID, Client PID, endpoint,
-tmux session, and matching processes. Use the Daemon `/status` payload, the
-Client startup status log line, and Daemon session runtime truth logs for
+tmux session, matching processes, and the normalized Daemon Runtime Truth block
+when `/status` is available. Use the Daemon `/status` payload, the Client
+startup status log line, and Daemon session runtime truth logs for deeper
 runtime truth. The Helper may parse `/status` to decide whether an existing
 Daemon matches the requested Profile, but shell logic should not infer Stream
 path, Seal path, interim transcript, or Overlay transport state from process

@@ -6,6 +6,8 @@ import json
 import os
 import shlex
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -16,9 +18,32 @@ from parakeet_stt_daemon.config import (
     daemon_status_url,
     daemon_websocket_endpoint,
 )
+from parakeet_stt_daemon.messages import (
+    STATUS_RUNTIME_TRUTH_FIELD_GROUPS,
+    STATUS_RUNTIME_TRUTH_FIELDS,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
+
+
+@contextmanager
+def _preserve_paths(*paths: Path) -> Iterator[None]:
+    snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
+    try:
+        yield
+    finally:
+        for path, snapshot in snapshots.items():
+            if snapshot is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(snapshot)
+
+
+def _write_fake_command(bin_dir: Path, name: str, script: str) -> None:
+    command_path = bin_dir / name
+    command_path.write_text(script, encoding="utf-8")
+    command_path.chmod(0o755)
 
 
 def _run_runtime_config(*args: str, extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -173,11 +198,16 @@ def _run_status_runtime_truth(payload_path: Path) -> dict[str, str]:
     return truth
 
 
+def _runtime_truth_contract_fields() -> list[str]:
+    return [field for fields in STATUS_RUNTIME_TRUTH_FIELD_GROUPS.values() for field in fields]
+
+
 def _status_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "type": "status",
         "state": "idle",
         "sessions_active": 0,
+        "gpu_mem_mb": 1024,
         "device": "cuda",
         "effective_device": "cpu",
         "streaming_enabled": True,
@@ -193,7 +223,27 @@ def _status_payload(**overrides: object) -> dict[str, object]:
         "vad_enabled": True,
         "vad_active": False,
         "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+        "interim_transcript_enabled": True,
+        "interim_transcript_last_source": "live",
+        "interim_transcript_live_chunks_processed": 2,
+        "interim_transcript_stop_replay_chunks_processed": 1,
+        "interim_transcript_updates_emitted": 3,
+        "interim_transcript_live_updates_emitted": 2,
+        "interim_transcript_stop_replay_updates_emitted": 1,
+        "interim_transcript_live_failed": False,
+        "interim_transcript_stop_replay_failed": False,
+        "interim_transcript_source_fallback_reason": None,
         "overlay_events_enabled": True,
+        "overlay_events_emitted": 9,
+        "overlay_events_dropped": 1,
+        "active_session_age_ms": 321,
+        "audio_stop_ms": 0,
+        "finalize_ms": 4,
+        "infer_ms": 5,
+        "send_ms": 6,
+        "last_audio_ms": 2400,
+        "last_infer_ms": 7,
+        "last_send_ms": 8,
     }
     payload.update(overrides)
     return payload
@@ -421,7 +471,13 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
 
     truth = _run_status_runtime_truth(payload_path)
 
+    assert set(truth) == STATUS_RUNTIME_TRUTH_FIELDS
+    assert list(truth) == _runtime_truth_contract_fields()
     assert truth == {
+        "type": "status",
+        "state": "idle",
+        "sessions_active": "0",
+        "gpu_mem_mb": "1024",
         "device": "cuda",
         "effective_device": "cpu",
         "streaming_enabled": "true",
@@ -437,7 +493,27 @@ def test_daemon_status_runtime_truth_reads_status_fields_unchanged(tmp_path: Pat
         "vad_enabled": "true",
         "vad_active": "false",
         "vad_fallback_reason": "load_failed:missing_dependency:onnxruntime",
+        "interim_transcript_enabled": "true",
+        "interim_transcript_last_source": "live",
+        "interim_transcript_live_chunks_processed": "2",
+        "interim_transcript_stop_replay_chunks_processed": "1",
+        "interim_transcript_updates_emitted": "3",
+        "interim_transcript_live_updates_emitted": "2",
+        "interim_transcript_stop_replay_updates_emitted": "1",
+        "interim_transcript_live_failed": "false",
+        "interim_transcript_stop_replay_failed": "false",
+        "interim_transcript_source_fallback_reason": "",
         "overlay_events_enabled": "true",
+        "overlay_events_emitted": "9",
+        "overlay_events_dropped": "1",
+        "active_session_age_ms": "321",
+        "audio_stop_ms": "0",
+        "finalize_ms": "4",
+        "infer_ms": "5",
+        "send_ms": "6",
+        "last_audio_ms": "2400",
+        "last_infer_ms": "7",
+        "last_send_ms": "8",
     }
 
 
@@ -452,24 +528,12 @@ def test_daemon_status_runtime_truth_accepts_minimal_protocol_status(
 
     truth = _run_status_runtime_truth(payload_path)
 
-    assert truth == {
-        "device": "",
-        "effective_device": "",
-        "streaming_enabled": "",
-        "stream_helper_active": "",
-        "stream_helper_scope": "",
-        "stream_fallback_reason": "",
-        "stream_path_executed": "",
-        "stream_chunks_processed": "",
-        "chunk_secs": "",
-        "finalization_mode": "",
-        "final_audio_source": "",
-        "tail_trim_mode": "",
-        "vad_enabled": "",
-        "vad_active": "",
-        "vad_fallback_reason": "",
-        "overlay_events_enabled": "",
-    }
+    assert set(truth) == STATUS_RUNTIME_TRUTH_FIELDS
+    assert truth["type"] == "status"
+    assert truth["state"] == "idle"
+    assert truth["sessions_active"] == "0"
+    for field in STATUS_RUNTIME_TRUTH_FIELDS - {"type", "state", "sessions_active"}:
+        assert truth[field] == ""
 
 
 def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -> None:
@@ -534,3 +598,102 @@ def test_status_runtime_truth_rejects_non_finite_numeric_tokens(tmp_path: Path) 
 
         with pytest.raises(subprocess.CalledProcessError):
             _run_status_runtime_truth(payload_path)
+
+
+def test_status_uses_persisted_daemon_authority_for_liveness(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    listener_port = "9876"
+    listener_pid = "424242"
+    expected_status_url = f"http://127.0.0.1:{listener_port}/status"
+    curl_url_file = tmp_path / "curl-url.txt"
+
+    _write_fake_command(
+        fake_bin,
+        "lsof",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-tiTCP:${STT_TEST_LISTENER_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_LISTENER_PID"
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "ps",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ] && [ "${2:-}" = "$STT_TEST_LISTENER_PID" ]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "curl",
+        """#!/usr/bin/env bash
+url="${@: -1}"
+printf '%s\\n' "$url" > "$STT_TEST_CURL_URL_FILE"
+if [ "$url" = "$STT_TEST_EXPECTED_STATUS_URL" ]; then
+    printf '%s' "$STT_TEST_STATUS_PAYLOAD"
+    exit 0
+fi
+exit 22
+""",
+    )
+    for command_name in ("nc", "pgrep", "tmux"):
+        _write_fake_command(
+            fake_bin,
+            command_name,
+            "#!/usr/bin/env bash\nexit 1\n",
+        )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_PORT": "8765",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+            "STT_TEST_CURL_URL_FILE": str(curl_url_file),
+            "STT_TEST_EXPECTED_STATUS_URL": expected_status_url,
+            "STT_TEST_LISTENER_PID": listener_pid,
+            "STT_TEST_LISTENER_PORT": listener_port,
+            "STT_TEST_STATUS_PAYLOAD": json.dumps(
+                {"type": "status", "state": "idle", "sessions_active": 0}
+            ),
+        }
+    )
+
+    port_file = Path("/tmp/parakeet-daemon.port")
+    pid_file = Path("/tmp/parakeet-daemon.pid")
+    with _preserve_paths(port_file, pid_file):
+        port_file.write_text(f"127.0.0.1:{listener_port}\n", encoding="utf-8")
+        pid_file.unlink(missing_ok=True)
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"source {shlex.quote(str(HELPER_PATH))} && stt status",
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        assert f"Daemon running (pid {listener_pid})" in completed.stdout
+        assert f"Endpoint: ws://127.0.0.1:{listener_port}/ws" in completed.stdout
+        assert "Daemon runtime truth:" in completed.stdout
+        assert "sessions_active=0" in completed.stdout
+        assert curl_url_file.read_text(encoding="utf-8").strip() == expected_status_url
+        assert pid_file.read_text(encoding="utf-8").strip() == listener_pid
