@@ -7,8 +7,17 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
+
+from .overlay_interim import (
+    InterimTranscriber,
+    InterimTranscriptRuntimeFacts,
+    OverlayInterimTranscriptSession,
+)
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class SessionState(StrEnum):
@@ -202,6 +211,96 @@ class StreamPathRuntime:
         )
 
 
+class InterimTranscriptRuntime:
+    """Own interim transcript source runtime truth for Daemon Sessions."""
+
+    def __init__(self, *, sample_rate: int, enabled: bool) -> None:
+        self.sample_rate = int(sample_rate)
+        self.enabled = bool(enabled)
+        self._by_session: dict[UUID, OverlayInterimTranscriptSession] = {}
+        self._last_facts: InterimTranscriptRuntimeFacts | None = None
+
+    @classmethod
+    def from_settings(cls, settings: object, *, sample_rate: int) -> InterimTranscriptRuntime:
+        return cls(
+            sample_rate=sample_rate,
+            enabled=bool(getattr(settings, "overlay_events_enabled", False)),
+        )
+
+    def sync_from_runtime(self, *, settings: object, sample_rate: int) -> None:
+        self.sample_rate = int(sample_rate)
+        self.enabled = bool(getattr(settings, "overlay_events_enabled", False))
+        for session in self._by_session.values():
+            session.sync_runtime_config(
+                sample_rate=self.sample_rate,
+                enabled=self.enabled,
+            )
+
+    def reset_session(self, session_id: UUID) -> None:
+        self._by_session[session_id] = self._new_session(session_id)
+
+    def clear_session(self, session_id: UUID) -> None:
+        self._by_session.pop(session_id, None)
+
+    def record_last_session(self, session_id: UUID) -> None:
+        session = self._by_session.get(session_id)
+        self._last_facts = session.runtime_facts if session is not None else self.empty_facts()
+
+    def session_runtime_facts(self, session_id: UUID) -> InterimTranscriptRuntimeFacts:
+        return self._session(session_id).runtime_facts
+
+    def facts(self, *, active_session_id: UUID | None) -> InterimTranscriptRuntimeFacts:
+        if active_session_id is not None:
+            return self._session(active_session_id).runtime_facts
+        return self._last_facts if self._last_facts is not None else self.empty_facts()
+
+    async def accept_live_chunk(
+        self,
+        session_id: UUID,
+        chunk: np.ndarray,
+        transcribe: InterimTranscriber,
+    ) -> str | None:
+        return await self._session(session_id).accept_live_chunk(chunk, transcribe)
+
+    async def collect_stop_replay_updates(
+        self,
+        session_id: UUID,
+        ready_chunks: list[np.ndarray],
+        transcribe: InterimTranscriber,
+    ) -> list[str]:
+        return await self._session(session_id).collect_stop_replay_updates(
+            ready_chunks,
+            transcribe,
+        )
+
+    def empty_facts(self) -> InterimTranscriptRuntimeFacts:
+        return InterimTranscriptRuntimeFacts(
+            enabled=self.enabled,
+            last_source=None,
+            live_chunks_processed=0,
+            live_updates_emitted=0,
+            live_failed=False,
+            stop_replay_chunks_processed=0,
+            stop_replay_updates_emitted=0,
+            stop_replay_failed=False,
+            source_fallback_reason=None,
+        )
+
+    def _session(self, session_id: UUID) -> OverlayInterimTranscriptSession:
+        session = self._by_session.get(session_id)
+        if session is None:
+            session = self._new_session(session_id)
+            self._by_session[session_id] = session
+        return session
+
+    def _new_session(self, session_id: UUID) -> OverlayInterimTranscriptSession:
+        return OverlayInterimTranscriptSession(
+            session_id=session_id,
+            sample_rate=self.sample_rate,
+            enabled=self.enabled,
+        )
+
+
 class SessionManager:
     """Coordinate access to the single active session allowed by the daemon."""
 
@@ -242,6 +341,8 @@ class SessionManager:
 
 
 __all__ = [
+    "InterimTranscriptRuntime",
+    "InterimTranscriptRuntimeFacts",
     "Session",
     "SessionBusyError",
     "SessionManager",
