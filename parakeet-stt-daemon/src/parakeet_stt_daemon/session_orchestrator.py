@@ -58,7 +58,15 @@ from .runtime_truth_snapshot import (
 from .runtime_truth_snapshot import (
     snapshot as runtime_truth_snapshot,
 )
-from .session import Session, SessionBusyError, SessionManager, SessionNotFoundError, SessionState
+from .session import (
+    Session,
+    SessionBusyError,
+    SessionManager,
+    SessionNotFoundError,
+    SessionState,
+    StreamPathRuntime,
+    StreamPathRuntimeFacts,
+)
 from .tail_trim import SealPathTailTrimmer
 
 SESSION_GUARD_POLL_SECS = 0.1
@@ -134,11 +142,10 @@ class SessionOrchestrator:
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
-        self._current_stream_chunks_processed = 0
-        self._current_stream_fallback_reason: str | None = None
-        self._last_stream_path_executed = False
-        self._last_stream_chunks_processed = 0
-        self._last_stream_fallback_reason: str | None = None
+        self.stream_path_runtime = StreamPathRuntime.from_settings(
+            settings,
+            self.streaming_transcriber,
+        )
         self._session_guard_task: asyncio.Task | None = None
         self._session_guard_running = False
         self._last_audio_ms: int | None = None
@@ -180,19 +187,18 @@ class SessionOrchestrator:
             return
         try:
             self._reset_interim_transcript_session(message.session_id)
-            self._reset_current_stream_runtime()
+            self._stream_path_runtime_for_runtime().reset_current()
             self.audio.start_session()
             streaming_transcriber = self.streaming_transcriber
-            if streaming_transcriber is not None or bool(
-                getattr(self.settings, "streaming_enabled", False)
-            ):
-                if self._streaming_helper_available() and streaming_transcriber is not None:
+            stream_runtime = self._stream_path_runtime_for_runtime()
+            if stream_runtime.should_start_drain_loop():
+                if stream_runtime.helper_available() and streaming_transcriber is not None:
                     self._active_stream = streaming_transcriber.start_session(
                         self.audio.sample_rate
                     )
                 else:
-                    self._current_stream_fallback_reason = (
-                        self._stream_fallback_reason_from_runtime()
+                    stream_runtime.record_current_fallback(
+                        stream_runtime.fallback_reason_from_runtime()
                     )
                 self._start_stream_drain_loop(event_sink, message.session_id)
             self._start_session_guard_loop(event_sink, message.session_id, owner_token=owner_token)
@@ -278,7 +284,7 @@ class SessionOrchestrator:
             await self._stop_stream_drain_loop()
             self._record_stream_runtime_result()
             # Final correctness must come from the capture layer's canonical buffer,
-            # not whatever the drain task managed to mirror into `_active_stream`.
+            # not whatever the Stream path managed to mirror into its active stream.
             self._active_stream = None
             audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
             audio_duration_raw = len(audio_samples) / self.audio.sample_rate
@@ -493,7 +499,7 @@ class SessionOrchestrator:
                 await self.sessions.clear(active_session_id, owner_token=active_owner_token)
                 self._clear_overlay_session_runtime(active_session_id)
             self._active_stream = None
-            self._reset_current_stream_runtime()
+            self._stream_path_runtime_for_runtime().reset_current()
             if active_session_id is not None and event_sink is not None and session_end_reason:
                 await self._emit_session_ended(
                     event_sink, active_session_id, reason=session_end_reason
@@ -827,6 +833,11 @@ class SessionOrchestrator:
             overlay_events_enabled=overlay_events_enabled,
         )
 
+    def stream_path_runtime_facts_for_runtime(self) -> StreamPathRuntimeFacts:
+        return self._stream_path_runtime_for_runtime().facts(
+            active_session=self.sessions.active is not None
+        )
+
     def runtime_status_state(self) -> RuntimeTruthState:
         active = self.sessions.active
         return RuntimeTruthState(
@@ -911,53 +922,20 @@ class SessionOrchestrator:
         finally:
             _release_cuda_cache(effective_device)
 
-    def _reset_current_stream_runtime(self) -> None:
-        self._current_stream_chunks_processed = 0
-        self._current_stream_fallback_reason = None
-
-    def _streaming_helper_available(self) -> bool:
-        transcriber = getattr(self, "streaming_transcriber", None)
-        return transcriber is not None and bool(getattr(transcriber, "helper_active", False))
-
-    def _stream_fallback_reason_from_runtime(self) -> str | None:
-        if not bool(getattr(self.settings, "streaming_enabled", False)):
-            return None
-        transcriber = getattr(self, "streaming_transcriber", None)
-        if transcriber is None:
-            return "streaming_transcriber_unavailable"
-        fallback_reason = getattr(transcriber, "fallback_reason", None)
-        if fallback_reason is not None:
-            return fallback_reason
-        if not bool(getattr(transcriber, "helper_active", False)):
-            return "streaming_helper_inactive"
-        return None
-
     def _record_stream_runtime_result(self) -> None:
-        chunks_processed = int(getattr(self, "_current_stream_chunks_processed", 0))
-        fallback_reason = getattr(self, "_current_stream_fallback_reason", None)
-        active_stream = getattr(self, "_active_stream", None)
-        if active_stream is not None and fallback_reason is None:
-            fallback_reason = getattr(active_stream, "stream_fallback_reason", None)
-        if bool(getattr(self.settings, "streaming_enabled", False)):
-            if fallback_reason is None:
-                fallback_reason = self._stream_fallback_reason_from_runtime()
-            if chunks_processed <= 0 and fallback_reason is None:
-                fallback_reason = "stream_path_not_exercised:no_chunks"
-        else:
-            fallback_reason = None
-        self._last_stream_chunks_processed = chunks_processed
-        self._last_stream_path_executed = chunks_processed > 0
-        self._last_stream_fallback_reason = fallback_reason
+        self._stream_path_runtime_for_runtime().record_session_result(
+            active_stream=getattr(self, "_active_stream", None)
+        )
 
     async def _feed_stream_chunk(self, stream: ParakeetStreamingSession, chunk: np.ndarray) -> None:
         async with self._inference_lock_for_runtime():
             processed = await asyncio.to_thread(stream.feed, chunk)
         if processed:
-            self._current_stream_chunks_processed += 1
+            self._stream_path_runtime_for_runtime().record_chunk_processed()
             return
         reason = getattr(stream, "stream_fallback_reason", None)
         if reason is not None:
-            self._current_stream_fallback_reason = reason
+            self._stream_path_runtime_for_runtime().record_current_fallback(reason)
 
     def _start_stream_drain_loop(self, event_sink: EventSink, session_id: UUID) -> None:
         if self._stream_drain_task is not None:
@@ -998,6 +976,21 @@ class SessionOrchestrator:
                 "Stream drain loop stopped with {} during shutdown",
                 exc.__class__.__name__,
             )
+
+    def _stream_path_runtime_for_runtime(self) -> StreamPathRuntime:
+        runtime = getattr(self, "stream_path_runtime", None)
+        if not isinstance(runtime, StreamPathRuntime):
+            runtime = StreamPathRuntime.from_settings(
+                self.settings,
+                getattr(self, "streaming_transcriber", None),
+            )
+            self.stream_path_runtime = runtime
+        else:
+            runtime.sync_from_runtime(
+                settings=self.settings,
+                streaming_transcriber=getattr(self, "streaming_transcriber", None),
+            )
+        return runtime
 
 
 __all__ = [

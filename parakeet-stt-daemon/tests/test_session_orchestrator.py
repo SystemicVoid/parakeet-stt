@@ -20,7 +20,7 @@ from parakeet_stt_daemon.events import (
     SessionWarningEvent,
 )
 from parakeet_stt_daemon.messages import SessionEndReason
-from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session import SessionManager, StreamPathRuntime
 from parakeet_stt_daemon.session_orchestrator import (
     AbortSessionIntent,
     SessionOrchestrator,
@@ -123,11 +123,10 @@ def _build_orchestrator(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
-    orchestrator._current_stream_chunks_processed = 0
-    orchestrator._current_stream_fallback_reason = None
-    orchestrator._last_stream_path_executed = False
-    orchestrator._last_stream_chunks_processed = 0
-    orchestrator._last_stream_fallback_reason = None
+    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
+        settings,
+        orchestrator.streaming_transcriber,
+    )
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
     orchestrator._session_sample_limit = int(max_session_seconds * FakeAudio.sample_rate)
@@ -216,7 +215,10 @@ def test_start_keeps_stream_drain_loop_when_helper_inactive() -> None:
         await orchestrator.sessions.clear(session_id, owner_token=1)
 
         assert orchestrator._active_stream is None
-        assert orchestrator._current_stream_fallback_reason == "init_failed:ImportError"
+        assert (
+            orchestrator.stream_path_runtime.facts(active_session=True).fallback_reason
+            == "init_failed:ImportError"
+        )
         assert audio.take_audio_levels_calls > 0
         assert audio.take_stream_chunks_calls > 0
 

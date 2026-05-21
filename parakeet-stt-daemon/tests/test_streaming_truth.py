@@ -12,7 +12,12 @@ import numpy as np
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import StatusMessage
 from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
-from parakeet_stt_daemon.session import Session, SessionManager
+from parakeet_stt_daemon.session import (
+    Session,
+    SessionManager,
+    StreamPathRuntime,
+    StreamPathRuntimeFacts,
+)
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
@@ -63,6 +68,14 @@ class FakeVadAdapter:
         return samples.astype(np.float32, copy=False)
 
 
+class StreamPrivateFieldTrap(SimpleNamespace):
+    def __getattr__(self, name: str) -> Any:
+        private_stream_prefixes = ("_current_" + "stream", "_last_" + "stream")
+        if name.startswith(private_stream_prefixes):
+            raise AssertionError(f"runtime truth probed old Stream path field {name}")
+        raise AttributeError(name)
+
+
 def _build_server(
     *,
     streaming_enabled: bool = True,
@@ -88,11 +101,10 @@ def _build_server(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
-    orchestrator._current_stream_chunks_processed = 0
-    orchestrator._current_stream_fallback_reason = None
-    orchestrator._last_stream_path_executed = False
-    orchestrator._last_stream_chunks_processed = 0
-    orchestrator._last_stream_fallback_reason = None
+    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
+        orchestrator.settings,
+        streaming_transcriber,
+    )
     orchestrator._last_interim_transcript_runtime_facts = None
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
@@ -243,6 +255,47 @@ def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> N
     assert truth.stream_fallback_reason == "streaming_transcriber_unavailable"
 
 
+def test_runtime_truth_reads_stream_path_interface_instead_of_orchestrator_fields() -> None:
+    runtime_facts = StreamPathRuntimeFacts(
+        streaming_enabled=True,
+        helper_active=True,
+        helper_scope="live_session_only",
+        helper_class_name="InterfaceHelper",
+        fallback_reason="interface:fallback",
+        chunk_secs=1.25,
+        path_executed=True,
+        chunks_processed=3,
+    )
+    orchestrator = cast(
+        SessionOrchestrator,
+        StreamPrivateFieldTrap(
+            settings=SimpleNamespace(
+                streaming_enabled=True,
+                chunk_secs=9.99,
+                overlay_events_enabled=False,
+            ),
+            streaming_transcriber=None,
+            stream_path_runtime_facts_for_runtime=lambda: runtime_facts,
+        ),
+    )
+
+    truth = snapshot(
+        orchestrator,
+        last_trim_outcome=SimpleNamespace(
+            tail_trim_mode="rms",
+            vad_active=False,
+            vad_fallback_reason=None,
+        ),
+    )
+
+    assert truth.stream_helper_active is True
+    assert truth.stream_helper_class_name == "InterfaceHelper"
+    assert truth.stream_path_executed is True
+    assert truth.stream_chunks_processed == 3
+    assert truth.stream_fallback_reason == "interface:fallback"
+    assert truth.chunk_secs == 1.25
+
+
 def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
     for chunk_secs in ("not-a-number", "nan", "inf", float("nan"), float("inf"), True):
         orchestrator = cast(
@@ -376,8 +429,9 @@ def test_stream_fallback_reason_none_when_active() -> None:
 def test_status_reports_stream_path_execution_from_last_session() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server._last_stream_path_executed = True
-    server._last_stream_chunks_processed = 2
+    server.stream_path_runtime.record_chunk_processed()
+    server.stream_path_runtime.record_chunk_processed()
+    server.stream_path_runtime.record_session_result(active_stream=None)
 
     status = _status(server)
     log_record = _truth(server).to_log_record()
@@ -394,9 +448,7 @@ def test_status_reports_stream_path_execution_from_last_session() -> None:
 def test_status_reports_fallback_when_helper_exists_but_no_stream_work_ran() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server._last_stream_path_executed = False
-    server._last_stream_chunks_processed = 0
-    server._last_stream_fallback_reason = "stream_path_not_exercised:no_chunks"
+    server.stream_path_runtime.record_session_result(active_stream=None)
 
     status = _status(server)
     log_record = _truth(server).to_log_record()
@@ -412,9 +464,9 @@ def test_status_reports_fallback_when_helper_exists_but_no_stream_work_ran() -> 
 def test_status_reports_fallback_even_after_stream_path_executed() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server._last_stream_path_executed = True
-    server._last_stream_chunks_processed = 1
-    server._last_stream_fallback_reason = "stream_chunk_failed:RuntimeError"
+    server.stream_path_runtime.record_chunk_processed()
+    server.stream_path_runtime.record_current_fallback("stream_chunk_failed:RuntimeError")
+    server.stream_path_runtime.record_session_result(active_stream=None)
 
     status = _status(server)
     truth = _truth(server)
@@ -528,7 +580,8 @@ def test_status_reports_interim_source_fallback_reason() -> None:
 def test_active_session_does_not_inherit_previous_stream_fallback() -> None:
     transcriber = FakeStreamingTranscriber(helper_active=True)
     server = _build_server(streaming_transcriber=transcriber)
-    server._last_stream_fallback_reason = "stream_path_not_exercised:no_chunks"
+    server.stream_path_runtime.record_session_result(active_stream=None)
+    server.stream_path_runtime.reset_current()
     cast(Any, server.sessions)._active = Session(session_id=uuid4(), owner_token=1)
 
     status = _status(server)
