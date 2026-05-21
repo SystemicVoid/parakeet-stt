@@ -25,6 +25,7 @@ from parakeet_stt_daemon.messages import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
+FIXTURE_DIR = REPO_ROOT / "docs" / "protocol" / "fixtures"
 
 
 @contextmanager
@@ -534,6 +535,14 @@ def test_daemon_status_runtime_truth_accepts_minimal_protocol_status(
     assert truth["sessions_active"] == "0"
     for field in STATUS_RUNTIME_TRUTH_FIELDS - {"type", "state", "sessions_active"}:
         assert truth[field] == ""
+
+
+def test_daemon_status_runtime_truth_accepts_protocol_status_fixtures() -> None:
+    for payload_path in sorted(FIXTURE_DIR.glob("status_*.json")):
+        truth = _run_status_runtime_truth(payload_path)
+
+        assert set(truth) == STATUS_RUNTIME_TRUTH_FIELDS, payload_path.name
+        assert list(truth) == _runtime_truth_contract_fields(), payload_path.name
 
 
 def test_daemon_status_runtime_truth_normalizes_numeric_string(tmp_path: Path) -> None:

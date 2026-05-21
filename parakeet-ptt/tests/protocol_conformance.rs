@@ -134,6 +134,29 @@ fn schema_message_definitions(schema: &Value) -> Vec<(&'static str, &Value)> {
     .collect()
 }
 
+fn status_runtime_truth_fields(schema: &Value) -> BTreeSet<String> {
+    let groups = schema
+        .pointer("/$defs/StatusMessage/x-runtime-truth-field-groups")
+        .and_then(Value::as_object)
+        .expect("schema should declare StatusMessage runtime truth groups");
+
+    groups
+        .values()
+        .flat_map(|fields| {
+            fields
+                .as_array()
+                .expect("runtime truth groups should be arrays")
+                .iter()
+                .map(|field| {
+                    field
+                        .as_str()
+                        .expect("runtime truth fields should be strings")
+                        .to_string()
+                })
+        })
+        .collect()
+}
+
 fn synthetic_message_from_schema(definition: &Value) -> Value {
     let properties = definition
         .get("properties")
@@ -157,6 +180,25 @@ fn round_trip_through_rust_codec(fixture: Value) -> Result<Value, Box<dyn Error>
         let decoded: protocol::ServerMessage = serde_json::from_value(fixture)?;
         Ok(serde_json::to_value(decoded)?)
     }
+}
+
+#[test]
+fn protocol_conformance_status_runtime_truth_fields_round_trip() -> Result<(), Box<dyn Error>> {
+    let schema = load_json(&schema_path())?;
+    let status_definition = schema
+        .pointer("/$defs/StatusMessage")
+        .expect("schema should include StatusMessage");
+    let synthetic = synthetic_message_from_schema(status_definition);
+    let encoded = round_trip_through_rust_codec(synthetic)?;
+    let actual = encoded
+        .as_object()
+        .expect("encoded status should be an object")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(actual, status_runtime_truth_fields(&schema));
+    Ok(())
 }
 
 #[test]

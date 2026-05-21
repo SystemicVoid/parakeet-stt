@@ -29,6 +29,10 @@ from parakeet_stt_daemon.messages import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "docs/protocol/schema/messages.schema.json"
 FIXTURE_DIR = REPO_ROOT / "docs/protocol/fixtures"
+RUNTIME_TRUTH_DOC_PATHS = (
+    REPO_ROOT / "docs/SPEC.md",
+    REPO_ROOT / "docs/stt-troubleshooting.md",
+)
 
 CLIENT_MODELS: dict[str, type[BaseModel]] = {
     "start_session": StartSession,
@@ -75,6 +79,12 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _fixture_paths() -> list[Path]:
     return sorted(FIXTURE_DIR.glob("*.json"))
+
+
+def _status_runtime_truth_groups(schema: dict[str, Any]) -> dict[str, list[str]]:
+    groups = schema["$defs"]["StatusMessage"]["x-runtime-truth-field-groups"]
+    assert isinstance(groups, dict)
+    return groups
 
 
 @pytest.fixture(scope="module")
@@ -141,7 +151,7 @@ def test_schema_properties_match_pydantic_model_fields(schema: dict[str, Any]) -
 
 def test_status_schema_declares_runtime_truth_contract_groups(schema: dict[str, Any]) -> None:
     status_def = schema["$defs"]["StatusMessage"]
-    schema_groups = status_def["x-runtime-truth-field-groups"]
+    schema_groups = _status_runtime_truth_groups(schema)
     expected_groups = {
         group: list(fields) for group, fields in STATUS_RUNTIME_TRUTH_FIELD_GROUPS.items()
     }
@@ -160,6 +170,20 @@ def test_status_fixtures_cover_complete_runtime_truth_contract() -> None:
             continue
 
         assert set(fixture) == STATUS_RUNTIME_TRUTH_FIELDS, path.name
+
+
+def test_runtime_truth_docs_reference_current_schema_groups(schema: dict[str, Any]) -> None:
+    groups = _status_runtime_truth_groups(schema)
+
+    for path in RUNTIME_TRUTH_DOC_PATHS:
+        text = path.read_text(encoding="utf-8")
+        missing_groups = [group for group in groups if f"`{group}`" not in text]
+
+        assert not missing_groups, (
+            f"{path.relative_to(REPO_ROOT)} must mention Runtime Truth groups from "
+            "StatusMessage.x-runtime-truth-field-groups: "
+            f"{missing_groups}"
+        )
 
 
 def test_default_status_fixture_represents_current_runtime_truth_groups() -> None:
