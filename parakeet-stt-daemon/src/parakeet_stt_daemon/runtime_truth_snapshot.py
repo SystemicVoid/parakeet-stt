@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from .messages import StatusMessage
 from .overlay_interim import InterimTranscriptRuntimeFacts, InterimTranscriptSource
-from .session import SessionState
+from .session import SessionState, StreamPathRuntimeFacts
 from .tail_trim import TailTrimMode
 
 StreamHelperScope = Literal["live_session_only"]
@@ -296,6 +296,23 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
     settings = orchestrator.settings
     streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
     chunk_secs = _chunk_secs_or_none(settings)
+    getter = getattr(orchestrator, "stream_path_runtime_facts_for_runtime", None)
+    if callable(getter):
+        try:
+            runtime_facts = getter()
+        except Exception:  # noqa: BLE001
+            runtime_facts = None
+        if isinstance(runtime_facts, StreamPathRuntimeFacts):
+            return StreamPathFacts(
+                streaming_enabled=runtime_facts.streaming_enabled,
+                helper_active=runtime_facts.helper_active,
+                helper_scope=runtime_facts.helper_scope,
+                helper_class_name=runtime_facts.helper_class_name,
+                fallback_reason=runtime_facts.fallback_reason,
+                chunk_secs=runtime_facts.chunk_secs,
+                path_executed=runtime_facts.path_executed,
+                chunks_processed=runtime_facts.chunks_processed,
+            )
     streaming_transcriber = getattr(orchestrator, "streaming_transcriber", None)
     if not streaming_enabled:
         return StreamPathFacts(
@@ -319,30 +336,7 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
             path_executed=False,
             chunks_processed=0,
         )
-    sessions = getattr(orchestrator, "sessions", None)
-    active_session = getattr(sessions, "active", None)
-    if active_session is not None:
-        chunks_processed = _non_negative_int(
-            getattr(orchestrator, "_current_stream_chunks_processed", 0)
-        )
-        path_executed = chunks_processed > 0
-        current_fallback_reason = getattr(orchestrator, "_current_stream_fallback_reason", None)
-    else:
-        path_executed = bool(getattr(orchestrator, "_last_stream_path_executed", False))
-        chunks_processed = _non_negative_int(
-            getattr(orchestrator, "_last_stream_chunks_processed", 0)
-        )
-        current_fallback_reason = None
     fallback_reason = getattr(streaming_transcriber, "fallback_reason", None)
-    last_fallback_reason = (
-        getattr(orchestrator, "_last_stream_fallback_reason", None)
-        if active_session is None
-        else None
-    )
-    if current_fallback_reason is not None:
-        fallback_reason = current_fallback_reason
-    elif last_fallback_reason is not None:
-        fallback_reason = last_fallback_reason
     return StreamPathFacts(
         streaming_enabled=True,
         helper_active=bool(getattr(streaming_transcriber, "helper_active", False)),
@@ -352,8 +346,8 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
         ),
         fallback_reason=fallback_reason,
         chunk_secs=chunk_secs,
-        path_executed=path_executed,
-        chunks_processed=chunks_processed,
+        path_executed=False,
+        chunks_processed=0,
     )
 
 
@@ -383,25 +377,6 @@ def _string_or_none(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
-
-
-def _non_negative_int(value: object) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, float):
-        if not math.isfinite(value):
-            return 0
-        parsed = int(value)
-    elif isinstance(value, str):
-        try:
-            parsed = int(value)
-        except ValueError:
-            return 0
-    else:
-        return 0
-    return max(0, parsed)
 
 
 def _chunk_secs_or_none(settings: object) -> float | None:
