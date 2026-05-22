@@ -1,11 +1,11 @@
 //! Client application loop for Parakeet Client PTT Sessions.
 //!
 //! This module owns the Client runtime loop: PTT hotkey events, daemon Session
-//! message dispatch, Overlay routing, and Injection queue coordination.
+//! message dispatch, Overlay routing, and calls into Client Session Injection
+//! dispatch.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,19 +19,17 @@ use tracing::{debug, info, warn};
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
-    classify_error_code, handle_server_message, ClientFocusRouter, ClientSessionRuntime,
-    SessionIntent,
+    classify_error_code, handle_server_message, ClientFocusRouter, ClientInjectionDispatcher,
+    ClientSessionRuntime, LlmAnswerInjection, SessionIntent,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent,
     HotkeyIntent, HotkeyTasks,
 };
-use crate::injector::injector_metrics_snapshot;
 use crate::injector_runtime::{
-    build_injection_runner, spawn_injector_worker, EnqueueFailure, InjectionErrorKind,
-    InjectionJob, InjectionJobRunner, InjectionOrigin, InjectionReport, InjectorWorkerHandle,
-    INJECTION_ENQUEUE_TIMEOUT_MS, INJECTION_QUEUE_CAPACITY,
+    build_injection_runner, spawn_injector_worker, InjectionJob, InjectionJobRunner,
+    InjectionOrigin, INJECTION_ENQUEUE_TIMEOUT_MS,
 };
 use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
@@ -421,6 +419,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     );
     let hotkey_runtime = hotkey_source.start(&config)?;
     let (injector_worker, mut injection_reports) = spawn_injector_worker(injection_runner);
+    let injection_dispatcher = ClientInjectionDispatcher::new(injector_worker.clone());
     let mut focus_router = ClientFocusRouter::new(focus_cache);
     let mut overlay_router = OverlayRouter::new(overlay_sink);
     spawn_event_loop_lag_monitor();
@@ -596,7 +595,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                     &mut session_runtime,
                                                     &mut focus_router,
                                                     &mut overlay_router,
-                                                    &injector_worker,
+                                                    &injection_dispatcher,
                                                 ).await?;
                                             }
                                         }
@@ -612,8 +611,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                 }
                             }
                             Some(report) = injection_reports.recv() => {
-                                handle_injection_report(
-                                    &injector_worker,
+                                injection_dispatcher.handle_report(
                                     report,
                                     &mut overlay_router,
                                     &audio_feedback,
@@ -678,53 +676,18 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         } else {
                                             response_text
                                         };
-                                        info!(
-                                            session = %session_id,
-                                            origin = InjectionOrigin::LlmAnswer.as_str(),
-                                            state_at_enqueue = completion.state_label,
-                                            session_end_was_deferred =
-                                                completion.session_end_was_deferred,
-                                            hotkey_up_elapsed_ms_at_enqueue =
-                                                completion.hotkey_up_elapsed_ms_at_enqueue,
-                                            stop_message_elapsed_ms_at_enqueue =
-                                                completion.stop_message_elapsed_ms_at_enqueue,
-                                            response_chars = to_inject.chars().count(),
-                                            "queueing llm answer injection job"
-                                        );
-
-                                        match injector_worker
-                                            .enqueue(
-                                                InjectionJob::new(
+                                        injection_dispatcher
+                                            .dispatch_llm_answer(
+                                                LlmAnswerInjection::new(
                                                     session_id,
                                                     to_inject,
                                                     daemon_latency_ms,
                                                     daemon_audio_ms,
-                                                )
-                                                .with_origin(InjectionOrigin::LlmAnswer)
-                                                .with_enqueue_timing(
-                                                    completion.hotkey_up_elapsed_ms_at_enqueue,
-                                                    completion.stop_message_elapsed_ms_at_enqueue,
-                                                )
-                                                .with_parent_focus(
-                                                    focus_router
-                                                        .take_parent_focus_for_enqueue(session_id),
+                                                    completion,
                                                 ),
+                                                &mut focus_router,
                                             )
-                                            .await
-                                        {
-                                            Ok(()) => debug!(session = %session_id, "llm final answer queued for injector worker"),
-                                            Err(EnqueueFailure::Timeout) => {
-                                                warn!(
-                                                    session = %session_id,
-                                                    queue_capacity = INJECTION_QUEUE_CAPACITY,
-                                                    enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
-                                                    "injector queue remained full; dropping llm final answer"
-                                                );
-                                            }
-                                            Err(EnqueueFailure::WorkerGone) => {
-                                                warn!(session = %session_id, "injector worker unavailable; dropping llm final answer");
-                                            }
-                                        }
+                                            .await;
                                     }
                                 }
                             }
@@ -758,109 +721,6 @@ async fn send_message(
     message: &crate::protocol::ClientMessage,
 ) -> Result<()> {
     daemon.send(message).await
-}
-
-fn handle_injection_report(
-    worker: &InjectorWorkerHandle,
-    report: InjectionReport,
-    overlay_router: &mut OverlayRouter<impl OverlaySink>,
-    audio_feedback: &AudioFeedback,
-) {
-    worker.metrics().note_report(&report);
-    let success = report.error_kind.is_none() && report.error.is_none();
-    match (report.error_kind, report.error) {
-        (Some(error_kind), Some(error)) => {
-            warn!(
-                session = %report.session_id,
-                origin = report.origin.as_str(),
-                error_kind = error_kind.as_str(),
-                daemon_latency_ms = report.daemon_latency_ms,
-                daemon_audio_ms = report.daemon_audio_ms,
-                queue_wait_ms = report.queue_wait_ms,
-                run_ms = report.run_ms,
-                total_worker_ms = report.total_worker_ms,
-                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
-                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
-                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
-                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
-                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
-                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
-                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
-                error = %error,
-                "injector worker reported failure"
-            );
-        }
-        (None, None) => {
-            info!(
-                session = %report.session_id,
-                origin = report.origin.as_str(),
-                daemon_latency_ms = report.daemon_latency_ms,
-                daemon_audio_ms = report.daemon_audio_ms,
-                queue_wait_ms = report.queue_wait_ms,
-                run_ms = report.run_ms,
-                total_worker_ms = report.total_worker_ms,
-                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
-                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
-                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
-                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
-                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
-                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
-                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
-                "injector worker completed job"
-            );
-            audio_feedback.play_completion();
-        }
-        (error_kind, error) => {
-            warn!(
-                session = %report.session_id,
-                origin = report.origin.as_str(),
-                error_kind = error_kind.map(InjectionErrorKind::as_str),
-                daemon_latency_ms = report.daemon_latency_ms,
-                daemon_audio_ms = report.daemon_audio_ms,
-                queue_wait_ms = report.queue_wait_ms,
-                run_ms = report.run_ms,
-                total_worker_ms = report.total_worker_ms,
-                enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
-                hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
-                stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
-                hotkey_up_elapsed_ms_at_worker_start = report.hotkey_up_elapsed_ms_at_worker_start,
-                stop_message_elapsed_ms_at_worker_start = report.stop_message_elapsed_ms_at_worker_start,
-                hotkey_up_elapsed_ms_at_completion = report.hotkey_up_elapsed_ms_at_completion,
-                stop_message_elapsed_ms_at_completion = report.stop_message_elapsed_ms_at_completion,
-                error = ?error,
-                "injector worker reported inconsistent error classification"
-            );
-        }
-    }
-
-    let processed = worker
-        .metrics()
-        .worker_success_total
-        .load(Ordering::Relaxed)
-        + worker
-            .metrics()
-            .worker_failure_total
-            .load(Ordering::Relaxed);
-    if processed.is_multiple_of(25) && processed > 0 {
-        worker.metrics().log_summary();
-        let snapshot = injector_metrics_snapshot();
-        info!(
-            clipboard_ready_success_total = snapshot.clipboard_ready_success_total,
-            clipboard_ready_failure_total = snapshot.clipboard_ready_failure_total,
-            clipboard_ready_duration_ms_total = snapshot.clipboard_ready_duration_ms_total,
-            route_shortcut_success_total = snapshot.route_shortcut_success_total,
-            route_shortcut_failure_total = snapshot.route_shortcut_failure_total,
-            route_shortcut_duration_ms_total = snapshot.route_shortcut_duration_ms_total,
-            backend_success_total = snapshot.backend_success_total,
-            backend_failure_total = snapshot.backend_failure_total,
-            backend_duration_ms_total = snapshot.backend_duration_ms_total,
-            wl_copy_spawn_total = snapshot.wl_copy_spawn_total,
-            wl_paste_spawn_total = snapshot.wl_paste_spawn_total,
-            "injector stage metrics summary"
-        );
-    }
-
-    overlay_router.route_injection_complete(report.session_id, success);
 }
 
 fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
@@ -933,10 +793,7 @@ mod tests {
     use tokio::time::timeout;
     use uuid::Uuid;
 
-    use crate::audio_feedback::AudioFeedback;
-    use crate::client_runtime_fixtures::{
-        ClientRuntimeHarness, RecordingInjectionRunner, RecordingOverlaySink,
-    };
+    use crate::client_runtime_fixtures::{ClientRuntimeHarness, RecordingInjectionRunner};
     use crate::client_session::SessionIntent;
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
@@ -946,19 +803,19 @@ mod tests {
     use crate::injector::{
         FailInjector, InjectorContext, PasteChordSender, PasteKeySender, TextInjector,
     };
-    use crate::overlay_router::{OverlayEvent, OverlayRouter, OverlayTextProducer};
+    use crate::overlay_router::{OverlayEvent, OverlayTextProducer};
     use crate::protocol::{ClientMessage, DaemonStatus, ServerMessage};
 
     use crate::injector::INJECTOR_JOB_TIMEOUT_MS;
     use crate::injector_runtime::{
         collect_pipe_reader, spawn_injector_worker_with_capacity, spawn_pipe_reader,
         EnqueueFailure, InProcessInjectorRunner, InjectionErrorKind, InjectionJob,
-        InjectionJobRunner, InjectionOrigin, InjectionReport, InjectionRunError,
-        InjectionRunOutput, InjectorSubprocessRunner, UinputSenderState,
+        InjectionJobRunner, InjectionRunError, InjectionRunOutput, InjectorSubprocessRunner,
+        UinputSenderState,
     };
     use crate::llm::{drain_sse_lines, sanitize_model_answer};
 
-    use super::{format_daemon_status, handle_injection_report, run, HotkeyIntentDiagnostics};
+    use super::{format_daemon_status, run, HotkeyIntentDiagnostics};
 
     #[test]
     fn daemon_status_accepts_minimal_protocol_payload() {
@@ -1532,61 +1389,6 @@ mod tests {
                     text: "answer delta".to_string(),
                 },
             ]
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn app_injection_report_error_routes_failure_classification() {
-        let (injector, _seen) = RecordingInjectionRunner::shared();
-        let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let session_id = Uuid::new_v4();
-        let (overlay_sink, seen_overlay_events) = RecordingOverlaySink::shared();
-        let mut overlay_router = OverlayRouter::new(overlay_sink);
-
-        handle_injection_report(
-            &worker,
-            InjectionReport {
-                session_id,
-                daemon_latency_ms: 20,
-                daemon_audio_ms: 1000,
-                origin: InjectionOrigin::RawFinalResult,
-                queue_wait_ms: 1,
-                run_ms: 2,
-                total_worker_ms: 3,
-                enqueue_to_injection_complete_ms: 3,
-                hotkey_up_elapsed_ms_at_enqueue: None,
-                stop_message_elapsed_ms_at_enqueue: None,
-                hotkey_up_elapsed_ms_at_worker_start: None,
-                stop_message_elapsed_ms_at_worker_start: None,
-                hotkey_up_elapsed_ms_at_completion: None,
-                stop_message_elapsed_ms_at_completion: None,
-                error_kind: Some(InjectionErrorKind::BackendFailure),
-                error: Some("stage=backend synthetic failure".to_string()),
-            },
-            &mut overlay_router,
-            &AudioFeedback::new(false, None, 0),
-        );
-
-        assert_eq!(
-            InjectionErrorKind::BackendFailure.as_str(),
-            "backend_failure"
-        );
-        assert_eq!(
-            worker
-                .metrics()
-                .worker_backend_failure_total
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            seen_overlay_events
-                .lock()
-                .expect("overlay recording lock should be available")
-                .as_slice(),
-            &[OverlayEvent::InjectionComplete {
-                session_id,
-                success: false,
-            }]
         );
     }
 
