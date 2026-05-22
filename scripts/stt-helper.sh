@@ -189,6 +189,12 @@ stt() {
         "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|"
         "llm-overlay-stream|llm_overlay_stream|default_llm_overlay_stream|PARAKEET_LLM_OVERLAY_STREAM|Stable controls|<v>|true|always|true"
     )
+    local start_profile_default="stream-seal"
+    local -a start_profile_rows=(
+        "stream-seal|stream,streaming,on|stream,on|streaming|true||true|false|(default) streaming,stream,on|Launch daemon with stream+seal + overlay defaults."
+        "offline|offline,off|off|offline|false||false|false|offline,off|Launch daemon with streaming disabled."
+        "cpu|cpu|cpu|cpu|false|cpu|false|false|cpu|Launch daemon in offline mode on CPU (no GPU)."
+    )
     : "$default_injection_mode" "$default_paste_backend_failure_policy" "$default_uinput_dwell_ms"
     : "$default_paste_seat" "$default_paste_write_primary" "$default_completion_sound"
     : "$default_completion_sound_path" "$default_completion_sound_volume"
@@ -199,56 +205,91 @@ stt() {
 
     local cmd="${1:-start}"
     shift || true
-    if [ "$cmd" = "stream" ]; then
-        cmd="start"
-        set -- streaming "$@"
-    elif [ "$cmd" = "off" ]; then
-        cmd="start"
-        set -- offline "$@"
-    elif [ "$cmd" = "on" ]; then
-        cmd="start"
-        set -- streaming "$@"
-    elif [ "$cmd" = "cpu" ]; then
-        cmd="start"
-        set -- cpu "$@"
-    fi
+    for row in "${start_profile_rows[@]}"; do
+        IFS='|' read -r _ _ command_aliases start_cli_arg _ <<<"$row"
+        case ",$command_aliases," in
+            *",$cmd,"*)
+                cmd="start"
+                set -- "$start_cli_arg" "$@"
+                break
+                ;;
+        esac
+    done
+
+    _start_profile_row_for_id() {
+        local target="$1"
+        local row profile_id
+        for row in "${start_profile_rows[@]}"; do
+            IFS='|' read -r profile_id _ <<<"$row"
+            if [ "$profile_id" = "$target" ]; then
+                printf "%s\n" "$row"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    _start_profile_row_for_token() {
+        local token="$1"
+        local row mode_aliases
+        [ -n "$token" ] || return 1
+        for row in "${start_profile_rows[@]}"; do
+            IFS='|' read -r _ mode_aliases _ <<<"$row"
+            case ",$mode_aliases," in
+                *",$token,"*)
+                    printf "%s\n" "$row"
+                    return 0
+                    ;;
+            esac
+        done
+        return 1
+    }
 
     _apply_launch_profile_defaults() {
         local profile="$1"
-        if [ "$profile" = "stream-seal" ]; then
-            # Keep "stt" ergonomic for daily use: online stream+seal with overlay,
-            # but non-adaptive width so rendering remains predictable.
-            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
-                default_overlay_enabled="true"
-            fi
-            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
-                default_overlay_adaptive_width="false"
-            fi
-            : "$default_overlay_enabled" "$default_overlay_adaptive_width"
-            return 0
+        local daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_label help_description
+        local row
+        row="$(_start_profile_row_for_id "$profile")" || return 1
+        IFS='|' read -r _ _ _ _ _ daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_label help_description <<<"$row"
+        if [ -n "$daemon_device_override" ]; then
+            default_daemon_device="$daemon_device_override"
         fi
-
-        if [ "$profile" = "offline" ]; then
-            # "stt off" favors fastest accurate offline dictation with no overlay.
-            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
-                default_overlay_enabled="false"
-            fi
-            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
-                default_overlay_adaptive_width="false"
-            fi
+        if [ -n "$overlay_enabled_default" ] && [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
+            default_overlay_enabled="$overlay_enabled_default"
         fi
-
-        if [ "$profile" = "cpu" ]; then
-            # "stt cpu" runs offline on CPU; no streaming, no overlay.
-            default_daemon_device="cpu"
-            if [ -z "${PARAKEET_OVERLAY_ENABLED+x}" ]; then
-                default_overlay_enabled="false"
-            fi
-            if [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
-                default_overlay_adaptive_width="false"
-            fi
+        if [ -n "$overlay_adaptive_width_default" ] && [ -z "${PARAKEET_OVERLAY_ADAPTIVE_WIDTH+x}" ]; then
+            default_overlay_adaptive_width="$overlay_adaptive_width_default"
         fi
         : "$default_overlay_enabled" "$default_overlay_adaptive_width"
+    }
+
+    _start_profile_cli_arg() {
+        local row start_cli_arg
+        row="$(_start_profile_row_for_id "$1")" || return 1
+        IFS='|' read -r _ _ _ start_cli_arg _ <<<"$row"
+        printf "%s" "$start_cli_arg"
+    }
+
+    _start_profile_daemon_streaming_enabled() {
+        local row daemon_streaming_enabled
+        row="$(_start_profile_row_for_id "$1")" || return 1
+        IFS='|' read -r _ _ _ _ daemon_streaming_enabled _ <<<"$row"
+        printf "%s" "$daemon_streaming_enabled"
+    }
+
+    _print_start_profile_modes() {
+        local row help_label help_description
+        for row in "${start_profile_rows[@]}"; do
+            IFS='|' read -r _ _ _ _ _ _ _ _ help_label help_description <<<"$row"
+            printf "  %-30s %s\n" "$help_label" "$help_description"
+        done
+    }
+
+    _print_start_profile_rows() {
+        local row
+        for row in "${start_profile_rows[@]}"; do
+            printf "%s\n" "$row"
+        done
     }
 
     _start_option_exists() {
@@ -329,19 +370,10 @@ stt() {
     _build_start_cli_args() {
         local -n start_cli_args_ref="$1"
         local launch_profile="$2"
-        local row opt_name var_name include_policy
+        local row opt_name var_name include_policy start_cli_arg
         start_cli_args_ref=()
-        case "$launch_profile" in
-            offline)
-                start_cli_args_ref+=(offline)
-                ;;
-            cpu)
-                start_cli_args_ref+=(cpu)
-                ;;
-            *)
-                start_cli_args_ref+=(streaming)
-                ;;
-        esac
+        start_cli_arg="$(_start_profile_cli_arg "$launch_profile")" || return 1
+        start_cli_args_ref+=("$start_cli_arg")
         for row in "${start_option_rows[@]}"; do
             IFS='|' read -r opt_name var_name _ _ _ _ _ include_policy _ <<<"$row"
             if [ "$include_policy" = "nonempty" ] && [ -z "${!var_name}" ]; then
@@ -456,44 +488,29 @@ stt() {
     _resolve_start_launch_profile() {
         local -n launch_profile_ref="$1"
         local candidate="${2:-}"
-        launch_profile_ref="stream-seal"
-        case "$candidate" in
-            stream|streaming|on)
-                return 0
-                ;;
-            offline|off)
-                launch_profile_ref="offline"
-                return 0
-                ;;
-            cpu)
-                launch_profile_ref="cpu"
-                : "$launch_profile_ref"
-                return 0
-                ;;
-            *)
-                return 1
-                ;;
-        esac
+        local row profile_id
+        launch_profile_ref="$start_profile_default"
+        row="$(_start_profile_row_for_token "$candidate")" || return 1
+        IFS='|' read -r profile_id _ <<<"$row"
+        launch_profile_ref="$profile_id"
+        : "$launch_profile_ref"
+        return 0
     }
 
     _resolve_start_runtime_config() {
         local launch_profile="$1"
         shift
 
-        _apply_launch_profile_defaults "$launch_profile"
+        _apply_launch_profile_defaults "$launch_profile" || return 1
         _load_start_vars_from_defaults
 
         daemon_device="$default_daemon_device"
-        daemon_streaming_enabled="$default_daemon_streaming_enabled"
+        daemon_streaming_enabled="$(_start_profile_daemon_streaming_enabled "$launch_profile")" || return 1
         daemon_chunk_secs="$default_daemon_chunk_secs"
         daemon_right_context_secs="$default_daemon_right_context_secs"
         daemon_left_context_secs="$default_daemon_left_context_secs"
         daemon_batch_size="$default_daemon_batch_size"
         daemon_overlay_events_enabled="false"
-
-        if [ "$launch_profile" = "stream-seal" ]; then
-            daemon_streaming_enabled="true"
-        fi
 
         local parse_status=0
         _parse_start_options "$@" || parse_status=$?
@@ -1172,16 +1189,15 @@ Commands:
 EOF
     }
     _print_help_start() {
-        _apply_launch_profile_defaults "stream-seal"
+        _apply_launch_profile_defaults "$start_profile_default"
         cat <<EOF
 Usage:
   stt start [streaming|offline|cpu] [options]
 
 Modes:
-  (default) streaming    Launch daemon with stream+seal + overlay defaults.
-  streaming|stream       Launch daemon with stream+seal enabled.
-  offline|off            Launch daemon with streaming disabled.
-  cpu                    Launch daemon in offline mode on CPU (no GPU).
+EOF
+        _print_start_profile_modes
+        cat <<EOF
 
 Injection mode:
   --paste                              Alias for --injection-mode paste
@@ -1266,6 +1282,32 @@ EOF
 CLIENTCMD
     }
 
+    _start_managed_llm_then_stt() {
+        local llm_base_url
+        echo ">>> Starting managed llama + Parakeet STT..."
+        echo "   - LLM binary: $default_llm_server_bin"
+        echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
+        echo "   - LLM model alias: $default_llm_server_model_alias"
+        echo "   - LLM API base URL: $(_llm_api_base_url)"
+        echo "   - LLM context/gpu/parallel: ${default_llm_server_ctx_size}/${default_llm_server_gpu_layers}/${default_llm_server_parallel}"
+        echo "   - LLM metrics: $default_llm_server_metrics"
+        if ! _ensure_llm_server; then
+            return 1
+        fi
+        if ! llm_base_url="$(_llm_api_base_url)"; then
+            echo "   - Failed to resolve managed LLM API base URL."
+            return 1
+        fi
+        if [ -z "$llm_base_url" ]; then
+            echo "   - Managed LLM API base URL is empty."
+            return 1
+        fi
+        export PARAKEET_LLM_BASE_URL="$llm_base_url"
+        export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
+        local _STT_SKIP_LOCAL_OVERRIDES=1
+        stt start "$@"
+    }
+
     case "$cmd" in
         help|--help|-h)
             case "${1:-}" in
@@ -1288,6 +1330,9 @@ CLIENTCMD
             ;;
         __start-option-names)
             _print_start_option_names
+            ;;
+        __start-profile-rows)
+            _print_start_profile_rows
             ;;
         __start-args)
             local injection_mode paste_backend_failure_policy
@@ -1387,6 +1432,8 @@ daemon_chunk_secs=$daemon_chunk_secs
 daemon_right_context_secs=$daemon_right_context_secs
 daemon_left_context_secs=$daemon_left_context_secs
 daemon_batch_size=$daemon_batch_size
+overlay_enabled=$overlay_enabled
+overlay_adaptive_width=$overlay_adaptive_width
 daemon_host=$HOST
 daemon_port=$PORT
 daemon_websocket_endpoint=$(_daemon_ws_endpoint)
@@ -1653,52 +1700,10 @@ EOF
                     ;;
                 start|"")
                     [ "$llm_action" = "start" ] && shift
-                    local llm_base_url
-                    echo ">>> Starting managed llama + Parakeet STT..."
-                    echo "   - LLM binary: $default_llm_server_bin"
-                    echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
-                    echo "   - LLM model alias: $default_llm_server_model_alias"
-                    echo "   - LLM API base URL: $(_llm_api_base_url)"
-                    echo "   - LLM context/gpu/parallel: ${default_llm_server_ctx_size}/${default_llm_server_gpu_layers}/${default_llm_server_parallel}"
-                    echo "   - LLM metrics: $default_llm_server_metrics"
-                    if ! _ensure_llm_server; then
-                        return 1
-                    fi
-                    if ! llm_base_url="$(_llm_api_base_url)"; then
-                        echo "   - Failed to resolve managed LLM API base URL."
-                        return 1
-                    fi
-                    if [ -z "$llm_base_url" ]; then
-                        echo "   - Managed LLM API base URL is empty."
-                        return 1
-                    fi
-                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
-                    export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
-                    local _STT_SKIP_LOCAL_OVERRIDES=1
-                    stt start "$@"
+                    _start_managed_llm_then_stt "$@"
                     ;;
-                stream|streaming|offline|off|on|cpu|--*)
-                    local llm_base_url
-                    echo ">>> Starting managed llama + Parakeet STT..."
-                    echo "   - LLM binary: $default_llm_server_bin"
-                    echo "   - LLM model path: ${default_llm_server_model_path:-<unset>}"
-                    echo "   - LLM model alias: $default_llm_server_model_alias"
-                    echo "   - LLM API base URL: $(_llm_api_base_url)"
-                    if ! _ensure_llm_server; then
-                        return 1
-                    fi
-                    if ! llm_base_url="$(_llm_api_base_url)"; then
-                        echo "   - Failed to resolve managed LLM API base URL."
-                        return 1
-                    fi
-                    if [ -z "$llm_base_url" ]; then
-                        echo "   - Managed LLM API base URL is empty."
-                        return 1
-                    fi
-                    export PARAKEET_LLM_BASE_URL="$llm_base_url"
-                    export PARAKEET_LLM_MODEL="$default_llm_server_model_alias"
-                    local _STT_SKIP_LOCAL_OVERRIDES=1
-                    stt start "$llm_action" "$@"
+                --*)
+                    _start_managed_llm_then_stt "$llm_action" "$@"
                     ;;
                 restart)
                     shift
@@ -1746,6 +1751,10 @@ EOF
                     fi
                     ;;
                 *)
+                    if _start_profile_row_for_token "$llm_action" >/dev/null; then
+                        _start_managed_llm_then_stt "$llm_action" "$@"
+                        return $?
+                    fi
                     echo "Unknown llm subcommand: $llm_action"
                     echo
                     _print_help_llm
@@ -1755,8 +1764,9 @@ EOF
             ;;
         restart)
             local restart_mode=""
-            if [ "${1:-}" = "stream" ] || [ "${1:-}" = "streaming" ] || [ "${1:-}" = "offline" ] || [ "${1:-}" = "cpu" ]; then
-                restart_mode="$1"
+            local restart_launch_profile
+            if _resolve_start_launch_profile restart_launch_profile "${1:-}"; then
+                restart_mode="$(_start_profile_cli_arg "$restart_launch_profile")"
                 shift
             fi
             stt stop
