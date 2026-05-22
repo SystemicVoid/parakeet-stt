@@ -35,7 +35,6 @@ START_PROFILE_ROW_FIELDS = (
     "daemon_device_override",
     "overlay_enabled_default",
     "overlay_adaptive_width_default",
-    "help_label",
     "help_description",
 )
 
@@ -158,7 +157,7 @@ def _run_start_profile_rows() -> list[dict[str, str]]:
     return rows
 
 
-def _run_start_help() -> str:
+def _run_helper_help(topic: str) -> str:
     env = {
         key: value
         for key, value in os.environ.items()
@@ -170,7 +169,7 @@ def _run_start_help() -> str:
     command = [
         "bash",
         "-lc",
-        f"source {shlex.quote(str(HELPER_PATH))} && stt help start",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt help {shlex.quote(topic)}",
     ]
     completed = subprocess.run(
         command,
@@ -419,10 +418,25 @@ def test_start_profile_metadata_drives_mode_aliases_and_generated_args() -> None
 
 
 def test_start_help_modes_are_generated_from_profile_metadata() -> None:
-    help_text = _run_start_help()
+    help_text = _run_helper_help("start")
 
     for profile in _run_start_profile_rows():
-        assert profile["help_label"] in help_text
+        for alias in profile["mode_aliases"].split(","):
+            assert alias in help_text
+        assert profile["help_description"] in help_text
+
+
+def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
+    profiles = _run_start_profile_rows()
+    help_text = _run_helper_help("llm")
+    profile_choices = "|".join(profile["start_cli_arg"] for profile in profiles)
+
+    assert f"stt llm [{profile_choices}]" in help_text
+    assert f"stt llm start [{profile_choices}]" in help_text
+    assert f"stt llm restart [{profile_choices}]" in help_text
+    for profile in profiles:
+        for alias in profile["mode_aliases"].split(","):
+            assert alias in help_text
         assert profile["help_description"] in help_text
 
 

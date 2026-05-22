@@ -191,9 +191,9 @@ stt() {
     )
     local start_profile_default="stream-seal"
     local -a start_profile_rows=(
-        "stream-seal|stream,streaming,on|stream,on|streaming|true||true|false|(default) streaming,stream,on|Launch daemon with stream+seal + overlay defaults."
-        "offline|offline,off|off|offline|false||false|false|offline,off|Launch daemon with streaming disabled."
-        "cpu|cpu|cpu|cpu|false|cpu|false|false|cpu|Launch daemon in offline mode on CPU (no GPU)."
+        "stream-seal|stream,streaming,on|stream,on|streaming|true||true|false|Launch daemon with stream+seal + overlay defaults."
+        "offline|offline,off|off|offline|false||false|false|Launch daemon with streaming disabled."
+        "cpu|cpu|cpu|cpu|false|cpu|false|false|Launch daemon in offline mode on CPU (no GPU)."
     )
     : "$default_injection_mode" "$default_paste_backend_failure_policy" "$default_uinput_dwell_ms"
     : "$default_paste_seat" "$default_paste_write_primary" "$default_completion_sound"
@@ -247,10 +247,10 @@ stt() {
 
     _apply_launch_profile_defaults() {
         local profile="$1"
-        local daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_label help_description
+        local daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_description
         local row
         row="$(_start_profile_row_for_id "$profile")" || return 1
-        IFS='|' read -r _ _ _ _ _ daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_label help_description <<<"$row"
+        IFS='|' read -r _ _ _ _ _ daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_description <<<"$row"
         if [ -n "$daemon_device_override" ]; then
             default_daemon_device="$daemon_device_override"
         fi
@@ -277,10 +277,38 @@ stt() {
         printf "%s" "$daemon_streaming_enabled"
     }
 
-    _print_start_profile_modes() {
-        local row help_label help_description
+    _start_profile_help_label() {
+        local profile_id="$1"
+        local mode_aliases="$2"
+        local start_cli_arg="$3"
+        local label="$start_cli_arg"
+        local alias
+        local -a aliases
+        IFS=',' read -r -a aliases <<<"$mode_aliases"
+        for alias in "${aliases[@]}"; do
+            [ "$alias" = "$start_cli_arg" ] && continue
+            label="$label,$alias"
+        done
+        if [ "$profile_id" = "$start_profile_default" ]; then
+            label="(default) $label"
+        fi
+        printf "%s" "$label"
+    }
+
+    _start_profile_cli_choices() {
+        local row start_cli_arg sep=""
         for row in "${start_profile_rows[@]}"; do
-            IFS='|' read -r _ _ _ _ _ _ _ _ help_label help_description <<<"$row"
+            IFS='|' read -r _ _ _ start_cli_arg _ <<<"$row"
+            printf "%s%s" "$sep" "$start_cli_arg"
+            sep="|"
+        done
+    }
+
+    _print_start_profile_modes() {
+        local row profile_id mode_aliases start_cli_arg help_label help_description
+        for row in "${start_profile_rows[@]}"; do
+            IFS='|' read -r profile_id mode_aliases _ start_cli_arg _ _ _ _ help_description <<<"$row"
+            help_label="$(_start_profile_help_label "$profile_id" "$mode_aliases" "$start_cli_arg")"
             printf "  %-30s %s\n" "$help_label" "$help_description"
         done
     }
@@ -1190,9 +1218,11 @@ EOF
     }
     _print_help_start() {
         _apply_launch_profile_defaults "$start_profile_default"
+        local profile_choices
+        profile_choices="$(_start_profile_cli_choices)"
         cat <<EOF
 Usage:
-  stt start [streaming|offline|cpu] [options]
+  stt start [$profile_choices] [options]
 
 Modes:
 EOF
@@ -1222,12 +1252,14 @@ EOF
     }
 
     _print_help_llm() {
+        local profile_choices
+        profile_choices="$(_start_profile_cli_choices)"
         cat <<EOF
 Usage:
-  stt llm [streaming|offline] [stt-start-options...]
-  stt llm start [streaming|offline] [stt-start-options...]
+  stt llm [$profile_choices] [stt-start-options...]
+  stt llm start [$profile_choices] [stt-start-options...]
   stt llm stop
-  stt llm restart [streaming|offline] [stt-start-options...]
+  stt llm restart [$profile_choices] [stt-start-options...]
   stt llm status
   stt llm logs
   stt llm show
@@ -1238,6 +1270,11 @@ Behavior:
   stt llm status        Show managed llama status, then normal STT status.
   stt llm logs          Tail /tmp/parakeet-llama-server.log.
   stt llm show          Attach to the llama tmux session.
+
+Profiles:
+EOF
+        _print_start_profile_modes
+        cat <<EOF
 
 Managed llama configuration (use shell env or $LOCAL_ENV_FILE):
   PARAKEET_LLM_SERVER_BIN=$default_llm_server_bin
