@@ -875,6 +875,10 @@ exit 1
         fake_bin,
         "ps",
         """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ] && [ "${2:-}" = "$STT_TEST_LISTENER_PID" ] && [ "${3:-}" = "-o" ]; then
+    printf '%s\\n' "python -m parakeet-stt-daemon"
+    exit 0
+fi
 if [ "${1:-}" = "-p" ] && [ "${2:-}" = "$STT_TEST_LISTENER_PID" ]; then
     exit 0
 fi
@@ -925,7 +929,7 @@ exit 22
     port_file = Path("/tmp/parakeet-daemon.port")
     pid_file = Path("/tmp/parakeet-daemon.pid")
     with _preserve_paths(port_file, pid_file):
-        port_file.write_text(f"127.0.0.1:{listener_port}\n", encoding="utf-8")
+        port_file.write_text(f"{listener_port}\n", encoding="utf-8")
         pid_file.unlink(missing_ok=True)
 
         completed = subprocess.run(
@@ -947,3 +951,590 @@ exit 22
         assert "sessions_active=0" in completed.stdout
         assert curl_url_file.read_text(encoding="utf-8").strip() == expected_status_url
         assert pid_file.read_text(encoding="utf-8").strip() == listener_pid
+
+
+def test_stop_refreshes_daemon_identity_from_bound_listener_before_shutdown(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    listener_port = "9877"
+    listener_pid = "424243"
+    launcher_pid = "111111"
+    expected_status_url = f"http://127.0.0.1:{listener_port}/status"
+    kill_log = tmp_path / "kill.log"
+    killed_marker = tmp_path / "listener-killed"
+
+    _write_fake_command(
+        fake_bin,
+        "lsof",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-tiTCP:${STT_TEST_LISTENER_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_LISTENER_PID"
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "ps",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ]; then
+    if [ "${2:-}" = "$STT_TEST_LISTENER_PID" ]; then
+        if [ "${3:-}" = "-o" ]; then
+            printf '%s\\n' "python -m parakeet-stt-daemon"
+            exit 0
+        fi
+        [ ! -f "$STT_TEST_KILLED_MARKER" ]
+        exit $?
+    fi
+    if [ "${2:-}" = "$STT_TEST_LAUNCHER_PID" ]; then
+        exit 0
+    fi
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "nc",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-z" ] && [ "${3:-}" = "$STT_TEST_LISTENER_PORT" ]; then
+    [ ! -f "$STT_TEST_KILLED_MARKER" ]
+    exit $?
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "curl",
+        """#!/usr/bin/env bash
+url="${@: -1}"
+if [ "$url" = "$STT_TEST_EXPECTED_STATUS_URL" ]; then
+    printf '%s' "$STT_TEST_STATUS_PAYLOAD"
+    exit 0
+fi
+exit 22
+""",
+    )
+    for command_name in ("pgrep", "pkill", "tmux"):
+        _write_fake_command(
+            fake_bin,
+            command_name,
+            "#!/usr/bin/env bash\nexit 1\n",
+        )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_PORT": "8765",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+            "STT_TEST_KILL_LOG": str(kill_log),
+            "STT_TEST_KILLED_MARKER": str(killed_marker),
+            "STT_TEST_EXPECTED_STATUS_URL": expected_status_url,
+            "STT_TEST_LAUNCHER_PID": launcher_pid,
+            "STT_TEST_LISTENER_PID": listener_pid,
+            "STT_TEST_LISTENER_PORT": listener_port,
+            "STT_TEST_STATUS_PAYLOAD": json.dumps(
+                {"type": "status", "state": "idle", "sessions_active": 0}
+            ),
+        }
+    )
+
+    client_pid_file = Path("/tmp/parakeet-ptt.pid")
+    daemon_pid_file = Path("/tmp/parakeet-daemon.pid")
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(
+        client_pid_file,
+        daemon_pid_file,
+        daemon_port_file,
+        llm_pid_file,
+        llm_port_file,
+    ):
+        client_pid_file.unlink(missing_ok=True)
+        llm_pid_file.unlink(missing_ok=True)
+        llm_port_file.unlink(missing_ok=True)
+        daemon_pid_file.write_text(f"{launcher_pid}\n", encoding="utf-8")
+        daemon_port_file.write_text(f"127.0.0.1:{listener_port}\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"""
+set -e
+source {shlex.quote(str(HELPER_PATH))}
+kill() {{
+    local signal=""
+    local pid=""
+    for arg in "$@"; do
+        case "$arg" in
+            -*) signal="$arg" ;;
+            *) pid="$arg" ;;
+        esac
+    done
+    printf '%s %s\\n' "$signal" "$pid" >> "$STT_TEST_KILL_LOG"
+    if [ "$pid" = "$STT_TEST_LISTENER_PID" ]; then
+        : > "$STT_TEST_KILLED_MARKER"
+    fi
+    return 0
+}}
+stt stop
+""",
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        killed_pids = [
+            line.rsplit(maxsplit=1)[-1]
+            for line in kill_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert "Daemon stopped" in completed.stdout
+        assert listener_pid in killed_pids
+        assert launcher_pid not in killed_pids
+        assert not daemon_pid_file.exists()
+        assert not daemon_port_file.exists()
+
+
+def test_stop_does_not_kill_listener_from_stale_daemon_port_file(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    listener_port = "9878"
+    unrelated_listener_pid = "525252"
+    stale_pid = "626262"
+    expected_health_url = f"http://127.0.0.1:{listener_port}/healthz"
+    kill_log = tmp_path / "kill.log"
+
+    _write_fake_command(
+        fake_bin,
+        "lsof",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-tiTCP:${STT_TEST_LISTENER_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_UNRELATED_LISTENER_PID"
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "ps",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ]; then
+    if [ "${2:-}" = "$STT_TEST_UNRELATED_LISTENER_PID" ]; then
+        exit 0
+    fi
+    if [ "${2:-}" = "$STT_TEST_STALE_PID" ]; then
+        exit 0
+    fi
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "nc",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-z" ] && [ "${3:-}" = "$STT_TEST_LISTENER_PORT" ]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "curl",
+        """#!/usr/bin/env bash
+url="${@: -1}"
+if [ "$url" = "$STT_TEST_EXPECTED_HEALTH_URL" ]; then
+    exit 0
+fi
+exit 22
+""",
+    )
+    for command_name in ("pgrep", "pkill", "tmux"):
+        _write_fake_command(
+            fake_bin,
+            command_name,
+            "#!/usr/bin/env bash\nexit 1\n",
+        )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_PORT": "8765",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+            "STT_TEST_EXPECTED_HEALTH_URL": expected_health_url,
+            "STT_TEST_KILL_LOG": str(kill_log),
+            "STT_TEST_LISTENER_PORT": listener_port,
+            "STT_TEST_STALE_PID": stale_pid,
+            "STT_TEST_UNRELATED_LISTENER_PID": unrelated_listener_pid,
+        }
+    )
+
+    client_pid_file = Path("/tmp/parakeet-ptt.pid")
+    daemon_pid_file = Path("/tmp/parakeet-daemon.pid")
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(
+        client_pid_file,
+        daemon_pid_file,
+        daemon_port_file,
+        llm_pid_file,
+        llm_port_file,
+    ):
+        client_pid_file.unlink(missing_ok=True)
+        daemon_pid_file.write_text(f"{stale_pid}\n", encoding="utf-8")
+        llm_pid_file.unlink(missing_ok=True)
+        llm_port_file.unlink(missing_ok=True)
+        daemon_port_file.write_text(f"127.0.0.1:{listener_port}\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"""
+set -e
+source {shlex.quote(str(HELPER_PATH))}
+kill() {{
+    printf '%s\\n' "$*" >> "$STT_TEST_KILL_LOG"
+    return 0
+}}
+stt stop
+""",
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        assert "Daemon stopped" not in completed.stdout
+        assert not kill_log.exists()
+        assert not daemon_pid_file.exists()
+        assert not daemon_port_file.exists()
+
+
+def test_stop_falls_back_to_current_daemon_authority_when_port_file_is_stale(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    current_port = "8765"
+    stale_port = "9878"
+    listener_pid = "424245"
+    unrelated_listener_pid = "525253"
+    launcher_pid = "111113"
+    expected_status_url = f"http://127.0.0.1:{current_port}/status"
+    kill_log = tmp_path / "kill.log"
+    killed_marker = tmp_path / "listener-killed"
+
+    _write_fake_command(
+        fake_bin,
+        "lsof",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-tiTCP:${STT_TEST_CURRENT_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_LISTENER_PID"
+    exit 0
+fi
+if [ "${1:-}" = "-tiTCP:${STT_TEST_STALE_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_UNRELATED_LISTENER_PID"
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "ps",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ]; then
+    if [ "${2:-}" = "$STT_TEST_LISTENER_PID" ]; then
+        if [ "${3:-}" = "-o" ]; then
+            printf '%s\\n' "python -m parakeet-stt-daemon"
+            exit 0
+        fi
+        [ ! -f "$STT_TEST_KILLED_MARKER" ]
+        exit $?
+    fi
+    if [ "${2:-}" = "$STT_TEST_UNRELATED_LISTENER_PID" ]; then
+        exit 0
+    fi
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "nc",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-z" ] && [ "${3:-}" = "$STT_TEST_CURRENT_PORT" ]; then
+    [ ! -f "$STT_TEST_KILLED_MARKER" ]
+    exit $?
+fi
+if [ "${1:-}" = "-z" ] && [ "${3:-}" = "$STT_TEST_STALE_PORT" ]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "curl",
+        """#!/usr/bin/env bash
+url="${@: -1}"
+if [ "$url" = "$STT_TEST_EXPECTED_STATUS_URL" ]; then
+    printf '%s' "$STT_TEST_STATUS_PAYLOAD"
+    exit 0
+fi
+exit 22
+""",
+    )
+    for command_name in ("pgrep", "pkill", "tmux"):
+        _write_fake_command(
+            fake_bin,
+            command_name,
+            "#!/usr/bin/env bash\nexit 1\n",
+        )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_PORT": current_port,
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+            "STT_TEST_CURRENT_PORT": current_port,
+            "STT_TEST_EXPECTED_STATUS_URL": expected_status_url,
+            "STT_TEST_KILL_LOG": str(kill_log),
+            "STT_TEST_KILLED_MARKER": str(killed_marker),
+            "STT_TEST_LISTENER_PID": listener_pid,
+            "STT_TEST_STALE_PORT": stale_port,
+            "STT_TEST_STATUS_PAYLOAD": json.dumps(
+                {"type": "status", "state": "idle", "sessions_active": 0}
+            ),
+            "STT_TEST_UNRELATED_LISTENER_PID": unrelated_listener_pid,
+        }
+    )
+
+    client_pid_file = Path("/tmp/parakeet-ptt.pid")
+    daemon_pid_file = Path("/tmp/parakeet-daemon.pid")
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(
+        client_pid_file,
+        daemon_pid_file,
+        daemon_port_file,
+        llm_pid_file,
+        llm_port_file,
+    ):
+        client_pid_file.unlink(missing_ok=True)
+        llm_pid_file.unlink(missing_ok=True)
+        llm_port_file.unlink(missing_ok=True)
+        daemon_pid_file.write_text(f"{launcher_pid}\n", encoding="utf-8")
+        daemon_port_file.write_text(f"127.0.0.1:{stale_port}\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"""
+set -e
+source {shlex.quote(str(HELPER_PATH))}
+kill() {{
+    local signal=""
+    local pid=""
+    for arg in "$@"; do
+        case "$arg" in
+            -*) signal="$arg" ;;
+            *) pid="$arg" ;;
+        esac
+    done
+    printf '%s %s\\n' "$signal" "$pid" >> "$STT_TEST_KILL_LOG"
+    if [ "$pid" = "$STT_TEST_LISTENER_PID" ]; then
+        : > "$STT_TEST_KILLED_MARKER"
+    fi
+    return 0
+}}
+stt stop
+""",
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        killed_pids = [
+            line.rsplit(maxsplit=1)[-1]
+            for line in kill_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert "Daemon stopped" in completed.stdout
+        assert listener_pid in killed_pids
+        assert unrelated_listener_pid not in killed_pids
+        assert not daemon_pid_file.exists()
+        assert not daemon_port_file.exists()
+
+
+def test_stop_preserves_daemon_identity_when_shutdown_fails(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    listener_port = "9879"
+    listener_pid = "424244"
+    launcher_pid = "111112"
+    expected_status_url = f"http://127.0.0.1:{listener_port}/status"
+
+    _write_fake_command(
+        fake_bin,
+        "lsof",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-tiTCP:${STT_TEST_LISTENER_PORT}" ]; then
+    printf '%s\\n' "$STT_TEST_LISTENER_PID"
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "ps",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ] && [ "${2:-}" = "$STT_TEST_LISTENER_PID" ] && [ "${3:-}" = "-o" ]; then
+    printf '%s\\n' "python -m parakeet-stt-daemon"
+    exit 0
+fi
+if [ "${1:-}" = "-p" ] && [ "${2:-}" = "$STT_TEST_LISTENER_PID" ]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "nc",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "-z" ] && [ "${3:-}" = "$STT_TEST_LISTENER_PORT" ]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_fake_command(
+        fake_bin,
+        "curl",
+        """#!/usr/bin/env bash
+url="${@: -1}"
+if [ "$url" = "$STT_TEST_EXPECTED_STATUS_URL" ]; then
+    printf '%s' "$STT_TEST_STATUS_PAYLOAD"
+    exit 0
+fi
+exit 22
+""",
+    )
+    for command_name in ("pgrep", "pkill", "tmux"):
+        _write_fake_command(
+            fake_bin,
+            command_name,
+            "#!/usr/bin/env bash\nexit 1\n",
+        )
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_PORT": "8765",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+            "STT_TEST_EXPECTED_STATUS_URL": expected_status_url,
+            "STT_TEST_LISTENER_PID": listener_pid,
+            "STT_TEST_LISTENER_PORT": listener_port,
+            "STT_TEST_STATUS_PAYLOAD": json.dumps(
+                {"type": "status", "state": "idle", "sessions_active": 0}
+            ),
+        }
+    )
+
+    client_pid_file = Path("/tmp/parakeet-ptt.pid")
+    daemon_pid_file = Path("/tmp/parakeet-daemon.pid")
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(
+        client_pid_file,
+        daemon_pid_file,
+        daemon_port_file,
+        llm_pid_file,
+        llm_port_file,
+    ):
+        client_pid_file.unlink(missing_ok=True)
+        llm_pid_file.unlink(missing_ok=True)
+        llm_port_file.unlink(missing_ok=True)
+        daemon_pid_file.write_text(f"{launcher_pid}\n", encoding="utf-8")
+        daemon_port_file.write_text(f"127.0.0.1:{listener_port}\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"""
+source {shlex.quote(str(HELPER_PATH))}
+kill() {{
+    return 0
+}}
+sleep() {{
+    return 0
+}}
+stt stop
+""",
+            ],
+            check=False,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        assert completed.returncode == 1
+        assert "Failed to stop the running daemon" in completed.stdout
+        assert daemon_pid_file.read_text(encoding="utf-8").strip() == listener_pid
+        assert daemon_port_file.read_text(encoding="utf-8").strip() == (
+            f"127.0.0.1:{listener_port}"
+        )
