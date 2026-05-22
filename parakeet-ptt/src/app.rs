@@ -3,7 +3,6 @@
 //! This module owns the Client runtime loop: PTT hotkey events, daemon Session
 //! message dispatch, Overlay routing, and Injection queue coordination.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -16,14 +15,11 @@ use tokio::time::{
     sleep, timeout, Duration as TokioDuration, Instant as TokioInstant, MissedTickBehavior,
 };
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
-    classify_error_code, elapsed_ms_since, final_result_belongs_to_active_session,
-    handle_server_message, log_rejected_final_result, session_id_from_state, state_label,
-    take_parent_focus_for_enqueue, CapturedParentFocus,
+    classify_error_code, handle_server_message, ClientSessionRuntime, SessionIntent,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
@@ -39,7 +35,6 @@ use crate::injector_runtime::{
 use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::{start_message, stop_message, ClientMessage, DaemonStatus, ServerMessage};
-use crate::state::PttState;
 use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -185,11 +180,6 @@ impl ClientPorts {
 const EVENT_LOOP_LAG_TICK_MS: u64 = 10;
 const EVENT_LOOP_LAG_LOG_INTERVAL_SECS: u64 = 30;
 const HOTKEY_INTENT_DIAGNOSTIC_LOG_INTERVAL_EVENTS: u64 = 20;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionIntent {
-    Dictate,
-    LlmQuery,
-}
 
 #[derive(Debug, Default)]
 struct HotkeyIntentDiagnostics {
@@ -306,27 +296,6 @@ fn spawn_event_loop_lag_monitor() {
     });
 }
 
-fn maybe_defer_llm_session_end(
-    message: &ServerMessage,
-    state: &PttState,
-    active_intent: Option<SessionIntent>,
-    llm_in_flight_session: Option<Uuid>,
-) -> Option<(Uuid, Option<String>)> {
-    let ServerMessage::SessionEnded { session_id, reason } = message else {
-        return None;
-    };
-
-    let waiting_for_llm_final = active_intent == Some(SessionIntent::LlmQuery)
-        && session_id_from_state(state) == Some(*session_id);
-    let llm_generation_running = llm_in_flight_session == Some(*session_id);
-
-    if waiting_for_llm_final || llm_generation_running {
-        Some((*session_id, reason.clone()))
-    } else {
-        None
-    }
-}
-
 pub async fn run_demo(
     config: ClientConfig,
     override_text: Option<String>,
@@ -337,8 +306,8 @@ pub async fn run_demo(
     let injector_runner = build_injection_runner(&config);
     let (injector_worker, mut injection_reports) = spawn_injector_worker(injector_runner);
 
-    let mut state = PttState::new();
-    let Some(session_id) = state.begin_listening() else {
+    let mut session_runtime = ClientSessionRuntime::new();
+    let Some(session_id) = session_runtime.begin_listening(SessionIntent::Dictate) else {
         return Err(anyhow!("failed to start session state"));
     };
 
@@ -349,7 +318,9 @@ pub async fn run_demo(
 
     // For demo purposes we immediately stop after starting.
     client.send(&stop_message(session_id)).await?;
-    state.stop_listening();
+    session_runtime
+        .stop_listening()
+        .ok_or_else(|| anyhow!("failed to stop session state"))?;
 
     let mut demo_injection_succeeded = false;
     while let Some(message) = client.next_message().await? {
@@ -364,8 +335,8 @@ pub async fn run_demo(
                 audio_ms,
                 ..
             } => {
-                if !final_result_belongs_to_active_session(&state, session_id) {
-                    log_rejected_final_result(session_id, &state, InjectionOrigin::Demo);
+                if !session_runtime.final_result_belongs_to_active_session(session_id) {
+                    session_runtime.log_rejected_final_result(session_id, InjectionOrigin::Demo);
                     continue;
                 }
 
@@ -394,7 +365,7 @@ pub async fn run_demo(
                 }
                 demo_injection_succeeded = true;
                 audio_feedback.play_completion();
-                state.reset();
+                session_runtime.reset();
                 break;
             }
             ServerMessage::Error {
@@ -453,7 +424,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     let mut overlay_router = OverlayRouter::new(overlay_sink, focus_cache);
     spawn_event_loop_lag_monitor();
 
-    let mut state = PttState::new();
+    let mut session_runtime = ClientSessionRuntime::new();
     let mut hk_rx = hotkey_runtime.events;
     info!(
         devices = hotkey_runtime.listener_count,
@@ -477,19 +448,8 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     fetch_status_once(&config).await;
 
     let mut backoff = TokioDuration::from_millis(500);
-    let mut llm_busy = false;
-    let mut active_intent: Option<SessionIntent> = None;
-    let mut llm_in_flight_session: Option<Uuid> = None;
-    let mut llm_seq: HashMap<Uuid, u64> = HashMap::new();
-    let mut llm_overlay_text: HashMap<Uuid, String> = HashMap::new();
-    let mut llm_deferred_session_end: HashMap<Uuid, Option<String>> = HashMap::new();
-    let mut llm_busy_overlay_seq: u64 = 0;
-    let llm_busy_overlay_session = Uuid::nil();
     let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
     let mut hotkey_intent_diagnostics = HotkeyIntentDiagnostics::default();
-    let mut last_hotkey_up_at: Option<TokioInstant> = None;
-    let mut last_stop_message: Option<(Uuid, TokioInstant)> = None;
-    let mut parent_focus_by_session = HashMap::<Uuid, CapturedParentFocus>::new();
 
     loop {
         match daemon_connector.connect(&config).await {
@@ -505,33 +465,35 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                     HotkeyEvent::Down { intent } => {
                                         let intent = session_intent_from_hotkey(intent);
                                         hotkey_intent_diagnostics.note_hotkey_down(intent);
-                                        if llm_busy {
+                                        if session_runtime.is_llm_busy() {
                                             warn!("ignoring hotkey down while LLM response is in progress");
-                                            llm_busy_overlay_seq = llm_busy_overlay_seq.saturating_add(1);
+                                            let (busy_session, busy_seq) =
+                                                session_runtime.note_llm_busy_overlay_rejection();
                                             overlay_router.route_llm_answer_state(
-                                                llm_busy_overlay_session,
-                                                llm_busy_overlay_seq,
+                                                busy_session,
+                                                busy_seq,
                                                 "LLM busy; wait for current answer".to_string(),
                                             );
                                             overlay_router.route_session_ended(
                                                 None,
-                                                llm_busy_overlay_session,
+                                                busy_session,
                                                 Some("busy".to_string()),
                                             );
                                             hotkey_intent_diagnostics.note_llm_busy_reject();
                                             hotkey_intent_diagnostics.maybe_log_summary("hotkey_down_busy");
                                             continue;
                                         }
-                                        if let Some(session_id) = state.begin_listening() {
-                                            active_intent = Some(intent);
+                                        if let Some(session_id) = session_runtime.begin_listening(intent) {
                                             let message = start_message(session_id, Some("auto".to_string()));
                                             send_message(daemon.as_mut(), &message).await?;
                                             info!(session = %session_id, ?intent, "start_session sent (hotkey down)");
                                         } else {
                                             hotkey_intent_diagnostics.note_hotkey_down_ignored();
                                             debug!(
-                                                ?state,
-                                                ?active_intent,
+                                                state = session_runtime.state_label(),
+                                                active_session = ?session_runtime.active_session_id(),
+                                                active_intent = ?session_runtime.active_intent(),
+                                                llm_busy = session_runtime.is_llm_busy(),
                                                 "ignoring hotkey down because client is not idle"
                                             );
                                         }
@@ -539,27 +501,26 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                     }
                                     HotkeyEvent::Up => {
                                         hotkey_intent_diagnostics.note_hotkey_up();
-                                        if let Some(session_id) = state.stop_listening() {
+                                        if let Some(session_id) = session_runtime.stop_listening() {
                                             let message = stop_message(session_id);
                                             send_message(daemon.as_mut(), &message).await?;
-                                            let now = TokioInstant::now();
-                                            last_hotkey_up_at = Some(now);
-                                            last_stop_message = Some((session_id, now));
-                                            if let Some(focus) = capture_parent_focus(focus_cache_for_parent_capture.as_ref()) {
-                                                parent_focus_by_session.insert(
-                                                    session_id,
-                                                    CapturedParentFocus {
-                                                        focus,
-                                                        captured_at: now,
-                                                    },
-                                                );
-                                            }
+                                            let stop_sent_at = TokioInstant::now();
+                                            let parent_focus = capture_parent_focus(
+                                                focus_cache_for_parent_capture.as_ref(),
+                                            );
+                                            session_runtime.record_stop_message_sent(
+                                                session_id,
+                                                parent_focus,
+                                                stop_sent_at,
+                                            );
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         } else {
                                             hotkey_intent_diagnostics.note_hotkey_up_ignored();
                                             debug!(
-                                                ?state,
-                                                ?active_intent,
+                                                state = session_runtime.state_label(),
+                                                active_session = ?session_runtime.active_session_id(),
+                                                active_intent = ?session_runtime.active_intent(),
+                                                llm_busy = session_runtime.is_llm_busy(),
                                                 "ignoring hotkey up because no listening session is active"
                                             );
                                         }
@@ -570,13 +531,9 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                             next = daemon.next_message() => {
                                 match next {
                                     Ok(Some(message)) => {
-                                        if let Some((session_id, reason)) = maybe_defer_llm_session_end(
-                                            &message,
-                                            &state,
-                                            active_intent,
-                                            llm_in_flight_session,
-                                        ) {
-                                            llm_deferred_session_end.insert(session_id, reason);
+                                        if let Some(session_id) =
+                                            session_runtime.defer_session_end_if_needed(&message)
+                                        {
                                             debug!(
                                                 session = %session_id,
                                                 "deferring daemon session_ended until llm answer injection"
@@ -585,11 +542,10 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         }
 
                                         if let ServerMessage::FinalResult { session_id, .. } = &message {
-                                            if !final_result_belongs_to_active_session(&state, *session_id) {
-                                                log_rejected_final_result(
+                                            if !session_runtime.final_result_belongs_to_active_session(*session_id) {
+                                                session_runtime.log_rejected_final_result(
                                                     *session_id,
-                                                    &state,
-                                                    match active_intent {
+                                                    match session_runtime.active_intent() {
                                                         Some(SessionIntent::LlmQuery) => InjectionOrigin::LlmAnswer,
                                                         _ => InjectionOrigin::RawFinalResult,
                                                     },
@@ -605,23 +561,21 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 latency_ms,
                                                 audio_ms,
                                                 ..
-                                            } if active_intent == Some(SessionIntent::LlmQuery) => {
+                                            } if session_runtime.active_intent()
+                                                == Some(SessionIntent::LlmQuery) => {
                                                 info!(
                                                     session = %session_id,
                                                     daemon_latency_ms = latency_ms,
                                                     audio_ms,
                                                     "final result received in llm_query mode"
                                                 );
-                                                llm_busy = true;
-                                                llm_in_flight_session = Some(session_id);
-                                                let seq = llm_seq.entry(session_id).or_insert(0);
-                                                *seq = seq.saturating_add(1);
+                                                let seq =
+                                                    session_runtime.start_llm_answer(session_id);
                                                 overlay_router.route_llm_answer_state(
                                                     session_id,
-                                                    *seq,
+                                                    seq,
                                                     "Generating answer...".to_string(),
                                                 );
-                                                state.reset();
                                                 let answerer = Arc::clone(&llm_answerer);
                                                 let progress_tx = llm_tx.clone();
                                                 tokio::spawn(async move {
@@ -637,25 +591,14 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                         result: llm_result,
                                                     });
                                                 });
-                                                active_intent = None;
                                             }
                                             known => {
-                                                let clear_intent = matches!(
-                                                    &known,
-                                                    ServerMessage::FinalResult { .. } | ServerMessage::Error { .. }
-                                                );
                                                 handle_server_message(
                                                     known,
-                                                    &mut state,
+                                                    &mut session_runtime,
                                                     &mut overlay_router,
                                                     &injector_worker,
-                                                    &mut parent_focus_by_session,
-                                                    last_hotkey_up_at,
-                                                    last_stop_message,
                                                 ).await?;
-                                                if clear_intent {
-                                                    active_intent = None;
-                                                }
                                             }
                                         }
                                     }
@@ -680,23 +623,15 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                             Some(progress) = llm_rx.recv() => {
                                 match progress {
                                     LlmProgress::Delta { session_id, delta } => {
-                                        if llm_in_flight_session != Some(session_id) {
-                                            debug!(
-                                                session = %session_id,
-                                                in_flight_session = ?llm_in_flight_session,
-                                                "ignoring stale llm delta for non-active session"
+                                        if let Some(update) =
+                                            session_runtime.record_llm_delta(session_id, delta)
+                                        {
+                                            overlay_router.route_llm_answer_delta(
+                                                session_id,
+                                                update.seq,
+                                                update.text,
                                             );
-                                            continue;
                                         }
-                                        let entry = llm_overlay_text.entry(session_id).or_default();
-                                        entry.push_str(&delta);
-                                        let seq = llm_seq.entry(session_id).or_insert(0);
-                                        *seq = seq.saturating_add(1);
-                                        overlay_router.route_llm_answer_delta(
-                                            session_id,
-                                            *seq,
-                                            entry.clone(),
-                                        );
                                     }
                                     LlmProgress::Finished {
                                         session_id,
@@ -705,29 +640,15 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         daemon_audio_ms,
                                         result,
                                     } => {
-                                        if llm_in_flight_session != Some(session_id) {
-                                            warn!(
-                                                session = %session_id,
-                                                in_flight_session = ?llm_in_flight_session,
-                                                "ignoring stale llm completion for non-active session"
-                                            );
-                                            llm_seq.remove(&session_id);
-                                            llm_overlay_text.remove(&session_id);
-                                            llm_deferred_session_end.remove(&session_id);
+                                        let Some(completion) =
+                                            session_runtime.finish_llm_answer(session_id)
+                                        else {
                                             continue;
-                                        }
-
-                                        llm_busy = false;
-                                        llm_in_flight_session = None;
-                                        llm_seq.remove(&session_id);
-                                        llm_overlay_text.remove(&session_id);
-                                        let session_end_reason =
-                                            llm_deferred_session_end.remove(&session_id).flatten();
-                                        let session_end_was_deferred = session_end_reason.is_some();
+                                        };
                                         overlay_router.route_session_ended(
                                             None,
                                             session_id,
-                                            session_end_reason,
+                                            completion.session_end_reason.clone(),
                                         );
                                         let fallback_transcript = transcript.clone();
                                         let response_text = match result {
@@ -756,20 +677,16 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         } else {
                                             response_text
                                         };
-                                        let hotkey_up_elapsed_ms_at_enqueue =
-                                            elapsed_ms_since(last_hotkey_up_at);
-                                        let stop_message_elapsed_ms_at_enqueue =
-                                            last_stop_message.and_then(|(stopped_session_id, instant)| {
-                                                (stopped_session_id == session_id)
-                                                    .then(|| instant.elapsed().as_millis() as u64)
-                                            });
                                         info!(
                                             session = %session_id,
                                             origin = InjectionOrigin::LlmAnswer.as_str(),
-                                            state_at_enqueue = state_label(&state),
-                                            session_end_was_deferred,
-                                            hotkey_up_elapsed_ms_at_enqueue,
-                                            stop_message_elapsed_ms_at_enqueue,
+                                            state_at_enqueue = completion.state_label,
+                                            session_end_was_deferred =
+                                                completion.session_end_was_deferred,
+                                            hotkey_up_elapsed_ms_at_enqueue =
+                                                completion.hotkey_up_elapsed_ms_at_enqueue,
+                                            stop_message_elapsed_ms_at_enqueue =
+                                                completion.stop_message_elapsed_ms_at_enqueue,
                                             response_chars = to_inject.chars().count(),
                                             "queueing llm answer injection job"
                                         );
@@ -784,13 +701,10 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 )
                                                 .with_origin(InjectionOrigin::LlmAnswer)
                                                 .with_enqueue_timing(
-                                                    hotkey_up_elapsed_ms_at_enqueue,
-                                                    stop_message_elapsed_ms_at_enqueue,
+                                                    completion.hotkey_up_elapsed_ms_at_enqueue,
+                                                    completion.stop_message_elapsed_ms_at_enqueue,
                                                 )
-                                                .with_parent_focus(take_parent_focus_for_enqueue(
-                                                    &mut parent_focus_by_session,
-                                                    session_id,
-                                                )),
+                                                .with_parent_focus(completion.parent_focus),
                                             )
                                             .await
                                         {
@@ -819,18 +733,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                     warn!("session loop ended with error: {err}");
                 }
                 hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
-                state.reset();
-                active_intent = None;
-                clear_transient_session_state(TransientSessionState {
-                    llm_busy: &mut llm_busy,
-                    llm_in_flight_session: &mut llm_in_flight_session,
-                    llm_seq: &mut llm_seq,
-                    llm_overlay_text: &mut llm_overlay_text,
-                    llm_deferred_session_end: &mut llm_deferred_session_end,
-                    parent_focus_by_session: &mut parent_focus_by_session,
-                    last_hotkey_up_at: &mut last_hotkey_up_at,
-                    last_stop_message: &mut last_stop_message,
-                });
+                session_runtime.reset_for_connection_drop();
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -992,39 +895,6 @@ fn capture_parent_focus(focus_cache: Option<&WaylandFocusCache>) -> Option<Paren
     }
 }
 
-struct TransientSessionState<'a> {
-    llm_busy: &'a mut bool,
-    llm_in_flight_session: &'a mut Option<Uuid>,
-    llm_seq: &'a mut HashMap<Uuid, u64>,
-    llm_overlay_text: &'a mut HashMap<Uuid, String>,
-    llm_deferred_session_end: &'a mut HashMap<Uuid, Option<String>>,
-    parent_focus_by_session: &'a mut HashMap<Uuid, CapturedParentFocus>,
-    last_hotkey_up_at: &'a mut Option<TokioInstant>,
-    last_stop_message: &'a mut Option<(Uuid, TokioInstant)>,
-}
-
-fn clear_transient_session_state(transient: TransientSessionState<'_>) {
-    let TransientSessionState {
-        llm_busy,
-        llm_in_flight_session,
-        llm_seq,
-        llm_overlay_text,
-        llm_deferred_session_end,
-        parent_focus_by_session,
-        last_hotkey_up_at,
-        last_stop_message,
-    } = transient;
-
-    *llm_busy = false;
-    *llm_in_flight_session = None;
-    llm_seq.clear();
-    llm_overlay_text.clear();
-    llm_deferred_session_end.clear();
-    parent_focus_by_session.clear();
-    *last_hotkey_up_at = None;
-    *last_stop_message = None;
-}
-
 fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
     match intent {
         HotkeyIntent::Dictate => SessionIntent::Dictate,
@@ -1078,7 +948,7 @@ async fn fetch_status_once(config: &ClientConfig) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
@@ -1099,18 +969,17 @@ mod tests {
     use crate::client_runtime_fixtures::{
         ClientRuntimeHarness, RecordingInjectionRunner, RecordingOverlaySink,
     };
+    use crate::client_session::SessionIntent;
     use crate::config::{
         ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
         PasteKeyBackend, PasteShortcut,
     };
     use crate::hotkey::HotkeyIntent;
     use crate::injector::{
-        FailInjector, InjectorContext, ParentFocusCapture, PasteChordSender, PasteKeySender,
-        TextInjector,
+        FailInjector, InjectorContext, PasteChordSender, PasteKeySender, TextInjector,
     };
     use crate::overlay_router::{OverlayEvent, OverlayRouter, OverlayTextProducer};
     use crate::protocol::{ClientMessage, DaemonStatus, ServerMessage};
-    use crate::state::PttState;
 
     use crate::injector::INJECTOR_JOB_TIMEOUT_MS;
     use crate::injector_runtime::{
@@ -1121,11 +990,7 @@ mod tests {
     };
     use crate::llm::{drain_sse_lines, sanitize_model_answer};
 
-    use super::{
-        clear_transient_session_state, format_daemon_status, handle_injection_report,
-        maybe_defer_llm_session_end, run, CapturedParentFocus, HotkeyIntentDiagnostics,
-        SessionIntent, TransientSessionState,
-    };
+    use super::{format_daemon_status, handle_injection_report, run, HotkeyIntentDiagnostics};
 
     #[test]
     fn daemon_status_accepts_minimal_protocol_payload() {
@@ -1308,52 +1173,6 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(formatted_fields, fields);
-    }
-
-    #[test]
-    fn clear_transient_session_state_resets_reconnect_caches() {
-        let session_id = Uuid::new_v4();
-        let mut llm_busy = true;
-        let mut llm_in_flight_session = Some(session_id);
-        let mut llm_seq = HashMap::from([(session_id, 7)]);
-        let mut llm_overlay_text = HashMap::from([(session_id, "partial answer".to_string())]);
-        let mut llm_deferred_session_end =
-            HashMap::from([(session_id, Some("connection_drop".to_string()))]);
-        let mut parent_focus_by_session = HashMap::from([(
-            session_id,
-            CapturedParentFocus {
-                focus: ParentFocusCapture {
-                    snapshot: None,
-                    source_selected: "test".to_string(),
-                    wayland_cache_age_ms: None,
-                    wayland_fallback_reason: None,
-                    captured_elapsed_ms: None,
-                },
-                captured_at: tokio::time::Instant::now(),
-            },
-        )]);
-        let mut last_hotkey_up_at = Some(tokio::time::Instant::now());
-        let mut last_stop_message = Some((session_id, tokio::time::Instant::now()));
-
-        clear_transient_session_state(TransientSessionState {
-            llm_busy: &mut llm_busy,
-            llm_in_flight_session: &mut llm_in_flight_session,
-            llm_seq: &mut llm_seq,
-            llm_overlay_text: &mut llm_overlay_text,
-            llm_deferred_session_end: &mut llm_deferred_session_end,
-            parent_focus_by_session: &mut parent_focus_by_session,
-            last_hotkey_up_at: &mut last_hotkey_up_at,
-            last_stop_message: &mut last_stop_message,
-        });
-
-        assert!(!llm_busy);
-        assert!(llm_in_flight_session.is_none());
-        assert!(llm_seq.is_empty());
-        assert!(llm_overlay_text.is_empty());
-        assert!(llm_deferred_session_end.is_empty());
-        assert!(parent_focus_by_session.is_empty());
-        assert!(last_hotkey_up_at.is_none());
-        assert!(last_stop_message.is_none());
     }
 
     struct SlowRunner {
@@ -2256,34 +2075,6 @@ mod tests {
             vec!["data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}"]
         );
         assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn maybe_defer_llm_session_end_for_query_or_inflight() {
-        let session_id = Uuid::new_v4();
-        let state = PttState::Listening { session_id };
-        let message = ServerMessage::SessionEnded {
-            session_id,
-            reason: Some("normal".to_string()),
-        };
-
-        let deferred_for_query =
-            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::LlmQuery), None);
-        assert_eq!(
-            deferred_for_query,
-            Some((session_id, Some("normal".to_string())))
-        );
-
-        let deferred_for_inflight =
-            maybe_defer_llm_session_end(&message, &PttState::Idle, None, Some(session_id));
-        assert_eq!(
-            deferred_for_inflight,
-            Some((session_id, Some("normal".to_string())))
-        );
-
-        let not_deferred =
-            maybe_defer_llm_session_end(&message, &state, Some(SessionIntent::Dictate), None);
-        assert_eq!(not_deferred, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
