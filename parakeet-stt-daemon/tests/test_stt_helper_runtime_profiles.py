@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import textwrap
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,7 +31,11 @@ from parakeet_stt_daemon.runtime_interface import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
+README_PATH = REPO_ROOT / "README.md"
+TROUBLESHOOTING_DOC_PATH = REPO_ROOT / "docs" / "stt-troubleshooting.md"
 FIXTURE_DIR = REPO_ROOT / "docs" / "protocol" / "fixtures"
+START_REFERENCE_START_MARKER = "<!-- stt-helper:start-reference:start -->"
+START_REFERENCE_END_MARKER = "<!-- stt-helper:start-reference:end -->"
 START_PROFILE_ROW_FIELDS = (
     "profile_id",
     "mode_aliases",
@@ -185,6 +190,38 @@ def _run_helper_help(topic: str) -> str:
         capture_output=True,
     )
     return completed.stdout
+
+
+def _run_helper_operator_docs_start(*, skip_local_overrides: bool = True) -> str:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    if skip_local_overrides:
+        env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt __operator-docs-start",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    return completed.stdout.strip()
+
+
+def _extract_start_reference_block(document: str) -> str:
+    start = document.index(START_REFERENCE_START_MARKER) + len(START_REFERENCE_START_MARKER)
+    end = document.index(START_REFERENCE_END_MARKER, start)
+    return textwrap.dedent(document[start:end]).strip()
 
 
 def _run_helper_variable_scope_probe() -> dict[str, str]:
@@ -512,6 +549,58 @@ def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
     assert f"stt llm start [{profile_choices}]" in help_text
     assert f"stt llm restart [{profile_choices}]" in help_text
     _assert_profile_help_lines(help_text, profiles)
+
+
+@pytest.mark.parametrize("doc_path", [README_PATH, TROUBLESHOOTING_DOC_PATH])
+def test_operator_docs_start_reference_matches_helper_metadata(doc_path: Path) -> None:
+    generated = _run_helper_operator_docs_start()
+
+    assert _extract_start_reference_block(doc_path.read_text(encoding="utf-8")) == generated
+
+
+def test_operator_docs_start_reference_uses_matching_end_marker() -> None:
+    document = "\n".join(
+        [
+            START_REFERENCE_END_MARKER,
+            START_REFERENCE_START_MARKER,
+            "expected",
+            START_REFERENCE_END_MARKER,
+        ]
+    )
+
+    assert _extract_start_reference_block(document) == "expected"
+
+
+def test_operator_docs_start_reference_ignores_local_overrides() -> None:
+    expected = _run_helper_operator_docs_start()
+    local_env_path = REPO_ROOT / ".parakeet-stt.local.env"
+    local_shell_path = REPO_ROOT / ".parakeet-stt.local.sh"
+
+    with _preserve_paths(local_env_path, local_shell_path):
+        local_env_path.write_text(
+            "\n".join(
+                [
+                    "PARAKEET_DEVICE=machine-local-device",
+                    "PARAKEET_LLM_SERVER_HOST=llm.machine.local",
+                    "PARAKEET_LLM_SERVER_PORT=9999",
+                    "PARAKEET_LLM_SYSTEM_PROMPT=machine-local-prompt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        local_shell_path.write_text(
+            "\n".join(
+                [
+                    "export PARAKEET_OVERLAY_ENABLED=false",
+                    "export PARAKEET_OVERLAY_ADAPTIVE_WIDTH=true",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert _run_helper_operator_docs_start(skip_local_overrides=False) == expected
 
 
 def test_llm_direct_profile_forwards_remaining_start_args_once(tmp_path: Path) -> None:

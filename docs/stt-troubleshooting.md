@@ -15,12 +15,41 @@ Canonical-source policy:
 
 - `stt start` now uses PID-file + socket health checks for daemon lifecycle decisions, not name-only process matching.
 - `stt start` rejects unknown options to avoid silent misconfiguration during injector tuning.
-- Default startup profile is now online stream+seal (`stt` / `stt start`) with paste-mode and adaptive cross-surface shortcut routing using internal defaults:
-  - `--injection-mode paste`
-  - `--paste-backend-failure-policy copy-only`
-  - daemon launch default: `PARAKEET_STREAMING_ENABLED=true` for the default profile
-  - overlay launch default: `PARAKEET_OVERLAY_ENABLED=true` with `--overlay-adaptive-width=false`
-  - `stt off` switches to offline profile defaults (`PARAKEET_STREAMING_ENABLED=false`, overlay disabled)
+- Default startup profile is online stream+seal (`stt` / `stt start`); exact
+  profile defaults and stable start controls are generated from Helper metadata
+  and checked below.
+  <!-- stt-helper:start-reference:start -->
+  Helper profile defaults (generated from `start_profile_rows`):
+
+  | Profile | Start tokens | Direct commands | Streaming | Device | Overlay | Overlay width | Description |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `streaming` (default) | `stream`, `streaming`, `on` | `stt`, `stt start`, `stt stream`, `stt on` | `true` | `cuda` | `true` | `false` | Launch daemon with stream+seal + overlay defaults. |
+  | `offline` | `offline`, `off` | `stt off` | `false` | `cuda` | `false` | `false` | Launch daemon with streaming disabled. |
+  | `cpu` | `cpu` | `stt cpu` | `false` | `cpu` | `false` | `false` | Launch daemon in offline mode on CPU (no GPU). |
+
+  `stt start` default-profile options (generated from `start_option_rows`):
+
+  | Option | Default for `stt start` | Env |
+  | --- | --- | --- |
+  | `--injection-mode <mode>` | `paste` | `PARAKEET_INJECTION_MODE` |
+  | `--paste-backend-failure-policy <v>` | `copy-only` | `PARAKEET_PASTE_BACKEND_FAILURE_POLICY` |
+  | `--uinput-dwell-ms <n>` | `18` | `PARAKEET_UINPUT_DWELL_MS` |
+  | `--paste-seat <v>` | `<unset>` | `PARAKEET_PASTE_SEAT` |
+  | `--paste-write-primary <v>` | `false` | `PARAKEET_PASTE_WRITE_PRIMARY` |
+  | `--completion-sound <v>` | `true` | `PARAKEET_COMPLETION_SOUND` |
+  | `--completion-sound-path <path>` | `<system default>` | `PARAKEET_COMPLETION_SOUND_PATH` |
+  | `--completion-sound-volume <n>` | `100` | `PARAKEET_COMPLETION_SOUND_VOLUME` |
+  | `--overlay-enabled <v>` | `true` | `PARAKEET_OVERLAY_ENABLED` |
+  | `--overlay-adaptive-width <v>` | `false` | `PARAKEET_OVERLAY_ADAPTIVE_WIDTH` |
+  | `--llm-pre-modifier-key <key>` | `KEY_SHIFT` | `PARAKEET_LLM_PRE_MODIFIER_KEY` |
+  | `--llm-base-url <url>` | `http://127.0.0.1:8080/v1` | `PARAKEET_LLM_BASE_URL` |
+  | `--llm-model <name>` | `local` | `PARAKEET_LLM_MODEL` |
+  | `--llm-timeout-seconds <n>` | `20` | `PARAKEET_LLM_TIMEOUT_SECONDS` |
+  | `--llm-max-tokens <n>` | `512` | `PARAKEET_LLM_MAX_TOKENS` |
+  | `--llm-temperature <n>` | `0.7` | `PARAKEET_LLM_TEMPERATURE` |
+  | `--llm-system-prompt <text>` | `<assistant prompt>` | `PARAKEET_LLM_SYSTEM_PROMPT` |
+  | `--llm-overlay-stream <v>` | `true` | `PARAKEET_LLM_OVERLAY_STREAM` |
+  <!-- stt-helper:start-reference:end -->
   - Wayland focus cache with 30s stale threshold, 500ms transition grace
 - low-confidence focus snapshots (`focus_focused=false`) now route as `unknown` (terminal-first default)
 - Paste backend failures are policy-driven:
@@ -197,16 +226,7 @@ With the append-only logging, tmux-based client start, PID tracking, and longer 
 Paste/copy injection now exposes a stable operator surface through `stt start` and
 `parakeet-ptt`.
 
-Client knobs:
-- `--injection-mode paste|copy-only`
-- `--paste-backend-failure-policy copy-only|error` (default: `copy-only`)
-- `--uinput-dwell-ms <ms>` (default: `18`)
-- `--paste-seat <seat>` (optional)
-- `--paste-write-primary true|false` (default: `false`)
-- `--completion-sound true|false` (default: `true`)
-- `--completion-sound-path <path>` (optional)
-- `--completion-sound-volume <0-100>` (default: `100`)
-- `--overlay-enabled true|false` (profile default: `true` for `stt`/`stt start`, `false` for `stt off`, env: `PARAKEET_OVERLAY_ENABLED`)
+Client knobs are listed in the checked Helper metadata reference above.
 
 Recommended baseline for Ghostty/COSMIC:
 
