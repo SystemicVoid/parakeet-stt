@@ -1,7 +1,8 @@
 //! Client Session dispatch policy for Daemon messages.
 //!
-//! This Module owns how Daemon `ServerMessage` values affect Client PTT state,
-//! Overlay routing, Injection enqueueing, and parent-focus handoff.
+//! This Module owns per-Session Client runtime state and how Daemon
+//! `ServerMessage` values affect Client PTT state, Overlay routing, Injection
+//! enqueueing, LLM progress, and parent-focus handoff.
 
 use std::collections::HashMap;
 
@@ -25,14 +26,270 @@ pub(crate) struct CapturedParentFocus {
     pub(crate) captured_at: TokioInstant,
 }
 
-pub(crate) async fn handle_server_message<S: OverlaySink>(
-    message: ServerMessage,
-    state: &mut PttState,
-    overlay_router: &mut OverlayRouter<S>,
-    injector_worker: &InjectorWorkerHandle,
-    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionIntent {
+    Dictate,
+    LlmQuery,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientSessionRuntime {
+    state: PttState,
+    active_intent: Option<SessionIntent>,
+    llm: LlmSessionRuntime,
+    parent_focus_by_session: HashMap<Uuid, CapturedParentFocus>,
     last_hotkey_up_at: Option<TokioInstant>,
     last_stop_message: Option<(Uuid, TokioInstant)>,
+}
+
+#[derive(Debug, Default)]
+struct LlmSessionRuntime {
+    busy: bool,
+    in_flight_session: Option<Uuid>,
+    seq: HashMap<Uuid, u64>,
+    overlay_text: HashMap<Uuid, String>,
+    deferred_session_end: HashMap<Uuid, Option<String>>,
+    busy_overlay_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LlmDeltaOverlay {
+    pub(crate) seq: u64,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LlmCompletionContext {
+    pub(crate) session_end_reason: Option<String>,
+    pub(crate) session_end_was_deferred: bool,
+    pub(crate) state_label: &'static str,
+    pub(crate) hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    pub(crate) stop_message_elapsed_ms_at_enqueue: Option<u64>,
+    pub(crate) parent_focus: Option<ParentFocusCapture>,
+}
+
+impl ClientSessionRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: PttState::new(),
+            active_intent: None,
+            llm: LlmSessionRuntime::default(),
+            parent_focus_by_session: HashMap::new(),
+            last_hotkey_up_at: None,
+            last_stop_message: None,
+        }
+    }
+
+    pub(crate) fn begin_listening(&mut self, intent: SessionIntent) -> Option<Uuid> {
+        let session_id = self.state.begin_listening()?;
+        self.active_intent = Some(intent);
+        Some(session_id)
+    }
+
+    pub(crate) fn stop_listening(&mut self) -> Option<Uuid> {
+        self.state.stop_listening()
+    }
+
+    pub(crate) fn record_stop_message_sent(
+        &mut self,
+        session_id: Uuid,
+        parent_focus: Option<ParentFocusCapture>,
+        sent_at: TokioInstant,
+    ) {
+        self.last_hotkey_up_at = Some(sent_at);
+        self.last_stop_message = Some((session_id, sent_at));
+        if let Some(focus) = parent_focus {
+            self.parent_focus_by_session.insert(
+                session_id,
+                CapturedParentFocus {
+                    focus,
+                    captured_at: sent_at,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.state.reset();
+        self.active_intent = None;
+    }
+
+    pub(crate) fn reset_for_connection_drop(&mut self) {
+        self.reset();
+        self.llm.clear();
+        self.parent_focus_by_session.clear();
+        self.last_hotkey_up_at = None;
+        self.last_stop_message = None;
+    }
+
+    pub(crate) fn active_intent(&self) -> Option<SessionIntent> {
+        self.active_intent
+    }
+
+    pub(crate) fn active_session_id(&self) -> Option<Uuid> {
+        session_id_from_state(&self.state)
+    }
+
+    pub(crate) fn state_label(&self) -> &'static str {
+        state_label(&self.state)
+    }
+
+    pub(crate) fn is_llm_busy(&self) -> bool {
+        self.llm.busy
+    }
+
+    pub(crate) fn note_llm_busy_overlay_rejection(&mut self) -> (Uuid, u64) {
+        self.llm.busy_overlay_seq = self.llm.busy_overlay_seq.saturating_add(1);
+        (Uuid::nil(), self.llm.busy_overlay_seq)
+    }
+
+    pub(crate) fn defer_session_end_if_needed(&mut self, message: &ServerMessage) -> Option<Uuid> {
+        let ServerMessage::SessionEnded { session_id, reason } = message else {
+            return None;
+        };
+
+        let waiting_for_llm_final = self.active_intent == Some(SessionIntent::LlmQuery)
+            && self.active_session_id() == Some(*session_id);
+        let llm_generation_running = self.llm.in_flight_session == Some(*session_id);
+
+        if waiting_for_llm_final || llm_generation_running {
+            self.llm
+                .deferred_session_end
+                .insert(*session_id, reason.clone());
+            Some(*session_id)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn start_llm_answer(&mut self, session_id: Uuid) -> u64 {
+        self.llm.busy = true;
+        self.llm.in_flight_session = Some(session_id);
+        let seq = self.llm.next_seq(session_id);
+        self.state.reset();
+        self.active_intent = None;
+        seq
+    }
+
+    pub(crate) fn record_llm_delta(
+        &mut self,
+        session_id: Uuid,
+        delta: String,
+    ) -> Option<LlmDeltaOverlay> {
+        if self.llm.in_flight_session != Some(session_id) {
+            debug!(
+                session = %session_id,
+                in_flight_session = ?self.llm.in_flight_session,
+                "ignoring stale llm delta for non-active session"
+            );
+            return None;
+        }
+
+        let text = {
+            let entry = self.llm.overlay_text.entry(session_id).or_default();
+            entry.push_str(&delta);
+            entry.clone()
+        };
+        let seq = self.llm.next_seq(session_id);
+        Some(LlmDeltaOverlay { seq, text })
+    }
+
+    pub(crate) fn finish_llm_answer(&mut self, session_id: Uuid) -> Option<LlmCompletionContext> {
+        if self.llm.in_flight_session != Some(session_id) {
+            warn!(
+                session = %session_id,
+                in_flight_session = ?self.llm.in_flight_session,
+                "ignoring stale llm completion for non-active session"
+            );
+            self.llm.clear_session(session_id);
+            return None;
+        }
+
+        self.llm.busy = false;
+        self.llm.in_flight_session = None;
+        self.llm.seq.remove(&session_id);
+        self.llm.overlay_text.remove(&session_id);
+        let session_end_reason = self.llm.deferred_session_end.remove(&session_id).flatten();
+        let session_end_was_deferred = session_end_reason.is_some();
+        Some(LlmCompletionContext {
+            session_end_reason,
+            session_end_was_deferred,
+            state_label: self.state_label(),
+            hotkey_up_elapsed_ms_at_enqueue: elapsed_ms_since(self.last_hotkey_up_at),
+            stop_message_elapsed_ms_at_enqueue: self.stop_message_elapsed_ms_at_enqueue(session_id),
+            parent_focus: self.take_parent_focus_for_enqueue(session_id),
+        })
+    }
+
+    pub(crate) fn final_result_belongs_to_active_session(&self, session_id: Uuid) -> bool {
+        self.active_session_id() == Some(session_id)
+    }
+
+    pub(crate) fn log_rejected_final_result(&self, session_id: Uuid, origin: InjectionOrigin) {
+        warn!(
+            session = %session_id,
+            active_session = ?self.active_session_id(),
+            origin = origin.as_str(),
+            state_at_receive = self.state_label(),
+            "ignoring final result for non-active session"
+        );
+    }
+
+    fn take_parent_focus_for_enqueue(&mut self, session_id: Uuid) -> Option<ParentFocusCapture> {
+        self.parent_focus_by_session
+            .remove(&session_id)
+            .map(|captured| {
+                let mut focus = captured.focus;
+                focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
+                focus
+            })
+    }
+
+    fn remove_parent_focus(&mut self, session_id: Uuid) {
+        self.parent_focus_by_session.remove(&session_id);
+    }
+
+    fn stop_message_elapsed_ms_at_enqueue(&self, session_id: Uuid) -> Option<u64> {
+        self.last_stop_message
+            .and_then(|(stopped_session_id, instant)| {
+                (stopped_session_id == session_id).then(|| instant.elapsed().as_millis() as u64)
+            })
+    }
+}
+
+impl Default for ClientSessionRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmSessionRuntime {
+    fn next_seq(&mut self, session_id: Uuid) -> u64 {
+        let seq = self.seq.entry(session_id).or_insert(0);
+        *seq = seq.saturating_add(1);
+        *seq
+    }
+
+    fn clear_session(&mut self, session_id: Uuid) {
+        self.seq.remove(&session_id);
+        self.overlay_text.remove(&session_id);
+        self.deferred_session_end.remove(&session_id);
+    }
+
+    fn clear(&mut self) {
+        self.busy = false;
+        self.in_flight_session = None;
+        self.seq.clear();
+        self.overlay_text.clear();
+        self.deferred_session_end.clear();
+    }
+}
+
+pub(crate) async fn handle_server_message<S: OverlaySink>(
+    message: ServerMessage,
+    runtime: &mut ClientSessionRuntime,
+    overlay_router: &mut OverlayRouter<S>,
+    injector_worker: &InjectorWorkerHandle,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -46,22 +303,20 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             audio_ms,
             ..
         } => {
-            if !final_result_belongs_to_active_session(state, session_id) {
-                log_rejected_final_result(session_id, state, InjectionOrigin::RawFinalResult);
+            if !runtime.final_result_belongs_to_active_session(session_id) {
+                runtime.log_rejected_final_result(session_id, InjectionOrigin::RawFinalResult);
                 return Ok(());
             }
 
-            let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(last_hotkey_up_at);
+            let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(runtime.last_hotkey_up_at);
             let stop_message_elapsed_ms_at_enqueue =
-                last_stop_message.and_then(|(stopped_session_id, instant)| {
-                    (stopped_session_id == session_id).then(|| instant.elapsed().as_millis() as u64)
-                });
+                runtime.stop_message_elapsed_ms_at_enqueue(session_id);
             info!(
                 session = %session_id,
                 origin = InjectionOrigin::RawFinalResult.as_str(),
                 daemon_latency_ms = latency_ms,
                 audio_ms,
-                state_at_enqueue = state_label(state),
+                state_at_enqueue = runtime.state_label(),
                 hotkey_up_elapsed_ms_at_enqueue,
                 stop_message_elapsed_ms_at_enqueue,
                 "final result received"
@@ -74,10 +329,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                             hotkey_up_elapsed_ms_at_enqueue,
                             stop_message_elapsed_ms_at_enqueue,
                         )
-                        .with_parent_focus(take_parent_focus_for_enqueue(
-                            parent_focus_by_session,
-                            session_id,
-                        )),
+                        .with_parent_focus(runtime.take_parent_focus_for_enqueue(session_id)),
                 )
                 .await
             {
@@ -99,7 +351,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                     );
                 }
             }
-            state.reset();
+            runtime.reset();
         }
         ServerMessage::Error {
             session_id,
@@ -115,9 +367,9 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                 message
             );
             if let Some(session_id) = session_id {
-                parent_focus_by_session.remove(&session_id);
+                runtime.remove_parent_focus(session_id);
             }
-            state.reset();
+            runtime.reset();
         }
         ServerMessage::InterimState {
             session_id,
@@ -125,7 +377,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             state: interim_state,
         } => {
             overlay_router.route_daemon_interim_state(
-                session_id_from_state(state),
+                runtime.active_session_id(),
                 session_id,
                 seq,
                 interim_state,
@@ -137,7 +389,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             text,
         } => {
             overlay_router.route_daemon_interim_text(
-                session_id_from_state(state),
+                runtime.active_session_id(),
                 session_id,
                 seq,
                 text,
@@ -147,11 +399,11 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             session_id,
             level_db,
         } => {
-            overlay_router.route_audio_level(session_id_from_state(state), session_id, level_db);
+            overlay_router.route_audio_level(runtime.active_session_id(), session_id, level_db);
         }
         ServerMessage::SessionEnded { session_id, reason } => {
-            parent_focus_by_session.remove(&session_id);
-            overlay_router.route_session_ended(session_id_from_state(state), session_id, reason);
+            runtime.remove_parent_focus(session_id);
+            overlay_router.route_session_ended(runtime.active_session_id(), session_id, reason);
         }
         ServerMessage::SessionWarning {
             session_id,
@@ -172,17 +424,6 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
     Ok(())
 }
 
-pub(crate) fn take_parent_focus_for_enqueue(
-    parent_focus_by_session: &mut HashMap<Uuid, CapturedParentFocus>,
-    session_id: Uuid,
-) -> Option<ParentFocusCapture> {
-    parent_focus_by_session.remove(&session_id).map(|captured| {
-        let mut focus = captured.focus;
-        focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
-        focus
-    })
-}
-
 pub(crate) fn session_id_from_state(state: &PttState) -> Option<Uuid> {
     match *state {
         PttState::Idle => None,
@@ -190,24 +431,6 @@ pub(crate) fn session_id_from_state(state: &PttState) -> Option<Uuid> {
             Some(session_id)
         }
     }
-}
-
-pub(crate) fn final_result_belongs_to_active_session(state: &PttState, session_id: Uuid) -> bool {
-    session_id_from_state(state) == Some(session_id)
-}
-
-pub(crate) fn log_rejected_final_result(
-    session_id: Uuid,
-    state: &PttState,
-    origin: InjectionOrigin,
-) {
-    warn!(
-        session = %session_id,
-        active_session = ?session_id_from_state(state),
-        origin = origin.as_str(),
-        state_at_receive = state_label(state),
-        "ignoring final result for non-active session"
-    );
 }
 
 pub(crate) fn state_label(state: &PttState) -> &'static str {
@@ -237,12 +460,13 @@ pub(crate) fn classify_error_code(code: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use crate::config::OverlayMode;
+    use crate::injector::ParentFocusCapture;
     use crate::injector_runtime::{
         spawn_injector_worker_with_capacity, InjectionJob, InjectionJobRunner, InjectionRunError,
         InjectionRunOutput, InjectorWorkerHandle,
@@ -255,13 +479,12 @@ mod tests {
         RuntimeOverlaySink,
     };
     use crate::protocol::ServerMessage;
-    use crate::state::PttState;
     use anyhow::anyhow;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Instant as TokioInstant};
     use uuid::Uuid;
 
-    use super::handle_server_message;
+    use super::{handle_server_message, ClientSessionRuntime, LlmDeltaOverlay, SessionIntent};
 
     struct SlowRunner {
         calls: Arc<AtomicU64>,
@@ -311,21 +534,124 @@ mod tests {
 
     async fn handle_server_message_for_tests<S: OverlaySink>(
         message: ServerMessage,
-        state: &mut PttState,
+        runtime: &mut ClientSessionRuntime,
         overlay_router: &mut OverlayRouter<S>,
         injector_worker: &InjectorWorkerHandle,
     ) -> anyhow::Result<()> {
-        let mut parent_focus_by_session = HashMap::new();
-        handle_server_message(
-            message,
-            state,
-            overlay_router,
-            injector_worker,
-            &mut parent_focus_by_session,
-            None,
-            None,
-        )
-        .await
+        handle_server_message(message, runtime, overlay_router, injector_worker).await
+    }
+
+    fn runtime_waiting_for_result() -> (ClientSessionRuntime, Uuid) {
+        runtime_waiting_for_result_with_timing(TokioInstant::now())
+    }
+
+    fn runtime_waiting_for_result_with_timing(
+        stopped_at: TokioInstant,
+    ) -> (ClientSessionRuntime, Uuid) {
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = runtime
+            .begin_listening(SessionIntent::Dictate)
+            .expect("state should begin listening");
+        runtime
+            .stop_listening()
+            .expect("state should stop listening");
+        runtime.record_stop_message_sent(session_id, None, stopped_at);
+        (runtime, session_id)
+    }
+
+    fn test_parent_focus() -> ParentFocusCapture {
+        ParentFocusCapture {
+            snapshot: None,
+            source_selected: "test".to_string(),
+            wayland_cache_age_ms: None,
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn client_session_runtime_resets_reconnect_caches() {
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = runtime
+            .begin_listening(SessionIntent::LlmQuery)
+            .expect("llm session should start");
+        runtime.stop_listening().expect("llm session should stop");
+        runtime.record_stop_message_sent(
+            session_id,
+            Some(test_parent_focus()),
+            TokioInstant::now(),
+        );
+        assert_eq!(
+            runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
+                session_id,
+                reason: Some("connection_drop".to_string()),
+            }),
+            Some(session_id)
+        );
+        assert_eq!(runtime.start_llm_answer(session_id), 1);
+        assert_eq!(
+            runtime.record_llm_delta(session_id, "partial".to_string()),
+            Some(LlmDeltaOverlay {
+                seq: 2,
+                text: "partial".to_string(),
+            })
+        );
+        assert!(runtime.is_llm_busy());
+        assert_eq!(runtime.note_llm_busy_overlay_rejection(), (Uuid::nil(), 1));
+
+        runtime.reset_for_connection_drop();
+
+        assert_eq!(runtime.state_label(), "idle");
+        assert_eq!(runtime.active_session_id(), None);
+        assert_eq!(runtime.active_intent(), None);
+        assert!(!runtime.is_llm_busy());
+        assert_eq!(
+            runtime.record_llm_delta(session_id, "late".to_string()),
+            None
+        );
+        assert!(runtime.finish_llm_answer(session_id).is_none());
+    }
+
+    #[test]
+    fn client_session_runtime_defers_session_end_until_llm_finish() {
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = runtime
+            .begin_listening(SessionIntent::LlmQuery)
+            .expect("llm session should start");
+        runtime.stop_listening().expect("llm session should stop");
+        runtime.record_stop_message_sent(
+            session_id,
+            Some(test_parent_focus()),
+            TokioInstant::now(),
+        );
+        assert_eq!(
+            runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
+                session_id,
+                reason: Some("normal".to_string()),
+            }),
+            Some(session_id)
+        );
+        assert_eq!(runtime.start_llm_answer(session_id), 1);
+        assert_eq!(
+            runtime.record_llm_delta(session_id, "answer".to_string()),
+            Some(LlmDeltaOverlay {
+                seq: 2,
+                text: "answer".to_string(),
+            })
+        );
+
+        let completion = runtime
+            .finish_llm_answer(session_id)
+            .expect("active llm completion should produce injection context");
+
+        assert_eq!(completion.session_end_reason.as_deref(), Some("normal"));
+        assert!(completion.session_end_was_deferred);
+        assert_eq!(completion.state_label, "idle");
+        assert!(completion.hotkey_up_elapsed_ms_at_enqueue.is_some());
+        assert!(completion.stop_message_elapsed_ms_at_enqueue.is_some());
+        assert!(completion.parent_focus.is_some());
+        assert!(!runtime.is_llm_busy());
+        assert!(runtime.finish_llm_answer(session_id).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -335,11 +661,7 @@ mod tests {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
 
         handle_server_message_for_tests(
@@ -351,7 +673,7 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.92),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -379,15 +701,9 @@ mod tests {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
-        let mut parent_focus_by_session = HashMap::new();
-        let hotkey_up_at = TokioInstant::now() - Duration::from_millis(50);
         let stop_message_at = TokioInstant::now() - Duration::from_millis(40);
+        let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
 
         handle_server_message(
             ServerMessage::FinalResult {
@@ -398,12 +714,9 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.92),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
-            &mut parent_focus_by_session,
-            Some(hotkey_up_at),
-            Some((session_id, stop_message_at)),
         )
         .await
         .expect("final result should enqueue");
@@ -447,11 +760,7 @@ mod tests {
             seen: Arc::clone(&seen_injection),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let mut state = PttState::new();
-        let active_session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, active_session_id) = runtime_waiting_for_result();
         let stale_session_id = Uuid::new_v4();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
 
@@ -464,16 +773,15 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.92),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
         .await
         .expect("stale final result should be ignored without failing dispatch");
 
-        assert!(
-            matches!(state, PttState::WaitingResult { session_id } if session_id == active_session_id)
-        );
+        assert_eq!(runtime.state_label(), "waiting_result");
+        assert_eq!(runtime.active_session_id(), Some(active_session_id));
         assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
         assert!(seen_injection
             .lock()
@@ -493,9 +801,7 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(slow_injector, 8);
 
-        let mut state = PttState::new();
-        let session_id = state.begin_listening().expect("state should start");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
         let message = ServerMessage::FinalResult {
             session_id,
@@ -507,7 +813,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        handle_server_message_for_tests(message, &mut state, &mut overlay_router, &worker)
+        handle_server_message_for_tests(message, &mut runtime, &mut overlay_router, &worker)
             .await
             .expect("server message should enqueue successfully");
         let elapsed = started.elapsed();
@@ -516,7 +822,7 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "handle_server_message should not wait for blocking injection, elapsed={elapsed:?}"
         );
-        assert!(matches!(state, PttState::Idle));
+        assert_eq!(runtime.state_label(), "idle");
 
         let report = timeout(Duration::from_secs(2), reports.recv())
             .await
@@ -541,18 +847,14 @@ mod tests {
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
                 state: "listening".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -564,7 +866,7 @@ mod tests {
                 seq: 2,
                 text: "hello".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -575,14 +877,15 @@ mod tests {
                 session_id,
                 reason: Some("normal".to_string()),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
         .await
         .expect("session ended should route to overlay");
 
-        assert!(matches!(state, PttState::WaitingResult { session_id: id } if id == session_id));
+        assert_eq!(runtime.state_label(), "waiting_result");
+        assert_eq!(runtime.active_session_id(), Some(session_id));
         assert_eq!(worker.metrics().queued_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             injector_seen
@@ -634,18 +937,14 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         handle_server_message_for_tests(
             ServerMessage::InterimState {
                 session_id,
                 seq: 1,
                 state: "processing".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -660,7 +959,7 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.9),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -672,7 +971,7 @@ mod tests {
                 seq: 2,
                 text: "post-final overlay".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -733,18 +1032,14 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
                 text: "overlay event while disconnected".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -766,7 +1061,7 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.95),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -836,11 +1131,7 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         for seq in 1..=4 {
             handle_server_message_for_tests(
                 ServerMessage::InterimText {
@@ -848,7 +1139,7 @@ mod tests {
                     seq,
                     text: format!("overlay seq {seq}"),
                 },
-                &mut state,
+                &mut runtime,
                 &mut overlay_router,
                 &worker,
             )
@@ -865,7 +1156,7 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.99),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -941,18 +1232,14 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 2);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
-        state.stop_listening();
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 1,
                 text: "old-state".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -980,7 +1267,7 @@ mod tests {
                 seq: 2,
                 text: "current-state".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -1013,7 +1300,7 @@ mod tests {
                 lang: Some("en".to_string()),
                 confidence: Some(0.98),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -1060,19 +1347,15 @@ mod tests {
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 2);
 
-        let mut state = PttState::new();
-        let session_id = state
-            .begin_listening()
-            .expect("state should begin listening");
+        let (mut runtime, session_id) = runtime_waiting_for_result();
         let stale_session_id = Uuid::new_v4();
-        state.stop_listening();
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id: stale_session_id,
                 seq: 1,
                 text: "stale session".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -1084,7 +1367,7 @@ mod tests {
                 seq: 10,
                 text: "newest".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
@@ -1096,20 +1379,20 @@ mod tests {
                 seq: 9,
                 text: "stale".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
         .await
         .expect("stale interim text should be dropped without failure");
-        state.reset();
+        runtime.reset();
         handle_server_message_for_tests(
             ServerMessage::InterimText {
                 session_id,
                 seq: 11,
                 text: "late daemon after reset".to_string(),
             },
-            &mut state,
+            &mut runtime,
             &mut overlay_router,
             &worker,
         )
