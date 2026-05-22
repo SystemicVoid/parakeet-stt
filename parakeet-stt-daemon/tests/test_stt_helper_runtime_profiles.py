@@ -182,6 +182,50 @@ def _run_helper_help(topic: str) -> str:
     return completed.stdout
 
 
+def _run_helper_variable_scope_probe() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        (
+            f"source {shlex.quote(str(HELPER_PATH))} && "
+            "row=outer-row && "
+            "command_aliases=outer-command-aliases && "
+            "start_cli_arg=outer-start-cli-arg && "
+            "export command_aliases && "
+            "stt help >/dev/null && "
+            "printf 'row=%s\\n' \"$row\" && "
+            "printf 'command_aliases=%s\\n' \"$command_aliases\" && "
+            "printf 'start_cli_arg=%s\\n' \"$start_cli_arg\" && "
+            "if export -p | "
+            "grep -F 'declare -x command_aliases=\"outer-command-aliases\"' >/dev/null; "
+            "then printf 'command_aliases_exported=true\\n'; "
+            "else printf 'command_aliases_exported=false\\n'; fi"
+        ),
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
 def _expected_profile_help_label(profile: dict[str, str]) -> str:
     aliases = [profile["start_cli_arg"]]
     aliases.extend(
@@ -435,6 +479,17 @@ def test_start_profile_metadata_drives_mode_aliases_and_generated_args() -> None
 
         args = _run_get_stt_start_args(profile["start_cli_arg"])
         assert args[0] == profile["start_cli_arg"]
+
+
+def test_start_profile_alias_scan_does_not_leak_shell_variables() -> None:
+    values = _run_helper_variable_scope_probe()
+
+    assert values == {
+        "row": "outer-row",
+        "command_aliases": "outer-command-aliases",
+        "start_cli_arg": "outer-start-cli-arg",
+        "command_aliases_exported": "true",
+    }
 
 
 def test_start_help_modes_are_generated_from_profile_metadata() -> None:
