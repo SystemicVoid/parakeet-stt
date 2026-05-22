@@ -10,7 +10,7 @@ import sounddevice as sd
 import uvicorn
 from loguru import logger
 
-from .config import ServerSettings
+from .config import DAEMON_STATUS_PATH, ServerSettings
 from .runtime_truth_snapshot import format_log_record
 from .server import DaemonServer, create_app
 
@@ -50,7 +50,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         dest="status_enabled",
         action="store_false",
         default=None,
-        help="Disable the /status endpoint",
+        help=f"Disable the {DAEMON_STATUS_PATH} endpoint",
     )
     parser.add_argument(
         "--no-streaming",

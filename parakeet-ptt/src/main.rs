@@ -13,6 +13,7 @@ mod overlay_process;
 mod overlay_router;
 mod protocol;
 mod routing;
+mod runtime_interface;
 mod state;
 mod surface_focus;
 

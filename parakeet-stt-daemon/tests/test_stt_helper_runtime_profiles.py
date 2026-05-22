@@ -15,12 +15,17 @@ import pytest
 from parakeet_stt_daemon.config import (
     DEFAULT_DAEMON_HOST,
     DEFAULT_DAEMON_PORT,
+    daemon_health_url,
     daemon_status_url,
     daemon_websocket_endpoint,
 )
 from parakeet_stt_daemon.messages import (
     STATUS_RUNTIME_TRUTH_FIELD_GROUPS,
     STATUS_RUNTIME_TRUTH_FIELDS,
+)
+from parakeet_stt_daemon.runtime_interface import (
+    managed_llm_api_base_url,
+    managed_llm_health_url,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -572,10 +577,10 @@ def test_helper_endpoint_defaults_match_daemon_settings() -> None:
     assert config["daemon_port"] == str(DEFAULT_DAEMON_PORT)
     assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint()
     assert config["daemon_status_url"] == daemon_status_url()
-    assert config["daemon_health_url"] == "http://127.0.0.1:8765/healthz"
-    assert config["llm_base_url"] == "http://127.0.0.1:8080/v1"
-    assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
-    assert config["llm_health_url"] == "http://127.0.0.1:8080/health"
+    assert config["daemon_health_url"] == daemon_health_url()
+    assert config["llm_base_url"] == managed_llm_api_base_url()
+    assert config["managed_llm_api_base_url"] == managed_llm_api_base_url()
+    assert config["llm_health_url"] == managed_llm_health_url()
 
 
 def test_helper_endpoint_env_overrides_resolve_consistently() -> None:
@@ -592,10 +597,10 @@ def test_helper_endpoint_env_overrides_resolve_consistently() -> None:
     assert config["daemon_port"] == "9001"
     assert config["daemon_websocket_endpoint"] == daemon_websocket_endpoint("0.0.0.0", 9001)
     assert config["daemon_status_url"] == daemon_status_url("0.0.0.0", 9001)
-    assert config["daemon_health_url"] == "http://0.0.0.0:9001/healthz"
-    assert config["llm_base_url"] == "http://llm.local:8181/v1"
-    assert config["managed_llm_api_base_url"] == "http://llm.local:8181/v1"
-    assert config["llm_health_url"] == "http://llm.local:8181/health"
+    assert config["daemon_health_url"] == daemon_health_url("0.0.0.0", 9001)
+    assert config["llm_base_url"] == managed_llm_api_base_url("llm.local", 8181)
+    assert config["managed_llm_api_base_url"] == managed_llm_api_base_url("llm.local", 8181)
+    assert config["llm_health_url"] == managed_llm_health_url("llm.local", 8181)
 
 
 def test_helper_start_cli_llm_base_url_overrides_env() -> None:

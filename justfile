@@ -9,7 +9,6 @@ offline_baseline := personal_dir + "/baseline.json"
 stream_baseline := personal_dir + "/baseline-stream-seal.json"
 stream_runtime_flags := "--bench-runtime stream-seal --stream-chunk-secs 2.4 --stream-right-context-secs 1.6 --stream-left-context-secs 10.0 --stream-batch-size 32 --stream-max-tail-trim-secs 0.35"
 unified_flags := "--bench-offline --bench-manifest bench_audio/personal --bench-append-legacy --bench-tier all"
-status_url := "http://127.0.0.1:8765/status"
 
 # Show available commands.
 default:
@@ -34,7 +33,7 @@ stop:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt stop'
 
 status:
-    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt status && echo && echo ">>> daemon status overlay fields" && if payload="$(curl -fsS "{{status_url}}" 2>/dev/null)"; then printf "%s" "$payload" | python3 -m json.tool | rg "streaming_enabled|overlay_events_enabled|overlay_events_emitted|overlay_events_dropped" || true; else echo "(daemon status unavailable)"; fi && echo && echo ">>> overlay processes" && pattern="(^|/)parakeet-overlay($| )" && matches="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$matches" ]]; then printf "%s\n" "$matches"; else echo "(none)"; fi'
+    @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt status && status_url="$(stt __start-runtime-config | awk -F= '"'"'$1 == "daemon_status_url" { print $2; exit }'"'"')" && echo && echo ">>> daemon status overlay fields" && if payload="$(curl -fsS "$status_url" 2>/dev/null)"; then printf "%s" "$payload" | python3 -m json.tool | rg "streaming_enabled|overlay_events_enabled|overlay_events_emitted|overlay_events_dropped" || true; else echo "(daemon status unavailable)"; fi && echo && echo ">>> overlay processes" && pattern="(^|/)parakeet-overlay($| )" && matches="$(pgrep -af "$pattern" 2>/dev/null || true)" && if [[ -n "$matches" ]]; then printf "%s\n" "$matches"; else echo "(none)"; fi'
 
 logs:
     @bash -lc 'cd "{{repo_root}}" && export PARAKEET_ROOT="{{repo_root}}" && source scripts/stt-helper.sh && stt logs both'

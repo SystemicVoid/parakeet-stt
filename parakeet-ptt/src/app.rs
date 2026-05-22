@@ -739,8 +739,8 @@ mod tests {
     use crate::client_runtime_fixtures::{ClientRuntimeHarness, RecordingInjectionRunner};
     use crate::client_session::SessionIntent;
     use crate::config::{
-        ClientConfig, ClipboardOptions, InjectionConfig, InjectionMode, PasteBackendFailurePolicy,
-        PasteKeyBackend, PasteShortcut,
+        default_daemon_websocket_endpoint, ClientConfig, ClipboardOptions, InjectionConfig,
+        InjectionMode, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
     use crate::hotkey::HotkeyIntent;
     use crate::injector::{
@@ -1066,7 +1066,7 @@ mod tests {
 
     fn test_client_config() -> ClientConfig {
         ClientConfig::new(
-            "ws://127.0.0.1:8765/ws",
+            &default_daemon_websocket_endpoint(),
             None,
             "KEY_RIGHTCTRL".to_string(),
             InjectionConfig {
