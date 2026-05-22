@@ -182,6 +182,26 @@ def _run_helper_help(topic: str) -> str:
     return completed.stdout
 
 
+def _expected_profile_help_label(profile: dict[str, str]) -> str:
+    aliases = [profile["start_cli_arg"]]
+    aliases.extend(
+        alias for alias in profile["mode_aliases"].split(",") if alias != profile["start_cli_arg"]
+    )
+    label = ",".join(aliases)
+    if profile["profile_id"] == "stream-seal":
+        return f"(default) {label}"
+    return label
+
+
+def _assert_profile_help_lines(help_text: str, profiles: list[dict[str, str]]) -> None:
+    help_lines = [line.strip() for line in help_text.splitlines()]
+    for profile in profiles:
+        matches = [line for line in help_lines if line.endswith(profile["help_description"])]
+        assert len(matches) == 1
+        rendered_label = matches[0][: -len(profile["help_description"])].rstrip()
+        assert rendered_label == _expected_profile_help_label(profile)
+
+
 def _run_get_stt_start_args_with_malformed_export() -> subprocess.CompletedProcess[str]:
     env = {
         key: value
@@ -420,10 +440,7 @@ def test_start_profile_metadata_drives_mode_aliases_and_generated_args() -> None
 def test_start_help_modes_are_generated_from_profile_metadata() -> None:
     help_text = _run_helper_help("start")
 
-    for profile in _run_start_profile_rows():
-        for alias in profile["mode_aliases"].split(","):
-            assert alias in help_text
-        assert profile["help_description"] in help_text
+    _assert_profile_help_lines(help_text, _run_start_profile_rows())
 
 
 def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
@@ -434,10 +451,7 @@ def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
     assert f"stt llm [{profile_choices}]" in help_text
     assert f"stt llm start [{profile_choices}]" in help_text
     assert f"stt llm restart [{profile_choices}]" in help_text
-    for profile in profiles:
-        for alias in profile["mode_aliases"].split(","):
-            assert alias in help_text
-        assert profile["help_description"] in help_text
+    _assert_profile_help_lines(help_text, profiles)
 
 
 def test_profile_overlay_env_overrides_metadata_defaults() -> None:
