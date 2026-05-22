@@ -179,7 +179,8 @@ stt() {
     local default_llm_temperature="${PARAKEET_LLM_TEMPERATURE:-0.7}"
     local default_llm_system_prompt="${PARAKEET_LLM_SYSTEM_PROMPT:-You are a concise assistant. Return only the final answer text for direct insertion.}"
     local default_llm_overlay_stream="${PARAKEET_LLM_OVERLAY_STREAM:-true}"
-    local default_daemon_device="${PARAKEET_DEVICE:-cuda}"
+    local default_daemon_device_doc_default="cuda"
+    local default_daemon_device="${PARAKEET_DEVICE:-$default_daemon_device_doc_default}"
     local default_daemon_streaming_enabled="false"
     local default_daemon_chunk_secs="2.4"
     local default_daemon_right_context_secs="1.6"
@@ -207,7 +208,7 @@ stt() {
         "llm-timeout-seconds|llm_timeout_seconds|default_llm_timeout_seconds|PARAKEET_LLM_TIMEOUT_SECONDS|Stable controls|<n>|20|always|20"
         "llm-max-tokens|llm_max_tokens|default_llm_max_tokens|PARAKEET_LLM_MAX_TOKENS|Stable controls|<n>|512|always|512"
         "llm-temperature|llm_temperature|default_llm_temperature|PARAKEET_LLM_TEMPERATURE|Stable controls|<n>|0.7|always|0.7"
-        "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|"
+        "llm-system-prompt|llm_system_prompt|default_llm_system_prompt|PARAKEET_LLM_SYSTEM_PROMPT|Stable controls|<text>|<assistant prompt>|nonempty|<assistant prompt>"
         "llm-overlay-stream|llm_overlay_stream|default_llm_overlay_stream|PARAKEET_LLM_OVERLAY_STREAM|Stable controls|<v>|true|always|true"
     )
     local start_profile_default="stream-seal"
@@ -339,6 +340,126 @@ stt() {
         local row
         for row in "${start_profile_rows[@]}"; do
             printf "%s\n" "$row"
+        done
+    }
+
+    _markdown_cell_text() {
+        local value="$1"
+        value="${value//$'\n'/ }"
+        value="${value//|/\\|}"
+        printf "%s" "$value"
+    }
+
+    _markdown_code() {
+        printf "%s%s%s" "\`" "$(_markdown_cell_text "$1")" "\`"
+    }
+
+    _markdown_csv_code_list() {
+        local csv="$1"
+        local sep=""
+        local -a values
+        local value
+        IFS=',' read -r -a values <<<"$csv"
+        for value in "${values[@]}"; do
+            [ -n "$value" ] || continue
+            printf "%s" "$sep"
+            _markdown_code "$value"
+            sep=", "
+        done
+    }
+
+    _start_profile_direct_commands_markdown() {
+        local profile_id="$1"
+        local command_aliases="$2"
+        local sep=""
+        local -a aliases
+        local alias
+        if [ "$profile_id" = "$start_profile_default" ]; then
+            _markdown_code "stt"
+            printf ", "
+            _markdown_code "stt start"
+            sep=", "
+        fi
+        IFS=',' read -r -a aliases <<<"$command_aliases"
+        for alias in "${aliases[@]}"; do
+            [ -n "$alias" ] || continue
+            printf "%s" "$sep"
+            _markdown_code "stt $alias"
+            sep=", "
+        done
+    }
+
+    _start_profile_markdown_label() {
+        local profile_id="$1"
+        local start_cli_arg="$2"
+        _markdown_code "$start_cli_arg"
+        if [ "$profile_id" = "$start_profile_default" ]; then
+            printf " (default)"
+        fi
+    }
+
+    _print_start_operator_docs() {
+        local row profile_id mode_aliases command_aliases start_cli_arg daemon_streaming_enabled
+        local daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_description
+        local daemon_device option_display opt_name default_var_name env_name option_group metavar empty_display
+        local include_policy doc_default default_value
+        local default_profile_row default_profile_overlay_enabled default_profile_overlay_adaptive_width
+        default_profile_row="$(_start_profile_row_for_id "$start_profile_default")" || return 1
+        IFS='|' read -r _ _ _ _ _ _ default_profile_overlay_enabled default_profile_overlay_adaptive_width _ <<<"$default_profile_row"
+
+        cat <<'EOF'
+Helper profile defaults (generated from `start_profile_rows`):
+
+| Profile | Start tokens | Direct commands | Streaming | Device | Overlay | Overlay width | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+EOF
+        for row in "${start_profile_rows[@]}"; do
+            IFS='|' read -r profile_id mode_aliases command_aliases start_cli_arg daemon_streaming_enabled daemon_device_override overlay_enabled_default overlay_adaptive_width_default help_description <<<"$row"
+            daemon_device="${daemon_device_override:-$default_daemon_device_doc_default}"
+            printf "| %s | %s | %s | " \
+                "$(_start_profile_markdown_label "$profile_id" "$start_cli_arg")" \
+                "$(_markdown_csv_code_list "$mode_aliases")" \
+                "$(_start_profile_direct_commands_markdown "$profile_id" "$command_aliases")"
+            printf "%s | %s | %s | %s | %s |\n" \
+                "$(_markdown_code "$daemon_streaming_enabled")" \
+                "$(_markdown_code "$daemon_device")" \
+                "$(_markdown_code "$overlay_enabled_default")" \
+                "$(_markdown_code "$overlay_adaptive_width_default")" \
+                "$(_markdown_cell_text "$help_description")"
+        done
+
+        cat <<'EOF'
+
+`stt start` default-profile options (generated from `start_option_rows`):
+
+| Option | Default for `stt start` | Env |
+| --- | --- | --- |
+EOF
+        for row in "${start_option_rows[@]}"; do
+            IFS='|' read -r opt_name _ default_var_name env_name option_group metavar empty_display include_policy doc_default <<<"$row"
+            : "$default_var_name" "$option_group" "$include_policy"
+            case "$opt_name" in
+                overlay-enabled)
+                    default_value="$default_profile_overlay_enabled"
+                    ;;
+                overlay-adaptive-width)
+                    default_value="$default_profile_overlay_adaptive_width"
+                    ;;
+                llm-base-url)
+                    default_value="$(_endpoint_url "http" "$DEFAULT_LLM_SERVER_HOST" "$DEFAULT_LLM_SERVER_PORT" "$LLM_API_PATH")"
+                    ;;
+                *)
+                    default_value="$doc_default"
+                    if [ -z "$default_value" ] || [ "$default_value" = "derived" ]; then
+                        default_value="$empty_display"
+                    fi
+                    ;;
+            esac
+            option_display="--$opt_name $metavar"
+            printf "| %s | %s | %s |\n" \
+                "$(_markdown_code "$option_display")" \
+                "$(_markdown_code "$default_value")" \
+                "$(_markdown_code "$env_name")"
         done
     }
 
@@ -1591,6 +1712,9 @@ CLIENTCMD
             ;;
         __start-profile-rows)
             _print_start_profile_rows
+            ;;
+        __operator-docs-start)
+            _print_start_operator_docs
             ;;
         __start-args)
             local injection_mode paste_backend_failure_policy
