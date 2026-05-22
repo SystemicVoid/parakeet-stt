@@ -26,6 +26,17 @@ from parakeet_stt_daemon.messages import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
 FIXTURE_DIR = REPO_ROOT / "docs" / "protocol" / "fixtures"
+START_PROFILE_ROW_FIELDS = (
+    "profile_id",
+    "mode_aliases",
+    "command_aliases",
+    "start_cli_arg",
+    "daemon_streaming_enabled",
+    "daemon_device_override",
+    "overlay_enabled_default",
+    "overlay_adaptive_width_default",
+    "help_description",
+)
 
 
 @contextmanager
@@ -114,6 +125,125 @@ def _run_get_stt_start_args(
         capture_output=True,
     )
     return [item.decode() for item in completed.stdout.split(b"\0") if item]
+
+
+def _run_start_profile_rows() -> list[dict[str, str]]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt __start-profile-rows",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    rows: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        values = line.split("|")
+        assert len(values) == len(START_PROFILE_ROW_FIELDS)
+        rows.append(dict(zip(START_PROFILE_ROW_FIELDS, values, strict=True)))
+    return rows
+
+
+def _run_helper_help(topic: str) -> str:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt help {shlex.quote(topic)}",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    return completed.stdout
+
+
+def _run_helper_variable_scope_probe() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        (
+            f"source {shlex.quote(str(HELPER_PATH))} && "
+            "row=outer-row && "
+            "command_aliases=outer-command-aliases && "
+            "start_cli_arg=outer-start-cli-arg && "
+            "export command_aliases && "
+            "stt help >/dev/null && "
+            "printf 'row=%s\\n' \"$row\" && "
+            "printf 'command_aliases=%s\\n' \"$command_aliases\" && "
+            "printf 'start_cli_arg=%s\\n' \"$start_cli_arg\" && "
+            "if export -p | "
+            "grep -F 'declare -x command_aliases=\"outer-command-aliases\"' >/dev/null; "
+            "then printf 'command_aliases_exported=true\\n'; "
+            "else printf 'command_aliases_exported=false\\n'; fi"
+        ),
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def _expected_profile_help_label(profile: dict[str, str]) -> str:
+    aliases = [profile["start_cli_arg"]]
+    aliases.extend(
+        alias for alias in profile["mode_aliases"].split(",") if alias != profile["start_cli_arg"]
+    )
+    label = ",".join(aliases)
+    if profile["profile_id"] == "stream-seal":
+        return f"(default) {label}"
+    return label
+
+
+def _assert_profile_help_lines(help_text: str, profiles: list[dict[str, str]]) -> None:
+    help_lines = [line.strip() for line in help_text.splitlines()]
+    for profile in profiles:
+        matches = [line for line in help_lines if line.endswith(profile["help_description"])]
+        assert len(matches) == 1
+        rendered_label = matches[0][: -len(profile["help_description"])].rstrip()
+        assert rendered_label == _expected_profile_help_label(profile)
 
 
 def _run_get_stt_start_args_with_malformed_export() -> subprocess.CompletedProcess[str]:
@@ -322,6 +452,117 @@ def test_offline_profile_resolves_cuda_without_streaming() -> None:
     assert config["daemon_device"] == "cuda"
     assert config["daemon_streaming_enabled"] == "false"
     assert config["daemon_overlay_events_enabled"] == "false"
+
+
+def test_start_profile_metadata_drives_runtime_defaults() -> None:
+    profiles = _run_start_profile_rows()
+
+    assert [profile["profile_id"] for profile in profiles] == ["stream-seal", "offline", "cpu"]
+    for profile in profiles:
+        args = () if profile["profile_id"] == "stream-seal" else (profile["start_cli_arg"],)
+        config = _run_runtime_config(*args)
+        expected_device = profile["daemon_device_override"] or "cuda"
+
+        assert config["launch_profile"] == profile["profile_id"]
+        assert config["daemon_device"] == expected_device
+        assert config["daemon_streaming_enabled"] == profile["daemon_streaming_enabled"]
+        assert config["overlay_enabled"] == profile["overlay_enabled_default"]
+        assert config["overlay_adaptive_width"] == profile["overlay_adaptive_width_default"]
+        assert config["daemon_overlay_events_enabled"] == profile["overlay_enabled_default"]
+
+
+def test_start_profile_metadata_drives_mode_aliases_and_generated_args() -> None:
+    for profile in _run_start_profile_rows():
+        for alias in profile["mode_aliases"].split(","):
+            config = _run_runtime_config(alias)
+            assert config["launch_profile"] == profile["profile_id"]
+
+        args = _run_get_stt_start_args(profile["start_cli_arg"])
+        assert args[0] == profile["start_cli_arg"]
+
+
+def test_start_profile_alias_scan_does_not_leak_shell_variables() -> None:
+    values = _run_helper_variable_scope_probe()
+
+    assert values == {
+        "row": "outer-row",
+        "command_aliases": "outer-command-aliases",
+        "start_cli_arg": "outer-start-cli-arg",
+        "command_aliases_exported": "true",
+    }
+
+
+def test_start_help_modes_are_generated_from_profile_metadata() -> None:
+    help_text = _run_helper_help("start")
+
+    _assert_profile_help_lines(help_text, _run_start_profile_rows())
+
+
+def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
+    profiles = _run_start_profile_rows()
+    help_text = _run_helper_help("llm")
+    profile_choices = "|".join(profile["start_cli_arg"] for profile in profiles)
+
+    assert f"stt llm [{profile_choices}]" in help_text
+    assert f"stt llm start [{profile_choices}]" in help_text
+    assert f"stt llm restart [{profile_choices}]" in help_text
+    _assert_profile_help_lines(help_text, profiles)
+
+
+def test_llm_direct_profile_forwards_remaining_start_args_once(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command_name in ("curl", "llama-server", "tmux"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 0\n")
+    for command_name in ("lsof", "ss"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 1\n")
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_LLM_SERVER_EXTRA_ARGS": "--test-no-model",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+        }
+    )
+
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(llm_pid_file, llm_port_file):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"source {shlex.quote(str(HELPER_PATH))} && stt llm cpu --stt-test-sentinel",
+            ],
+            check=False,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    assert "Unknown option for 'stt start': --stt-test-sentinel" in completed.stdout
+    assert "Unknown option for 'stt start': cpu" not in completed.stdout
+
+
+def test_profile_overlay_env_overrides_metadata_defaults() -> None:
+    config = _run_runtime_config(
+        "offline",
+        extra_env={
+            "PARAKEET_OVERLAY_ENABLED": "true",
+            "PARAKEET_OVERLAY_ADAPTIVE_WIDTH": "true",
+        },
+    )
+
+    assert config["overlay_enabled"] == "true"
+    assert config["overlay_adaptive_width"] == "true"
+    assert config["daemon_overlay_events_enabled"] == "true"
 
 
 def test_helper_endpoint_defaults_match_daemon_settings() -> None:
