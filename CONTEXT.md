@@ -26,7 +26,7 @@ The activation model: hold Right Ctrl to capture, release to finalize. The only 
 _Avoid_: hotword, wake word, toggle, hands-free.
 
 **Profile**:
-A named bundle of helper defaults that maps to a startup flag set. Two profiles exist: `stt` (online, stream+seal, overlay on) and `stt off` (offline, no streaming, overlay off).
+A named bundle of helper defaults that maps to a startup flag set. Current profiles are `stt` / `stt start` (online, stream+seal, overlay on), `stt off` (offline on CUDA, no streaming, overlay off), and `stt cpu` (offline on CPU, no streaming, overlay off).
 _Avoid_: mode, preset, config.
 
 **Stream path / Seal path**:
