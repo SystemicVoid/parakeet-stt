@@ -57,6 +57,11 @@ from .runtime_truth_snapshot import (
 from .session import (
     InterimTranscriptRuntime,
     InterimTranscriptRuntimeFacts,
+    SealPathFinalizationFailure,
+    SealPathFinalizationResult,
+    SealPathRuntime,
+    SealPathRuntimeFacts,
+    SealPathRuntimeMetrics,
     Session,
     SessionBusyError,
     SessionManager,
@@ -146,16 +151,16 @@ class SessionOrchestrator:
         )
         self._session_guard_task: asyncio.Task | None = None
         self._session_guard_running = False
-        self._last_audio_ms: int | None = None
-        self._last_audio_stop_ms: int | None = None
-        self._last_finalize_ms: int | None = None
-        self._last_infer_ms: int | None = None
-        self._last_send_ms: int | None = None
         self._vad_enabled = bool(settings.vad_enabled)
         self.tail_trimmer = SealPathTailTrimmer(
             vad_enabled=self._vad_enabled,
             silence_floor_db=float(settings.silence_floor_db),
             warmup_sample_rate=sample_rate,
+        )
+        self.seal_path_runtime = SealPathRuntime(
+            sample_rate=sample_rate,
+            tail_trimmer=self.tail_trimmer,
+            release_device_cache=_release_cuda_cache,
         )
         if settings.streaming_enabled:
             chunk_samples = int(settings.chunk_secs * self.audio.sample_rate)
@@ -288,27 +293,7 @@ class SessionOrchestrator:
             self._active_stream = None
             audio_stop_ms = int((time.perf_counter() - audio_stop_started) * 1000)
             audio_samples = capture_result.audio_samples
-            audio_duration_raw = len(audio_samples) / self.audio.sample_rate
-            audio_ms = int(audio_duration_raw * 1000)
-
-            if audio_samples.size == 0:
-                await self._send_error(
-                    event_sink,
-                    session.session_id,
-                    "AUDIO_DEVICE",
-                    "No audio captured for session",
-                )
-                await self._emit_session_ended(
-                    event_sink, session.session_id, reason=SessionEndReason.ERROR
-                )
-                await self._record_last_and_clear_session_runtime(
-                    session.session_id,
-                    owner_token=owner_token,
-                )
-                return
-
-            finalize_ms: int | None = None
-            infer_ms: int | None = None
+            finalization: SealPathFinalizationResult | SealPathFinalizationFailure
             try:
                 interim_updates = await self._collect_interim_text_updates(
                     session.session_id,
@@ -331,13 +316,36 @@ class SessionOrchestrator:
                     session.session_id,
                     state=InterimStateValue.FINALIZING,
                 )
-                finalize_started = time.perf_counter()
-                text, infer_ms = await self._finalise_transcription(audio_samples)
-                finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
+                finalization = await self._seal_path_runtime_for_runtime().finalize(
+                    audio_samples,
+                    self._transcribe_samples_serialized,
+                    effective_device=str(getattr(self, "_effective_device", self.settings.device)),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to transcribe session {}: {}", session.session_id, exc)
                 await self._send_error(
                     event_sink, session.session_id, "MODEL", "Transcription failed"
+                )
+                await self._emit_session_ended(
+                    event_sink, session.session_id, reason=SessionEndReason.ERROR
+                )
+                await self._record_last_and_clear_session_runtime(
+                    session.session_id,
+                    owner_token=owner_token,
+                )
+                return
+            if isinstance(finalization, SealPathFinalizationFailure):
+                if finalization.exception is not None:
+                    logger.opt(exception=finalization.exception).error(
+                        "Failed to transcribe session {}: {}",
+                        session.session_id,
+                        finalization.exception,
+                    )
+                await self._send_error(
+                    event_sink,
+                    session.session_id,
+                    finalization.code,
+                    finalization.message,
                 )
                 await self._emit_session_ended(
                     event_sink, session.session_id, reason=SessionEndReason.ERROR
@@ -356,9 +364,9 @@ class SessionOrchestrator:
             await event_sink.emit(
                 FinalResultEvent(
                     session_id=session.session_id,
-                    text=text,
+                    text=finalization.text,
                     latency_ms=latency_ms,
-                    audio_ms=audio_ms,
+                    audio_ms=finalization.audio_ms,
                     lang=self.settings.language,
                     confidence=None,
                     tail_trim_mode=runtime_truth.tail_trim_mode,
@@ -374,26 +382,30 @@ class SessionOrchestrator:
                 session.session_id,
                 owner_token=owner_token,
             )
-            self._last_audio_ms = audio_ms
-            self._last_audio_stop_ms = audio_stop_ms
-            self._last_finalize_ms = finalize_ms
-            self._last_infer_ms = infer_ms
-            self._last_send_ms = send_ms
+            self._seal_path_runtime_for_runtime().record_success(
+                finalization,
+                audio_stop_ms=audio_stop_ms,
+                send_ms=send_ms,
+            )
 
             # Diagnostic logging for truncation investigation
-            text_len = len(text)
-            chars_per_sec = text_len / audio_duration_raw if audio_duration_raw > 0 else 0
+            text_len = len(finalization.text)
+            chars_per_sec = (
+                text_len / finalization.audio_duration_raw
+                if finalization.audio_duration_raw > 0
+                else 0
+            )
             logger.info(
                 "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
                 "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
                 "chars_per_sec={:.1f}, runtime_truth={}",
                 session.session_id,
-                audio_duration_raw,
-                audio_ms,
+                finalization.audio_duration_raw,
+                finalization.audio_ms,
                 audio_stop_ms,
                 latency_ms,
-                finalize_ms,
-                infer_ms,
+                finalization.finalize_ms,
+                finalization.infer_ms,
                 send_ms,
                 text_len,
                 chars_per_sec,
@@ -785,9 +797,10 @@ class SessionOrchestrator:
         interim_runtime.clear_session(session_id)
 
     def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
+        seal_path_runtime = self._seal_path_runtime_for_runtime()
         return runtime_truth_snapshot(
             self,
-            last_trim_outcome=self._tail_trimmer_for_runtime().last_outcome,
+            last_trim_outcome=seal_path_runtime.last_tail_trim_outcome,
             overlay_events_enabled=overlay_events_enabled,
         )
 
@@ -810,21 +823,28 @@ class SessionOrchestrator:
         overlay_events_emitted: int,
         overlay_events_dropped: int,
     ) -> RuntimeTruthMetrics:
+        seal_metrics = self._seal_path_runtime_for_runtime().metrics()
         return RuntimeTruthMetrics(
             gpu_mem_mb=self._gpu_mem_mb(),
             overlay_events_emitted=overlay_events_emitted,
             overlay_events_dropped=overlay_events_dropped,
-            audio_stop_ms=getattr(self, "_last_audio_stop_ms", None),
-            finalize_ms=getattr(self, "_last_finalize_ms", None),
-            infer_ms=getattr(self, "_last_infer_ms", None),
-            send_ms=getattr(self, "_last_send_ms", None),
-            last_audio_ms=getattr(self, "_last_audio_ms", None),
-            last_infer_ms=getattr(self, "_last_infer_ms", None),
-            last_send_ms=getattr(self, "_last_send_ms", None),
+            audio_stop_ms=seal_metrics.audio_stop_ms,
+            finalize_ms=seal_metrics.finalize_ms,
+            infer_ms=seal_metrics.infer_ms,
+            send_ms=seal_metrics.send_ms,
+            last_audio_ms=seal_metrics.last_audio_ms,
+            last_infer_ms=seal_metrics.last_infer_ms,
+            last_send_ms=seal_metrics.last_send_ms,
         )
 
     def prepare_vad(self) -> None:
-        self._tail_trimmer_for_runtime().prepare()
+        self._seal_path_runtime_for_runtime().prepare_tail_trimmer()
+
+    def seal_path_runtime_facts_for_runtime(self) -> SealPathRuntimeFacts:
+        return self._seal_path_runtime_for_runtime().facts()
+
+    def seal_path_runtime_metrics_for_runtime(self) -> SealPathRuntimeMetrics:
+        return self._seal_path_runtime_for_runtime().metrics()
 
     def _tail_trimmer_for_runtime(self) -> SealPathTailTrimmer:
         tail_trimmer = getattr(self, "tail_trimmer", None)
@@ -857,28 +877,6 @@ class SessionOrchestrator:
 
         reserved_bytes = torch.cuda.memory_reserved(device_index or 0)
         return int(reserved_bytes / (1024 * 1024))
-
-    async def _finalise_transcription(self, audio_samples: np.ndarray) -> tuple[str, int]:
-        # The full capture buffer is the only authoritative source for final decode.
-        loop = asyncio.get_running_loop()
-        tail_trimmer = self._tail_trimmer_for_runtime()
-        trim_outcome = await loop.run_in_executor(
-            None,
-            partial(tail_trimmer.trim, audio_samples, self.audio.sample_rate),
-        )
-        trimmed = trim_outcome.samples
-        effective_device = str(getattr(self, "_effective_device", self.settings.device))
-        if trimmed.size == 0:
-            logger.info("Skipping offline transcription: silence trimming removed all samples")
-            _release_cuda_cache(effective_device)
-            return "", 0
-        infer_started = time.perf_counter()
-        try:
-            text = await self._transcribe_samples_serialized(trimmed)
-            infer_ms = int((time.perf_counter() - infer_started) * 1000)
-            return text, infer_ms
-        finally:
-            _release_cuda_cache(effective_device)
 
     def _record_stream_runtime_result(self) -> None:
         self._stream_path_runtime_for_runtime().record_session_result(
@@ -961,6 +959,25 @@ class SessionOrchestrator:
             self.interim_transcript_runtime = runtime
         else:
             runtime.sync_from_runtime(settings=self.settings, sample_rate=sample_rate)
+        return runtime
+
+    def _seal_path_runtime_for_runtime(self) -> SealPathRuntime:
+        runtime = getattr(self, "seal_path_runtime", None)
+        sample_rate = int(getattr(self.audio, "sample_rate", 16_000))
+        tail_trimmer = self._tail_trimmer_for_runtime()
+        if not isinstance(runtime, SealPathRuntime):
+            runtime = SealPathRuntime(
+                sample_rate=sample_rate,
+                tail_trimmer=tail_trimmer,
+                release_device_cache=_release_cuda_cache,
+            )
+            self.seal_path_runtime = runtime
+        else:
+            runtime.sync_from_runtime(
+                sample_rate=sample_rate,
+                tail_trimmer=tail_trimmer,
+                release_device_cache=runtime.release_device_cache,
+            )
         return runtime
 
 
