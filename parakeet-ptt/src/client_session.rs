@@ -6,8 +6,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -18,6 +20,7 @@ use crate::injector_runtime::{
     EnqueueFailure, InjectionErrorKind, InjectionJob, InjectionOrigin, InjectionReport,
     InjectorWorkerHandle, INJECTION_ENQUEUE_TIMEOUT_MS, INJECTION_QUEUE_CAPACITY,
 };
+use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::ServerMessage;
 use crate::state::PttState;
@@ -50,11 +53,17 @@ pub(crate) struct ClientInjectionDispatcher {
     worker: InjectorWorkerHandle,
 }
 
+pub(crate) struct ClientLlmQueryRuntime {
+    answerer: Arc<dyn LlmAnswerer>,
+    progress_tx: mpsc::UnboundedSender<LlmProgress>,
+    progress_rx: mpsc::UnboundedReceiver<LlmProgress>,
+    state: LlmSessionRuntime,
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientSessionRuntime {
     state: PttState,
     active_intent: Option<SessionIntent>,
-    llm: LlmSessionRuntime,
     last_hotkey_up_at: Option<TokioInstant>,
     last_stop_message: Option<(Uuid, TokioInstant)>,
 }
@@ -71,8 +80,16 @@ struct LlmSessionRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LlmDeltaOverlay {
+    pub(crate) session_id: Uuid,
     pub(crate) seq: u64,
     pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LlmStateOverlay {
+    pub(crate) session_id: Uuid,
+    pub(crate) seq: u64,
+    pub(crate) state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +124,28 @@ pub(crate) enum InjectionDispatchOutcome {
     QueueTimeout,
     WorkerGone,
     SkippedStaleSession,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LlmQueryRequest {
+    session_id: Uuid,
+    transcript: String,
+    daemon_latency_ms: u64,
+    daemon_audio_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct LlmCompletedAnswer {
+    pub(crate) session_id: Uuid,
+    pub(crate) session_end_reason: Option<String>,
+    pub(crate) injection: LlmAnswerInjection,
+}
+
+#[derive(Debug)]
+pub(crate) enum LlmProgressOutcome {
+    Delta(LlmDeltaOverlay),
+    Finished(LlmCompletedAnswer),
+    Ignored,
 }
 
 impl ClientFocusRouter {
@@ -223,6 +262,245 @@ impl LlmAnswerInjection {
             daemon_audio_ms,
             completion,
         }
+    }
+}
+
+impl LlmQueryRequest {
+    pub(crate) fn new(
+        session_id: Uuid,
+        transcript: String,
+        daemon_latency_ms: u64,
+        daemon_audio_ms: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            transcript,
+            daemon_latency_ms,
+            daemon_audio_ms,
+        }
+    }
+}
+
+impl ClientLlmQueryRuntime {
+    pub(crate) fn new(answerer: Arc<dyn LlmAnswerer>) -> Self {
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        Self {
+            answerer,
+            progress_tx,
+            progress_rx,
+            state: LlmSessionRuntime::default(),
+        }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.state.busy
+    }
+
+    pub(crate) fn note_busy_overlay_rejection(&mut self) -> LlmStateOverlay {
+        self.state.busy_overlay_seq = self.state.busy_overlay_seq.saturating_add(1);
+        LlmStateOverlay {
+            session_id: Uuid::nil(),
+            seq: self.state.busy_overlay_seq,
+            state: "LLM busy; wait for current answer".to_string(),
+        }
+    }
+
+    pub(crate) fn defer_session_end_if_needed(
+        &mut self,
+        message: &ServerMessage,
+        runtime: &ClientSessionRuntime,
+    ) -> Option<Uuid> {
+        let ServerMessage::SessionEnded { session_id, reason } = message else {
+            return None;
+        };
+
+        let waiting_for_llm_final = runtime.active_intent() == Some(SessionIntent::LlmQuery)
+            && runtime.active_session_id() == Some(*session_id);
+        let llm_generation_running = self.state.in_flight_session == Some(*session_id);
+
+        if waiting_for_llm_final || llm_generation_running {
+            self.state
+                .deferred_session_end
+                .insert(*session_id, reason.clone());
+            Some(*session_id)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn start_answer(
+        &mut self,
+        request: LlmQueryRequest,
+        runtime: &mut ClientSessionRuntime,
+    ) -> LlmStateOverlay {
+        let LlmQueryRequest {
+            session_id,
+            transcript,
+            daemon_latency_ms,
+            daemon_audio_ms,
+        } = request;
+        info!(
+            session = %session_id,
+            daemon_latency_ms,
+            audio_ms = daemon_audio_ms,
+            "final result received in llm_query mode"
+        );
+        self.state.busy = true;
+        self.state.in_flight_session = Some(session_id);
+        let seq = self.state.next_seq(session_id);
+        runtime.reset();
+
+        let answerer = Arc::clone(&self.answerer);
+        let progress_tx = self.progress_tx.clone();
+        tokio::spawn(async move {
+            let llm_result = answerer
+                .answer(session_id, transcript.clone(), progress_tx.clone())
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = progress_tx.send(LlmProgress::Finished {
+                session_id,
+                transcript,
+                daemon_latency_ms,
+                daemon_audio_ms,
+                result: llm_result,
+            });
+        });
+
+        LlmStateOverlay {
+            session_id,
+            seq,
+            state: "Generating answer...".to_string(),
+        }
+    }
+
+    pub(crate) async fn recv_progress(&mut self) -> Option<LlmProgress> {
+        self.progress_rx.recv().await
+    }
+
+    pub(crate) fn handle_progress(
+        &mut self,
+        progress: LlmProgress,
+        runtime: &mut ClientSessionRuntime,
+    ) -> LlmProgressOutcome {
+        match progress {
+            LlmProgress::Delta { session_id, delta } => self
+                .record_delta(session_id, delta)
+                .map_or(LlmProgressOutcome::Ignored, LlmProgressOutcome::Delta),
+            LlmProgress::Finished {
+                session_id,
+                transcript,
+                daemon_latency_ms,
+                daemon_audio_ms,
+                result,
+            } => {
+                let Some(completion) = self.finish_answer(session_id, runtime) else {
+                    return LlmProgressOutcome::Ignored;
+                };
+                let fallback_transcript = transcript.clone();
+                let response_text = match result {
+                    Ok(answer) => {
+                        let sanitized = sanitize_model_answer(&answer);
+                        info!(
+                            session = %session_id,
+                            answer_chars = sanitized.chars().count(),
+                            "llm response completed"
+                        );
+                        sanitized
+                    }
+                    Err(error) => {
+                        warn!(
+                            session = %session_id,
+                            error = %error,
+                            "llm generation failed; falling back to raw transcript"
+                        );
+                        fallback_transcript.clone()
+                    }
+                };
+
+                let to_inject = if response_text.trim().is_empty() {
+                    warn!(
+                        session = %session_id,
+                        "llm response empty after sanitization; falling back to transcript"
+                    );
+                    fallback_transcript
+                } else {
+                    response_text
+                };
+                LlmProgressOutcome::Finished(LlmCompletedAnswer {
+                    session_id,
+                    session_end_reason: completion.session_end_reason.clone(),
+                    injection: LlmAnswerInjection::new(
+                        session_id,
+                        to_inject,
+                        daemon_latency_ms,
+                        daemon_audio_ms,
+                        completion,
+                    ),
+                })
+            }
+        }
+    }
+
+    pub(crate) fn reset_for_connection_drop(&mut self) {
+        self.state.clear();
+    }
+
+    fn record_delta(&mut self, session_id: Uuid, delta: String) -> Option<LlmDeltaOverlay> {
+        if self.state.in_flight_session != Some(session_id) {
+            debug!(
+                session = %session_id,
+                in_flight_session = ?self.state.in_flight_session,
+                "ignoring stale llm delta for non-active session"
+            );
+            return None;
+        }
+
+        let text = {
+            let entry = self.state.overlay_text.entry(session_id).or_default();
+            entry.push_str(&delta);
+            entry.clone()
+        };
+        let seq = self.state.next_seq(session_id);
+        Some(LlmDeltaOverlay {
+            session_id,
+            seq,
+            text,
+        })
+    }
+
+    fn finish_answer(
+        &mut self,
+        session_id: Uuid,
+        runtime: &ClientSessionRuntime,
+    ) -> Option<LlmCompletionContext> {
+        if self.state.in_flight_session != Some(session_id) {
+            warn!(
+                session = %session_id,
+                in_flight_session = ?self.state.in_flight_session,
+                "ignoring stale llm completion for non-active session"
+            );
+            self.state.clear_session(session_id);
+            return None;
+        }
+
+        self.state.busy = false;
+        self.state.in_flight_session = None;
+        self.state.seq.remove(&session_id);
+        self.state.overlay_text.remove(&session_id);
+        let session_end_reason = self
+            .state
+            .deferred_session_end
+            .remove(&session_id)
+            .flatten();
+        let session_end_was_deferred = session_end_reason.is_some();
+        Some(LlmCompletionContext {
+            session_end_reason,
+            session_end_was_deferred,
+            state_label: runtime.state_label(),
+            hotkey_up_elapsed_ms_at_enqueue: elapsed_ms_since(runtime.last_hotkey_up_at),
+            stop_message_elapsed_ms_at_enqueue: runtime
+                .stop_message_elapsed_ms_at_enqueue(session_id),
+        })
     }
 }
 
@@ -618,7 +896,6 @@ impl ClientSessionRuntime {
         Self {
             state: PttState::new(),
             active_intent: None,
-            llm: LlmSessionRuntime::default(),
             last_hotkey_up_at: None,
             last_stop_message: None,
         }
@@ -646,7 +923,6 @@ impl ClientSessionRuntime {
 
     pub(crate) fn reset_for_connection_drop(&mut self) {
         self.reset();
-        self.llm.clear();
         self.last_hotkey_up_at = None;
         self.last_stop_message = None;
     }
@@ -661,92 +937,6 @@ impl ClientSessionRuntime {
 
     pub(crate) fn state_label(&self) -> &'static str {
         state_label(&self.state)
-    }
-
-    pub(crate) fn is_llm_busy(&self) -> bool {
-        self.llm.busy
-    }
-
-    pub(crate) fn note_llm_busy_overlay_rejection(&mut self) -> (Uuid, u64) {
-        self.llm.busy_overlay_seq = self.llm.busy_overlay_seq.saturating_add(1);
-        (Uuid::nil(), self.llm.busy_overlay_seq)
-    }
-
-    pub(crate) fn defer_session_end_if_needed(&mut self, message: &ServerMessage) -> Option<Uuid> {
-        let ServerMessage::SessionEnded { session_id, reason } = message else {
-            return None;
-        };
-
-        let waiting_for_llm_final = self.active_intent == Some(SessionIntent::LlmQuery)
-            && self.active_session_id() == Some(*session_id);
-        let llm_generation_running = self.llm.in_flight_session == Some(*session_id);
-
-        if waiting_for_llm_final || llm_generation_running {
-            self.llm
-                .deferred_session_end
-                .insert(*session_id, reason.clone());
-            Some(*session_id)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn start_llm_answer(&mut self, session_id: Uuid) -> u64 {
-        self.llm.busy = true;
-        self.llm.in_flight_session = Some(session_id);
-        let seq = self.llm.next_seq(session_id);
-        self.state.reset();
-        self.active_intent = None;
-        seq
-    }
-
-    pub(crate) fn record_llm_delta(
-        &mut self,
-        session_id: Uuid,
-        delta: String,
-    ) -> Option<LlmDeltaOverlay> {
-        if self.llm.in_flight_session != Some(session_id) {
-            debug!(
-                session = %session_id,
-                in_flight_session = ?self.llm.in_flight_session,
-                "ignoring stale llm delta for non-active session"
-            );
-            return None;
-        }
-
-        let text = {
-            let entry = self.llm.overlay_text.entry(session_id).or_default();
-            entry.push_str(&delta);
-            entry.clone()
-        };
-        let seq = self.llm.next_seq(session_id);
-        Some(LlmDeltaOverlay { seq, text })
-    }
-
-    pub(crate) fn finish_llm_answer(&mut self, session_id: Uuid) -> Option<LlmCompletionContext> {
-        if self.llm.in_flight_session != Some(session_id) {
-            warn!(
-                session = %session_id,
-                in_flight_session = ?self.llm.in_flight_session,
-                "ignoring stale llm completion for non-active session"
-            );
-            self.llm.clear_session(session_id);
-            return None;
-        }
-
-        self.llm.busy = false;
-        self.llm.in_flight_session = None;
-        self.llm.seq.remove(&session_id);
-        self.llm.overlay_text.remove(&session_id);
-        let session_end_reason = self.llm.deferred_session_end.remove(&session_id).flatten();
-        let session_end_was_deferred = session_end_reason.is_some();
-        Some(LlmCompletionContext {
-            session_end_reason,
-            session_end_was_deferred,
-            state_label: self.state_label(),
-            hotkey_up_elapsed_ms_at_enqueue: elapsed_ms_since(self.last_hotkey_up_at),
-            stop_message_elapsed_ms_at_enqueue: self.stop_message_elapsed_ms_at_enqueue(session_id),
-        })
     }
 
     pub(crate) fn final_result_belongs_to_active_session(&self, session_id: Uuid) -> bool {
@@ -946,6 +1136,8 @@ pub(crate) fn classify_error_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -957,6 +1149,7 @@ mod tests {
         InjectionOrigin, InjectionReport, InjectionRunError, InjectionRunOutput,
         InjectorWorkerHandle,
     };
+    use crate::llm::{LlmAnswerer, LlmDelta, LlmDeltaStream, LlmProgress};
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
@@ -973,9 +1166,92 @@ mod tests {
 
     use super::{
         handle_server_message, parent_focus_from_observation, ClientFocusRouter,
-        ClientInjectionDispatcher, ClientSessionRuntime, InjectionDispatchOutcome,
-        LlmAnswerInjection, LlmCompletionContext, LlmDeltaOverlay, SessionIntent,
+        ClientInjectionDispatcher, ClientLlmQueryRuntime, ClientSessionRuntime,
+        InjectionDispatchOutcome, LlmAnswerInjection, LlmCompletionContext, LlmDeltaOverlay,
+        LlmProgressOutcome, LlmQueryRequest, LlmStateOverlay, SessionIntent,
     };
+
+    type TestBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+    type RecordedLlmRequests = Arc<Mutex<Vec<(Uuid, String)>>>;
+
+    struct TestLlmAnswerer {
+        requests: RecordedLlmRequests,
+        deltas: Vec<String>,
+        result: std::result::Result<String, String>,
+    }
+
+    impl TestLlmAnswerer {
+        fn successful<I, S>(
+            deltas: I,
+            answer: impl Into<String>,
+        ) -> (Arc<Self>, RecordedLlmRequests)
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            Self::new(deltas, Ok(answer.into()))
+        }
+
+        fn failing(error: impl Into<String>) -> (Arc<Self>, RecordedLlmRequests) {
+            Self::new(std::iter::empty::<String>(), Err(error.into()))
+        }
+
+        fn new<I, S>(
+            deltas: I,
+            result: std::result::Result<String, String>,
+        ) -> (Arc<Self>, RecordedLlmRequests)
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    requests: Arc::clone(&requests),
+                    deltas: deltas.into_iter().map(Into::into).collect(),
+                    result,
+                }),
+                requests,
+            )
+        }
+    }
+
+    impl LlmAnswerer for TestLlmAnswerer {
+        fn label(&self) -> String {
+            "test-llm".to_string()
+        }
+
+        fn stream_answer<'a>(&'a self, _prompt: &'a str) -> LlmDeltaStream<'a> {
+            Box::pin(futures::stream::empty::<anyhow::Result<LlmDelta>>())
+        }
+
+        fn health<'a>(&'a self) -> TestBoxFuture<'a, bool> {
+            Box::pin(async { true })
+        }
+
+        fn answer<'a>(
+            &'a self,
+            session_id: Uuid,
+            transcript: String,
+            progress_tx: mpsc::UnboundedSender<LlmProgress>,
+        ) -> TestBoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .expect("recorded LLM request lock should be available")
+                    .push((session_id, transcript));
+                for delta in &self.deltas {
+                    let _ = progress_tx.send(LlmProgress::Delta {
+                        session_id,
+                        delta: delta.clone(),
+                    });
+                }
+                self.result
+                    .clone()
+                    .map_err(|error| anyhow!("synthetic LLM failure: {error}"))
+            })
+        }
+    }
 
     struct SlowRunner {
         calls: Arc<AtomicU64>,
@@ -1181,8 +1457,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_session_runtime_resets_reconnect_caches() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_llm_query_runtime_resets_reconnect_caches() {
+        let (answerer, _requests) =
+            TestLlmAnswerer::successful(std::iter::empty::<String>(), "late answer");
+        let mut llm_runtime = ClientLlmQueryRuntime::new(answerer);
         let mut runtime = ClientSessionRuntime::new();
         let session_id = runtime
             .begin_listening(SessionIntent::LlmQuery)
@@ -1190,38 +1469,73 @@ mod tests {
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
         assert_eq!(
-            runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
-                session_id,
-                reason: Some("connection_drop".to_string()),
-            }),
+            llm_runtime.defer_session_end_if_needed(
+                &ServerMessage::SessionEnded {
+                    session_id,
+                    reason: Some("connection_drop".to_string()),
+                },
+                &runtime,
+            ),
             Some(session_id)
         );
-        assert_eq!(runtime.start_llm_answer(session_id), 1);
         assert_eq!(
-            runtime.record_llm_delta(session_id, "partial".to_string()),
-            Some(LlmDeltaOverlay {
-                seq: 2,
-                text: "partial".to_string(),
-            })
+            llm_runtime.start_answer(
+                LlmQueryRequest::new(session_id, "prompt".to_string(), 1, 2),
+                &mut runtime,
+            ),
+            LlmStateOverlay {
+                session_id,
+                seq: 1,
+                state: "Generating answer...".to_string(),
+            }
         );
-        assert!(runtime.is_llm_busy());
-        assert_eq!(runtime.note_llm_busy_overlay_rejection(), (Uuid::nil(), 1));
+        assert!(llm_runtime.is_busy());
+        assert_eq!(
+            llm_runtime.note_busy_overlay_rejection(),
+            LlmStateOverlay {
+                session_id: Uuid::nil(),
+                seq: 1,
+                state: "LLM busy; wait for current answer".to_string(),
+            }
+        );
 
         runtime.reset_for_connection_drop();
+        llm_runtime.reset_for_connection_drop();
 
         assert_eq!(runtime.state_label(), "idle");
         assert_eq!(runtime.active_session_id(), None);
         assert_eq!(runtime.active_intent(), None);
-        assert!(!runtime.is_llm_busy());
-        assert_eq!(
-            runtime.record_llm_delta(session_id, "late".to_string()),
-            None
-        );
-        assert!(runtime.finish_llm_answer(session_id).is_none());
+        assert!(!llm_runtime.is_busy());
+        assert!(matches!(
+            llm_runtime.handle_progress(
+                LlmProgress::Delta {
+                    session_id,
+                    delta: "late".to_string(),
+                },
+                &mut runtime,
+            ),
+            LlmProgressOutcome::Ignored
+        ));
+        assert!(matches!(
+            llm_runtime.handle_progress(
+                LlmProgress::Finished {
+                    session_id,
+                    transcript: "prompt".to_string(),
+                    daemon_latency_ms: 1,
+                    daemon_audio_ms: 2,
+                    result: Ok("late answer".to_string()),
+                },
+                &mut runtime,
+            ),
+            LlmProgressOutcome::Ignored
+        ));
     }
 
-    #[test]
-    fn client_session_runtime_defers_session_end_until_llm_finish() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_llm_query_runtime_defers_session_end_until_llm_finish() {
+        let (answerer, requests) =
+            TestLlmAnswerer::successful(["answer", " delta"], "answer delta");
+        let mut llm_runtime = ClientLlmQueryRuntime::new(answerer);
         let mut runtime = ClientSessionRuntime::new();
         let session_id = runtime
             .begin_listening(SessionIntent::LlmQuery)
@@ -1229,32 +1543,164 @@ mod tests {
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
         assert_eq!(
-            runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
-                session_id,
-                reason: Some("normal".to_string()),
-            }),
+            llm_runtime.defer_session_end_if_needed(
+                &ServerMessage::SessionEnded {
+                    session_id,
+                    reason: Some("normal".to_string()),
+                },
+                &runtime,
+            ),
             Some(session_id)
         );
-        assert_eq!(runtime.start_llm_answer(session_id), 1);
         assert_eq!(
-            runtime.record_llm_delta(session_id, "answer".to_string()),
-            Some(LlmDeltaOverlay {
-                seq: 2,
-                text: "answer".to_string(),
-            })
+            llm_runtime.start_answer(
+                LlmQueryRequest::new(session_id, "private prompt".to_string(), 55, 1500),
+                &mut runtime,
+            ),
+            LlmStateOverlay {
+                session_id,
+                seq: 1,
+                state: "Generating answer...".to_string(),
+            }
         );
 
-        let completion = runtime
-            .finish_llm_answer(session_id)
-            .expect("active llm completion should produce injection context");
+        let mut deltas = Vec::new();
+        let finished = timeout(Duration::from_secs(1), async {
+            loop {
+                let progress = llm_runtime
+                    .recv_progress()
+                    .await
+                    .expect("LLM progress channel should stay open");
+                match llm_runtime.handle_progress(progress, &mut runtime) {
+                    LlmProgressOutcome::Delta(delta) => deltas.push(delta),
+                    LlmProgressOutcome::Finished(answer) => break answer,
+                    LlmProgressOutcome::Ignored => {}
+                }
+            }
+        })
+        .await
+        .expect("LLM answer should finish");
 
-        assert_eq!(completion.session_end_reason.as_deref(), Some("normal"));
-        assert!(completion.session_end_was_deferred);
-        assert_eq!(completion.state_label, "idle");
-        assert!(completion.hotkey_up_elapsed_ms_at_enqueue.is_some());
-        assert!(completion.stop_message_elapsed_ms_at_enqueue.is_some());
-        assert!(!runtime.is_llm_busy());
-        assert!(runtime.finish_llm_answer(session_id).is_none());
+        assert_eq!(
+            *requests
+                .lock()
+                .expect("recorded LLM request lock should be available"),
+            vec![(session_id, "private prompt".to_string())]
+        );
+        assert_eq!(
+            deltas,
+            vec![
+                LlmDeltaOverlay {
+                    session_id,
+                    seq: 2,
+                    text: "answer".to_string(),
+                },
+                LlmDeltaOverlay {
+                    session_id,
+                    seq: 3,
+                    text: "answer delta".to_string(),
+                },
+            ]
+        );
+        assert_eq!(finished.session_id, session_id);
+        assert_eq!(finished.session_end_reason.as_deref(), Some("normal"));
+        assert_eq!(finished.injection.session_id, session_id);
+        assert_eq!(finished.injection.text, "answer delta");
+        assert_eq!(finished.injection.daemon_latency_ms, 55);
+        assert_eq!(finished.injection.daemon_audio_ms, 1500);
+        assert_eq!(
+            finished.injection.completion.session_end_reason.as_deref(),
+            Some("normal")
+        );
+        assert!(finished.injection.completion.session_end_was_deferred);
+        assert_eq!(finished.injection.completion.state_label, "idle");
+        assert!(finished
+            .injection
+            .completion
+            .hotkey_up_elapsed_ms_at_enqueue
+            .is_some());
+        assert!(finished
+            .injection
+            .completion
+            .stop_message_elapsed_ms_at_enqueue
+            .is_some());
+        assert!(!llm_runtime.is_busy());
+        assert!(matches!(
+            llm_runtime.handle_progress(
+                LlmProgress::Finished {
+                    session_id,
+                    transcript: "late prompt".to_string(),
+                    daemon_latency_ms: 1,
+                    daemon_audio_ms: 2,
+                    result: Ok("late".to_string()),
+                },
+                &mut runtime,
+            ),
+            LlmProgressOutcome::Ignored
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_llm_query_runtime_falls_back_to_transcript_on_failure_or_empty_answer() {
+        let (failing_answerer, _requests) = TestLlmAnswerer::failing("offline");
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = runtime
+            .begin_listening(SessionIntent::LlmQuery)
+            .expect("llm session should start");
+        runtime.stop_listening().expect("llm session should stop");
+        runtime.record_stop_message_sent(session_id, TokioInstant::now());
+        let mut failing_runtime = ClientLlmQueryRuntime::new(failing_answerer);
+        failing_runtime.start_answer(
+            LlmQueryRequest::new(session_id, "raw transcript".to_string(), 10, 20),
+            &mut runtime,
+        );
+
+        let failed = timeout(Duration::from_secs(1), async {
+            loop {
+                let progress = failing_runtime
+                    .recv_progress()
+                    .await
+                    .expect("LLM progress channel should stay open");
+                if let LlmProgressOutcome::Finished(answer) =
+                    failing_runtime.handle_progress(progress, &mut runtime)
+                {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .expect("failed LLM answer should finish");
+        assert_eq!(failed.injection.text, "raw transcript");
+
+        let (empty_answerer, _requests) =
+            TestLlmAnswerer::successful(std::iter::empty::<String>(), "<think>hidden</think>");
+        let mut empty_runtime = ClientLlmQueryRuntime::new(empty_answerer);
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = runtime
+            .begin_listening(SessionIntent::LlmQuery)
+            .expect("llm session should start");
+        runtime.stop_listening().expect("llm session should stop");
+        runtime.record_stop_message_sent(session_id, TokioInstant::now());
+        empty_runtime.start_answer(
+            LlmQueryRequest::new(session_id, "fallback transcript".to_string(), 11, 21),
+            &mut runtime,
+        );
+        let empty = timeout(Duration::from_secs(1), async {
+            loop {
+                let progress = empty_runtime
+                    .recv_progress()
+                    .await
+                    .expect("LLM progress channel should stay open");
+                if let LlmProgressOutcome::Finished(answer) =
+                    empty_runtime.handle_progress(progress, &mut runtime)
+                {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .expect("empty sanitized LLM answer should finish");
+        assert_eq!(empty.injection.text, "fallback transcript");
     }
 
     #[tokio::test(flavor = "current_thread")]
