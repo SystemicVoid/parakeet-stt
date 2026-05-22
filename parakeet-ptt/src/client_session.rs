@@ -2,7 +2,7 @@
 //!
 //! This Module owns per-Session Client runtime state and how Daemon
 //! `ServerMessage` values affect Client PTT state, Overlay routing, Injection
-//! enqueueing, LLM progress, and parent-focus handoff.
+//! enqueueing, LLM progress, and focus-routing handoff.
 
 use std::collections::HashMap;
 
@@ -19,11 +19,15 @@ use crate::injector_runtime::{
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::ServerMessage;
 use crate::state::PttState;
+use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
+
+const PARENT_FOCUS_STALE_MS: u64 = 30_000;
+const PARENT_FOCUS_TRANSITION_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
-pub(crate) struct CapturedParentFocus {
-    pub(crate) focus: ParentFocusCapture,
-    pub(crate) captured_at: TokioInstant,
+struct CapturedParentFocus {
+    focus: ParentFocusCapture,
+    captured_at: TokioInstant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +37,17 @@ pub(crate) enum SessionIntent {
 }
 
 #[derive(Debug)]
+pub(crate) struct ClientFocusRouter {
+    focus_cache: Option<WaylandFocusCache>,
+    parent_focus_by_session: HashMap<Uuid, CapturedParentFocus>,
+    last_overlay_output_name: Option<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ClientSessionRuntime {
     state: PttState,
     active_intent: Option<SessionIntent>,
     llm: LlmSessionRuntime,
-    parent_focus_by_session: HashMap<Uuid, CapturedParentFocus>,
     last_hotkey_up_at: Option<TokioInstant>,
     last_stop_message: Option<(Uuid, TokioInstant)>,
 }
@@ -65,7 +75,130 @@ pub(crate) struct LlmCompletionContext {
     pub(crate) state_label: &'static str,
     pub(crate) hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
     pub(crate) stop_message_elapsed_ms_at_enqueue: Option<u64>,
-    pub(crate) parent_focus: Option<ParentFocusCapture>,
+}
+
+impl ClientFocusRouter {
+    pub(crate) fn new(focus_cache: Option<WaylandFocusCache>) -> Self {
+        Self {
+            focus_cache,
+            parent_focus_by_session: HashMap::new(),
+            last_overlay_output_name: None,
+        }
+    }
+
+    pub(crate) fn record_stop_target(&mut self, session_id: Uuid, captured_at: TokioInstant) {
+        if let Some(focus) = self.capture_parent_focus() {
+            self.parent_focus_by_session
+                .insert(session_id, CapturedParentFocus { focus, captured_at });
+        }
+    }
+
+    pub(crate) fn take_parent_focus_for_enqueue(
+        &mut self,
+        session_id: Uuid,
+    ) -> Option<ParentFocusCapture> {
+        self.parent_focus_by_session
+            .remove(&session_id)
+            .map(|captured| {
+                let mut focus = captured.focus;
+                focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
+                focus
+            })
+    }
+
+    pub(crate) fn clear_session(&mut self, session_id: Uuid) {
+        self.parent_focus_by_session.remove(&session_id);
+    }
+
+    pub(crate) fn reset_for_connection_drop(&mut self) {
+        self.parent_focus_by_session.clear();
+        self.reset_overlay_target();
+    }
+
+    pub(crate) fn reset_overlay_target(&mut self) {
+        self.last_overlay_output_name = None;
+    }
+
+    pub(crate) fn next_overlay_output_hint(&mut self) -> Option<String> {
+        let output_name = self.focus_cache.as_ref()?.current_output_name();
+        self.next_overlay_output_hint_from(output_name)
+    }
+
+    fn next_overlay_output_hint_from(&mut self, output_name: Option<String>) -> Option<String> {
+        let output_name = output_name?;
+        if self.last_overlay_output_name.as_deref() == Some(output_name.as_str()) {
+            return None;
+        }
+
+        self.last_overlay_output_name = Some(output_name.clone());
+        Some(output_name)
+    }
+
+    fn capture_parent_focus(&self) -> Option<ParentFocusCapture> {
+        let cache = self.focus_cache.as_ref()?;
+        Some(parent_focus_from_observation(cache.observe(
+            PARENT_FOCUS_STALE_MS,
+            PARENT_FOCUS_TRANSITION_GRACE_MS,
+        )))
+    }
+
+    #[cfg(test)]
+    fn record_parent_focus_for_tests(
+        &mut self,
+        session_id: Uuid,
+        focus: ParentFocusCapture,
+        captured_at: TokioInstant,
+    ) {
+        self.parent_focus_by_session
+            .insert(session_id, CapturedParentFocus { focus, captured_at });
+    }
+
+    #[cfg(test)]
+    fn next_overlay_output_hint_for_tests(&mut self, output_name: Option<&str>) -> Option<String> {
+        self.next_overlay_output_hint_from(output_name.map(str::to_string))
+    }
+}
+
+impl Default for ClientFocusRouter {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+fn parent_focus_from_observation(observation: WaylandFocusObservation) -> ParentFocusCapture {
+    match observation {
+        WaylandFocusObservation::Fresh {
+            snapshot,
+            cache_age_ms,
+        } => ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: None,
+            captured_elapsed_ms: Some(0),
+        },
+        WaylandFocusObservation::LowConfidence {
+            snapshot,
+            cache_age_ms,
+            reason,
+        } => ParentFocusCapture {
+            snapshot: Some(snapshot),
+            source_selected: "wayland_cache_low_confidence".to_string(),
+            wayland_cache_age_ms: Some(cache_age_ms),
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        },
+        WaylandFocusObservation::Unavailable {
+            reason,
+            cache_age_ms,
+        } => ParentFocusCapture {
+            snapshot: None,
+            source_selected: "wayland_unavailable".to_string(),
+            wayland_cache_age_ms: cache_age_ms,
+            wayland_fallback_reason: Some(reason.to_string()),
+            captured_elapsed_ms: Some(0),
+        },
+    }
 }
 
 impl ClientSessionRuntime {
@@ -74,7 +207,6 @@ impl ClientSessionRuntime {
             state: PttState::new(),
             active_intent: None,
             llm: LlmSessionRuntime::default(),
-            parent_focus_by_session: HashMap::new(),
             last_hotkey_up_at: None,
             last_stop_message: None,
         }
@@ -90,23 +222,9 @@ impl ClientSessionRuntime {
         self.state.stop_listening()
     }
 
-    pub(crate) fn record_stop_message_sent(
-        &mut self,
-        session_id: Uuid,
-        parent_focus: Option<ParentFocusCapture>,
-        sent_at: TokioInstant,
-    ) {
+    pub(crate) fn record_stop_message_sent(&mut self, session_id: Uuid, sent_at: TokioInstant) {
         self.last_hotkey_up_at = Some(sent_at);
         self.last_stop_message = Some((session_id, sent_at));
-        if let Some(focus) = parent_focus {
-            self.parent_focus_by_session.insert(
-                session_id,
-                CapturedParentFocus {
-                    focus,
-                    captured_at: sent_at,
-                },
-            );
-        }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -117,7 +235,6 @@ impl ClientSessionRuntime {
     pub(crate) fn reset_for_connection_drop(&mut self) {
         self.reset();
         self.llm.clear();
-        self.parent_focus_by_session.clear();
         self.last_hotkey_up_at = None;
         self.last_stop_message = None;
     }
@@ -217,7 +334,6 @@ impl ClientSessionRuntime {
             state_label: self.state_label(),
             hotkey_up_elapsed_ms_at_enqueue: elapsed_ms_since(self.last_hotkey_up_at),
             stop_message_elapsed_ms_at_enqueue: self.stop_message_elapsed_ms_at_enqueue(session_id),
-            parent_focus: self.take_parent_focus_for_enqueue(session_id),
         })
     }
 
@@ -233,20 +349,6 @@ impl ClientSessionRuntime {
             state_at_receive = self.state_label(),
             "ignoring final result for non-active session"
         );
-    }
-
-    fn take_parent_focus_for_enqueue(&mut self, session_id: Uuid) -> Option<ParentFocusCapture> {
-        self.parent_focus_by_session
-            .remove(&session_id)
-            .map(|captured| {
-                let mut focus = captured.focus;
-                focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
-                focus
-            })
-    }
-
-    fn remove_parent_focus(&mut self, session_id: Uuid) {
-        self.parent_focus_by_session.remove(&session_id);
     }
 
     fn stop_message_elapsed_ms_at_enqueue(&self, session_id: Uuid) -> Option<u64> {
@@ -288,12 +390,14 @@ impl LlmSessionRuntime {
 pub(crate) async fn handle_server_message<S: OverlaySink>(
     message: ServerMessage,
     runtime: &mut ClientSessionRuntime,
+    focus_router: &mut ClientFocusRouter,
     overlay_router: &mut OverlayRouter<S>,
     injector_worker: &InjectorWorkerHandle,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
             info!(session = %session_id, "session started ack");
+            focus_router.reset_overlay_target();
             overlay_router.note_session_started(session_id);
         }
         ServerMessage::FinalResult {
@@ -329,7 +433,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                             hotkey_up_elapsed_ms_at_enqueue,
                             stop_message_elapsed_ms_at_enqueue,
                         )
-                        .with_parent_focus(runtime.take_parent_focus_for_enqueue(session_id)),
+                        .with_parent_focus(focus_router.take_parent_focus_for_enqueue(session_id)),
                 )
                 .await
             {
@@ -367,7 +471,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                 message
             );
             if let Some(session_id) = session_id {
-                runtime.remove_parent_focus(session_id);
+                focus_router.clear_session(session_id);
             }
             runtime.reset();
         }
@@ -376,11 +480,12 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             seq,
             state: interim_state,
         } => {
-            overlay_router.route_daemon_interim_state(
+            overlay_router.route_daemon_interim_state_with_output_hint(
                 runtime.active_session_id(),
                 session_id,
                 seq,
                 interim_state,
+                || focus_router.next_overlay_output_hint(),
             );
         }
         ServerMessage::InterimText {
@@ -388,11 +493,12 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             seq,
             text,
         } => {
-            overlay_router.route_daemon_interim_text(
+            overlay_router.route_daemon_interim_text_with_output_hint(
                 runtime.active_session_id(),
                 session_id,
                 seq,
                 text,
+                || focus_router.next_overlay_output_hint(),
             );
         }
         ServerMessage::AudioLevel {
@@ -402,8 +508,12 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             overlay_router.route_audio_level(runtime.active_session_id(), session_id, level_db);
         }
         ServerMessage::SessionEnded { session_id, reason } => {
-            runtime.remove_parent_focus(session_id);
+            let ends_active_session = runtime.active_session_id() == Some(session_id);
+            focus_router.clear_session(session_id);
             overlay_router.route_session_ended(runtime.active_session_id(), session_id, reason);
+            if ends_active_session {
+                focus_router.reset_overlay_target();
+            }
         }
         ServerMessage::SessionWarning {
             session_id,
@@ -466,7 +576,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::config::OverlayMode;
-    use crate::injector::ParentFocusCapture;
     use crate::injector_runtime::{
         spawn_injector_worker_with_capacity, InjectionJob, InjectionJobRunner, InjectionRunError,
         InjectionRunOutput, InjectorWorkerHandle,
@@ -479,12 +588,16 @@ mod tests {
         RuntimeOverlaySink,
     };
     use crate::protocol::ServerMessage;
+    use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
     use anyhow::anyhow;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Instant as TokioInstant};
     use uuid::Uuid;
 
-    use super::{handle_server_message, ClientSessionRuntime, LlmDeltaOverlay, SessionIntent};
+    use super::{
+        handle_server_message, parent_focus_from_observation, ClientFocusRouter,
+        ClientSessionRuntime, LlmDeltaOverlay, SessionIntent,
+    };
 
     struct SlowRunner {
         calls: Arc<AtomicU64>,
@@ -538,7 +651,15 @@ mod tests {
         overlay_router: &mut OverlayRouter<S>,
         injector_worker: &InjectorWorkerHandle,
     ) -> anyhow::Result<()> {
-        handle_server_message(message, runtime, overlay_router, injector_worker).await
+        let mut focus_router = ClientFocusRouter::default();
+        handle_server_message(
+            message,
+            runtime,
+            &mut focus_router,
+            overlay_router,
+            injector_worker,
+        )
+        .await
     }
 
     fn runtime_waiting_for_result() -> (ClientSessionRuntime, Uuid) {
@@ -555,18 +676,113 @@ mod tests {
         runtime
             .stop_listening()
             .expect("state should stop listening");
-        runtime.record_stop_message_sent(session_id, None, stopped_at);
+        runtime.record_stop_message_sent(session_id, stopped_at);
         (runtime, session_id)
     }
 
-    fn test_parent_focus() -> ParentFocusCapture {
-        ParentFocusCapture {
-            snapshot: None,
-            source_selected: "test".to_string(),
-            wayland_cache_age_ms: None,
-            wayland_fallback_reason: None,
-            captured_elapsed_ms: None,
+    fn test_focus_snapshot(output_name: Option<&str>) -> FocusSnapshot {
+        FocusSnapshot {
+            app_name: Some("Code".to_string()),
+            object_name: Some("editor".to_string()),
+            object_path: Some("/com/system76/Cosmic/Window/1".to_string()),
+            service_name: Some(":1.42".to_string()),
+            output_name: output_name.map(str::to_string),
+            focused: true,
+            active: true,
+            resolver: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn client_focus_router_maps_parent_focus_for_injection() {
+        let session_id = Uuid::new_v4();
+        let parent_focus = parent_focus_from_observation(WaylandFocusObservation::LowConfidence {
+            snapshot: test_focus_snapshot(Some("DP-1")),
+            cache_age_ms: 17,
+            reason: "within_transition_grace",
+        });
+        let mut focus_router = ClientFocusRouter::default();
+        focus_router.record_parent_focus_for_tests(
+            session_id,
+            parent_focus,
+            TokioInstant::now() - Duration::from_millis(25),
+        );
+
+        let routed = focus_router
+            .take_parent_focus_for_enqueue(session_id)
+            .expect("captured parent focus should be available for Injection");
+
+        assert_eq!(routed.source_selected, "wayland_cache_low_confidence");
+        assert_eq!(routed.wayland_cache_age_ms, Some(17));
+        assert_eq!(
+            routed.wayland_fallback_reason.as_deref(),
+            Some("within_transition_grace")
+        );
+        assert_eq!(
+            routed
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.output_name.as_deref()),
+            Some("DP-1")
+        );
+        assert!(
+            routed.captured_elapsed_ms.unwrap_or_default() >= 25,
+            "captured elapsed should reflect time between stop capture and enqueue"
+        );
+        assert!(focus_router
+            .take_parent_focus_for_enqueue(session_id)
+            .is_none());
+    }
+
+    #[test]
+    fn client_focus_router_deduplicates_overlay_output_hints_until_reset() {
+        let mut focus_router = ClientFocusRouter::default();
+
+        assert_eq!(
+            focus_router.next_overlay_output_hint_for_tests(Some("DP-1")),
+            Some("DP-1".to_string())
+        );
+        assert_eq!(
+            focus_router.next_overlay_output_hint_for_tests(Some("DP-1")),
+            None
+        );
+        assert_eq!(
+            focus_router.next_overlay_output_hint_for_tests(Some("HDMI-A-1")),
+            Some("HDMI-A-1".to_string())
+        );
+
+        focus_router.reset_overlay_target();
+
+        assert_eq!(
+            focus_router.next_overlay_output_hint_for_tests(Some("HDMI-A-1")),
+            Some("HDMI-A-1".to_string())
+        );
+    }
+
+    #[test]
+    fn client_focus_router_output_hint_feeds_overlay_router() {
+        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
+        let mut focus_router = ClientFocusRouter::default();
+        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
+            seen: Arc::clone(&seen_overlay_events),
+        });
+
+        if let Some(output_name) = focus_router.next_overlay_output_hint_for_tests(Some("DP-1")) {
+            overlay_router.route_output_hint(output_name);
+        }
+        if let Some(output_name) = focus_router.next_overlay_output_hint_for_tests(Some("DP-1")) {
+            overlay_router.route_output_hint(output_name);
+        }
+
+        assert_eq!(
+            seen_overlay_events
+                .lock()
+                .expect("overlay recording lock should be available")
+                .as_slice(),
+            &[OverlayEvent::OutputHint {
+                output_name: "DP-1".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -576,11 +792,7 @@ mod tests {
             .begin_listening(SessionIntent::LlmQuery)
             .expect("llm session should start");
         runtime.stop_listening().expect("llm session should stop");
-        runtime.record_stop_message_sent(
-            session_id,
-            Some(test_parent_focus()),
-            TokioInstant::now(),
-        );
+        runtime.record_stop_message_sent(session_id, TokioInstant::now());
         assert_eq!(
             runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
                 session_id,
@@ -619,11 +831,7 @@ mod tests {
             .begin_listening(SessionIntent::LlmQuery)
             .expect("llm session should start");
         runtime.stop_listening().expect("llm session should stop");
-        runtime.record_stop_message_sent(
-            session_id,
-            Some(test_parent_focus()),
-            TokioInstant::now(),
-        );
+        runtime.record_stop_message_sent(session_id, TokioInstant::now());
         assert_eq!(
             runtime.defer_session_end_if_needed(&ServerMessage::SessionEnded {
                 session_id,
@@ -649,7 +857,6 @@ mod tests {
         assert_eq!(completion.state_label, "idle");
         assert!(completion.hotkey_up_elapsed_ms_at_enqueue.is_some());
         assert!(completion.stop_message_elapsed_ms_at_enqueue.is_some());
-        assert!(completion.parent_focus.is_some());
         assert!(!runtime.is_llm_busy());
         assert!(runtime.finish_llm_answer(session_id).is_none());
     }
@@ -662,7 +869,7 @@ mod tests {
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
         let (mut runtime, session_id) = runtime_waiting_for_result();
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
 
         handle_server_message_for_tests(
             ServerMessage::FinalResult {
@@ -703,7 +910,8 @@ mod tests {
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
         let stop_message_at = TokioInstant::now() - Duration::from_millis(40);
         let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+        let mut focus_router = ClientFocusRouter::default();
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
 
         handle_server_message(
             ServerMessage::FinalResult {
@@ -715,6 +923,7 @@ mod tests {
                 confidence: Some(0.92),
             },
             &mut runtime,
+            &mut focus_router,
             &mut overlay_router,
             &worker,
         )
@@ -762,7 +971,7 @@ mod tests {
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
         let (mut runtime, active_session_id) = runtime_waiting_for_result();
         let stale_session_id = Uuid::new_v4();
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
 
         handle_server_message_for_tests(
             ServerMessage::FinalResult {
@@ -802,7 +1011,7 @@ mod tests {
         let (worker, mut reports) = spawn_injector_worker_with_capacity(slow_injector, 8);
 
         let (mut runtime, session_id) = runtime_waiting_for_result();
-        let mut overlay_router = OverlayRouter::new(NoopOverlaySink, None);
+        let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
         let message = ServerMessage::FinalResult {
             session_id,
             text: "hello from daemon".to_string(),
@@ -835,12 +1044,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn interim_overlay_messages_route_without_injection_enqueue() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(
-            RecordingOverlaySink {
-                seen: Arc::clone(&seen_overlay_events),
-            },
-            None,
-        );
+        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
+            seen: Arc::clone(&seen_overlay_events),
+        });
         let injector_seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&injector_seen),
@@ -925,12 +1131,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mixed_stream_enqueues_exactly_one_final_result() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(
-            RecordingOverlaySink {
-                seen: Arc::clone(&seen_overlay_events),
-            },
-            None,
-        );
+        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
+            seen: Arc::clone(&seen_overlay_events),
+        });
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
             seen: Arc::clone(&seen_injection),
@@ -1023,8 +1226,7 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router =
-            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)));
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
@@ -1122,8 +1324,7 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router =
-            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)));
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
@@ -1223,8 +1424,7 @@ mod tests {
             Duration::ZERO,
         );
         let manager_metrics = Arc::clone(manager.metrics());
-        let mut overlay_router =
-            OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)), None);
+        let mut overlay_router = OverlayRouter::new(RuntimeOverlaySink::Process(Box::new(manager)));
 
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
@@ -1336,12 +1536,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn daemon_interim_text_requires_active_session_and_fresh_sequence() {
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
-        let mut overlay_router = OverlayRouter::new(
-            RecordingOverlaySink {
-                seen: Arc::clone(&seen_overlay_events),
-            },
-            None,
-        );
+        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
+            seen: Arc::clone(&seen_overlay_events),
+        });
         let injector = Arc::new(RecordingRunner {
             seen: Arc::new(Mutex::new(Vec::new())),
         });
