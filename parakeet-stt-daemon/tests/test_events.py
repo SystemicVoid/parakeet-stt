@@ -12,10 +12,11 @@ from parakeet_stt_daemon.events import (
     FinalResultEvent,
     InterimStateEvent,
     InterimTextEvent,
+    OverlayEventAdapter,
     RecordingEventSink,
     SessionEndedEvent,
     SessionStartedEvent,
-    WebSocketEventSink,
+    WebSocketEventSinkState,
 )
 from parakeet_stt_daemon.messages import InterimStateValue, SessionEndReason
 
@@ -76,50 +77,8 @@ def test_websocket_event_sink_serializes_existing_wire_messages() -> None:
     async def scenario() -> None:
         websocket = FakeWebSocket()
         send_lock = asyncio.Lock()
-        overlay_seq_by_session: dict[UUID, int] = {}
-        overlay_state_by_session: dict[UUID, str] = {}
-        last_interim_text_by_session: dict[UUID, str] = {}
-        counters = {"emitted": 0, "dropped": 0}
-
-        def next_overlay_seq(session_id: UUID) -> int:
-            current = overlay_seq_by_session.get(session_id, 0)
-            overlay_seq_by_session[session_id] = current + 1
-            return current
-
-        def overlay_session_state(session_id: UUID) -> str | None:
-            return overlay_state_by_session.get(session_id)
-
-        def set_overlay_session_state(session_id: UUID, state: str) -> None:
-            overlay_state_by_session[session_id] = state
-
-        def last_interim_text(session_id: UUID) -> str | None:
-            return last_interim_text_by_session.get(session_id)
-
-        def record_interim_text(session_id: UUID, text: str) -> None:
-            last_interim_text_by_session[session_id] = text
-
-        def clear_interim_text(session_id: UUID) -> None:
-            last_interim_text_by_session.pop(session_id, None)
-
-        def increment_emitted() -> None:
-            counters["emitted"] += 1
-
-        def increment_dropped() -> None:
-            counters["dropped"] += 1
-
-        sink = WebSocketEventSink(
-            websocket=websocket,
-            send_lock=lambda: send_lock,
-            overlay_events_enabled=True,
-            next_overlay_seq=next_overlay_seq,
-            overlay_session_state=overlay_session_state,
-            set_overlay_session_state=set_overlay_session_state,
-            last_interim_text=last_interim_text,
-            record_interim_text=record_interim_text,
-            clear_interim_text=clear_interim_text,
-            increment_overlay_events_emitted=increment_emitted,
-            increment_overlay_events_dropped=increment_dropped,
-        )
+        event_sinks = WebSocketEventSinkState(overlay_events_enabled=True)
+        sink = event_sinks.sink(websocket=websocket, send_lock=lambda: send_lock)
         session_id = uuid4()
 
         await sink.emit(
@@ -134,7 +93,6 @@ def test_websocket_event_sink_serializes_existing_wire_messages() -> None:
         await sink.emit(InterimTextEvent(session_id=session_id, text=" hello   world "))
         await sink.emit(InterimTextEvent(session_id=session_id, text="hello world"))
         await sink.emit(AudioLevelEvent(session_id=session_id, rms=0.1))
-        set_overlay_session_state(session_id, "terminal")
         await sink.emit(
             FinalResultEvent(
                 session_id=session_id,
@@ -176,7 +134,98 @@ def test_websocket_event_sink_serializes_existing_wire_messages() -> None:
             "lang": "auto",
             "confidence": None,
         }
+        assert event_sinks.overlay_events_emitted == 4
+        assert event_sinks.overlay_events_dropped == 0
+
+    asyncio.run(scenario())
+
+
+def test_overlay_event_adapter_preserves_transport_boundary_invariants() -> None:
+    async def scenario() -> None:
+        sent_payloads: list[dict[str, Any]] = []
+        send_lock = asyncio.Lock()
+        overlay_seq_by_session: dict[UUID, int] = {}
+        overlay_state_by_session: dict[UUID, str] = {}
+        last_interim_text_by_session: dict[UUID, str] = {}
+        counters = {"emitted": 0, "dropped": 0}
+
+        async def send_payload(payload: dict[str, Any]) -> None:
+            if payload["type"] == "audio_level":
+                raise RuntimeError("overlay transport unavailable")
+            sent_payloads.append(payload)
+
+        def next_overlay_seq(session_id: UUID) -> int:
+            current = overlay_seq_by_session.get(session_id, 0)
+            overlay_seq_by_session[session_id] = current + 1
+            return current
+
+        def overlay_session_state(session_id: UUID) -> str | None:
+            return overlay_state_by_session.get(session_id)
+
+        def set_overlay_session_state(session_id: UUID, state: str) -> None:
+            overlay_state_by_session[session_id] = state
+
+        def last_interim_text(session_id: UUID) -> str | None:
+            return last_interim_text_by_session.get(session_id)
+
+        def record_interim_text(session_id: UUID, text: str) -> None:
+            last_interim_text_by_session[session_id] = text
+
+        def clear_interim_text(session_id: UUID) -> None:
+            last_interim_text_by_session.pop(session_id, None)
+
+        def clear_session_runtime(session_id: UUID) -> None:
+            overlay_seq_by_session.pop(session_id, None)
+            clear_interim_text(session_id)
+            set_overlay_session_state(session_id, "active")
+
+        def increment_emitted() -> None:
+            counters["emitted"] += 1
+
+        def increment_dropped() -> None:
+            counters["dropped"] += 1
+
+        adapter = OverlayEventAdapter(
+            overlay_events_enabled=True,
+            send_payload=send_payload,
+            send_lock=lambda: send_lock,
+            next_overlay_seq=next_overlay_seq,
+            overlay_session_state=overlay_session_state,
+            set_overlay_session_state=set_overlay_session_state,
+            last_interim_text=last_interim_text,
+            record_interim_text=record_interim_text,
+            clear_interim_text=clear_interim_text,
+            increment_overlay_events_emitted=increment_emitted,
+            increment_overlay_events_dropped=increment_dropped,
+            clear_session_runtime=clear_session_runtime,
+            mark_session_terminal=lambda session_id: set_overlay_session_state(
+                session_id, "terminal"
+            ),
+        )
+        session_id = uuid4()
+
+        adapter.reset_session(session_id)
+        await adapter.emit_interim_text(InterimTextEvent(session_id=session_id, text=" hello "))
+        await adapter.emit_interim_text(InterimTextEvent(session_id=session_id, text="hello"))
+        await adapter.emit_audio_level(AudioLevelEvent(session_id=session_id, rms=0.1))
+        adapter.mark_session_terminal(session_id)
+        await adapter.emit_interim_state(
+            InterimStateEvent(session_id=session_id, state=InterimStateValue.FINALIZING)
+        )
+        await adapter.emit_session_ended(
+            SessionEndedEvent(session_id=session_id, reason=SessionEndReason.FINAL)
+        )
+        await adapter.emit_session_ended(
+            SessionEndedEvent(session_id=session_id, reason=SessionEndReason.FINAL)
+        )
+
+        assert [payload["type"] for payload in sent_payloads] == [
+            "interim_text",
+            "session_ended",
+        ]
+        assert sent_payloads[0]["seq"] == 0
         assert last_interim_text_by_session == {}
-        assert counters == {"emitted": 4, "dropped": 0}
+        assert overlay_state_by_session[session_id] == "ended"
+        assert counters == {"emitted": 2, "dropped": 3}
 
     asyncio.run(scenario())
