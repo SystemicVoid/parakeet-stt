@@ -194,19 +194,15 @@ pub(crate) struct OverlayRouter<S: OverlaySink> {
     metrics: Arc<OverlayRoutingMetrics>,
     active_session_id: Option<Uuid>,
     last_seq_by_producer: HashMap<OverlayTextProducer, u64>,
-    focus_cache: Option<WaylandFocusCache>,
-    last_output_name: Option<String>,
 }
 
 impl<S: OverlaySink> OverlayRouter<S> {
-    pub(crate) fn new(sink: S, focus_cache: Option<WaylandFocusCache>) -> Self {
+    pub(crate) fn new(sink: S) -> Self {
         Self {
             sink,
             metrics: Arc::new(OverlayRoutingMetrics::default()),
             active_session_id: None,
             last_seq_by_producer: HashMap::new(),
-            focus_cache,
-            last_output_name: None,
         }
     }
 
@@ -219,16 +215,47 @@ impl<S: OverlaySink> OverlayRouter<S> {
         if self.active_session_id != Some(session_id) {
             self.active_session_id = Some(session_id);
             self.last_seq_by_producer.clear();
-            self.last_output_name = None;
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn route_output_hint(&mut self, output_name: String) {
+        self.route_optional_output_hint(Some(output_name));
+    }
+
+    fn route_optional_output_hint(&mut self, output_name: Option<String>) {
+        let Some(output_name) = output_name else {
+            return;
+        };
+
+        self.sink
+            .on_overlay_event(OverlayEvent::OutputHint { output_name });
+    }
+
+    #[cfg(test)]
     pub(crate) fn route_daemon_interim_state(
         &mut self,
         expected_session_id: Option<Uuid>,
         session_id: Uuid,
         seq: u64,
         state: String,
+    ) {
+        self.route_daemon_interim_state_with_output_hint(
+            expected_session_id,
+            session_id,
+            seq,
+            state,
+            || None,
+        );
+    }
+
+    pub(crate) fn route_daemon_interim_state_with_output_hint(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        seq: u64,
+        state: String,
+        output_hint: impl FnOnce() -> Option<String>,
     ) {
         let Some(expected_session_id) = expected_session_id else {
             self.metrics.note_session_mismatch_drop();
@@ -245,15 +272,34 @@ impl<S: OverlaySink> OverlayRouter<S> {
             seq,
             state,
             OverlayTextProducer::DaemonSttInterim,
+            output_hint,
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn route_daemon_interim_text(
         &mut self,
         expected_session_id: Option<Uuid>,
         session_id: Uuid,
         seq: u64,
         text: String,
+    ) {
+        self.route_daemon_interim_text_with_output_hint(
+            expected_session_id,
+            session_id,
+            seq,
+            text,
+            || None,
+        );
+    }
+
+    pub(crate) fn route_daemon_interim_text_with_output_hint(
+        &mut self,
+        expected_session_id: Option<Uuid>,
+        session_id: Uuid,
+        seq: u64,
+        text: String,
+        output_hint: impl FnOnce() -> Option<String>,
     ) {
         let Some(expected_session_id) = expected_session_id else {
             self.metrics.note_session_mismatch_drop();
@@ -270,26 +316,46 @@ impl<S: OverlaySink> OverlayRouter<S> {
             seq,
             text,
             OverlayTextProducer::DaemonSttInterim,
+            output_hint,
         );
     }
 
-    pub(crate) fn route_llm_answer_state(&mut self, session_id: Uuid, seq: u64, state: String) {
+    pub(crate) fn route_llm_answer_state_with_output_hint(
+        &mut self,
+        session_id: Uuid,
+        seq: u64,
+        state: String,
+        output_hint: impl FnOnce() -> Option<String>,
+    ) {
         self.route_interim_state(
             None,
             session_id,
             seq,
             state,
             OverlayTextProducer::LlmAnswerDelta,
+            output_hint,
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn route_llm_answer_delta(&mut self, session_id: Uuid, seq: u64, text: String) {
+        self.route_llm_answer_delta_with_output_hint(session_id, seq, text, || None);
+    }
+
+    pub(crate) fn route_llm_answer_delta_with_output_hint(
+        &mut self,
+        session_id: Uuid,
+        seq: u64,
+        text: String,
+        output_hint: impl FnOnce() -> Option<String>,
+    ) {
         self.route_interim_text(
             None,
             session_id,
             seq,
             text,
             OverlayTextProducer::LlmAnswerDelta,
+            output_hint,
         );
     }
 
@@ -326,7 +392,6 @@ impl<S: OverlaySink> OverlayRouter<S> {
         if self.active_session_id == Some(session_id) {
             self.active_session_id = None;
             self.last_seq_by_producer.clear();
-            self.last_output_name = None;
         }
     }
 
@@ -337,6 +402,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
         seq: u64,
         state: String,
         producer: OverlayTextProducer,
+        output_hint: impl FnOnce() -> Option<String>,
     ) {
         if !self.allow_session(expected_session_id, session_id)
             || !self.accept_seq(session_id, seq, &producer)
@@ -350,7 +416,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
             overlay_text_producer = producer.as_str(),
             "routing overlay interim state"
         );
-        self.maybe_emit_output_hint();
+        self.route_optional_output_hint(output_hint());
         self.sink.on_overlay_event(OverlayEvent::InterimState {
             producer,
             session_id,
@@ -367,6 +433,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
         seq: u64,
         text: String,
         producer: OverlayTextProducer,
+        output_hint: impl FnOnce() -> Option<String>,
     ) {
         if !self.allow_session(expected_session_id, session_id)
             || !self.accept_seq(session_id, seq, &producer)
@@ -381,7 +448,7 @@ impl<S: OverlaySink> OverlayRouter<S> {
             text_chars = text.chars().count(),
             "routing overlay interim text"
         );
-        self.maybe_emit_output_hint();
+        self.route_optional_output_hint(output_hint());
         self.sink.on_overlay_event(OverlayEvent::InterimText {
             producer,
             session_id,
@@ -404,24 +471,6 @@ impl<S: OverlaySink> OverlayRouter<S> {
         }
         self.sink
             .on_overlay_event(OverlayEvent::SessionWarning { session_id });
-    }
-
-    fn maybe_emit_output_hint(&mut self) {
-        let Some(focus_cache) = self.focus_cache.as_ref() else {
-            return;
-        };
-
-        let Some(output_name) = focus_cache.current_output_name() else {
-            return;
-        };
-
-        if self.last_output_name.as_deref() == Some(output_name.as_str()) {
-            return;
-        }
-
-        self.last_output_name = Some(output_name.clone());
-        self.sink
-            .on_overlay_event(OverlayEvent::OutputHint { output_name });
     }
 
     fn allow_session(&self, expected_session_id: Option<Uuid>, incoming_session_id: Uuid) -> bool {
@@ -507,7 +556,7 @@ mod tests {
     fn stale_interim_sequences_are_dropped_near_router() {
         let session_id = Uuid::new_v4();
         let (sink, seen) = RecordingOverlaySink::new();
-        let mut router = OverlayRouter::new(sink, None);
+        let mut router = OverlayRouter::new(sink);
         router.note_session_started(session_id);
 
         router.route_daemon_interim_text(Some(session_id), session_id, 10, "newest".to_string());
@@ -537,7 +586,7 @@ mod tests {
     fn daemon_interim_requires_active_client_session() {
         let session_id = Uuid::new_v4();
         let (sink, seen) = RecordingOverlaySink::new();
-        let mut router = OverlayRouter::new(sink, None);
+        let mut router = OverlayRouter::new(sink);
 
         router.route_daemon_interim_state(None, session_id, 1, "listening".to_string());
         router.route_daemon_interim_text(None, session_id, 2, "late daemon".to_string());
@@ -560,7 +609,7 @@ mod tests {
         let active_session_id = Uuid::new_v4();
         let stale_session_id = Uuid::new_v4();
         let (sink, seen) = RecordingOverlaySink::new();
-        let mut router = OverlayRouter::new(sink, None);
+        let mut router = OverlayRouter::new(sink);
         router.note_session_started(active_session_id);
 
         router.route_daemon_interim_text(
@@ -600,7 +649,7 @@ mod tests {
     fn daemon_and_llm_overlay_text_sequences_are_independent() {
         let session_id = Uuid::new_v4();
         let (sink, seen) = RecordingOverlaySink::new();
-        let mut router = OverlayRouter::new(sink, None);
+        let mut router = OverlayRouter::new(sink);
         router.note_session_started(session_id);
 
         router.route_daemon_interim_text(
@@ -658,7 +707,7 @@ mod tests {
         let active_session_id = Uuid::new_v4();
         let inactive_session_id = Uuid::new_v4();
         let (sink, seen) = RecordingOverlaySink::new();
-        let mut router = OverlayRouter::new(sink, None);
+        let mut router = OverlayRouter::new(sink);
         router.note_session_started(active_session_id);
 
         router.route_session_warning(inactive_session_id);

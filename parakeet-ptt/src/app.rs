@@ -19,14 +19,15 @@ use tracing::{debug, info, warn};
 use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
-    classify_error_code, handle_server_message, ClientSessionRuntime, SessionIntent,
+    classify_error_code, handle_server_message, ClientFocusRouter, ClientSessionRuntime,
+    SessionIntent,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent,
     HotkeyIntent, HotkeyTasks,
 };
-use crate::injector::{injector_metrics_snapshot, ParentFocusCapture};
+use crate::injector::injector_metrics_snapshot;
 use crate::injector_runtime::{
     build_injection_runner, spawn_injector_worker, EnqueueFailure, InjectionErrorKind,
     InjectionJob, InjectionJobRunner, InjectionOrigin, InjectionReport, InjectorWorkerHandle,
@@ -35,7 +36,7 @@ use crate::injector_runtime::{
 use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::{start_message, stop_message, ClientMessage, DaemonStatus, ServerMessage};
-use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
+use crate::surface_focus::WaylandFocusCache;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -420,8 +421,8 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     );
     let hotkey_runtime = hotkey_source.start(&config)?;
     let (injector_worker, mut injection_reports) = spawn_injector_worker(injection_runner);
-    let focus_cache_for_parent_capture = focus_cache.clone();
-    let mut overlay_router = OverlayRouter::new(overlay_sink, focus_cache);
+    let mut focus_router = ClientFocusRouter::new(focus_cache);
+    let mut overlay_router = OverlayRouter::new(overlay_sink);
     spawn_event_loop_lag_monitor();
 
     let mut session_runtime = ClientSessionRuntime::new();
@@ -469,16 +470,18 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             warn!("ignoring hotkey down while LLM response is in progress");
                                             let (busy_session, busy_seq) =
                                                 session_runtime.note_llm_busy_overlay_rejection();
-                                            overlay_router.route_llm_answer_state(
+                                            overlay_router.route_llm_answer_state_with_output_hint(
                                                 busy_session,
                                                 busy_seq,
                                                 "LLM busy; wait for current answer".to_string(),
+                                                || focus_router.next_overlay_output_hint(),
                                             );
                                             overlay_router.route_session_ended(
                                                 None,
                                                 busy_session,
                                                 Some("busy".to_string()),
                                             );
+                                            focus_router.reset_overlay_target();
                                             hotkey_intent_diagnostics.note_llm_busy_reject();
                                             hotkey_intent_diagnostics.maybe_log_summary("hotkey_down_busy");
                                             continue;
@@ -505,14 +508,8 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             let message = stop_message(session_id);
                                             send_message(daemon.as_mut(), &message).await?;
                                             let stop_sent_at = TokioInstant::now();
-                                            let parent_focus = capture_parent_focus(
-                                                focus_cache_for_parent_capture.as_ref(),
-                                            );
-                                            session_runtime.record_stop_message_sent(
-                                                session_id,
-                                                parent_focus,
-                                                stop_sent_at,
-                                            );
+                                            focus_router.record_stop_target(session_id, stop_sent_at);
+                                            session_runtime.record_stop_message_sent(session_id, stop_sent_at);
                                             info!(session = %session_id, "stop_session sent (hotkey up)");
                                         } else {
                                             hotkey_intent_diagnostics.note_hotkey_up_ignored();
@@ -571,10 +568,11 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 );
                                                 let seq =
                                                     session_runtime.start_llm_answer(session_id);
-                                                overlay_router.route_llm_answer_state(
+                                                overlay_router.route_llm_answer_state_with_output_hint(
                                                     session_id,
                                                     seq,
                                                     "Generating answer...".to_string(),
+                                                    || focus_router.next_overlay_output_hint(),
                                                 );
                                                 let answerer = Arc::clone(&llm_answerer);
                                                 let progress_tx = llm_tx.clone();
@@ -596,6 +594,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 handle_server_message(
                                                     known,
                                                     &mut session_runtime,
+                                                    &mut focus_router,
                                                     &mut overlay_router,
                                                     &injector_worker,
                                                 ).await?;
@@ -626,10 +625,11 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                         if let Some(update) =
                                             session_runtime.record_llm_delta(session_id, delta)
                                         {
-                                            overlay_router.route_llm_answer_delta(
+                                            overlay_router.route_llm_answer_delta_with_output_hint(
                                                 session_id,
                                                 update.seq,
                                                 update.text,
+                                                || focus_router.next_overlay_output_hint(),
                                             );
                                         }
                                     }
@@ -650,6 +650,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             session_id,
                                             completion.session_end_reason.clone(),
                                         );
+                                        focus_router.reset_overlay_target();
                                         let fallback_transcript = transcript.clone();
                                         let response_text = match result {
                                             Ok(answer) => {
@@ -704,7 +705,10 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                     completion.hotkey_up_elapsed_ms_at_enqueue,
                                                     completion.stop_message_elapsed_ms_at_enqueue,
                                                 )
-                                                .with_parent_focus(completion.parent_focus),
+                                                .with_parent_focus(
+                                                    focus_router
+                                                        .take_parent_focus_for_enqueue(session_id),
+                                                ),
                                             )
                                             .await
                                         {
@@ -734,6 +738,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                 }
                 hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
                 session_runtime.reset_for_connection_drop();
+                focus_router.reset_for_connection_drop();
                 warn!("Reconnecting to daemon after drop");
             }
             Err(err) => {
@@ -856,43 +861,6 @@ fn handle_injection_report(
     }
 
     overlay_router.route_injection_complete(report.session_id, success);
-}
-
-fn capture_parent_focus(focus_cache: Option<&WaylandFocusCache>) -> Option<ParentFocusCapture> {
-    let cache = focus_cache?;
-    match cache.observe(30_000, 500) {
-        WaylandFocusObservation::Fresh {
-            snapshot,
-            cache_age_ms,
-        } => Some(ParentFocusCapture {
-            snapshot: Some(snapshot),
-            source_selected: "wayland_cache".to_string(),
-            wayland_cache_age_ms: Some(cache_age_ms),
-            wayland_fallback_reason: None,
-            captured_elapsed_ms: Some(0),
-        }),
-        WaylandFocusObservation::LowConfidence {
-            snapshot,
-            cache_age_ms,
-            reason,
-        } => Some(ParentFocusCapture {
-            snapshot: Some(snapshot),
-            source_selected: "wayland_cache_low_confidence".to_string(),
-            wayland_cache_age_ms: Some(cache_age_ms),
-            wayland_fallback_reason: Some(reason.to_string()),
-            captured_elapsed_ms: Some(0),
-        }),
-        WaylandFocusObservation::Unavailable {
-            reason,
-            cache_age_ms,
-        } => Some(ParentFocusCapture {
-            snapshot: None,
-            source_selected: "wayland_unavailable".to_string(),
-            wayland_cache_age_ms: cache_age_ms,
-            wayland_fallback_reason: Some(reason.to_string()),
-            captured_elapsed_ms: Some(0),
-        }),
-    }
 }
 
 fn session_intent_from_hotkey(intent: HotkeyIntent) -> SessionIntent {
@@ -1573,7 +1541,7 @@ mod tests {
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
         let session_id = Uuid::new_v4();
         let (overlay_sink, seen_overlay_events) = RecordingOverlaySink::shared();
-        let mut overlay_router = OverlayRouter::new(overlay_sink, None);
+        let mut overlay_router = OverlayRouter::new(overlay_sink);
 
         handle_injection_report(
             &worker,
