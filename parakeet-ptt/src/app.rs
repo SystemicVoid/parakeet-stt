@@ -20,7 +20,8 @@ use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
     classify_error_code, handle_server_message, ClientFocusRouter, ClientInjectionDispatcher,
-    ClientSessionRuntime, LlmAnswerInjection, SessionIntent,
+    ClientLlmQueryRuntime, ClientSessionRuntime, LlmProgressOutcome, LlmQueryRequest,
+    SessionIntent,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
@@ -31,7 +32,7 @@ use crate::injector_runtime::{
     build_injection_runner, spawn_injector_worker, InjectionJob, InjectionJobRunner,
     InjectionOrigin, INJECTION_ENQUEUE_TIMEOUT_MS,
 };
-use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
+use crate::llm::LlmAnswerer;
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::{start_message, stop_message, ClientMessage, DaemonStatus, ServerMessage};
 use crate::surface_focus::WaylandFocusCache;
@@ -448,7 +449,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     fetch_status_once(&config).await;
 
     let mut backoff = TokioDuration::from_millis(500);
-    let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmProgress>();
+    let mut llm_query_runtime = ClientLlmQueryRuntime::new(Arc::clone(&llm_answerer));
     let mut hotkey_intent_diagnostics = HotkeyIntentDiagnostics::default();
 
     loop {
@@ -465,19 +466,18 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                     HotkeyEvent::Down { intent } => {
                                         let intent = session_intent_from_hotkey(intent);
                                         hotkey_intent_diagnostics.note_hotkey_down(intent);
-                                        if session_runtime.is_llm_busy() {
+                                        if llm_query_runtime.is_busy() {
                                             warn!("ignoring hotkey down while LLM response is in progress");
-                                            let (busy_session, busy_seq) =
-                                                session_runtime.note_llm_busy_overlay_rejection();
+                                            let busy = llm_query_runtime.note_busy_overlay_rejection();
                                             overlay_router.route_llm_answer_state_with_output_hint(
-                                                busy_session,
-                                                busy_seq,
-                                                "LLM busy; wait for current answer".to_string(),
+                                                busy.session_id,
+                                                busy.seq,
+                                                busy.state,
                                                 || focus_router.next_overlay_output_hint(),
                                             );
                                             overlay_router.route_session_ended(
                                                 None,
-                                                busy_session,
+                                                busy.session_id,
                                                 Some("busy".to_string()),
                                             );
                                             focus_router.reset_overlay_target();
@@ -495,7 +495,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 state = session_runtime.state_label(),
                                                 active_session = ?session_runtime.active_session_id(),
                                                 active_intent = ?session_runtime.active_intent(),
-                                                llm_busy = session_runtime.is_llm_busy(),
+                                                llm_busy = llm_query_runtime.is_busy(),
                                                 "ignoring hotkey down because client is not idle"
                                             );
                                         }
@@ -516,7 +516,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 state = session_runtime.state_label(),
                                                 active_session = ?session_runtime.active_session_id(),
                                                 active_intent = ?session_runtime.active_intent(),
-                                                llm_busy = session_runtime.is_llm_busy(),
+                                                llm_busy = llm_query_runtime.is_busy(),
                                                 "ignoring hotkey up because no listening session is active"
                                             );
                                         }
@@ -528,7 +528,10 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                 match next {
                                     Ok(Some(message)) => {
                                         if let Some(session_id) =
-                                            session_runtime.defer_session_end_if_needed(&message)
+                                            llm_query_runtime.defer_session_end_if_needed(
+                                                &message,
+                                                &session_runtime,
+                                            )
                                         {
                                             debug!(
                                                 session = %session_id,
@@ -559,35 +562,21 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 ..
                                             } if session_runtime.active_intent()
                                                 == Some(SessionIntent::LlmQuery) => {
-                                                info!(
-                                                    session = %session_id,
-                                                    daemon_latency_ms = latency_ms,
-                                                    audio_ms,
-                                                    "final result received in llm_query mode"
+                                                let started = llm_query_runtime.start_answer(
+                                                    LlmQueryRequest::new(
+                                                        session_id,
+                                                        text,
+                                                        latency_ms,
+                                                        audio_ms,
+                                                    ),
+                                                    &mut session_runtime,
                                                 );
-                                                let seq =
-                                                    session_runtime.start_llm_answer(session_id);
                                                 overlay_router.route_llm_answer_state_with_output_hint(
-                                                    session_id,
-                                                    seq,
-                                                    "Generating answer...".to_string(),
+                                                    started.session_id,
+                                                    started.seq,
+                                                    started.state,
                                                     || focus_router.next_overlay_output_hint(),
                                                 );
-                                                let answerer = Arc::clone(&llm_answerer);
-                                                let progress_tx = llm_tx.clone();
-                                                tokio::spawn(async move {
-                                                    let llm_result = answerer
-                                                        .answer(session_id, text.clone(), progress_tx.clone())
-                                                        .await
-                                                        .map_err(|err| format!("{err:#}"));
-                                                    let _ = progress_tx.send(LlmProgress::Finished {
-                                                        session_id,
-                                                        transcript: text,
-                                                        daemon_latency_ms: latency_ms,
-                                                        daemon_audio_ms: audio_ms,
-                                                        result: llm_result,
-                                                    });
-                                                });
                                             }
                                             known => {
                                                 handle_server_message(
@@ -617,78 +606,31 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                     &audio_feedback,
                                 );
                             }
-                            Some(progress) = llm_rx.recv() => {
-                                match progress {
-                                    LlmProgress::Delta { session_id, delta } => {
-                                        if let Some(update) =
-                                            session_runtime.record_llm_delta(session_id, delta)
-                                        {
-                                            overlay_router.route_llm_answer_delta_with_output_hint(
-                                                session_id,
-                                                update.seq,
-                                                update.text,
-                                                || focus_router.next_overlay_output_hint(),
-                                            );
-                                        }
+                            Some(progress) = llm_query_runtime.recv_progress() => {
+                                match llm_query_runtime.handle_progress(progress, &mut session_runtime) {
+                                    LlmProgressOutcome::Delta(update) => {
+                                        overlay_router.route_llm_answer_delta_with_output_hint(
+                                            update.session_id,
+                                            update.seq,
+                                            update.text,
+                                            || focus_router.next_overlay_output_hint(),
+                                        );
                                     }
-                                    LlmProgress::Finished {
-                                        session_id,
-                                        transcript,
-                                        daemon_latency_ms,
-                                        daemon_audio_ms,
-                                        result,
-                                    } => {
-                                        let Some(completion) =
-                                            session_runtime.finish_llm_answer(session_id)
-                                        else {
-                                            continue;
-                                        };
+                                    LlmProgressOutcome::Finished(answer) => {
                                         overlay_router.route_session_ended(
                                             None,
-                                            session_id,
-                                            completion.session_end_reason.clone(),
+                                            answer.session_id,
+                                            answer.session_end_reason.clone(),
                                         );
                                         focus_router.reset_overlay_target();
-                                        let fallback_transcript = transcript.clone();
-                                        let response_text = match result {
-                                            Ok(answer) => {
-                                                let sanitized = sanitize_model_answer(&answer);
-                                                info!(
-                                                    session = %session_id,
-                                                    answer_chars = sanitized.chars().count(),
-                                                    "llm response completed"
-                                                );
-                                                sanitized
-                                            }
-                                            Err(error) => {
-                                                warn!(
-                                                    session = %session_id,
-                                                    error = %error,
-                                                    "llm generation failed; falling back to raw transcript"
-                                                );
-                                                fallback_transcript.clone()
-                                            }
-                                        };
-
-                                        let to_inject = if response_text.trim().is_empty() {
-                                            warn!(session = %session_id, "llm response empty after sanitization; falling back to transcript");
-                                            fallback_transcript
-                                        } else {
-                                            response_text
-                                        };
                                         injection_dispatcher
                                             .dispatch_llm_answer(
-                                                LlmAnswerInjection::new(
-                                                    session_id,
-                                                    to_inject,
-                                                    daemon_latency_ms,
-                                                    daemon_audio_ms,
-                                                    completion,
-                                                ),
+                                                answer.injection,
                                                 &mut focus_router,
                                             )
                                             .await;
                                     }
+                                    LlmProgressOutcome::Ignored => {}
                                 }
                             }
                         }
@@ -701,6 +643,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                 }
                 hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
                 session_runtime.reset_for_connection_drop();
+                llm_query_runtime.reset_for_connection_drop();
                 focus_router.reset_for_connection_drop();
                 warn!("Reconnecting to daemon after drop");
             }
