@@ -107,6 +107,19 @@ stt() {
         printf "http://%s%s" "$1" "$DAEMON_STATUS_PATH"
     }
 
+    _daemon_health_url_from_authority() {
+        printf "http://%s%s" "$1" "$DAEMON_HEALTH_PATH"
+    }
+
+    _host_from_authority() {
+        local authority="$1"
+        local host="${authority%:*}"
+        if [ -z "$host" ] || [ "$host" = "$authority" ]; then
+            return 1
+        fi
+        printf "%s" "$host"
+    }
+
     _port_from_authority() {
         local authority="$1"
         local port="${authority##*:}"
@@ -590,13 +603,15 @@ stt() {
         [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" >/dev/null 2>&1
     }
 
-    _socket_ready_once() {
+    _socket_ready_once_for() {
+        local host="$1"
+        local port="$2"
         if command -v nc >/dev/null 2>&1; then
-            nc -z "$HOST" "$PORT" 2>/dev/null
+            nc -z "$host" "$port" 2>/dev/null
             return $?
         fi
 
-        python3 - "$HOST" "$PORT" <<'PY' >/dev/null 2>&1
+        python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
 import socket, sys
 host = sys.argv[1]
 port = int(sys.argv[2])
@@ -666,10 +681,12 @@ PY
         [ "$ready" -eq 1 ]
     }
 
-    _wait_for_socket_gone() {
-        local tries="${1:-20}"
+    _wait_for_socket_gone_for() {
+        local host="$1"
+        local port="$2"
+        local tries="${3:-20}"
         for _ in $(seq 1 "$tries"); do
-            if ! _socket_ready_once; then
+            if ! _socket_ready_once_for "$host" "$port"; then
                 return 0
             fi
             sleep 0.2
@@ -787,13 +804,6 @@ PY
         return 1
     }
 
-    _refresh_daemon_pid_file_from_listener() {
-        local listener_pid
-        listener_pid="$(_listener_pid "$PORT")" || return 1
-        printf "%s\n" "$listener_pid" >| "$DAEMON_PID_FILE"
-        return 0
-    }
-
     _refresh_pid_file_from_listener() {
         local port="$1"
         local pid_file="$2"
@@ -801,6 +811,202 @@ PY
         listener_pid="$(_listener_pid "$port")" || return 1
         printf "%s\n" "$listener_pid" >| "$pid_file"
         return 0
+    }
+
+    # Daemon lifecycle adapter: start/status/stop should use these helpers for
+    # daemon identity instead of reading PID/port files directly.
+    _daemon_lifecycle_current_authority() {
+        printf "%s:%s" "$HOST" "$PORT"
+    }
+
+    _daemon_lifecycle_authority() {
+        local authority=""
+        local port=""
+        if [ -s "$PORT_FILE" ]; then
+            authority="$(sed -n '1p' "$PORT_FILE")"
+            if [ -n "$authority" ]; then
+                if _host_from_authority "$authority" >/dev/null 2>&1 && _port_from_authority "$authority" >/dev/null 2>&1; then
+                    printf "%s" "$authority"
+                    return 0
+                fi
+                port="$(_port_from_authority "$authority" 2>/dev/null)" || port=""
+                if [ -n "$port" ]; then
+                    printf "%s:%s" "$HOST" "$port"
+                    return 0
+                fi
+            fi
+        fi
+
+        _daemon_lifecycle_current_authority
+    }
+
+    _daemon_lifecycle_listener_host() {
+        local authority="${1:-}"
+        local host
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        if ! host="$(_host_from_authority "$authority")"; then
+            host="$HOST"
+        fi
+        printf "%s" "$host"
+    }
+
+    _daemon_lifecycle_listener_port() {
+        local authority="${1:-}"
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        _port_from_authority "$authority" || printf "%s" "$PORT"
+    }
+
+    _daemon_lifecycle_ws_endpoint() {
+        local authority="${1:-}"
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        _daemon_ws_endpoint_from_authority "$authority"
+    }
+
+    _daemon_lifecycle_status_url() {
+        local authority="${1:-}"
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        _daemon_status_url_from_authority "$authority"
+    }
+
+    _daemon_lifecycle_health_url() {
+        local authority="${1:-}"
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        _daemon_health_url_from_authority "$authority"
+    }
+
+    _daemon_lifecycle_socket_ready() {
+        local authority="${1:-}"
+        local host port
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        host="$(_daemon_lifecycle_listener_host "$authority")"
+        port="$(_daemon_lifecycle_listener_port "$authority")"
+        _socket_ready_once_for "$host" "$port"
+    }
+
+    _daemon_lifecycle_refresh_pid_from_listener() {
+        local authority="${1:-}"
+        local port
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        port="$(_daemon_lifecycle_listener_port "$authority")"
+        _refresh_pid_file_from_listener "$port" "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_pid_alive() {
+        _pid_alive "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_pid() {
+        [ -f "$DAEMON_PID_FILE" ] || return 1
+        sed -n '1p' "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_cached_pid_process_identified() {
+        local pid process_args
+        pid="$(_daemon_lifecycle_pid)" || return 1
+        process_args="$(ps -p "$pid" -o args= 2>/dev/null)" || process_args=""
+        if grep -Fq "parakeet-stt-daemon" <<<"$process_args"; then
+            return 0
+        fi
+        if [ -r "/proc/$pid/cmdline" ]; then
+            tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "parakeet-stt-daemon"
+            return $?
+        fi
+        return 1
+    }
+
+    _daemon_lifecycle_record_launcher_pid() {
+        printf "%s\n" "$1" >| "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_health_ok() {
+        local authority="${1:-}"
+        _http_ok_once "$(_daemon_lifecycle_health_url "$authority")"
+    }
+
+    _daemon_lifecycle_wait_for_health() {
+        local authority="${1:-}"
+        local tries="${2:-120}"
+        _wait_for_http "$(_daemon_lifecycle_health_url "$authority")" "$DAEMON_PID_FILE" "$tries"
+    }
+
+    _daemon_lifecycle_runtime_truth() {
+        local authority="${1:-}"
+        _daemon_status_runtime_truth "$(_daemon_lifecycle_status_url "$authority")"
+    }
+
+    _daemon_lifecycle_listener_process_identified() {
+        local authority="${1:-}"
+        local port listener_pid process_args
+
+        port="$(_daemon_lifecycle_listener_port "$authority")"
+        listener_pid="$(_listener_pid "$port")" || return 1
+        process_args="$(ps -p "$listener_pid" -o args= 2>/dev/null)" || process_args=""
+        if grep -Fq "parakeet-stt-daemon" <<<"$process_args"; then
+            return 0
+        fi
+        if [ -r "/proc/$listener_pid/cmdline" ]; then
+            tr '\0' ' ' < "/proc/$listener_pid/cmdline" | grep -Fq "parakeet-stt-daemon"
+            return $?
+        fi
+        return 1
+    }
+
+    _daemon_lifecycle_identity_confirmed() {
+        local authority="${1:-}"
+        _daemon_lifecycle_listener_process_identified "$authority"
+    }
+
+    _daemon_lifecycle_stop_pid_file_process() {
+        _stop_pid "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_stop_bound_listener() {
+        local authority="${1:-}"
+        local port listener_pid
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        port="$(_daemon_lifecycle_listener_port "$authority")"
+        listener_pid="$(_listener_pid "$port")" || true
+        if [ -n "$listener_pid" ] && ps -p "$listener_pid" >/dev/null 2>&1; then
+            kill -TERM "$listener_pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+                if ! ps -p "$listener_pid" >/dev/null 2>&1; then
+                    return 0
+                fi
+                sleep 0.2
+            done
+            kill -KILL "$listener_pid" 2>/dev/null || true
+            if ps -p "$listener_pid" >/dev/null 2>&1; then
+                return 1
+            fi
+            return 0
+        fi
+        return 1
+    }
+
+    _daemon_lifecycle_wait_for_socket_gone() {
+        local authority="${1:-}"
+        local tries="${2:-20}"
+        local host port
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_authority)"
+        host="$(_daemon_lifecycle_listener_host "$authority")"
+        port="$(_daemon_lifecycle_listener_port "$authority")"
+        _wait_for_socket_gone_for "$host" "$port" "$tries"
+    }
+
+    _daemon_lifecycle_persist_current_authority() {
+        _daemon_lifecycle_persist_authority "$(_daemon_lifecycle_current_authority)"
+    }
+
+    _daemon_lifecycle_persist_authority() {
+        printf "%s\n" "$1" >| "$PORT_FILE"
+    }
+
+    _daemon_lifecycle_forget_pid() {
+        rm -f "$DAEMON_PID_FILE"
+    }
+
+    _daemon_lifecycle_clear_identity() {
+        rm -f "$DAEMON_PID_FILE" "$PORT_FILE"
     }
 
     _daemon_status_runtime_truth() {
@@ -968,34 +1174,40 @@ PY
     }
 
     _stop_running_daemon() {
-        if _socket_ready_once; then
-            _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
-        fi
+        local authority="${1:-}"
+        local refresh_from_bound_listener="${2:-1}"
+        [ -n "$authority" ] || authority="$(_daemon_lifecycle_current_authority)"
 
-        if _pid_alive "$DAEMON_PID_FILE"; then
-            _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
-        fi
-
-        local listener_pid
-        listener_pid="$(_listener_pid "$PORT")" || true
-        if [ -n "$listener_pid" ] && ps -p "$listener_pid" >/dev/null 2>&1; then
-            kill -TERM "$listener_pid" 2>/dev/null || true
-            for _ in $(seq 1 10); do
-                if ! ps -p "$listener_pid" >/dev/null 2>&1; then
-                    break
+        if [ "$refresh_from_bound_listener" != "1" ]; then
+            if _daemon_lifecycle_pid_alive; then
+                if _daemon_lifecycle_cached_pid_process_identified; then
+                    _daemon_lifecycle_stop_pid_file_process >/dev/null 2>&1 || return 1
                 fi
-                sleep 0.2
-            done
-            if ps -p "$listener_pid" >/dev/null 2>&1; then
-                kill -KILL "$listener_pid" 2>/dev/null || true
+            fi
+            _daemon_lifecycle_forget_pid
+            return 0
+        fi
+
+        if [ "$refresh_from_bound_listener" = "1" ]; then
+            _daemon_lifecycle_refresh_pid_from_listener "$authority" >/dev/null 2>&1 || true
+        fi
+        local daemon_pid_was_alive=0
+        if _daemon_lifecycle_pid_alive; then
+            daemon_pid_was_alive=1
+            _daemon_lifecycle_stop_pid_file_process >/dev/null 2>&1 || true
+        fi
+
+        if [ "$daemon_pid_was_alive" -eq 1 ] && [ "$refresh_from_bound_listener" = "1" ]; then
+            _daemon_lifecycle_stop_bound_listener "$authority" >/dev/null 2>&1 || true
+        fi
+
+        if [ "$refresh_from_bound_listener" = "1" ]; then
+            if ! _daemon_lifecycle_wait_for_socket_gone "$authority" 20; then
+                return 1
             fi
         fi
 
-        if ! _wait_for_socket_gone 20; then
-            return 1
-        fi
-
-        rm -f "$DAEMON_PID_FILE"
+        _daemon_lifecycle_forget_pid
         return 0
     }
 
@@ -1581,25 +1793,25 @@ EOF
             fi
 
             local daemon_reused=0
-            local daemon_status_url daemon_health_url
-            daemon_status_url="$(_daemon_status_url)"
-            daemon_health_url="$(_daemon_health_url)"
-            if _socket_ready_once; then
+            local daemon_authority daemon_health_url
+            daemon_authority="$(_daemon_lifecycle_current_authority)"
+            daemon_health_url="$(_daemon_lifecycle_health_url "$daemon_authority")"
+            if _daemon_lifecycle_socket_ready "$daemon_authority"; then
                 local current_device=""
                 local current_effective_device=""
                 local current_streaming_enabled=""
                 local current_overlay_events_enabled=""
                 local runtime_truth
 
-                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
-                if ! _http_ok_once "$daemon_health_url"; then
+                _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
+                if ! _daemon_lifecycle_health_ok "$daemon_authority"; then
                     echo "   - Existing daemon health check failed ($daemon_health_url); restarting."
-                    if ! _stop_running_daemon; then
+                    if ! _stop_running_daemon "$daemon_authority"; then
                         echo "   - Failed to stop the running daemon before relaunch."
                         return 1
                     fi
                 else
-                    runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url" 2>/dev/null)" || runtime_truth=""
+                    runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_authority" 2>/dev/null)" || runtime_truth=""
 
                     echo "   - Requested daemon runtime: device=$daemon_device, streaming_enabled=$daemon_streaming_enabled, overlay_events_enabled=$daemon_overlay_events_enabled"
                     if [ -n "$runtime_truth" ]; then
@@ -1622,27 +1834,27 @@ EOF
                             "$current_effective_device" \
                             "$current_streaming_enabled" \
                             "$current_overlay_events_enabled"; then
-                            echo "   - Reusing existing daemon (pid $(cat "$DAEMON_PID_FILE" 2>/dev/null))."
+                            echo "   - Reusing existing daemon (pid $(_daemon_lifecycle_pid 2>/dev/null))."
                             daemon_reused=1
                         else
                             echo "   - Existing daemon runtime does not match request; restarting."
-                            if ! _stop_running_daemon; then
+                            if ! _stop_running_daemon "$daemon_authority"; then
                                 echo "   - Failed to stop the running daemon before relaunch."
                                 return 1
                             fi
                         fi
                     else
                         echo "   - Existing daemon status missing or unparseable; restarting to enforce requested runtime."
-                        if ! _stop_running_daemon; then
+                        if ! _stop_running_daemon "$daemon_authority"; then
                             echo "   - Failed to stop the running daemon before relaunch."
                             return 1
                         fi
                     fi
                 fi
-            elif _pid_alive "$DAEMON_PID_FILE"; then
-                echo "   - Daemon pid $(cat "$DAEMON_PID_FILE") is stale (socket not ready); restarting."
-                _stop_pid "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
-                rm -f "$DAEMON_PID_FILE"
+            elif _daemon_lifecycle_pid_alive; then
+                echo "   - Daemon pid $(_daemon_lifecycle_pid) is stale (socket not ready); restarting."
+                _daemon_lifecycle_stop_pid_file_process >/dev/null 2>&1 || true
+                _daemon_lifecycle_forget_pid
             fi
 
             if [ "$daemon_reused" -ne 1 ]; then
@@ -1658,15 +1870,15 @@ EOF
                     PARAKEET_OVERLAY_EVENTS_ENABLED="$daemon_overlay_events_enabled" \
                     PARAKEET_HOST="$HOST" PARAKEET_PORT="$PORT" \
                     setsid uv run parakeet-stt-daemon --host "$HOST" --port "$PORT" --device "$daemon_device" </dev/null >> "$LOG_DAEMON" 2>&1 &
-                    echo $! >| "$DAEMON_PID_FILE"
+                    _daemon_lifecycle_record_launcher_pid "$!"
                 )
             fi
 
             echo -n "   - Waiting for daemon health..."
-            if _wait_for_http "$daemon_health_url" "$DAEMON_PID_FILE" 120; then
-                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
+            if _daemon_lifecycle_wait_for_health "$daemon_authority" 120; then
+                _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
                 echo " OK"
-                echo "${HOST}:${PORT}" >| "$PORT_FILE"
+                _daemon_lifecycle_persist_current_authority
             else
                 echo " not healthy; last daemon log lines:"
                 tail -n 80 "$LOG_DAEMON"
@@ -1809,6 +2021,10 @@ EOF
                 shift
             fi
             stt stop
+            local stop_status=$?
+            if [ "$stop_status" -ne 0 ]; then
+                return "$stop_status"
+            fi
             if [ -n "$restart_mode" ]; then
                 stt start "$restart_mode" "$@"
             else
@@ -1823,20 +2039,46 @@ EOF
             pkill -f "[p]arakeet-ptt" >/dev/null 2>&1 && echo "   - Client stopped"
             _tmux_kill_session "$TMUX_SESSION"
 
-            if _socket_ready_once; then
-                _refresh_daemon_pid_file_from_listener >/dev/null 2>&1 || true
+            local daemon_authority
+            local daemon_bound_identity_confirmed=0
+            local daemon_stop_status=0
+            local daemon_was_running=0
+            daemon_authority="$(_daemon_lifecycle_authority)"
+            if _daemon_lifecycle_identity_confirmed "$daemon_authority"; then
+                daemon_bound_identity_confirmed=1
+            else
+                local daemon_current_authority
+                daemon_current_authority="$(_daemon_lifecycle_current_authority)"
+                if [ "$daemon_authority" != "$daemon_current_authority" ] && _daemon_lifecycle_identity_confirmed "$daemon_current_authority"; then
+                    daemon_authority="$daemon_current_authority"
+                    daemon_bound_identity_confirmed=1
+                fi
             fi
-            if _pid_alive "$DAEMON_PID_FILE"; then
-                if _stop_pid "$DAEMON_PID_FILE"; then
+            if [ "$daemon_bound_identity_confirmed" -eq 1 ]; then
+                _daemon_lifecycle_persist_authority "$daemon_authority"
+                _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
+            fi
+            if _daemon_lifecycle_pid_alive; then
+                daemon_was_running=1
+            fi
+            if _stop_running_daemon "$daemon_authority" "$daemon_bound_identity_confirmed"; then
+                if [ "$daemon_was_running" -eq 1 ] && [ "$daemon_bound_identity_confirmed" -eq 1 ]; then
                     echo "   - Daemon stopped"
                 fi
+            else
+                daemon_stop_status=1
             fi
 
             if _stop_llm_server; then
                 echo "   - Managed LLM server stopped"
             fi
 
-            rm -f "$CLIENT_PID_FILE" "$DAEMON_PID_FILE" "$PORT_FILE"
+            rm -f "$CLIENT_PID_FILE"
+            if [ "$daemon_stop_status" -ne 0 ]; then
+                echo "   - Failed to stop the running daemon."
+                return 1
+            fi
+            _daemon_lifecycle_clear_identity
             ;;
         logs)
             case "${1:-both}" in
@@ -1865,21 +2107,35 @@ EOF
             ;;
         status)
             echo ">>> Status:"
-            local daemon_authority=""
-            local daemon_listener_port="$PORT"
+            local daemon_authority
             local daemon_status_url
-            if [ -s "$PORT_FILE" ]; then
-                daemon_authority="$(cat "$PORT_FILE")"
-                daemon_status_url="$(_daemon_status_url_from_authority "$daemon_authority")"
-                daemon_listener_port="$(_port_from_authority "$daemon_authority" || printf "%s" "$PORT")"
-            else
-                daemon_status_url="$(_daemon_status_url)"
-            fi
-            _refresh_pid_file_from_listener "$daemon_listener_port" "$DAEMON_PID_FILE" >/dev/null 2>&1 || true
+            local daemon_identity_confirmed=0
+            daemon_authority="$(_daemon_lifecycle_authority)"
+            daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
             local daemon_runtime_truth=""
-            if _pid_alive "$DAEMON_PID_FILE"; then
-                echo "   - Daemon running (pid $(cat "$DAEMON_PID_FILE"))"
-                daemon_runtime_truth="$(_daemon_status_runtime_truth "$daemon_status_url")" || daemon_runtime_truth=""
+            daemon_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_authority" 2>/dev/null)" || daemon_runtime_truth=""
+            if [ -n "$daemon_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_authority"; then
+                daemon_identity_confirmed=1
+            else
+                local daemon_current_authority current_runtime_truth
+                daemon_current_authority="$(_daemon_lifecycle_current_authority)"
+                current_runtime_truth=""
+                if [ "$daemon_authority" != "$daemon_current_authority" ]; then
+                    current_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_current_authority" 2>/dev/null)" || current_runtime_truth=""
+                    if [ -n "$current_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_current_authority"; then
+                        daemon_authority="$daemon_current_authority"
+                        daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
+                        daemon_runtime_truth="$current_runtime_truth"
+                        daemon_identity_confirmed=1
+                        _daemon_lifecycle_persist_authority "$daemon_authority"
+                    fi
+                fi
+            fi
+            if [ "$daemon_identity_confirmed" -eq 1 ]; then
+                _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
+            fi
+            if [ "$daemon_identity_confirmed" -eq 1 ] && _daemon_lifecycle_pid_alive; then
+                echo "   - Daemon running (pid $(_daemon_lifecycle_pid))"
             else
                 echo "   - Daemon not running"
             fi
@@ -1888,11 +2144,7 @@ EOF
             else
                 echo "   - Client not running"
             fi
-            if [ -n "$daemon_authority" ]; then
-                echo "   - Endpoint: $(_daemon_ws_endpoint_from_authority "$daemon_authority")"
-            else
-                echo "   - Endpoint: $DEFAULT_ENDPOINT"
-            fi
+            echo "   - Endpoint: $(_daemon_lifecycle_ws_endpoint "$daemon_authority")"
             if pgrep -af "[p]arakeet" >/dev/null; then
                 echo "   - Matching processes:"
                 pgrep -af "[p]arakeet" | sed 's/^/     /'
@@ -1902,7 +2154,7 @@ EOF
             fi
             if [ -n "$daemon_runtime_truth" ]; then
                 _print_daemon_runtime_truth "$daemon_runtime_truth"
-            elif _pid_alive "$DAEMON_PID_FILE"; then
+            elif [ "$daemon_identity_confirmed" -eq 1 ] && _daemon_lifecycle_pid_alive; then
                 echo "   - Daemon runtime truth: unavailable from $daemon_status_url"
             fi
             ;;
@@ -1931,7 +2183,7 @@ EOF
             echo "Creating tmux session '$TMUX_SESSION' (daemon | client | logs)..."
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
             echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
-            echo "${HOST}:${PORT}" >| "$PORT_FILE"
+            _daemon_lifecycle_persist_current_authority
 
             local daemon_streaming_enabled="$default_daemon_streaming_enabled"
             local injection_mode paste_backend_failure_policy
