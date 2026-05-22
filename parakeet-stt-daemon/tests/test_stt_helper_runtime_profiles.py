@@ -509,6 +509,48 @@ def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
     _assert_profile_help_lines(help_text, profiles)
 
 
+def test_llm_direct_profile_forwards_remaining_start_args_once(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command_name in ("curl", "llama-server", "tmux"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 0\n")
+    for command_name in ("lsof", "ss"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 1\n")
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env.update(
+        {
+            "PARAKEET_ROOT": str(REPO_ROOT),
+            "PARAKEET_LLM_SERVER_EXTRA_ARGS": "--test-no-model",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "_STT_SKIP_LOCAL_OVERRIDES": "1",
+        }
+    )
+
+    llm_pid_file = Path("/tmp/parakeet-llama-server.pid")
+    llm_port_file = Path("/tmp/parakeet-llama-server.port")
+    with _preserve_paths(llm_pid_file, llm_port_file):
+        completed = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"source {shlex.quote(str(HELPER_PATH))} && stt llm cpu --stt-test-sentinel",
+            ],
+            check=False,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    assert "Unknown option for 'stt start': --stt-test-sentinel" in completed.stdout
+    assert "Unknown option for 'stt start': cpu" not in completed.stdout
+
+
 def test_profile_overlay_env_overrides_metadata_defaults() -> None:
     config = _run_runtime_config(
         "offline",

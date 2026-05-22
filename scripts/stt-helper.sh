@@ -1790,6 +1790,7 @@ EOF
                     ;;
                 *)
                     if _start_profile_row_for_token "$llm_action" >/dev/null; then
+                        shift
                         _start_managed_llm_then_stt "$llm_action" "$@"
                         return $?
                     fi
