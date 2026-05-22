@@ -205,8 +205,9 @@ stt() {
 
     local cmd="${1:-start}"
     shift || true
+    local row _profile_id _mode_aliases command_aliases start_cli_arg _profile_remainder
     for row in "${start_profile_rows[@]}"; do
-        IFS='|' read -r _ _ command_aliases start_cli_arg _ <<<"$row"
+        IFS='|' read -r _profile_id _mode_aliases command_aliases start_cli_arg _profile_remainder <<<"$row"
         case ",$command_aliases," in
             *",$cmd,"*)
                 cmd="start"
