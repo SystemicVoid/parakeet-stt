@@ -4,11 +4,35 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import sounddevice as sd
 from loguru import logger
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSessionResult:
+    """Stop-time audio facts captured for one Session."""
+
+    audio_samples: np.ndarray
+    ready_chunks: list[np.ndarray]
+    tail_buffer: np.ndarray
+    pre_roll_samples: int
+    post_start_samples: int
+
+    @property
+    def captured_samples(self) -> int:
+        return int(self.audio_samples.size)
+
+    @property
+    def ready_chunk_count(self) -> int:
+        return len(self.ready_chunks)
+
+    @property
+    def tail_samples(self) -> int:
+        return int(self.tail_buffer.size)
 
 
 class AudioInput:
@@ -39,6 +63,7 @@ class AudioInput:
         self._max_session_samples = (
             max(1, int(max_session_samples)) if max_session_samples is not None else None
         )
+        self._session_pre_roll_samples = 0
         self._session_samples = 0
         self._session_limit_exceeded = False
         self._stream_chunk_size: int | None = None
@@ -79,6 +104,7 @@ class AudioInput:
         with self._lock:
             pre_roll_chunks = self._bounded_pre_roll_chunks()
             self._session_chunks = pre_roll_chunks
+            self._session_pre_roll_samples = sum(int(chunk.size) for chunk in pre_roll_chunks)
             # Pre-roll is clipped up front so low session caps still start cleanly.
             # The live session budget applies to post-start capture.
             self._session_samples = 0
@@ -114,23 +140,28 @@ class AudioInput:
             self._session_active = False
             self._reset_session_runtime_state()
 
-    def stop_session_with_streaming(self) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
-        """Stop accumulation and return captured samples plus streaming slices.
-
-        Returns: (full_audio, ready_chunks, leftover_buffer)
-        """
+    def stop_session_with_streaming(self) -> CaptureSessionResult:
+        """Stop accumulation and return captured samples plus streaming slices."""
         with self._lock:
             self._session_active = False
             chunks = self._session_chunks
             ready = self._stream_ready
             tail = self._stream_buffer.copy()
+            pre_roll_samples = self._session_pre_roll_samples
+            post_start_samples = self._session_samples
             self._reset_session_runtime_state()
         audio = (
             np.concatenate(chunks).astype(self.dtype, copy=False)
             if chunks
             else np.zeros((0,), dtype=self.dtype)
         )
-        return audio, ready, tail
+        return CaptureSessionResult(
+            audio_samples=audio,
+            ready_chunks=ready,
+            tail_buffer=tail,
+            pre_roll_samples=pre_roll_samples,
+            post_start_samples=post_start_samples,
+        )
 
     def session_limit_exceeded(self) -> bool:
         with self._lock:
@@ -260,6 +291,7 @@ class AudioInput:
 
     def _reset_session_runtime_state(self) -> None:
         self._session_chunks = []
+        self._session_pre_roll_samples = 0
         self._session_samples = 0
         self._session_limit_exceeded = False
         self._stream_ready = []
@@ -267,4 +299,4 @@ class AudioInput:
         self._stream_buffer = np.zeros((0,), dtype=np.float32)
 
 
-__all__ = ["AudioInput"]
+__all__ = ["AudioInput", "CaptureSessionResult"]
