@@ -15,6 +15,9 @@ from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
 from parakeet_stt_daemon.session import (
     InterimTranscriptRuntime,
     InterimTranscriptRuntimeFacts,
+    SealPathFinalizationResult,
+    SealPathRuntime,
+    SealPathRuntimeFacts,
     Session,
     SessionManager,
     StreamPathRuntime,
@@ -81,6 +84,15 @@ class RuntimeTruthPrivateFieldTrap(SimpleNamespace):
         )
         if name in private_interim_fields:
             raise AssertionError(f"runtime truth probed old interim transcript field {name}")
+        private_seal_fields = (
+            "_last_audio_ms",
+            "_last_audio_stop_ms",
+            "_last_finalize_ms",
+            "_last_infer_ms",
+            "_last_send_ms",
+        )
+        if name in private_seal_fields:
+            raise AssertionError(f"runtime truth probed old Seal path field {name}")
         raise AttributeError(name)
 
 
@@ -111,17 +123,17 @@ def _build_server(
     orchestrator._stream_drain_running = False
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
-    orchestrator._last_audio_ms = None
-    orchestrator._last_audio_stop_ms = None
-    orchestrator._last_finalize_ms = None
-    orchestrator._last_infer_ms = None
-    orchestrator._last_send_ms = None
     orchestrator._vad_enabled = vad_enabled
     orchestrator.tail_trimmer = SealPathTailTrimmer(
         vad_enabled=vad_enabled,
         silence_floor_db=float(orchestrator.settings.silence_floor_db),
         vad_adapter=FakeVadAdapter(),
         warmup_sample_rate=FakeAudio.sample_rate,
+    )
+    orchestrator.seal_path_runtime = SealPathRuntime(
+        sample_rate=FakeAudio.sample_rate,
+        tail_trimmer=orchestrator.tail_trimmer,
+        release_device_cache=lambda _device: None,
     )
     return cast(SessionOrchestrator, orchestrator)
 
@@ -353,6 +365,37 @@ def test_runtime_truth_reads_interim_interface_instead_of_orchestrator_fields() 
         truth.interim_transcript_source_fallback_reason
         == "stop_replay_transcribe_error:RuntimeError"
     )
+
+
+def test_runtime_truth_reads_seal_path_interface() -> None:
+    runtime_facts = SealPathRuntimeFacts(
+        finalization_mode="offline_seal",
+        final_audio_source="canonical_session_audio",
+    )
+    orchestrator = cast(
+        SessionOrchestrator,
+        RuntimeTruthPrivateFieldTrap(
+            settings=SimpleNamespace(
+                streaming_enabled=False,
+                chunk_secs=None,
+                overlay_events_enabled=False,
+            ),
+            streaming_transcriber=None,
+            seal_path_runtime_facts_for_runtime=lambda: runtime_facts,
+        ),
+    )
+
+    truth = snapshot(
+        orchestrator,
+        last_trim_outcome=SimpleNamespace(
+            tail_trim_mode="rms",
+            vad_active=False,
+            vad_fallback_reason=None,
+        ),
+    )
+
+    assert truth.finalization_mode == "offline_seal"
+    assert truth.final_audio_source == "canonical_session_audio"
 
 
 def test_interim_runtime_syncs_cached_session_config() -> None:
@@ -709,14 +752,44 @@ def test_status_last_timings_none_before_first_session() -> None:
     assert status.last_send_ms is None
 
 
+def test_seal_path_runtime_sync_preserves_injected_cache_releaser() -> None:
+    """Existing Seal runtime refreshes without replacing injected cleanup hooks."""
+    server = _build_server(streaming_enabled=False)
+    calls: list[str] = []
+
+    def release_device_cache(device: str) -> None:
+        calls.append(device)
+
+    runtime = SealPathRuntime(
+        sample_rate=8_000,
+        tail_trimmer=SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0),
+        release_device_cache=release_device_cache,
+    )
+    server.seal_path_runtime = runtime
+
+    synced = server._seal_path_runtime_for_runtime()
+    synced.release_device_cache("cuda:0")
+
+    assert synced is runtime
+    assert synced.sample_rate == FakeAudio.sample_rate
+    assert synced.tail_trimmer is server.tail_trimmer
+    assert calls == ["cuda:0"]
+
+
 def test_status_last_timings_populated_after_session() -> None:
     """Timing fields reflect last session values."""
     server = _build_server(streaming_enabled=False)
-    server._last_audio_ms = 2500
-    server._last_audio_stop_ms = 12
-    server._last_finalize_ms = 180
-    server._last_infer_ms = 120
-    server._last_send_ms = 3
+    server._seal_path_runtime_for_runtime().record_success(
+        SealPathFinalizationResult(
+            text="final text",
+            audio_ms=2500,
+            audio_duration_raw=2.5,
+            finalize_ms=180,
+            infer_ms=120,
+        ),
+        audio_stop_ms=12,
+        send_ms=3,
+    )
 
     status = _status(server)
     assert status.audio_stop_ms == 12

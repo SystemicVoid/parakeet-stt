@@ -22,7 +22,7 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import Session, SessionManager
+from parakeet_stt_daemon.session import SealPathFinalizationResult, Session, SessionManager
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 
 
@@ -96,6 +96,12 @@ class FakeStreamingTranscriber:
         return object()
 
 
+class FakeTranscriber:
+    def transcribe_samples(self, _samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del sample_rate
+        return "final text"
+
+
 class FakeWebSocket:
     def __init__(self, incoming: list[dict | Exception]) -> None:
         self._incoming = incoming
@@ -154,7 +160,7 @@ def _build_server() -> DaemonServer:
     orchestrator.sessions = SessionManager()
     orchestrator.audio = FakeAudio()
     orchestrator.model = object()
-    orchestrator.transcriber = object()
+    orchestrator.transcriber = FakeTranscriber()
     orchestrator._session_lock = asyncio.Lock()
     orchestrator._inference_lock = asyncio.Lock()
     orchestrator.streaming_transcriber = None
@@ -167,22 +173,13 @@ def _build_server() -> DaemonServer:
     orchestrator._session_age_limit_ms = 90_000
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
-    orchestrator._last_audio_ms = None
-    orchestrator._last_audio_stop_ms = None
-    orchestrator._last_finalize_ms = None
-    orchestrator._last_infer_ms = None
-    orchestrator._last_send_ms = None
 
     async def fake_collect_interim_text_updates(
         _session_id: UUID, _ready_chunks: list[object]
     ) -> list[str]:
         return []
 
-    async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
-        return "final text", 7
-
     orchestrator._collect_interim_text_updates = fake_collect_interim_text_updates
-    orchestrator._finalise_transcription = fake_finalize
     return cast(DaemonServer, server)
 
 
@@ -558,11 +555,17 @@ def test_status_reports_runtime_truth_and_last_timings() -> None:
         server.orchestrator.streaming_transcriber = cast(
             Any, FakeStreamingTranscriber(helper_active=False)
         )
-        server.orchestrator._last_audio_ms = 1200
-        server.orchestrator._last_audio_stop_ms = 9
-        server.orchestrator._last_finalize_ms = 120
-        server.orchestrator._last_infer_ms = 85
-        server.orchestrator._last_send_ms = 4
+        server.orchestrator._seal_path_runtime_for_runtime().record_success(
+            SealPathFinalizationResult(
+                text="final text",
+                audio_ms=1200,
+                audio_duration_raw=1.2,
+                finalize_ms=120,
+                infer_ms=85,
+            ),
+            audio_stop_ms=9,
+            send_ms=4,
+        )
         session_id = uuid4()
         await server.orchestrator.sessions.start_session(session_id, owner_token=1)
 

@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from functools import partial
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import UUID
+
+from loguru import logger
 
 from .overlay_interim import (
     InterimTranscriber,
     InterimTranscriptRuntimeFacts,
     OverlayInterimTranscriptSession,
 )
+from .tail_trim import SealPathTailTrimmer, TailTrimOutcome
 
 if TYPE_CHECKING:
     import numpy as np
@@ -56,6 +62,17 @@ class SessionNotFoundError(RuntimeError):
 
 
 StreamHelperScope = Literal["live_session_only"]
+FinalizationMode = Literal["offline_seal"]
+FinalAudioSource = Literal["canonical_session_audio"]
+SealPathErrorCode = Literal["AUDIO_DEVICE", "MODEL"]
+
+
+class SealPathTranscriber(Protocol):
+    def __call__(self, samples: np.ndarray) -> Awaitable[str]: ...
+
+
+class DeviceCacheReleaser(Protocol):
+    def __call__(self, device: str, /) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +85,175 @@ class StreamPathRuntimeFacts:
     chunk_secs: float | None
     path_executed: bool
     chunks_processed: int
+
+
+@dataclass(frozen=True, slots=True)
+class SealPathRuntimeFacts:
+    finalization_mode: FinalizationMode = "offline_seal"
+    final_audio_source: FinalAudioSource = "canonical_session_audio"
+
+
+@dataclass(frozen=True, slots=True)
+class SealPathRuntimeMetrics:
+    audio_stop_ms: int | None = None
+    finalize_ms: int | None = None
+    infer_ms: int | None = None
+    send_ms: int | None = None
+    last_audio_ms: int | None = None
+    last_infer_ms: int | None = None
+    last_send_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SealPathFinalizationResult:
+    text: str
+    audio_ms: int
+    audio_duration_raw: float
+    finalize_ms: int
+    infer_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class SealPathFinalizationFailure:
+    code: SealPathErrorCode
+    message: str
+    exception: Exception | None = None
+
+
+SealPathFinalizationOutcome = SealPathFinalizationResult | SealPathFinalizationFailure
+
+
+class SealPathRuntime:
+    """Own Seal path finalization and last final runtime facts."""
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int,
+        tail_trimmer: SealPathTailTrimmer,
+        release_device_cache: DeviceCacheReleaser,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.tail_trimmer = tail_trimmer
+        self.release_device_cache = release_device_cache
+        self._metrics = SealPathRuntimeMetrics()
+        self._last_failure: SealPathFinalizationFailure | None = None
+
+    def sync_from_runtime(
+        self,
+        *,
+        sample_rate: int,
+        tail_trimmer: SealPathTailTrimmer,
+        release_device_cache: DeviceCacheReleaser,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.tail_trimmer = tail_trimmer
+        self.release_device_cache = release_device_cache
+
+    @property
+    def last_tail_trim_outcome(self) -> TailTrimOutcome:
+        return self.tail_trimmer.last_outcome
+
+    @property
+    def last_failure(self) -> SealPathFinalizationFailure | None:
+        return self._last_failure
+
+    def facts(self) -> SealPathRuntimeFacts:
+        return SealPathRuntimeFacts()
+
+    def metrics(self) -> SealPathRuntimeMetrics:
+        return self._metrics
+
+    def prepare_tail_trimmer(self) -> None:
+        self.tail_trimmer.prepare()
+
+    async def finalize(
+        self,
+        audio_samples: np.ndarray,
+        transcribe: SealPathTranscriber,
+        *,
+        effective_device: str,
+    ) -> SealPathFinalizationOutcome:
+        audio_duration_raw = len(audio_samples) / self.sample_rate
+        audio_ms = int(audio_duration_raw * 1000)
+        if audio_samples.size == 0:
+            failure = SealPathFinalizationFailure(
+                code="AUDIO_DEVICE",
+                message="No audio captured for session",
+            )
+            self._last_failure = failure
+            return failure
+
+        finalize_started = time.perf_counter()
+        cache_released = False
+        try:
+            loop = asyncio.get_running_loop()
+            trim_outcome = await loop.run_in_executor(
+                None,
+                partial(self.tail_trimmer.trim, audio_samples, self.sample_rate),
+            )
+            trimmed = trim_outcome.samples
+            if trimmed.size == 0:
+                logger.info("Skipping offline transcription: silence trimming removed all samples")
+                self._release_device_cache(effective_device)
+                cache_released = True
+                self._last_failure = None
+                return SealPathFinalizationResult(
+                    text="",
+                    audio_ms=audio_ms,
+                    audio_duration_raw=audio_duration_raw,
+                    finalize_ms=int((time.perf_counter() - finalize_started) * 1000),
+                    infer_ms=0,
+                )
+
+            infer_started = time.perf_counter()
+            try:
+                text = await transcribe(trimmed)
+                infer_ms = int((time.perf_counter() - infer_started) * 1000)
+            finally:
+                self._release_device_cache(effective_device)
+                cache_released = True
+            self._last_failure = None
+            return SealPathFinalizationResult(
+                text=text,
+                audio_ms=audio_ms,
+                audio_duration_raw=audio_duration_raw,
+                finalize_ms=int((time.perf_counter() - finalize_started) * 1000),
+                infer_ms=infer_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - returned to orchestrator as model failure
+            if not cache_released:
+                self._release_device_cache(effective_device)
+            failure = SealPathFinalizationFailure(
+                code="MODEL",
+                message="Transcription failed",
+                exception=exc,
+            )
+            self._last_failure = failure
+            return failure
+
+    def _release_device_cache(self, effective_device: str) -> None:
+        try:
+            self.release_device_cache(effective_device)
+        except Exception as exc:  # noqa: BLE001 - cache cleanup is best effort
+            logger.warning("Failed to release device cache for {}: {}", effective_device, exc)
+
+    def record_success(
+        self,
+        result: SealPathFinalizationResult,
+        *,
+        audio_stop_ms: int,
+        send_ms: int,
+    ) -> None:
+        self._metrics = SealPathRuntimeMetrics(
+            audio_stop_ms=audio_stop_ms,
+            finalize_ms=result.finalize_ms,
+            infer_ms=result.infer_ms,
+            send_ms=send_ms,
+            last_audio_ms=result.audio_ms,
+            last_infer_ms=result.infer_ms,
+            last_send_ms=send_ms,
+        )
 
 
 class StreamPathRuntime:
@@ -343,6 +529,14 @@ class SessionManager:
 __all__ = [
     "InterimTranscriptRuntime",
     "InterimTranscriptRuntimeFacts",
+    "SealPathErrorCode",
+    "SealPathFinalizationFailure",
+    "SealPathFinalizationOutcome",
+    "SealPathFinalizationResult",
+    "SealPathRuntime",
+    "SealPathRuntimeFacts",
+    "SealPathRuntimeMetrics",
+    "SealPathTranscriber",
     "Session",
     "SessionBusyError",
     "SessionManager",
