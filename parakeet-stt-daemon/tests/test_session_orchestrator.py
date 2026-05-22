@@ -22,6 +22,9 @@ from parakeet_stt_daemon.events import (
 )
 from parakeet_stt_daemon.messages import SessionEndReason
 from parakeet_stt_daemon.session import (
+    SealPathFinalizationFailure,
+    SealPathFinalizationResult,
+    SealPathRuntime,
     SessionManager,
     StreamPathRuntime,
 )
@@ -31,6 +34,7 @@ from parakeet_stt_daemon.session_orchestrator import (
     StartSessionIntent,
     StopSessionIntent,
 )
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
 class FakeAudio:
@@ -109,6 +113,48 @@ class FakeStreamingTranscriber:
         return FakeStreamSession()
 
 
+class FakeTranscriber:
+    def __init__(self, text: str = "final text") -> None:
+        self.text = text
+        self.calls: list[tuple[np.ndarray, int]] = []
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        self.calls.append((samples.copy(), sample_rate))
+        return self.text
+
+
+class FakeSealPathRuntime(SealPathRuntime):
+    def __init__(self, text: str = "final text") -> None:
+        super().__init__(
+            sample_rate=16_000,
+            tail_trimmer=SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0),
+            release_device_cache=lambda _device: None,
+        )
+        self.text = text
+
+    async def finalize(
+        self,
+        audio_samples: np.ndarray,
+        transcribe,
+        *,
+        effective_device: str,
+    ) -> SealPathFinalizationResult | SealPathFinalizationFailure:
+        del transcribe, effective_device
+        if audio_samples.size == 0:
+            return SealPathFinalizationFailure(
+                code="AUDIO_DEVICE",
+                message="No audio captured for session",
+            )
+        audio_duration_raw = len(audio_samples) / self.sample_rate
+        return SealPathFinalizationResult(
+            text=self.text,
+            audio_ms=int(audio_duration_raw * 1000),
+            audio_duration_raw=audio_duration_raw,
+            finalize_ms=0,
+            infer_ms=7,
+        )
+
+
 def _build_orchestrator(
     *,
     streaming_enabled: bool = False,
@@ -127,7 +173,7 @@ def _build_orchestrator(
     orchestrator.sessions = SessionManager()
     orchestrator.audio = FakeAudio(samples=samples, stream_chunks=stream_chunks)
     orchestrator.model = object()
-    orchestrator.transcriber = object()
+    orchestrator.transcriber = FakeTranscriber()
     orchestrator._session_lock = asyncio.Lock()
     orchestrator._inference_lock = asyncio.Lock()
     orchestrator.streaming_transcriber = FakeStreamingTranscriber() if streaming_enabled else None
@@ -140,23 +186,16 @@ def _build_orchestrator(
     orchestrator._session_age_limit_ms = int(max_session_seconds * 1000)
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
-    orchestrator._last_audio_ms = None
-    orchestrator._last_audio_stop_ms = None
-    orchestrator._last_finalize_ms = None
-    orchestrator._last_infer_ms = None
-    orchestrator._last_send_ms = None
     orchestrator._vad_enabled = False
+    orchestrator.tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+    orchestrator.seal_path_runtime = FakeSealPathRuntime()
 
     async def fake_collect_interim_text_updates(
         _session_id: UUID, _ready_chunks: list[np.ndarray]
     ) -> list[str]:
         return []
 
-    async def fake_finalise(_audio_samples: np.ndarray) -> tuple[str, int]:
-        return "final text", 7
-
     orchestrator._collect_interim_text_updates = fake_collect_interim_text_updates
-    orchestrator._finalise_transcription = fake_finalise
     return cast(SessionOrchestrator, orchestrator)
 
 

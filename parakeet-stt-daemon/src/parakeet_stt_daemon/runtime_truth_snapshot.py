@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from .messages import StatusMessage
 from .overlay_interim import InterimTranscriptRuntimeFacts, InterimTranscriptSource
-from .session import SessionState, StreamPathRuntimeFacts
+from .session import SealPathRuntimeFacts, SessionState, StreamPathRuntimeFacts
 from .tail_trim import TailTrimMode
 
 StreamHelperScope = Literal["live_session_only"]
@@ -208,7 +208,7 @@ def snapshot(
 ) -> RuntimeTruth:
     settings = orchestrator.settings
     stream_path = stream_path or _stream_path_facts(orchestrator)
-    seal_path = seal_path or SealPathFacts()
+    seal_path = seal_path or _seal_path_facts(orchestrator)
     tail_trim = _tail_trim_facts(orchestrator, last_trim_outcome)
     device_info = device_info or _device_info(orchestrator)
     overlay_enabled = (
@@ -349,6 +349,21 @@ def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
         path_executed=False,
         chunks_processed=0,
     )
+
+
+def _seal_path_facts(orchestrator: Any) -> SealPathFacts:
+    getter = getattr(orchestrator, "seal_path_runtime_facts_for_runtime", None)
+    if callable(getter):
+        try:
+            runtime_facts = getter()
+        except Exception:  # noqa: BLE001
+            runtime_facts = None
+        if isinstance(runtime_facts, SealPathRuntimeFacts):
+            return SealPathFacts(
+                finalization_mode=runtime_facts.finalization_mode,
+                final_audio_source=runtime_facts.final_audio_source,
+            )
+    return SealPathFacts()
 
 
 def _tail_trim_facts(orchestrator: Any, last_trim_outcome: object | None) -> TailTrimFacts:

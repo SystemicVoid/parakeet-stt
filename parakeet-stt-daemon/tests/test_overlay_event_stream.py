@@ -25,8 +25,13 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import SessionManager
+from parakeet_stt_daemon.session import (
+    SealPathFinalizationResult,
+    SealPathRuntime,
+    SessionManager,
+)
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
 class FakeAudio:
@@ -144,6 +149,33 @@ class SerializingTranscriber:
                 self.active_calls -= 1
 
 
+class FakeSealPathRuntime(SealPathRuntime):
+    def __init__(self, text: str = "overlay test text") -> None:
+        super().__init__(
+            sample_rate=16_000,
+            tail_trimmer=SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0),
+            release_device_cache=lambda _device: None,
+        )
+        self.text = text
+
+    async def finalize(
+        self,
+        audio_samples: np.ndarray,
+        transcribe,
+        *,
+        effective_device: str,
+    ) -> SealPathFinalizationResult:
+        del transcribe, effective_device
+        audio_duration_raw = len(audio_samples) / self.sample_rate
+        return SealPathFinalizationResult(
+            text=self.text,
+            audio_ms=int(audio_duration_raw * 1000),
+            audio_duration_raw=audio_duration_raw,
+            finalize_ms=0,
+            infer_ms=7,
+        )
+
+
 def _build_server(
     *,
     overlay_events_enabled: bool,
@@ -185,16 +217,8 @@ def _build_server(
     orchestrator._session_age_limit_ms = 90_000
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
-    orchestrator._last_audio_ms = None
-    orchestrator._last_audio_stop_ms = None
-    orchestrator._last_finalize_ms = None
-    orchestrator._last_infer_ms = None
-    orchestrator._last_send_ms = None
-
-    async def fake_finalize(_audio_samples: np.ndarray) -> tuple[str, int]:
-        return "overlay test text", 7
-
-    orchestrator._finalise_transcription = fake_finalize
+    orchestrator.tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+    orchestrator.seal_path_runtime = FakeSealPathRuntime()
     return cast(DaemonServer, server)
 
 
@@ -893,12 +917,15 @@ def test_stop_path_serializes_live_interim_and_final_decode(monkeypatch) -> None
         server = _build_server(overlay_events_enabled=True)
         transcriber = SerializingTranscriber()
         _set_dynamic_attr(server.orchestrator, "transcriber", transcriber)
+        tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+        _set_dynamic_attr(server.orchestrator, "tail_trimmer", tail_trimmer)
         _set_dynamic_attr(
             server.orchestrator,
-            "_finalise_transcription",
-            SessionOrchestrator._finalise_transcription.__get__(
-                server.orchestrator,
-                SessionOrchestrator,
+            "seal_path_runtime",
+            SealPathRuntime(
+                sample_rate=16_000,
+                tail_trimmer=tail_trimmer,
+                release_device_cache=lambda _device: None,
             ),
         )
         websocket = FakeWebSocket()

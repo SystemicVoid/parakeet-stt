@@ -12,10 +12,12 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from parakeet_stt_daemon import session_orchestrator as orchestrator_module
-from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.model import ParakeetTranscriber
-from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
+from parakeet_stt_daemon.session import (
+    SealPathFinalizationFailure,
+    SealPathFinalizationResult,
+    SealPathRuntime,
+)
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer, TailTrimOutcome
 
 
@@ -51,19 +53,6 @@ class _RecordingTranscriber:
         return "offline text"
 
 
-class _ExplodingStreamSession:
-    def __init__(self) -> None:
-        self.feed_calls: list[np.ndarray] = []
-        self.finalize_called = False
-
-    def feed(self, chunk: np.ndarray) -> None:
-        self.feed_calls.append(chunk.copy())
-
-    def finalize(self) -> str:
-        self.finalize_called = True
-        raise AssertionError("final transcript should not read from streaming mirror")
-
-
 def _tail_trimmer_with_trim(
     trim: Callable[[np.ndarray, int], TailTrimOutcome],
 ) -> SealPathTailTrimmer:
@@ -74,6 +63,27 @@ def _tail_trimmer_with_trim(
 
 def _identity_tail_trim(samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
     return TailTrimOutcome(samples, "rms", False, None)
+
+
+def _runtime(
+    trim: Callable[[np.ndarray, int], TailTrimOutcome] = _identity_tail_trim,
+    *,
+    released_devices: list[str] | None = None,
+) -> SealPathRuntime:
+    return SealPathRuntime(
+        sample_rate=16_000,
+        tail_trimmer=_tail_trimmer_with_trim(trim),
+        release_device_cache=(
+            released_devices.append if released_devices is not None else lambda _device: None
+        ),
+    )
+
+
+def _async_transcriber(transcriber: _RecordingTranscriber):
+    async def transcribe(samples: np.ndarray) -> str:
+        return transcriber.transcribe_samples(samples, sample_rate=16_000)
+
+    return transcribe
 
 
 def test_transcribe_samples_uses_array_path_when_supported() -> None:
@@ -140,41 +150,40 @@ def test_transcribe_samples_empty_audio_returns_empty_string_without_model_call(
     assert model.calls == []
 
 
-def test_server_offline_finalize_uses_in_memory_transcriber() -> None:
+def test_seal_path_finalize_uses_in_memory_transcriber_and_records_timing() -> None:
     async def scenario() -> None:
-        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-        server.settings = ServerSettings(device="cpu", streaming_enabled=False)
-        server.audio = SimpleNamespace(sample_rate=16_000)
-        server.transcriber = _RecordingTranscriber()
-        server.streaming_transcriber = None
-        server._active_stream = None
-
+        runtime = _runtime()
+        transcriber = _RecordingTranscriber()
         samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
-        typed_server = cast(SessionOrchestrator, server)
-        text, infer_ms = await typed_server._finalise_transcription(samples)
+        outcome = await runtime.finalize(
+            samples,
+            _async_transcriber(transcriber),
+            effective_device="cpu",
+        )
 
-        assert text == "offline text"
-        assert infer_ms >= 0
-        recording = server.transcriber
-        assert len(recording.calls) == 1
-        forwarded_samples, forwarded_rate = recording.calls[0]
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == "offline text"
+        assert outcome.infer_ms >= 0
+        assert outcome.finalize_ms >= outcome.infer_ms
+        runtime.record_success(outcome, audio_stop_ms=9, send_ms=4)
+        metrics = runtime.metrics()
+        assert metrics.audio_stop_ms == 9
+        assert metrics.finalize_ms == outcome.finalize_ms
+        assert metrics.infer_ms == outcome.infer_ms
+        assert metrics.send_ms == 4
+        assert metrics.last_audio_ms == outcome.audio_ms
+        assert metrics.last_infer_ms == outcome.infer_ms
+        assert metrics.last_send_ms == 4
+        assert len(transcriber.calls) == 1
+        forwarded_samples, forwarded_rate = transcriber.calls[0]
         assert forwarded_rate == 16_000
         assert forwarded_samples.size > 0
 
     asyncio.run(scenario())
 
 
-def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monkeypatch) -> None:
+def test_seal_path_finalize_skips_model_call_when_trimmed_audio_empty() -> None:
     async def scenario() -> None:
-        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-        server.settings = ServerSettings(device="cuda", streaming_enabled=False)
-        server.audio = SimpleNamespace(sample_rate=16_000)
-        server.transcriber = _RecordingTranscriber()
-        server.streaming_transcriber = None
-        server._active_stream = None
-        server._vad_enabled = False
-        server._effective_device = "cuda"
-
         def trim_empty(_samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
             return TailTrimOutcome(
                 np.zeros((0,), dtype=np.float32),
@@ -183,70 +192,55 @@ def test_server_offline_finalize_skips_model_call_when_trimmed_audio_empty(monke
                 None,
             )
 
-        server.tail_trimmer = _tail_trimmer_with_trim(trim_empty)
         released_devices: list[str] = []
-
-        monkeypatch.setattr(
-            orchestrator_module,
-            "_release_cuda_cache",
-            lambda device: released_devices.append(device),
+        runtime = _runtime(trim_empty, released_devices=released_devices)
+        transcriber = _RecordingTranscriber()
+        samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
+        outcome = await runtime.finalize(
+            samples,
+            _async_transcriber(transcriber),
+            effective_device="cuda",
         )
 
-        samples = np.array([0.2, 0.1, 0.05], dtype=np.float32)
-        typed_server = cast(SessionOrchestrator, server)
-        text, infer_ms = await typed_server._finalise_transcription(samples)
-
-        assert text == ""
-        assert infer_ms == 0
-        assert server.transcriber.calls == []
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == ""
+        assert outcome.infer_ms == 0
+        assert transcriber.calls == []
         assert released_devices == ["cuda"]
 
     asyncio.run(scenario())
 
 
-def test_server_finalize_uses_canonical_audio_even_when_stream_session_exists() -> None:
+def test_seal_path_finalize_forwards_canonical_audio_samples() -> None:
     async def scenario() -> None:
-        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-        server.settings = ServerSettings(device="cpu", streaming_enabled=True)
-        server.audio = SimpleNamespace(sample_rate=16_000)
-        server.transcriber = _RecordingTranscriber()
-        server.streaming_transcriber = object()
-        server._active_stream = _ExplodingStreamSession()
-        server.tail_trimmer = _tail_trimmer_with_trim(_identity_tail_trim)
-
+        runtime = _runtime()
+        transcriber = _RecordingTranscriber()
         samples = np.array([0.2, 0.1, 0.05, 0.4], dtype=np.float32)
-        typed_server = cast(SessionOrchestrator, server)
-        text, infer_ms = await typed_server._finalise_transcription(samples)
+        outcome = await runtime.finalize(
+            samples,
+            _async_transcriber(transcriber),
+            effective_device="cpu",
+        )
 
-        assert text == "offline text"
-        assert infer_ms >= 0
-        recording = server.transcriber
-        assert len(recording.calls) == 1
-        forwarded_samples, forwarded_rate = recording.calls[0]
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == "offline text"
+        assert outcome.infer_ms >= 0
+        assert len(transcriber.calls) == 1
+        forwarded_samples, forwarded_rate = transcriber.calls[0]
         assert forwarded_rate == 16_000
         np.testing.assert_array_equal(forwarded_samples, samples)
-        stream = server._active_stream
-        assert stream.feed_calls == []
-        assert stream.finalize_called is False
 
     asyncio.run(scenario())
 
 
-def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
+def test_seal_path_finalize_offloads_tail_trim_off_event_loop() -> None:
     async def scenario() -> None:
-        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-        server.settings = ServerSettings(device="cpu", streaming_enabled=False)
-        server.audio = SimpleNamespace(sample_rate=16_000)
-        server.transcriber = _RecordingTranscriber()
-        server.streaming_transcriber = None
-        server._active_stream = None
-
         def slow_trim(samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
             time.sleep(0.12)
             return TailTrimOutcome(samples, "rms", False, None)
 
-        server.tail_trimmer = _tail_trimmer_with_trim(slow_trim)
-
+        runtime = _runtime(slow_trim)
+        transcriber = _RecordingTranscriber()
         progress = asyncio.Event()
 
         async def ticker() -> None:
@@ -254,46 +248,88 @@ def test_server_finalize_offloads_tail_trim_off_event_loop() -> None:
             progress.set()
 
         finalize_task = asyncio.create_task(
-            cast(SessionOrchestrator, server)._finalise_transcription(
-                np.array([0.2, 0.1, 0.05], dtype=np.float32)
+            runtime.finalize(
+                np.array([0.2, 0.1, 0.05], dtype=np.float32),
+                _async_transcriber(transcriber),
+                effective_device="cpu",
             )
         )
         ticker_task = asyncio.create_task(ticker())
 
         await asyncio.wait_for(progress.wait(), timeout=0.05)
-        text, infer_ms = await finalize_task
+        outcome = await finalize_task
         await ticker_task
 
-        assert text == "offline text"
-        assert infer_ms >= 0
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == "offline text"
+        assert outcome.infer_ms >= 0
 
     asyncio.run(scenario())
 
 
-def test_server_finalize_releases_cuda_cache_after_model_call(monkeypatch) -> None:
+def test_seal_path_finalize_releases_cuda_cache_after_model_call() -> None:
     async def scenario() -> None:
-        server = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-        server.settings = ServerSettings(device="cuda", streaming_enabled=False)
-        server.audio = SimpleNamespace(sample_rate=16_000)
-        server.transcriber = _RecordingTranscriber()
-        server.streaming_transcriber = None
-        server._active_stream = None
-        server._effective_device = "cuda"
-        server.tail_trimmer = _tail_trimmer_with_trim(_identity_tail_trim)
         released_devices: list[str] = []
+        runtime = _runtime(released_devices=released_devices)
+        transcriber = _RecordingTranscriber()
 
-        monkeypatch.setattr(
-            orchestrator_module,
-            "_release_cuda_cache",
-            lambda device: released_devices.append(device),
+        outcome = await runtime.finalize(
+            np.array([0.2, 0.1, 0.05], dtype=np.float32),
+            _async_transcriber(transcriber),
+            effective_device="cuda",
         )
 
-        text, infer_ms = await cast(SessionOrchestrator, server)._finalise_transcription(
-            np.array([0.2, 0.1, 0.05], dtype=np.float32)
-        )
-
-        assert text == "offline text"
-        assert infer_ms >= 0
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == "offline text"
+        assert outcome.infer_ms >= 0
         assert released_devices == ["cuda"]
+
+    asyncio.run(scenario())
+
+
+def test_seal_path_finalize_releases_cuda_cache_when_tail_trim_fails() -> None:
+    async def scenario() -> None:
+        def fail_trim(_samples: np.ndarray, _sample_rate: int) -> TailTrimOutcome:
+            raise RuntimeError("trim failed")
+
+        released_devices: list[str] = []
+        runtime = _runtime(fail_trim, released_devices=released_devices)
+        transcriber = _RecordingTranscriber()
+
+        outcome = await runtime.finalize(
+            np.array([0.2, 0.1, 0.05], dtype=np.float32),
+            _async_transcriber(transcriber),
+            effective_device="cuda",
+        )
+
+        assert isinstance(outcome, SealPathFinalizationFailure)
+        assert outcome.code == "MODEL"
+        assert transcriber.calls == []
+        assert released_devices == ["cuda"]
+
+    asyncio.run(scenario())
+
+
+def test_seal_path_finalize_preserves_result_when_cache_release_fails() -> None:
+    async def scenario() -> None:
+        def fail_release(_device: str) -> None:
+            raise RuntimeError("cache release failed")
+
+        runtime = SealPathRuntime(
+            sample_rate=16_000,
+            tail_trimmer=_tail_trimmer_with_trim(_identity_tail_trim),
+            release_device_cache=fail_release,
+        )
+        transcriber = _RecordingTranscriber()
+
+        outcome = await runtime.finalize(
+            np.array([0.2, 0.1, 0.05], dtype=np.float32),
+            _async_transcriber(transcriber),
+            effective_device="cuda",
+        )
+
+        assert isinstance(outcome, SealPathFinalizationResult)
+        assert outcome.text == "offline text"
+        assert runtime.last_failure is None
 
     asyncio.run(scenario())
