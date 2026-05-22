@@ -26,6 +26,18 @@ from parakeet_stt_daemon.messages import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "scripts" / "stt-helper.sh"
 FIXTURE_DIR = REPO_ROOT / "docs" / "protocol" / "fixtures"
+START_PROFILE_ROW_FIELDS = (
+    "profile_id",
+    "mode_aliases",
+    "command_aliases",
+    "start_cli_arg",
+    "daemon_streaming_enabled",
+    "daemon_device_override",
+    "overlay_enabled_default",
+    "overlay_adaptive_width_default",
+    "help_label",
+    "help_description",
+)
 
 
 @contextmanager
@@ -114,6 +126,61 @@ def _run_get_stt_start_args(
         capture_output=True,
     )
     return [item.decode() for item in completed.stdout.split(b"\0") if item]
+
+
+def _run_start_profile_rows() -> list[dict[str, str]]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt __start-profile-rows",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    rows: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        values = line.split("|")
+        assert len(values) == len(START_PROFILE_ROW_FIELDS)
+        rows.append(dict(zip(START_PROFILE_ROW_FIELDS, values, strict=True)))
+    return rows
+
+
+def _run_start_help() -> str:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt help start",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    return completed.stdout
 
 
 def _run_get_stt_start_args_with_malformed_export() -> subprocess.CompletedProcess[str]:
@@ -322,6 +389,55 @@ def test_offline_profile_resolves_cuda_without_streaming() -> None:
     assert config["daemon_device"] == "cuda"
     assert config["daemon_streaming_enabled"] == "false"
     assert config["daemon_overlay_events_enabled"] == "false"
+
+
+def test_start_profile_metadata_drives_runtime_defaults() -> None:
+    profiles = _run_start_profile_rows()
+
+    assert [profile["profile_id"] for profile in profiles] == ["stream-seal", "offline", "cpu"]
+    for profile in profiles:
+        args = () if profile["profile_id"] == "stream-seal" else (profile["start_cli_arg"],)
+        config = _run_runtime_config(*args)
+        expected_device = profile["daemon_device_override"] or "cuda"
+
+        assert config["launch_profile"] == profile["profile_id"]
+        assert config["daemon_device"] == expected_device
+        assert config["daemon_streaming_enabled"] == profile["daemon_streaming_enabled"]
+        assert config["overlay_enabled"] == profile["overlay_enabled_default"]
+        assert config["overlay_adaptive_width"] == profile["overlay_adaptive_width_default"]
+        assert config["daemon_overlay_events_enabled"] == profile["overlay_enabled_default"]
+
+
+def test_start_profile_metadata_drives_mode_aliases_and_generated_args() -> None:
+    for profile in _run_start_profile_rows():
+        for alias in profile["mode_aliases"].split(","):
+            config = _run_runtime_config(alias)
+            assert config["launch_profile"] == profile["profile_id"]
+
+        args = _run_get_stt_start_args(profile["start_cli_arg"])
+        assert args[0] == profile["start_cli_arg"]
+
+
+def test_start_help_modes_are_generated_from_profile_metadata() -> None:
+    help_text = _run_start_help()
+
+    for profile in _run_start_profile_rows():
+        assert profile["help_label"] in help_text
+        assert profile["help_description"] in help_text
+
+
+def test_profile_overlay_env_overrides_metadata_defaults() -> None:
+    config = _run_runtime_config(
+        "offline",
+        extra_env={
+            "PARAKEET_OVERLAY_ENABLED": "true",
+            "PARAKEET_OVERLAY_ADAPTIVE_WIDTH": "true",
+        },
+    )
+
+    assert config["overlay_enabled"] == "true"
+    assert config["overlay_adaptive_width"] == "true"
+    assert config["daemon_overlay_events_enabled"] == "true"
 
 
 def test_helper_endpoint_defaults_match_daemon_settings() -> None:
