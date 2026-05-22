@@ -5,16 +5,18 @@
 //! enqueueing, LLM progress, and focus-routing handoff.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::injector::ParentFocusCapture;
+use crate::audio_feedback::AudioFeedback;
+use crate::injector::{injector_metrics_snapshot, ParentFocusCapture};
 use crate::injector_runtime::{
-    EnqueueFailure, InjectionJob, InjectionOrigin, InjectorWorkerHandle,
-    INJECTION_ENQUEUE_TIMEOUT_MS, INJECTION_QUEUE_CAPACITY,
+    EnqueueFailure, InjectionErrorKind, InjectionJob, InjectionOrigin, InjectionReport,
+    InjectorWorkerHandle, INJECTION_ENQUEUE_TIMEOUT_MS, INJECTION_QUEUE_CAPACITY,
 };
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::ServerMessage;
@@ -41,6 +43,11 @@ pub(crate) struct ClientFocusRouter {
     focus_cache: Option<WaylandFocusCache>,
     parent_focus_by_session: HashMap<Uuid, CapturedParentFocus>,
     last_overlay_output_name: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClientInjectionDispatcher {
+    worker: InjectorWorkerHandle,
 }
 
 #[derive(Debug)]
@@ -77,6 +84,31 @@ pub(crate) struct LlmCompletionContext {
     pub(crate) stop_message_elapsed_ms_at_enqueue: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LlmAnswerInjection {
+    session_id: Uuid,
+    text: String,
+    daemon_latency_ms: u64,
+    daemon_audio_ms: u64,
+    completion: LlmCompletionContext,
+}
+
+#[derive(Debug, Clone)]
+struct FinalResultInjection {
+    session_id: Uuid,
+    text: String,
+    latency_ms: u64,
+    audio_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectionDispatchOutcome {
+    Queued,
+    QueueTimeout,
+    WorkerGone,
+    SkippedStaleSession,
+}
+
 impl ClientFocusRouter {
     pub(crate) fn new(focus_cache: Option<WaylandFocusCache>) -> Self {
         Self {
@@ -93,17 +125,13 @@ impl ClientFocusRouter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn take_parent_focus_for_enqueue(
         &mut self,
         session_id: Uuid,
     ) -> Option<ParentFocusCapture> {
-        self.parent_focus_by_session
-            .remove(&session_id)
-            .map(|captured| {
-                let mut focus = captured.focus;
-                focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
-                focus
-            })
+        self.take_captured_parent_focus_for_enqueue(session_id)
+            .map(|captured| parent_focus_for_enqueue(&captured))
     }
 
     pub(crate) fn clear_session(&mut self, session_id: Uuid) {
@@ -142,6 +170,21 @@ impl ClientFocusRouter {
         )))
     }
 
+    fn take_captured_parent_focus_for_enqueue(
+        &mut self,
+        session_id: Uuid,
+    ) -> Option<CapturedParentFocus> {
+        self.parent_focus_by_session.remove(&session_id)
+    }
+
+    fn restore_captured_parent_focus_for_enqueue(
+        &mut self,
+        session_id: Uuid,
+        captured: CapturedParentFocus,
+    ) {
+        self.parent_focus_by_session.insert(session_id, captured);
+    }
+
     #[cfg(test)]
     fn record_parent_focus_for_tests(
         &mut self,
@@ -162,6 +205,369 @@ impl ClientFocusRouter {
 impl Default for ClientFocusRouter {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+impl LlmAnswerInjection {
+    pub(crate) fn new(
+        session_id: Uuid,
+        text: String,
+        daemon_latency_ms: u64,
+        daemon_audio_ms: u64,
+        completion: LlmCompletionContext,
+    ) -> Self {
+        Self {
+            session_id,
+            text,
+            daemon_latency_ms,
+            daemon_audio_ms,
+            completion,
+        }
+    }
+}
+
+impl ClientInjectionDispatcher {
+    pub(crate) fn new(worker: InjectorWorkerHandle) -> Self {
+        Self { worker }
+    }
+
+    async fn dispatch_raw_final_result(
+        &self,
+        injection: FinalResultInjection,
+        runtime: &mut ClientSessionRuntime,
+        focus_router: &mut ClientFocusRouter,
+    ) -> InjectionDispatchOutcome {
+        if !runtime.final_result_belongs_to_active_session(injection.session_id) {
+            runtime
+                .log_rejected_final_result(injection.session_id, InjectionOrigin::RawFinalResult);
+            return InjectionDispatchOutcome::SkippedStaleSession;
+        }
+
+        let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(runtime.last_hotkey_up_at);
+        let stop_message_elapsed_ms_at_enqueue =
+            runtime.stop_message_elapsed_ms_at_enqueue(injection.session_id);
+        info!(
+            session = %injection.session_id,
+            origin = InjectionOrigin::RawFinalResult.as_str(),
+            daemon_latency_ms = injection.latency_ms,
+            audio_ms = injection.audio_ms,
+            state_at_enqueue = runtime.state_label(),
+            hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue,
+            "final result received"
+        );
+
+        let outcome = self
+            .enqueue(
+                QueueInjectionRequest {
+                    session_id: injection.session_id,
+                    text: injection.text,
+                    daemon_latency_ms: injection.latency_ms,
+                    daemon_audio_ms: injection.audio_ms,
+                    origin: InjectionOrigin::RawFinalResult,
+                    hotkey_up_elapsed_ms_at_enqueue,
+                    stop_message_elapsed_ms_at_enqueue,
+                },
+                focus_router,
+            )
+            .await;
+        runtime.reset();
+        outcome
+    }
+
+    pub(crate) async fn dispatch_llm_answer(
+        &self,
+        injection: LlmAnswerInjection,
+        focus_router: &mut ClientFocusRouter,
+    ) -> InjectionDispatchOutcome {
+        info!(
+            session = %injection.session_id,
+            origin = InjectionOrigin::LlmAnswer.as_str(),
+            state_at_enqueue = injection.completion.state_label,
+            session_end_was_deferred = injection.completion.session_end_was_deferred,
+            hotkey_up_elapsed_ms_at_enqueue =
+                injection.completion.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue =
+                injection.completion.stop_message_elapsed_ms_at_enqueue,
+            response_chars = injection.text.chars().count(),
+            "queueing llm answer injection job"
+        );
+
+        self.enqueue(
+            QueueInjectionRequest {
+                session_id: injection.session_id,
+                text: injection.text,
+                daemon_latency_ms: injection.daemon_latency_ms,
+                daemon_audio_ms: injection.daemon_audio_ms,
+                origin: InjectionOrigin::LlmAnswer,
+                hotkey_up_elapsed_ms_at_enqueue: injection
+                    .completion
+                    .hotkey_up_elapsed_ms_at_enqueue,
+                stop_message_elapsed_ms_at_enqueue: injection
+                    .completion
+                    .stop_message_elapsed_ms_at_enqueue,
+            },
+            focus_router,
+        )
+        .await
+    }
+
+    async fn enqueue(
+        &self,
+        request: QueueInjectionRequest,
+        focus_router: &mut ClientFocusRouter,
+    ) -> InjectionDispatchOutcome {
+        let session_id = request.session_id;
+        let origin = request.origin;
+        let captured_parent_focus =
+            focus_router.take_captured_parent_focus_for_enqueue(request.session_id);
+        let parent_focus = captured_parent_focus.as_ref().map(parent_focus_for_enqueue);
+        let result = self
+            .worker
+            .enqueue(
+                InjectionJob::new(
+                    request.session_id,
+                    request.text,
+                    request.daemon_latency_ms,
+                    request.daemon_audio_ms,
+                )
+                .with_origin(request.origin)
+                .with_enqueue_timing(
+                    request.hotkey_up_elapsed_ms_at_enqueue,
+                    request.stop_message_elapsed_ms_at_enqueue,
+                )
+                .with_parent_focus(parent_focus),
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                log_dispatch_queued(session_id, origin);
+                InjectionDispatchOutcome::Queued
+            }
+            Err(EnqueueFailure::Timeout) => {
+                if let Some(captured_parent_focus) = captured_parent_focus {
+                    focus_router.restore_captured_parent_focus_for_enqueue(
+                        session_id,
+                        captured_parent_focus,
+                    );
+                }
+                log_dispatch_enqueue_timeout(session_id, origin);
+                InjectionDispatchOutcome::QueueTimeout
+            }
+            Err(EnqueueFailure::WorkerGone) => {
+                if let Some(captured_parent_focus) = captured_parent_focus {
+                    focus_router.restore_captured_parent_focus_for_enqueue(
+                        session_id,
+                        captured_parent_focus,
+                    );
+                }
+                log_dispatch_worker_gone(session_id, origin);
+                InjectionDispatchOutcome::WorkerGone
+            }
+        }
+    }
+
+    pub(crate) fn handle_report<S: OverlaySink>(
+        &self,
+        report: InjectionReport,
+        overlay_router: &mut OverlayRouter<S>,
+        audio_feedback: &AudioFeedback,
+    ) {
+        self.worker.metrics().note_report(&report);
+        let success = report.error_kind.is_none() && report.error.is_none();
+        match (report.error_kind, report.error) {
+            (Some(error_kind), Some(error)) => {
+                warn!(
+                    session = %report.session_id,
+                    origin = report.origin.as_str(),
+                    error_kind = error_kind.as_str(),
+                    daemon_latency_ms = report.daemon_latency_ms,
+                    daemon_audio_ms = report.daemon_audio_ms,
+                    queue_wait_ms = report.queue_wait_ms,
+                    run_ms = report.run_ms,
+                    total_worker_ms = report.total_worker_ms,
+                    enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
+                    hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                    stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                    hotkey_up_elapsed_ms_at_worker_start =
+                        report.hotkey_up_elapsed_ms_at_worker_start,
+                    stop_message_elapsed_ms_at_worker_start =
+                        report.stop_message_elapsed_ms_at_worker_start,
+                    hotkey_up_elapsed_ms_at_completion =
+                        report.hotkey_up_elapsed_ms_at_completion,
+                    stop_message_elapsed_ms_at_completion =
+                        report.stop_message_elapsed_ms_at_completion,
+                    error = %error,
+                    "injector worker reported failure"
+                );
+            }
+            (None, None) => {
+                info!(
+                    session = %report.session_id,
+                    origin = report.origin.as_str(),
+                    daemon_latency_ms = report.daemon_latency_ms,
+                    daemon_audio_ms = report.daemon_audio_ms,
+                    queue_wait_ms = report.queue_wait_ms,
+                    run_ms = report.run_ms,
+                    total_worker_ms = report.total_worker_ms,
+                    enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
+                    hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                    stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                    hotkey_up_elapsed_ms_at_worker_start =
+                        report.hotkey_up_elapsed_ms_at_worker_start,
+                    stop_message_elapsed_ms_at_worker_start =
+                        report.stop_message_elapsed_ms_at_worker_start,
+                    hotkey_up_elapsed_ms_at_completion =
+                        report.hotkey_up_elapsed_ms_at_completion,
+                    stop_message_elapsed_ms_at_completion =
+                        report.stop_message_elapsed_ms_at_completion,
+                    "injector worker completed job"
+                );
+                audio_feedback.play_completion();
+            }
+            (error_kind, error) => {
+                warn!(
+                    session = %report.session_id,
+                    origin = report.origin.as_str(),
+                    error_kind = error_kind.map(InjectionErrorKind::as_str),
+                    daemon_latency_ms = report.daemon_latency_ms,
+                    daemon_audio_ms = report.daemon_audio_ms,
+                    queue_wait_ms = report.queue_wait_ms,
+                    run_ms = report.run_ms,
+                    total_worker_ms = report.total_worker_ms,
+                    enqueue_to_injection_complete_ms = report.enqueue_to_injection_complete_ms,
+                    hotkey_up_elapsed_ms_at_enqueue = report.hotkey_up_elapsed_ms_at_enqueue,
+                    stop_message_elapsed_ms_at_enqueue = report.stop_message_elapsed_ms_at_enqueue,
+                    hotkey_up_elapsed_ms_at_worker_start =
+                        report.hotkey_up_elapsed_ms_at_worker_start,
+                    stop_message_elapsed_ms_at_worker_start =
+                        report.stop_message_elapsed_ms_at_worker_start,
+                    hotkey_up_elapsed_ms_at_completion =
+                        report.hotkey_up_elapsed_ms_at_completion,
+                    stop_message_elapsed_ms_at_completion =
+                        report.stop_message_elapsed_ms_at_completion,
+                    error = ?error,
+                    "injector worker reported inconsistent error classification"
+                );
+            }
+        }
+
+        let processed = self
+            .worker
+            .metrics()
+            .worker_success_total
+            .load(Ordering::Relaxed)
+            + self
+                .worker
+                .metrics()
+                .worker_failure_total
+                .load(Ordering::Relaxed);
+        if processed.is_multiple_of(25) && processed > 0 {
+            self.worker.metrics().log_summary();
+            let snapshot = injector_metrics_snapshot();
+            info!(
+                clipboard_ready_success_total = snapshot.clipboard_ready_success_total,
+                clipboard_ready_failure_total = snapshot.clipboard_ready_failure_total,
+                clipboard_ready_duration_ms_total = snapshot.clipboard_ready_duration_ms_total,
+                route_shortcut_success_total = snapshot.route_shortcut_success_total,
+                route_shortcut_failure_total = snapshot.route_shortcut_failure_total,
+                route_shortcut_duration_ms_total = snapshot.route_shortcut_duration_ms_total,
+                backend_success_total = snapshot.backend_success_total,
+                backend_failure_total = snapshot.backend_failure_total,
+                backend_duration_ms_total = snapshot.backend_duration_ms_total,
+                wl_copy_spawn_total = snapshot.wl_copy_spawn_total,
+                wl_paste_spawn_total = snapshot.wl_paste_spawn_total,
+                "injector stage metrics summary"
+            );
+        }
+
+        overlay_router.route_injection_complete(report.session_id, success);
+    }
+}
+
+#[derive(Debug)]
+struct QueueInjectionRequest {
+    session_id: Uuid,
+    text: String,
+    daemon_latency_ms: u64,
+    daemon_audio_ms: u64,
+    origin: InjectionOrigin,
+    hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    stop_message_elapsed_ms_at_enqueue: Option<u64>,
+}
+
+fn log_dispatch_queued(session_id: Uuid, origin: InjectionOrigin) {
+    match origin {
+        InjectionOrigin::RawFinalResult => {
+            debug!(session = %session_id, "final result queued for injector worker");
+        }
+        InjectionOrigin::LlmAnswer => {
+            debug!(session = %session_id, "llm final answer queued for injector worker");
+        }
+        InjectionOrigin::Demo => {
+            debug!(session = %session_id, "demo injection queued for injector worker");
+        }
+        InjectionOrigin::Unspecified => {
+            debug!(session = %session_id, "injection queued for injector worker");
+        }
+    }
+}
+
+fn log_dispatch_enqueue_timeout(session_id: Uuid, origin: InjectionOrigin) {
+    match origin {
+        InjectionOrigin::RawFinalResult => {
+            warn!(
+                session = %session_id,
+                queue_capacity = INJECTION_QUEUE_CAPACITY,
+                enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                "injector queue remained full; dropping final result injection job"
+            );
+        }
+        InjectionOrigin::LlmAnswer => {
+            warn!(
+                session = %session_id,
+                queue_capacity = INJECTION_QUEUE_CAPACITY,
+                enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                "injector queue remained full; dropping llm final answer"
+            );
+        }
+        InjectionOrigin::Demo => {
+            warn!(
+                session = %session_id,
+                queue_capacity = INJECTION_QUEUE_CAPACITY,
+                enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                "injector queue remained full; dropping demo injection job"
+            );
+        }
+        InjectionOrigin::Unspecified => {
+            warn!(
+                session = %session_id,
+                queue_capacity = INJECTION_QUEUE_CAPACITY,
+                enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
+                "injector queue remained full; dropping injection job"
+            );
+        }
+    }
+}
+
+fn log_dispatch_worker_gone(session_id: Uuid, origin: InjectionOrigin) {
+    match origin {
+        InjectionOrigin::RawFinalResult => {
+            warn!(
+                session = %session_id,
+                "injector worker unavailable; dropping final result injection job"
+            );
+        }
+        InjectionOrigin::LlmAnswer => {
+            warn!(session = %session_id, "injector worker unavailable; dropping llm final answer");
+        }
+        InjectionOrigin::Demo => {
+            warn!(session = %session_id, "injector worker unavailable; dropping demo injection job");
+        }
+        InjectionOrigin::Unspecified => {
+            warn!(session = %session_id, "injector worker unavailable; dropping injection job");
+        }
     }
 }
 
@@ -199,6 +605,12 @@ fn parent_focus_from_observation(observation: WaylandFocusObservation) -> Parent
             captured_elapsed_ms: Some(0),
         },
     }
+}
+
+fn parent_focus_for_enqueue(captured: &CapturedParentFocus) -> ParentFocusCapture {
+    let mut focus = captured.focus.clone();
+    focus.captured_elapsed_ms = Some(captured.captured_at.elapsed().as_millis() as u64);
+    focus
 }
 
 impl ClientSessionRuntime {
@@ -392,7 +804,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
     runtime: &mut ClientSessionRuntime,
     focus_router: &mut ClientFocusRouter,
     overlay_router: &mut OverlayRouter<S>,
-    injector_worker: &InjectorWorkerHandle,
+    injection_dispatcher: &ClientInjectionDispatcher,
 ) -> Result<()> {
     match message {
         ServerMessage::SessionStarted { session_id, .. } => {
@@ -407,55 +819,18 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             audio_ms,
             ..
         } => {
-            if !runtime.final_result_belongs_to_active_session(session_id) {
-                runtime.log_rejected_final_result(session_id, InjectionOrigin::RawFinalResult);
-                return Ok(());
-            }
-
-            let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(runtime.last_hotkey_up_at);
-            let stop_message_elapsed_ms_at_enqueue =
-                runtime.stop_message_elapsed_ms_at_enqueue(session_id);
-            info!(
-                session = %session_id,
-                origin = InjectionOrigin::RawFinalResult.as_str(),
-                daemon_latency_ms = latency_ms,
-                audio_ms,
-                state_at_enqueue = runtime.state_label(),
-                hotkey_up_elapsed_ms_at_enqueue,
-                stop_message_elapsed_ms_at_enqueue,
-                "final result received"
-            );
-            match injector_worker
-                .enqueue(
-                    InjectionJob::new(session_id, text, latency_ms, audio_ms)
-                        .with_origin(InjectionOrigin::RawFinalResult)
-                        .with_enqueue_timing(
-                            hotkey_up_elapsed_ms_at_enqueue,
-                            stop_message_elapsed_ms_at_enqueue,
-                        )
-                        .with_parent_focus(focus_router.take_parent_focus_for_enqueue(session_id)),
+            injection_dispatcher
+                .dispatch_raw_final_result(
+                    FinalResultInjection {
+                        session_id,
+                        text,
+                        latency_ms,
+                        audio_ms,
+                    },
+                    runtime,
+                    focus_router,
                 )
-                .await
-            {
-                Ok(()) => {
-                    debug!(session = %session_id, "final result queued for injector worker");
-                }
-                Err(EnqueueFailure::Timeout) => {
-                    warn!(
-                        session = %session_id,
-                        queue_capacity = INJECTION_QUEUE_CAPACITY,
-                        enqueue_timeout_ms = INJECTION_ENQUEUE_TIMEOUT_MS,
-                        "injector queue remained full; dropping final result injection job"
-                    );
-                }
-                Err(EnqueueFailure::WorkerGone) => {
-                    warn!(
-                        session = %session_id,
-                        "injector worker unavailable; dropping final result injection job"
-                    );
-                }
-            }
-            runtime.reset();
+                .await;
         }
         ServerMessage::Error {
             session_id,
@@ -575,10 +950,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use crate::audio_feedback::AudioFeedback;
     use crate::config::OverlayMode;
     use crate::injector_runtime::{
-        spawn_injector_worker_with_capacity, InjectionJob, InjectionJobRunner, InjectionRunError,
-        InjectionRunOutput, InjectorWorkerHandle,
+        spawn_injector_worker_with_capacity, InjectionErrorKind, InjectionJob, InjectionJobRunner,
+        InjectionOrigin, InjectionReport, InjectionRunError, InjectionRunOutput,
+        InjectorWorkerHandle,
     };
     use crate::overlay_process::{
         OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
@@ -596,7 +973,8 @@ mod tests {
 
     use super::{
         handle_server_message, parent_focus_from_observation, ClientFocusRouter,
-        ClientSessionRuntime, LlmDeltaOverlay, SessionIntent,
+        ClientInjectionDispatcher, ClientSessionRuntime, InjectionDispatchOutcome,
+        LlmAnswerInjection, LlmCompletionContext, LlmDeltaOverlay, SessionIntent,
     };
 
     struct SlowRunner {
@@ -632,6 +1010,23 @@ mod tests {
         }
     }
 
+    struct RecordingJobRunner {
+        seen: Arc<Mutex<Vec<InjectionJob>>>,
+    }
+
+    impl InjectionJobRunner for RecordingJobRunner {
+        fn run(
+            &self,
+            job: &InjectionJob,
+        ) -> std::result::Result<InjectionRunOutput, InjectionRunError> {
+            self.seen
+                .lock()
+                .expect("recording job lock should be available")
+                .push(job.clone());
+            Ok(InjectionRunOutput::default())
+        }
+    }
+
     struct RecordingOverlaySink {
         seen: Arc<Mutex<Vec<OverlayEvent>>>,
     }
@@ -652,12 +1047,13 @@ mod tests {
         injector_worker: &InjectorWorkerHandle,
     ) -> anyhow::Result<()> {
         let mut focus_router = ClientFocusRouter::default();
+        let injection_dispatcher = ClientInjectionDispatcher::new(injector_worker.clone());
         handle_server_message(
             message,
             runtime,
             &mut focus_router,
             overlay_router,
-            injector_worker,
+            &injection_dispatcher,
         )
         .await
     }
@@ -862,6 +1258,210 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn client_injection_dispatcher_queues_llm_answer_with_focus_context() {
+        let seen_jobs = Arc::new(Mutex::new(Vec::<InjectionJob>::new()));
+        let injector = Arc::new(RecordingJobRunner {
+            seen: Arc::clone(&seen_jobs),
+        });
+        let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
+        let dispatcher = ClientInjectionDispatcher::new(worker);
+        let session_id = Uuid::new_v4();
+        let mut focus_router = ClientFocusRouter::default();
+        let parent_focus = parent_focus_from_observation(WaylandFocusObservation::Fresh {
+            snapshot: test_focus_snapshot(Some("DP-1")),
+            cache_age_ms: 8,
+        });
+        focus_router.record_parent_focus_for_tests(
+            session_id,
+            parent_focus,
+            TokioInstant::now() - Duration::from_millis(15),
+        );
+
+        let outcome = dispatcher
+            .dispatch_llm_answer(
+                LlmAnswerInjection::new(
+                    session_id,
+                    "model answer".to_string(),
+                    77,
+                    1400,
+                    LlmCompletionContext {
+                        session_end_reason: Some("normal".to_string()),
+                        session_end_was_deferred: true,
+                        state_label: "idle",
+                        hotkey_up_elapsed_ms_at_enqueue: Some(21),
+                        stop_message_elapsed_ms_at_enqueue: Some(22),
+                    },
+                ),
+                &mut focus_router,
+            )
+            .await;
+
+        assert_eq!(outcome, InjectionDispatchOutcome::Queued);
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("injection report should arrive")
+            .expect("report channel should stay open");
+        assert!(report.error.is_none());
+        assert_eq!(report.origin, InjectionOrigin::LlmAnswer);
+
+        let jobs = seen_jobs
+            .lock()
+            .expect("recording job lock should be available");
+        let job = jobs
+            .first()
+            .expect("dispatcher should submit exactly one job");
+        assert_eq!(job.session_id, session_id);
+        assert_eq!(job.text, "model answer");
+        assert_eq!(job.daemon_latency_ms, 77);
+        assert_eq!(job.daemon_audio_ms, 1400);
+        assert_eq!(job.origin, InjectionOrigin::LlmAnswer);
+        assert_eq!(job.hotkey_up_elapsed_ms_at_enqueue, Some(21));
+        assert_eq!(job.stop_message_elapsed_ms_at_enqueue, Some(22));
+        let parent_focus = job
+            .parent_focus
+            .as_ref()
+            .expect("focus router should provide parent focus to Injection");
+        assert_eq!(parent_focus.source_selected, "wayland_cache");
+        assert_eq!(parent_focus.wayland_cache_age_ms, Some(8));
+        assert!(
+            parent_focus.captured_elapsed_ms.unwrap_or_default() >= 15,
+            "parent focus elapsed should reflect capture-to-dispatch time"
+        );
+        drop(jobs);
+        assert!(focus_router
+            .take_parent_focus_for_enqueue(session_id)
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_injection_dispatcher_preserves_focus_after_enqueue_timeout() {
+        let slow = Arc::new(SlowRunner {
+            calls: Arc::new(AtomicU64::new(0)),
+            sleep_ms: 200,
+        });
+        let (worker, _reports) = spawn_injector_worker_with_capacity(slow, 1);
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "busy worker".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("first enqueue should occupy the worker");
+        worker
+            .enqueue(InjectionJob::new(
+                Uuid::new_v4(),
+                "queued job".to_string(),
+                1,
+                1,
+            ))
+            .await
+            .expect("second enqueue should fill the bounded queue");
+
+        let dispatcher = ClientInjectionDispatcher::new(worker);
+        let session_id = Uuid::new_v4();
+        let mut focus_router = ClientFocusRouter::default();
+        focus_router.record_parent_focus_for_tests(
+            session_id,
+            parent_focus_from_observation(WaylandFocusObservation::Fresh {
+                snapshot: test_focus_snapshot(Some("DP-1")),
+                cache_age_ms: 3,
+            }),
+            TokioInstant::now() - Duration::from_millis(10),
+        );
+
+        let outcome = dispatcher
+            .dispatch_llm_answer(
+                LlmAnswerInjection::new(
+                    session_id,
+                    "preserve focus".to_string(),
+                    1,
+                    1,
+                    LlmCompletionContext {
+                        session_end_reason: None,
+                        session_end_was_deferred: false,
+                        state_label: "idle",
+                        hotkey_up_elapsed_ms_at_enqueue: None,
+                        stop_message_elapsed_ms_at_enqueue: None,
+                    },
+                ),
+                &mut focus_router,
+            )
+            .await;
+
+        assert_eq!(outcome, InjectionDispatchOutcome::QueueTimeout);
+        let restored = focus_router
+            .take_parent_focus_for_enqueue(session_id)
+            .expect("enqueue failure should restore parent focus for the session");
+        assert_eq!(restored.source_selected, "wayland_cache");
+        assert_eq!(restored.wayland_cache_age_ms, Some(3));
+        assert!(
+            restored.captured_elapsed_ms.unwrap_or_default() >= 10,
+            "restored focus should keep its original capture time"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_injection_dispatcher_routes_worker_report_completion() {
+        let injector = Arc::new(RecordingRunner {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
+        let dispatcher = ClientInjectionDispatcher::new(worker.clone());
+        let session_id = Uuid::new_v4();
+        let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
+        let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
+            seen: Arc::clone(&seen_overlay_events),
+        });
+
+        dispatcher.handle_report(
+            InjectionReport {
+                session_id,
+                daemon_latency_ms: 20,
+                daemon_audio_ms: 1000,
+                origin: InjectionOrigin::RawFinalResult,
+                queue_wait_ms: 1,
+                run_ms: 2,
+                total_worker_ms: 3,
+                enqueue_to_injection_complete_ms: 3,
+                hotkey_up_elapsed_ms_at_enqueue: None,
+                stop_message_elapsed_ms_at_enqueue: None,
+                hotkey_up_elapsed_ms_at_worker_start: None,
+                stop_message_elapsed_ms_at_worker_start: None,
+                hotkey_up_elapsed_ms_at_completion: None,
+                stop_message_elapsed_ms_at_completion: None,
+                error_kind: Some(InjectionErrorKind::BackendFailure),
+                error: Some("stage=backend synthetic failure".to_string()),
+            },
+            &mut overlay_router,
+            &AudioFeedback::new(false, None, 0),
+        );
+
+        assert_eq!(
+            InjectionErrorKind::BackendFailure.as_str(),
+            "backend_failure"
+        );
+        assert_eq!(
+            worker
+                .metrics()
+                .worker_backend_failure_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            seen_overlay_events
+                .lock()
+                .expect("overlay recording lock should be available")
+                .as_slice(),
+            &[OverlayEvent::InjectionComplete {
+                session_id,
+                success: false,
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn final_result_enqueues_injection_job() {
         let seen_injection = Arc::new(Mutex::new(Vec::<String>::new()));
         let injector = Arc::new(RecordingRunner {
@@ -912,6 +1512,7 @@ mod tests {
         let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
         let mut focus_router = ClientFocusRouter::default();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
+        let injection_dispatcher = ClientInjectionDispatcher::new(worker.clone());
 
         handle_server_message(
             ServerMessage::FinalResult {
@@ -925,7 +1526,7 @@ mod tests {
             &mut runtime,
             &mut focus_router,
             &mut overlay_router,
-            &worker,
+            &injection_dispatcher,
         )
         .await
         .expect("final result should enqueue");
