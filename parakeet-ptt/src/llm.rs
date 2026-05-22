@@ -15,11 +15,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-pub(crate) const DEFAULT_LLM_HOST: &str = "127.0.0.1";
-pub(crate) const DEFAULT_LLM_PORT: u16 = 8080;
-const LLM_API_PATH: &str = "/v1";
-#[cfg(test)]
-const MANAGED_LLM_HEALTH_PATH: &str = "/health";
+use crate::runtime_interface::{
+    endpoint_url, DEFAULT_LLM_HOST, DEFAULT_LLM_PORT, LLM_API_PATH, LLM_HEALTH_PATH,
+};
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[allow(dead_code)]
@@ -143,16 +141,16 @@ pub fn build_http_llm_answerer(config: LlmRuntimeConfig) -> Arc<dyn LlmAnswerer>
 }
 
 pub(crate) fn llm_api_base_url(host: &str, port: u16) -> String {
-    format!("http://{host}:{port}{LLM_API_PATH}")
+    endpoint_url("http", host, port, LLM_API_PATH)
 }
 
 pub(crate) fn default_llm_base_url() -> String {
     llm_api_base_url(DEFAULT_LLM_HOST, DEFAULT_LLM_PORT)
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn default_managed_llm_health_url() -> String {
-    format!("http://{DEFAULT_LLM_HOST}:{DEFAULT_LLM_PORT}{MANAGED_LLM_HEALTH_PATH}")
+    endpoint_url("http", DEFAULT_LLM_HOST, DEFAULT_LLM_PORT, LLM_HEALTH_PATH)
 }
 
 fn receiver_delta_stream(
@@ -461,29 +459,38 @@ mod tests {
 
     #[test]
     fn llm_endpoint_urls_preserve_configured_base_path() {
-        let base = url::Url::parse("http://127.0.0.1:8080/api/v1").expect("base URL should parse");
+        let base = url::Url::parse("http://llm.local:8181/api/v1").expect("base URL should parse");
 
         assert_eq!(
             llm_chat_completions_url(&base)
                 .expect("chat URL should build")
                 .as_str(),
-            "http://127.0.0.1:8080/api/v1/chat/completions"
+            "http://llm.local:8181/api/v1/chat/completions"
         );
         assert_eq!(
             llm_health_url(&base)
                 .expect("health URL should build")
                 .as_str(),
-            "http://127.0.0.1:8080/api/v1/health"
+            "http://llm.local:8181/api/v1/health"
         );
     }
 
     #[test]
     fn managed_llm_endpoint_defaults_are_derived_from_named_parts() {
-        assert_eq!(default_llm_base_url(), "http://127.0.0.1:8080/v1");
-        assert_eq!(
-            default_managed_llm_health_url(),
-            "http://127.0.0.1:8080/health"
+        let expected_base_url = crate::runtime_interface::endpoint_url(
+            "http",
+            crate::runtime_interface::DEFAULT_LLM_HOST,
+            crate::runtime_interface::DEFAULT_LLM_PORT,
+            crate::runtime_interface::LLM_API_PATH,
         );
+        let expected_health_url = crate::runtime_interface::endpoint_url(
+            "http",
+            crate::runtime_interface::DEFAULT_LLM_HOST,
+            crate::runtime_interface::DEFAULT_LLM_PORT,
+            crate::runtime_interface::LLM_HEALTH_PATH,
+        );
+        assert_eq!(default_llm_base_url(), expected_base_url);
+        assert_eq!(default_managed_llm_health_url(), expected_health_url);
     }
 
     #[test]
