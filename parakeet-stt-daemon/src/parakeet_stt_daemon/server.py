@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from .config import ServerSettings
+from .config import DAEMON_HEALTH_PATH, DAEMON_STATUS_PATH, DAEMON_WS_PATH, ServerSettings
 from .events import (
     ErrorCode,
     EventSinkClosed,
@@ -206,17 +206,17 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     app = FastAPI(title="Parakeet STT Daemon", version="0.2.0", lifespan=lifespan)
 
-    @app.get("/healthz")
+    @app.get(DAEMON_HEALTH_PATH)
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     if settings.status_enabled:
 
-        @app.get("/status")
+        @app.get(DAEMON_STATUS_PATH)
         async def status() -> JSONResponse:
             return JSONResponse(server.status().model_dump())
 
-    @app.websocket("/ws")
+    @app.websocket(DAEMON_WS_PATH)
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await server.handle_websocket(websocket)
 

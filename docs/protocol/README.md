@@ -2,6 +2,8 @@
 
 The canonical WebSocket contract lives in `docs/protocol/schema/messages.schema.json`.
 Canonical wire examples live in `docs/protocol/fixtures/`.
+Shared endpoint and path defaults live in `docs/protocol/runtime-interface.json`,
+with checked projections for the Python Daemon, Rust Client, and shell Helper.
 
 The schema is the source of truth for known daemon/client message fields. The Python
 daemon and Rust client keep their hand-written codec APIs, but CI round-trips every
