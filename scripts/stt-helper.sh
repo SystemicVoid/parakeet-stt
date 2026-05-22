@@ -69,15 +69,23 @@ stt() {
         fi
     fi
 
-    local DEFAULT_DAEMON_HOST="127.0.0.1"
-    local DEFAULT_DAEMON_PORT="8765"
-    local DAEMON_WS_PATH="/ws"
-    local DAEMON_STATUS_PATH="/status"
-    local DAEMON_HEALTH_PATH="/healthz"
-    local DEFAULT_LLM_SERVER_HOST="127.0.0.1"
-    local DEFAULT_LLM_SERVER_PORT="8080"
-    local LLM_API_PATH="/v1"
-    local LLM_HEALTH_PATH="/health"
+    local RUNTIME_INTERFACE_FILE="$REPO_ROOT/scripts/stt-runtime-interface.sh"
+    if [ ! -f "$RUNTIME_INTERFACE_FILE" ]; then
+        echo "stt helper: missing runtime interface projection: $RUNTIME_INTERFACE_FILE"
+        return 1
+    fi
+    # shellcheck source=scripts/stt-runtime-interface.sh
+    . "$RUNTIME_INTERFACE_FILE"
+
+    local DEFAULT_DAEMON_HOST="$STT_DEFAULT_DAEMON_HOST"
+    local DEFAULT_DAEMON_PORT="$STT_DEFAULT_DAEMON_PORT"
+    local DAEMON_WS_PATH="$STT_DAEMON_WS_PATH"
+    local DAEMON_STATUS_PATH="$STT_DAEMON_STATUS_PATH"
+    local DAEMON_HEALTH_PATH="$STT_DAEMON_HEALTH_PATH"
+    local DEFAULT_LLM_SERVER_HOST="$STT_DEFAULT_LLM_SERVER_HOST"
+    local DEFAULT_LLM_SERVER_PORT="$STT_DEFAULT_LLM_SERVER_PORT"
+    local LLM_API_PATH="$STT_LLM_API_PATH"
+    local LLM_HEALTH_PATH="$STT_LLM_HEALTH_PATH"
 
     _endpoint_url() {
         local scheme="$1"

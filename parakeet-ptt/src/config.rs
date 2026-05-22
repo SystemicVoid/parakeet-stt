@@ -8,16 +8,16 @@ use url::Url;
 use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-pub(crate) const DEFAULT_DAEMON_HOST: &str = "127.0.0.1";
-pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
-const DAEMON_WS_PATH: &str = "/ws";
-const DAEMON_STATUS_PATH: &str = "/status";
+use crate::runtime_interface::{
+    endpoint_url, DAEMON_STATUS_PATH, DAEMON_WS_PATH, DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT,
+};
+
 const OVERLAY_ENABLED_ENV: &str = "PARAKEET_OVERLAY_ENABLED";
 const OVERLAY_MODE_ENV: &str = "PARAKEET_OVERLAY_MODE";
 const OVERLAY_ADAPTIVE_WIDTH_ENV: &str = "PARAKEET_OVERLAY_ADAPTIVE_WIDTH";
 
 pub(crate) fn daemon_websocket_endpoint(host: &str, port: u16) -> String {
-    format!("ws://{host}:{port}{DAEMON_WS_PATH}")
+    endpoint_url("ws", host, port, DAEMON_WS_PATH)
 }
 
 pub(crate) fn default_daemon_websocket_endpoint() -> String {
@@ -26,7 +26,12 @@ pub(crate) fn default_daemon_websocket_endpoint() -> String {
 
 #[cfg(test)]
 pub(crate) fn default_daemon_status_url() -> String {
-    format!("http://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}{DAEMON_STATUS_PATH}")
+    endpoint_url(
+        "http",
+        DEFAULT_DAEMON_HOST,
+        DEFAULT_DAEMON_PORT,
+        DAEMON_STATUS_PATH,
+    )
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -408,14 +413,23 @@ mod tests {
 
     #[test]
     fn daemon_endpoint_defaults_are_derived_from_named_parts() {
+        let expected_websocket = crate::runtime_interface::endpoint_url(
+            "ws",
+            crate::runtime_interface::DEFAULT_DAEMON_HOST,
+            crate::runtime_interface::DEFAULT_DAEMON_PORT,
+            crate::runtime_interface::DAEMON_WS_PATH,
+        );
+        let expected_status = crate::runtime_interface::endpoint_url(
+            "http",
+            crate::runtime_interface::DEFAULT_DAEMON_HOST,
+            crate::runtime_interface::DEFAULT_DAEMON_PORT,
+            crate::runtime_interface::DAEMON_STATUS_PATH,
+        );
         assert_eq!(
             super::default_daemon_websocket_endpoint(),
-            "ws://127.0.0.1:8765/ws"
+            expected_websocket
         );
-        assert_eq!(
-            super::default_daemon_status_url(),
-            "http://127.0.0.1:8765/status"
-        );
+        assert_eq!(super::default_daemon_status_url(), expected_status);
 
         let config = ClientConfig::new(
             &super::default_daemon_websocket_endpoint(),

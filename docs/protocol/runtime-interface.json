@@ -1,0 +1,31 @@
+{
+  "schema_version": "parakeet_runtime_interface/v1",
+  "daemon": {
+    "description": "Shared Daemon endpoint defaults consumed by the Daemon, Client, and Helper.",
+    "default_host": "127.0.0.1",
+    "default_port": 8765,
+    "env": {
+      "host": "PARAKEET_HOST",
+      "port": "PARAKEET_PORT"
+    },
+    "paths": {
+      "websocket": "/ws",
+      "status": "/status",
+      "health": "/healthz"
+    }
+  },
+  "managed_llm": {
+    "description": "Shared managed llama-server endpoint defaults consumed by the Client and Helper.",
+    "default_host": "127.0.0.1",
+    "default_port": 8080,
+    "env": {
+      "base_url": "PARAKEET_LLM_BASE_URL",
+      "host": "PARAKEET_LLM_SERVER_HOST",
+      "port": "PARAKEET_LLM_SERVER_PORT"
+    },
+    "paths": {
+      "api": "/v1",
+      "health": "/health"
+    }
+  }
+}

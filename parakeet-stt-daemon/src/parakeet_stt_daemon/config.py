@@ -8,24 +8,16 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_DAEMON_HOST = "127.0.0.1"
-DEFAULT_DAEMON_PORT = 8765
-DAEMON_WS_PATH = "/ws"
-DAEMON_STATUS_PATH = "/status"
-
-
-def daemon_websocket_endpoint(
-    host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT
-) -> str:
-    """Return the Client WebSocket endpoint for a Daemon host/port pair."""
-
-    return f"ws://{host}:{port}{DAEMON_WS_PATH}"
-
-
-def daemon_status_url(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> str:
-    """Return the Daemon status endpoint for a host/port pair."""
-
-    return f"http://{host}:{port}{DAEMON_STATUS_PATH}"
+from .runtime_interface import (
+    DAEMON_HEALTH_PATH,
+    DAEMON_STATUS_PATH,
+    DAEMON_WS_PATH,
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    daemon_health_url,
+    daemon_status_url,
+    daemon_websocket_endpoint,
+)
 
 
 class ServerSettings(BaseSettings):
@@ -50,7 +42,7 @@ class ServerSettings(BaseSettings):
         default="cuda", description="Inference device to target."
     )
     status_enabled: bool = Field(
-        default=True, description="Expose /status HTTP endpoint when true."
+        default=True, description=f"Expose {DAEMON_STATUS_PATH} HTTP endpoint when true."
     )
     config_path: Path | None = Field(
         default=None, description="Optional explicit config file path (reserved)."
@@ -118,11 +110,13 @@ class ServerSettings(BaseSettings):
 
 
 __all__ = [
+    "DAEMON_HEALTH_PATH",
     "DAEMON_STATUS_PATH",
     "DAEMON_WS_PATH",
     "DEFAULT_DAEMON_HOST",
     "DEFAULT_DAEMON_PORT",
     "ServerSettings",
+    "daemon_health_url",
     "daemon_status_url",
     "daemon_websocket_endpoint",
 ]
