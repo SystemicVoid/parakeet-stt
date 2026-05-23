@@ -178,7 +178,7 @@ pub(crate) enum InjectionDispatchOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LlmQueryRequest {
+struct LlmQueryRequest {
     session_id: Uuid,
     transcript: String,
     daemon_latency_ms: u64,
@@ -193,10 +193,29 @@ pub(crate) struct LlmCompletedAnswer {
 }
 
 #[derive(Debug)]
-pub(crate) enum LlmProgressOutcome {
-    Delta(LlmDeltaOverlay),
-    Finished(LlmCompletedAnswer),
-    Ignored,
+pub(crate) struct LlmSessionSnapshot {
+    pub(crate) busy: bool,
+    pub(crate) in_flight_session: Option<Uuid>,
+}
+
+#[derive(Debug)]
+pub(crate) enum LlmQueryAction {
+    PassThroughDaemonMessage(Box<ServerMessage>),
+    DeferSessionEnded {
+        session_id: Uuid,
+    },
+    RouteAnswerState(LlmStateOverlay),
+    IgnoreFinalResult {
+        session_id: Uuid,
+        origin: InjectionOrigin,
+        snapshot: ClientSessionSnapshot,
+    },
+    RouteAnswerDelta(LlmDeltaOverlay),
+    FinishAnswer(LlmCompletedAnswer),
+    IgnoreProgress,
+    ResetForConnectionDrop {
+        before: LlmSessionSnapshot,
+    },
 }
 
 impl ClientFocusRouter {
@@ -317,7 +336,7 @@ impl LlmAnswerInjection {
 }
 
 impl LlmQueryRequest {
-    pub(crate) fn new(
+    fn new(
         session_id: Uuid,
         transcript: String,
         daemon_latency_ms: u64,
@@ -365,7 +384,7 @@ impl ClientLlmQueryRuntime {
         self.state.busy
     }
 
-    pub(crate) fn note_busy_overlay_rejection(&mut self) -> LlmStateOverlay {
+    fn note_busy_overlay_rejection(&mut self) -> LlmStateOverlay {
         self.state.busy_overlay_seq = self.state.busy_overlay_seq.saturating_add(1);
         LlmStateOverlay {
             session_id: Uuid::nil(),
@@ -374,30 +393,51 @@ impl ClientLlmQueryRuntime {
         }
     }
 
-    pub(crate) fn defer_session_end_if_needed(
+    pub(crate) fn handle_busy_rejection(&mut self) -> LlmQueryAction {
+        LlmQueryAction::RouteAnswerState(self.note_busy_overlay_rejection())
+    }
+
+    pub(crate) fn handle_daemon_message(
         &mut self,
-        message: &ServerMessage,
-        runtime: &ClientSessionRuntime,
-    ) -> Option<Uuid> {
-        let ServerMessage::SessionEnded { session_id, reason } = message else {
-            return None;
-        };
+        message: ServerMessage,
+        runtime: &mut ClientSessionRuntime,
+    ) -> LlmQueryAction {
+        match message {
+            ServerMessage::SessionEnded { session_id, reason } => {
+                if self.defer_session_end_if_needed(session_id, reason.clone(), runtime) {
+                    LlmQueryAction::DeferSessionEnded { session_id }
+                } else {
+                    LlmQueryAction::PassThroughDaemonMessage(Box::new(
+                        ServerMessage::SessionEnded { session_id, reason },
+                    ))
+                }
+            }
+            ServerMessage::FinalResult {
+                session_id,
+                text,
+                latency_ms,
+                audio_ms,
+                ..
+            } if runtime.active_intent() == Some(SessionIntent::LlmQuery) => {
+                if !runtime.final_result_belongs_to_active_session(session_id) {
+                    return LlmQueryAction::IgnoreFinalResult {
+                        session_id,
+                        origin: InjectionOrigin::LlmAnswer,
+                        snapshot: runtime.snapshot(),
+                    };
+                }
 
-        let waiting_for_llm_final = runtime.active_intent() == Some(SessionIntent::LlmQuery)
-            && runtime.active_session_id() == Some(*session_id);
-        let llm_generation_running = self.state.in_flight_session == Some(*session_id);
-
-        if waiting_for_llm_final || llm_generation_running {
-            self.state
-                .deferred_session_end
-                .insert(*session_id, reason.clone());
-            Some(*session_id)
-        } else {
-            None
+                let overlay = self.start_answer(
+                    LlmQueryRequest::new(session_id, text, latency_ms, audio_ms),
+                    runtime,
+                );
+                LlmQueryAction::RouteAnswerState(overlay)
+            }
+            other => LlmQueryAction::PassThroughDaemonMessage(Box::new(other)),
         }
     }
 
-    pub(crate) fn start_answer(
+    fn start_answer(
         &mut self,
         request: LlmQueryRequest,
         runtime: &mut ClientSessionRuntime,
@@ -450,11 +490,14 @@ impl ClientLlmQueryRuntime {
         &mut self,
         progress: LlmProgress,
         runtime: &mut ClientSessionRuntime,
-    ) -> LlmProgressOutcome {
+    ) -> LlmQueryAction {
         match progress {
-            LlmProgress::Delta { session_id, delta } => self
-                .record_delta(session_id, delta)
-                .map_or(LlmProgressOutcome::Ignored, LlmProgressOutcome::Delta),
+            LlmProgress::Delta { session_id, delta } => {
+                self.record_delta(session_id, delta).map_or(
+                    LlmQueryAction::IgnoreProgress,
+                    LlmQueryAction::RouteAnswerDelta,
+                )
+            }
             LlmProgress::Finished {
                 session_id,
                 transcript,
@@ -463,7 +506,7 @@ impl ClientLlmQueryRuntime {
                 result,
             } => {
                 let Some(completion) = self.finish_answer(session_id, runtime) else {
-                    return LlmProgressOutcome::Ignored;
+                    return LlmQueryAction::IgnoreProgress;
                 };
                 let fallback_transcript = transcript.clone();
                 let response_text = match result {
@@ -495,7 +538,7 @@ impl ClientLlmQueryRuntime {
                 } else {
                     response_text
                 };
-                LlmProgressOutcome::Finished(LlmCompletedAnswer {
+                LlmQueryAction::FinishAnswer(LlmCompletedAnswer {
                     session_id,
                     session_end_reason: completion.session_end_reason.clone(),
                     injection: LlmAnswerInjection::new(
@@ -510,8 +553,35 @@ impl ClientLlmQueryRuntime {
         }
     }
 
-    pub(crate) fn reset_for_connection_drop(&mut self) {
+    pub(crate) fn handle_connection_drop(&mut self) -> LlmQueryAction {
+        let before = self.snapshot();
         self.state.clear();
+        LlmQueryAction::ResetForConnectionDrop { before }
+    }
+
+    fn defer_session_end_if_needed(
+        &mut self,
+        session_id: Uuid,
+        reason: Option<String>,
+        runtime: &ClientSessionRuntime,
+    ) -> bool {
+        let waiting_for_llm_final = runtime.active_intent() == Some(SessionIntent::LlmQuery)
+            && runtime.active_session_id() == Some(session_id);
+        let llm_generation_running = self.state.in_flight_session == Some(session_id);
+
+        if waiting_for_llm_final || llm_generation_running {
+            self.state.deferred_session_end.insert(session_id, reason);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn snapshot(&self) -> LlmSessionSnapshot {
+        LlmSessionSnapshot {
+            busy: self.state.busy,
+            in_flight_session: self.state.in_flight_session,
+        }
     }
 
     fn record_delta(&mut self, session_id: Uuid, delta: String) -> Option<LlmDeltaOverlay> {
@@ -1312,8 +1382,7 @@ mod tests {
         ClientInjectionDispatcher, ClientLlmQueryRuntime, ClientSessionAction,
         ClientSessionIgnoredHotkeyReason, ClientSessionRuntime, ClientSessionSnapshot,
         ClientSessionStartBlocker, InjectionDispatchOutcome, LlmAnswerInjection,
-        LlmCompletionContext, LlmDeltaOverlay, LlmProgressOutcome, LlmQueryRequest,
-        LlmStateOverlay, SessionIntent,
+        LlmCompletionContext, LlmDeltaOverlay, LlmQueryAction, LlmStateOverlay, SessionIntent,
     };
 
     type TestBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1788,21 +1857,32 @@ mod tests {
             .expect("llm session should start");
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
-        assert_eq!(
-            llm_runtime.defer_session_end_if_needed(
-                &ServerMessage::SessionEnded {
+        assert!(matches!(
+            llm_runtime.handle_daemon_message(
+                ServerMessage::SessionEnded {
                     session_id,
                     reason: Some("connection_drop".to_string()),
                 },
-                &runtime,
-            ),
-            Some(session_id)
-        );
-        assert_eq!(
-            llm_runtime.start_answer(
-                LlmQueryRequest::new(session_id, "prompt".to_string(), 1, 2),
                 &mut runtime,
             ),
+            LlmQueryAction::DeferSessionEnded { session_id: deferred } if deferred == session_id
+        ));
+        let started = match llm_runtime.handle_daemon_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "prompt".to_string(),
+                latency_ms: 1,
+                audio_ms: 2,
+                lang: Some("en".to_string()),
+                confidence: Some(0.9),
+            },
+            &mut runtime,
+        ) {
+            LlmQueryAction::RouteAnswerState(started) => started,
+            other => panic!("expected llm answer state action, got {other:?}"),
+        };
+        assert_eq!(
+            started,
             LlmStateOverlay {
                 session_id,
                 seq: 1,
@@ -1810,8 +1890,12 @@ mod tests {
             }
         );
         assert!(llm_runtime.is_busy());
+        let busy = match llm_runtime.handle_busy_rejection() {
+            LlmQueryAction::RouteAnswerState(busy) => busy,
+            other => panic!("expected busy overlay action, got {other:?}"),
+        };
         assert_eq!(
-            llm_runtime.note_busy_overlay_rejection(),
+            busy,
             LlmStateOverlay {
                 session_id: Uuid::nil(),
                 seq: 1,
@@ -1819,8 +1903,17 @@ mod tests {
             }
         );
 
-        runtime.reset_for_connection_drop();
-        llm_runtime.reset_for_connection_drop();
+        assert!(matches!(
+            runtime.handle_connection_drop(),
+            ClientSessionAction::ResetForConnectionDrop { .. }
+        ));
+        let LlmQueryAction::ResetForConnectionDrop { before } =
+            llm_runtime.handle_connection_drop()
+        else {
+            panic!("expected llm connection-drop reset action");
+        };
+        assert_eq!(before.in_flight_session, Some(session_id));
+        assert!(before.busy);
 
         assert_eq!(runtime.state_label(), "idle");
         assert_eq!(runtime.active_session_id(), None);
@@ -1834,7 +1927,7 @@ mod tests {
                 },
                 &mut runtime,
             ),
-            LlmProgressOutcome::Ignored
+            LlmQueryAction::IgnoreProgress
         ));
         assert!(matches!(
             llm_runtime.handle_progress(
@@ -1847,8 +1940,94 @@ mod tests {
                 },
                 &mut runtime,
             ),
-            LlmProgressOutcome::Ignored
+            LlmQueryAction::IgnoreProgress
         ));
+    }
+
+    #[test]
+    fn client_llm_query_runtime_rejects_stale_final_without_reset() {
+        let (answerer, _requests) =
+            TestLlmAnswerer::successful(std::iter::empty::<String>(), "unused");
+        let mut llm_runtime = ClientLlmQueryRuntime::new(answerer);
+        let mut runtime = ClientSessionRuntime::new();
+        let active_session_id = runtime
+            .begin_listening(SessionIntent::LlmQuery)
+            .expect("llm session should start");
+        runtime.stop_listening().expect("llm session should stop");
+        let stale_session_id = Uuid::new_v4();
+
+        let action = llm_runtime.handle_daemon_message(
+            ServerMessage::FinalResult {
+                session_id: stale_session_id,
+                text: "stale prompt".to_string(),
+                latency_ms: 12,
+                audio_ms: 34,
+                lang: Some("en".to_string()),
+                confidence: Some(0.9),
+            },
+            &mut runtime,
+        );
+        let LlmQueryAction::IgnoreFinalResult {
+            session_id,
+            origin,
+            snapshot,
+        } = action
+        else {
+            panic!("expected stale llm final-result ignore action, got {action:?}");
+        };
+        assert_eq!(session_id, stale_session_id);
+        assert_eq!(origin, InjectionOrigin::LlmAnswer);
+        assert_eq!(
+            snapshot,
+            ClientSessionSnapshot {
+                state: "waiting_result",
+                active_session_id: Some(active_session_id),
+                active_intent: Some(SessionIntent::LlmQuery),
+            }
+        );
+        assert_eq!(runtime.state_label(), "waiting_result");
+        assert_eq!(runtime.active_session_id(), Some(active_session_id));
+        assert_eq!(runtime.active_intent(), Some(SessionIntent::LlmQuery));
+        assert!(!llm_runtime.is_busy());
+    }
+
+    #[test]
+    fn client_llm_query_runtime_ignores_stale_progress_without_clearing_active_answer() {
+        let (answerer, _requests) =
+            TestLlmAnswerer::successful(std::iter::empty::<String>(), "unused");
+        let mut llm_runtime = ClientLlmQueryRuntime::new(answerer);
+        let mut runtime = ClientSessionRuntime::new();
+        let active_session_id = Uuid::new_v4();
+        let stale_session_id = Uuid::new_v4();
+
+        llm_runtime.state.busy = true;
+        llm_runtime.state.in_flight_session = Some(active_session_id);
+
+        assert!(matches!(
+            llm_runtime.handle_progress(
+                LlmProgress::Delta {
+                    session_id: stale_session_id,
+                    delta: "stale".to_string(),
+                },
+                &mut runtime,
+            ),
+            LlmQueryAction::IgnoreProgress
+        ));
+        assert!(matches!(
+            llm_runtime.handle_progress(
+                LlmProgress::Finished {
+                    session_id: stale_session_id,
+                    transcript: "stale prompt".to_string(),
+                    daemon_latency_ms: 1,
+                    daemon_audio_ms: 2,
+                    result: Ok("stale answer".to_string()),
+                },
+                &mut runtime,
+            ),
+            LlmQueryAction::IgnoreProgress
+        ));
+        assert!(llm_runtime.is_busy());
+        assert_eq!(llm_runtime.state.in_flight_session, Some(active_session_id));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1862,21 +2041,32 @@ mod tests {
             .expect("llm session should start");
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
-        assert_eq!(
-            llm_runtime.defer_session_end_if_needed(
-                &ServerMessage::SessionEnded {
+        assert!(matches!(
+            llm_runtime.handle_daemon_message(
+                ServerMessage::SessionEnded {
                     session_id,
                     reason: Some("normal".to_string()),
                 },
-                &runtime,
-            ),
-            Some(session_id)
-        );
-        assert_eq!(
-            llm_runtime.start_answer(
-                LlmQueryRequest::new(session_id, "private prompt".to_string(), 55, 1500),
                 &mut runtime,
             ),
+            LlmQueryAction::DeferSessionEnded { session_id: deferred } if deferred == session_id
+        ));
+        let started = match llm_runtime.handle_daemon_message(
+            ServerMessage::FinalResult {
+                session_id,
+                text: "private prompt".to_string(),
+                latency_ms: 55,
+                audio_ms: 1500,
+                lang: Some("en".to_string()),
+                confidence: Some(0.95),
+            },
+            &mut runtime,
+        ) {
+            LlmQueryAction::RouteAnswerState(started) => started,
+            other => panic!("expected llm answer state action, got {other:?}"),
+        };
+        assert_eq!(
+            started,
             LlmStateOverlay {
                 session_id,
                 seq: 1,
@@ -1892,9 +2082,10 @@ mod tests {
                     .await
                     .expect("LLM progress channel should stay open");
                 match llm_runtime.handle_progress(progress, &mut runtime) {
-                    LlmProgressOutcome::Delta(delta) => deltas.push(delta),
-                    LlmProgressOutcome::Finished(answer) => break answer,
-                    LlmProgressOutcome::Ignored => {}
+                    LlmQueryAction::RouteAnswerDelta(delta) => deltas.push(delta),
+                    LlmQueryAction::FinishAnswer(answer) => break answer,
+                    LlmQueryAction::IgnoreProgress => {}
+                    other => panic!("expected llm progress action, got {other:?}"),
                 }
             }
         })
@@ -1956,7 +2147,7 @@ mod tests {
                 },
                 &mut runtime,
             ),
-            LlmProgressOutcome::Ignored
+            LlmQueryAction::IgnoreProgress
         ));
     }
 
@@ -1970,10 +2161,20 @@ mod tests {
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
         let mut failing_runtime = ClientLlmQueryRuntime::new(failing_answerer);
-        failing_runtime.start_answer(
-            LlmQueryRequest::new(session_id, "raw transcript".to_string(), 10, 20),
-            &mut runtime,
-        );
+        assert!(matches!(
+            failing_runtime.handle_daemon_message(
+                ServerMessage::FinalResult {
+                    session_id,
+                    text: "raw transcript".to_string(),
+                    latency_ms: 10,
+                    audio_ms: 20,
+                    lang: Some("en".to_string()),
+                    confidence: Some(0.9),
+                },
+                &mut runtime,
+            ),
+            LlmQueryAction::RouteAnswerState(_)
+        ));
 
         let failed = timeout(Duration::from_secs(1), async {
             loop {
@@ -1981,7 +2182,7 @@ mod tests {
                     .recv_progress()
                     .await
                     .expect("LLM progress channel should stay open");
-                if let LlmProgressOutcome::Finished(answer) =
+                if let LlmQueryAction::FinishAnswer(answer) =
                     failing_runtime.handle_progress(progress, &mut runtime)
                 {
                     break answer;
@@ -2001,17 +2202,27 @@ mod tests {
             .expect("llm session should start");
         runtime.stop_listening().expect("llm session should stop");
         runtime.record_stop_message_sent(session_id, TokioInstant::now());
-        empty_runtime.start_answer(
-            LlmQueryRequest::new(session_id, "fallback transcript".to_string(), 11, 21),
-            &mut runtime,
-        );
+        assert!(matches!(
+            empty_runtime.handle_daemon_message(
+                ServerMessage::FinalResult {
+                    session_id,
+                    text: "fallback transcript".to_string(),
+                    latency_ms: 11,
+                    audio_ms: 21,
+                    lang: Some("en".to_string()),
+                    confidence: Some(0.9),
+                },
+                &mut runtime,
+            ),
+            LlmQueryAction::RouteAnswerState(_)
+        ));
         let empty = timeout(Duration::from_secs(1), async {
             loop {
                 let progress = empty_runtime
                     .recv_progress()
                     .await
                     .expect("LLM progress channel should stay open");
-                if let LlmProgressOutcome::Finished(answer) =
+                if let LlmQueryAction::FinishAnswer(answer) =
                     empty_runtime.handle_progress(progress, &mut runtime)
                 {
                     break answer;
