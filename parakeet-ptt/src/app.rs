@@ -21,8 +21,7 @@ use crate::client::WsClient;
 use crate::client_session::{
     classify_error_code, handle_server_message, ClientFocusRouter, ClientInjectionDispatcher,
     ClientLlmQueryRuntime, ClientSessionAction, ClientSessionIgnoredHotkeyReason,
-    ClientSessionRuntime, ClientSessionStartBlocker, LlmProgressOutcome, LlmQueryRequest,
-    SessionIntent,
+    ClientSessionRuntime, ClientSessionStartBlocker, LlmQueryAction, SessionIntent,
 };
 use crate::config::ClientConfig;
 use crate::hotkey::{
@@ -493,15 +492,19 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                                 warn!(
                                                     "ignoring hotkey down while LLM response is in progress"
                                                 );
-                                                let busy =
-                                                    llm_query_runtime.note_busy_overlay_rejection();
-                                                overlay_router
-                                                    .route_llm_answer_state_with_output_hint(
-                                                        busy.session_id,
-                                                        busy.seq,
-                                                        busy.state,
-                                                        || focus_router.next_overlay_output_hint(),
+                                                let LlmQueryAction::RouteAnswerState(busy) =
+                                                    llm_query_runtime.handle_busy_rejection()
+                                                else {
+                                                    unreachable!(
+                                                        "busy rejection produced non-overlay action"
                                                     );
+                                                };
+                                                overlay_router.route_llm_answer_state_with_output_hint(
+                                                    busy.session_id,
+                                                    busy.seq,
+                                                    busy.state,
+                                                    || focus_router.next_overlay_output_hint(),
+                                                );
                                                 overlay_router.route_session_ended(
                                                     None,
                                                     busy.session_id,
@@ -576,72 +579,51 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                             next = daemon.next_message() => {
                                 match next {
                                     Ok(Some(message)) => {
-                                        if let Some(session_id) =
-                                            llm_query_runtime.defer_session_end_if_needed(
-                                                &message,
-                                                &session_runtime,
-                                            )
-                                        {
-                                            debug!(
-                                                session = %session_id,
-                                                "deferring daemon session_ended until llm answer injection"
-                                            );
-                                            continue;
-                                        }
-
-                                        if session_runtime.active_intent()
-                                            == Some(SessionIntent::LlmQuery)
-                                        {
-                                            if let ServerMessage::FinalResult { session_id, .. } =
-                                                &message
-                                            {
-                                                if !session_runtime
-                                                    .final_result_belongs_to_active_session(
-                                                        *session_id,
-                                                    )
-                                                {
-                                                    session_runtime.log_rejected_final_result(
-                                                        *session_id,
-                                                        InjectionOrigin::LlmAnswer,
+                                        match llm_query_runtime.handle_daemon_message(
+                                            message,
+                                            &mut session_runtime,
+                                        ) {
+                                            LlmQueryAction::DeferSessionEnded { session_id } => {
+                                                debug!(
+                                                    session = %session_id,
+                                                    "deferring daemon session_ended until llm answer injection"
+                                                );
+                                            }
+                                            LlmQueryAction::RouteAnswerState(started) => {
+                                                overlay_router
+                                                    .route_llm_answer_state_with_output_hint(
+                                                        started.session_id,
+                                                        started.seq,
+                                                        started.state,
+                                                        || focus_router.next_overlay_output_hint(),
                                                     );
-                                                    continue;
-                                                }
                                             }
-                                        }
-
-                                        match message {
-                                            ServerMessage::FinalResult {
+                                            LlmQueryAction::IgnoreFinalResult {
                                                 session_id,
-                                                text,
-                                                latency_ms,
-                                                audio_ms,
-                                                ..
-                                            } if session_runtime.active_intent()
-                                                == Some(SessionIntent::LlmQuery) => {
-                                                let started = llm_query_runtime.start_answer(
-                                                    LlmQueryRequest::new(
-                                                        session_id,
-                                                        text,
-                                                        latency_ms,
-                                                        audio_ms,
-                                                    ),
-                                                    &mut session_runtime,
-                                                );
-                                                overlay_router.route_llm_answer_state_with_output_hint(
-                                                    started.session_id,
-                                                    started.seq,
-                                                    started.state,
-                                                    || focus_router.next_overlay_output_hint(),
+                                                origin,
+                                                snapshot,
+                                            } => {
+                                                warn!(
+                                                    session = %session_id,
+                                                    active_session = ?snapshot.active_session_id,
+                                                    origin = origin.as_str(),
+                                                    state_at_receive = snapshot.state,
+                                                    "ignoring final result for non-active session"
                                                 );
                                             }
-                                            known => {
+                                            LlmQueryAction::PassThroughDaemonMessage(known) => {
                                                 handle_server_message(
-                                                    known,
+                                                    *known,
                                                     &mut session_runtime,
                                                     &mut focus_router,
                                                     &mut overlay_router,
                                                     &injection_dispatcher,
                                                 ).await?;
+                                            }
+                                            other => {
+                                                unreachable!(
+                                                    "daemon message produced non-daemon llm action: {other:?}"
+                                                );
                                             }
                                         }
                                     }
@@ -664,7 +646,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                             }
                             Some(progress) = llm_query_runtime.recv_progress() => {
                                 match llm_query_runtime.handle_progress(progress, &mut session_runtime) {
-                                    LlmProgressOutcome::Delta(update) => {
+                                    LlmQueryAction::RouteAnswerDelta(update) => {
                                         overlay_router.route_llm_answer_delta_with_output_hint(
                                             update.session_id,
                                             update.seq,
@@ -672,7 +654,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             || focus_router.next_overlay_output_hint(),
                                         );
                                     }
-                                    LlmProgressOutcome::Finished(answer) => {
+                                    LlmQueryAction::FinishAnswer(answer) => {
                                         overlay_router.route_session_ended(
                                             None,
                                             answer.session_id,
@@ -686,7 +668,12 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             )
                                             .await;
                                     }
-                                    LlmProgressOutcome::Ignored => {}
+                                    LlmQueryAction::IgnoreProgress => {}
+                                    other => {
+                                        unreachable!(
+                                            "llm progress produced non-progress action: {other:?}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -703,7 +690,18 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                     ?reset_action,
                     "client session coordinator reset after daemon connection drop"
                 );
-                llm_query_runtime.reset_for_connection_drop();
+                match llm_query_runtime.handle_connection_drop() {
+                    LlmQueryAction::ResetForConnectionDrop { before } => {
+                        debug!(
+                            llm_busy = before.busy,
+                            llm_in_flight_session = ?before.in_flight_session,
+                            "client llm session coordinator reset after daemon connection drop"
+                        );
+                    }
+                    other => {
+                        unreachable!("connection drop produced non-reset llm action: {other:?}");
+                    }
+                }
                 focus_router.reset_for_connection_drop();
                 warn!("Reconnecting to daemon after drop");
             }
