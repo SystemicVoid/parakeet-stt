@@ -5,8 +5,9 @@ The Daemon's WebSocket server had grown into a god object. One class mixed trans
 buffering, and status reporting. The 2026-03 architecture risk audit found that real
 concurrency, ownership, and resource bugs were tangled in that mud: there was no single
 place to enforce who owns the active Session, to serialize inference, or to bound the
-audio the Daemon retains. This work (issues #60, #61, and the deepening follow-ups
-#122-#127) carves the orchestration out and leaves the server as a transport adapter.
+audio the Daemon retains. This work (issues #60, #61, and the deepening
+follow-ups #122-#127) carves the orchestration out and leaves the server as a
+transport adapter.
 
 We introduce an intent/event seam. Transport messages become typed intents
 (`StartSessionIntent` / `StopSessionIntent` / `AbortSessionIntent`); the
