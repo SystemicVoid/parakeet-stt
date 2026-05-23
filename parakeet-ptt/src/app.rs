@@ -589,16 +589,23 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                             continue;
                                         }
 
-                                        if let ServerMessage::FinalResult { session_id, .. } = &message {
-                                            if !session_runtime.final_result_belongs_to_active_session(*session_id) {
-                                                session_runtime.log_rejected_final_result(
-                                                    *session_id,
-                                                    match session_runtime.active_intent() {
-                                                        Some(SessionIntent::LlmQuery) => InjectionOrigin::LlmAnswer,
-                                                        _ => InjectionOrigin::RawFinalResult,
-                                                    },
-                                                );
-                                                continue;
+                                        if session_runtime.active_intent()
+                                            == Some(SessionIntent::LlmQuery)
+                                        {
+                                            if let ServerMessage::FinalResult { session_id, .. } =
+                                                &message
+                                            {
+                                                if !session_runtime
+                                                    .final_result_belongs_to_active_session(
+                                                        *session_id,
+                                                    )
+                                                {
+                                                    session_runtime.log_rejected_final_result(
+                                                        *session_id,
+                                                        InjectionOrigin::LlmAnswer,
+                                                    );
+                                                    continue;
+                                                }
                                             }
                                         }
 
