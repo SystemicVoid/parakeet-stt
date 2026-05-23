@@ -104,6 +104,14 @@ pub(crate) enum ClientSessionAction {
         reason: ClientSessionIgnoredHotkeyReason,
         snapshot: ClientSessionSnapshot,
     },
+    QueueRawFinalResultInjection {
+        injection: FinalResultInjection,
+    },
+    IgnoreFinalResult {
+        session_id: Uuid,
+        origin: InjectionOrigin,
+        snapshot: ClientSessionSnapshot,
+    },
     ResetForConnectionDrop {
         before: ClientSessionSnapshot,
     },
@@ -151,12 +159,15 @@ pub(crate) struct LlmAnswerInjection {
     completion: LlmCompletionContext,
 }
 
-#[derive(Debug, Clone)]
-struct FinalResultInjection {
-    session_id: Uuid,
-    text: String,
-    latency_ms: u64,
-    audio_ms: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalResultInjection {
+    pub(crate) session_id: Uuid,
+    pub(crate) text: String,
+    pub(crate) latency_ms: u64,
+    pub(crate) audio_ms: u64,
+    pub(crate) state_at_enqueue: &'static str,
+    pub(crate) hotkey_up_elapsed_ms_at_enqueue: Option<u64>,
+    pub(crate) stop_message_elapsed_ms_at_enqueue: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +175,6 @@ pub(crate) enum InjectionDispatchOutcome {
     Queued,
     QueueTimeout,
     WorkerGone,
-    SkippedStaleSession,
 }
 
 #[derive(Debug, Clone)]
@@ -571,26 +581,16 @@ impl ClientInjectionDispatcher {
     async fn dispatch_raw_final_result(
         &self,
         injection: FinalResultInjection,
-        runtime: &mut ClientSessionRuntime,
         focus_router: &mut ClientFocusRouter,
     ) -> InjectionDispatchOutcome {
-        if !runtime.final_result_belongs_to_active_session(injection.session_id) {
-            runtime
-                .log_rejected_final_result(injection.session_id, InjectionOrigin::RawFinalResult);
-            return InjectionDispatchOutcome::SkippedStaleSession;
-        }
-
-        let hotkey_up_elapsed_ms_at_enqueue = elapsed_ms_since(runtime.last_hotkey_up_at);
-        let stop_message_elapsed_ms_at_enqueue =
-            runtime.stop_message_elapsed_ms_at_enqueue(injection.session_id);
         info!(
             session = %injection.session_id,
             origin = InjectionOrigin::RawFinalResult.as_str(),
             daemon_latency_ms = injection.latency_ms,
             audio_ms = injection.audio_ms,
-            state_at_enqueue = runtime.state_label(),
-            hotkey_up_elapsed_ms_at_enqueue,
-            stop_message_elapsed_ms_at_enqueue,
+            state_at_enqueue = injection.state_at_enqueue,
+            hotkey_up_elapsed_ms_at_enqueue = injection.hotkey_up_elapsed_ms_at_enqueue,
+            stop_message_elapsed_ms_at_enqueue = injection.stop_message_elapsed_ms_at_enqueue,
             "final result received"
         );
 
@@ -602,13 +602,13 @@ impl ClientInjectionDispatcher {
                     daemon_latency_ms: injection.latency_ms,
                     daemon_audio_ms: injection.audio_ms,
                     origin: InjectionOrigin::RawFinalResult,
-                    hotkey_up_elapsed_ms_at_enqueue,
-                    stop_message_elapsed_ms_at_enqueue,
+                    hotkey_up_elapsed_ms_at_enqueue: injection.hotkey_up_elapsed_ms_at_enqueue,
+                    stop_message_elapsed_ms_at_enqueue: injection
+                        .stop_message_elapsed_ms_at_enqueue,
                 },
                 focus_router,
             )
             .await;
-        runtime.reset();
         outcome
     }
 
@@ -991,6 +991,34 @@ impl ClientSessionRuntime {
         }
     }
 
+    pub(crate) fn handle_raw_final_result(
+        &mut self,
+        session_id: Uuid,
+        text: String,
+        latency_ms: u64,
+        audio_ms: u64,
+    ) -> ClientSessionAction {
+        if !self.final_result_belongs_to_active_session(session_id) {
+            return ClientSessionAction::IgnoreFinalResult {
+                session_id,
+                origin: InjectionOrigin::RawFinalResult,
+                snapshot: self.snapshot(),
+            };
+        }
+
+        let injection = FinalResultInjection {
+            session_id,
+            text,
+            latency_ms,
+            audio_ms,
+            state_at_enqueue: self.state_label(),
+            hotkey_up_elapsed_ms_at_enqueue: elapsed_ms_since(self.last_hotkey_up_at),
+            stop_message_elapsed_ms_at_enqueue: self.stop_message_elapsed_ms_at_enqueue(session_id),
+        };
+        self.reset();
+        ClientSessionAction::QueueRawFinalResultInjection { injection }
+    }
+
     pub(crate) fn handle_connection_drop(&mut self) -> ClientSessionAction {
         let before = self.snapshot();
         self.reset_for_connection_drop();
@@ -1048,13 +1076,7 @@ impl ClientSessionRuntime {
     }
 
     pub(crate) fn log_rejected_final_result(&self, session_id: Uuid, origin: InjectionOrigin) {
-        warn!(
-            session = %session_id,
-            active_session = ?self.active_session_id(),
-            origin = origin.as_str(),
-            state_at_receive = self.state_label(),
-            "ignoring final result for non-active session"
-        );
+        log_rejected_final_result(session_id, origin, &self.snapshot());
     }
 
     fn stop_message_elapsed_ms_at_enqueue(&self, session_id: Uuid) -> Option<u64> {
@@ -1063,6 +1085,20 @@ impl ClientSessionRuntime {
                 (stopped_session_id == session_id).then(|| instant.elapsed().as_millis() as u64)
             })
     }
+}
+
+fn log_rejected_final_result(
+    session_id: Uuid,
+    origin: InjectionOrigin,
+    snapshot: &ClientSessionSnapshot,
+) {
+    warn!(
+        session = %session_id,
+        active_session = ?snapshot.active_session_id,
+        origin = origin.as_str(),
+        state_at_receive = snapshot.state,
+        "ignoring final result for non-active session"
+    );
 }
 
 impl Default for ClientSessionRuntime {
@@ -1112,20 +1148,23 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
             latency_ms,
             audio_ms,
             ..
-        } => {
-            injection_dispatcher
-                .dispatch_raw_final_result(
-                    FinalResultInjection {
-                        session_id,
-                        text,
-                        latency_ms,
-                        audio_ms,
-                    },
-                    runtime,
-                    focus_router,
-                )
-                .await;
-        }
+        } => match runtime.handle_raw_final_result(session_id, text, latency_ms, audio_ms) {
+            ClientSessionAction::QueueRawFinalResultInjection { injection } => {
+                injection_dispatcher
+                    .dispatch_raw_final_result(injection, focus_router)
+                    .await;
+            }
+            ClientSessionAction::IgnoreFinalResult {
+                session_id,
+                origin,
+                snapshot,
+            } => {
+                log_rejected_final_result(session_id, origin, &snapshot);
+            }
+            other => {
+                unreachable!("raw final result produced non-final action: {other:?}");
+            }
+        },
         ServerMessage::Error {
             session_id,
             code,
@@ -1577,6 +1616,60 @@ mod tests {
         assert_eq!(runtime.active_intent(), None);
         assert_eq!(runtime.last_hotkey_up_at, None);
         assert_eq!(runtime.last_stop_message, None);
+    }
+
+    #[test]
+    fn client_session_coordinator_accepts_active_raw_final_result() {
+        let stop_message_at = TokioInstant::now() - Duration::from_millis(40);
+        let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
+
+        let action = runtime.handle_raw_final_result(
+            session_id,
+            "accepted transcript".to_string(),
+            44,
+            1200,
+        );
+        let ClientSessionAction::QueueRawFinalResultInjection { injection } = action else {
+            panic!("expected raw final result to queue Injection, got {action:?}");
+        };
+
+        assert_eq!(injection.session_id, session_id);
+        assert_eq!(injection.text, "accepted transcript");
+        assert_eq!(injection.latency_ms, 44);
+        assert_eq!(injection.audio_ms, 1200);
+        assert_eq!(injection.state_at_enqueue, "waiting_result");
+        assert!(injection.hotkey_up_elapsed_ms_at_enqueue.is_some());
+        assert!(injection.stop_message_elapsed_ms_at_enqueue.is_some());
+        assert_eq!(runtime.state_label(), "idle");
+        assert_eq!(runtime.active_session_id(), None);
+        assert_eq!(runtime.active_intent(), None);
+    }
+
+    #[test]
+    fn client_session_coordinator_rejects_stale_raw_final_result_without_reset() {
+        let (mut runtime, active_session_id) = runtime_waiting_for_result();
+        let stale_session_id = Uuid::new_v4();
+
+        assert_eq!(
+            runtime.handle_raw_final_result(
+                stale_session_id,
+                "stale transcript".to_string(),
+                44,
+                1200,
+            ),
+            ClientSessionAction::IgnoreFinalResult {
+                session_id: stale_session_id,
+                origin: InjectionOrigin::RawFinalResult,
+                snapshot: ClientSessionSnapshot {
+                    state: "waiting_result",
+                    active_session_id: Some(active_session_id),
+                    active_intent: Some(SessionIntent::Dictate),
+                },
+            }
+        );
+        assert_eq!(runtime.state_label(), "waiting_result");
+        assert_eq!(runtime.active_session_id(), Some(active_session_id));
+        assert_eq!(runtime.active_intent(), Some(SessionIntent::Dictate));
     }
 
     fn test_focus_snapshot(output_name: Option<&str>) -> FocusSnapshot {
