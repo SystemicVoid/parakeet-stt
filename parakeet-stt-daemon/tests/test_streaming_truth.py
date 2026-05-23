@@ -11,17 +11,23 @@ import numpy as np
 
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.messages import StatusMessage
-from parakeet_stt_daemon.runtime_truth_snapshot import RuntimeTruth, snapshot
+from parakeet_stt_daemon.runtime_truth_snapshot import (
+    DeviceInfo,
+    OverlayTransportFacts,
+    RuntimeTruth,
+    SealPathFacts,
+    StreamPathFacts,
+    TailTrimFacts,
+    snapshot,
+)
 from parakeet_stt_daemon.session import (
     InterimTranscriptRuntime,
     InterimTranscriptRuntimeFacts,
     SealPathFinalizationResult,
     SealPathRuntime,
-    SealPathRuntimeFacts,
     Session,
     SessionManager,
     StreamPathRuntime,
-    StreamPathRuntimeFacts,
 )
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
 from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
@@ -73,27 +79,71 @@ class FakeVadAdapter:
         return samples.astype(np.float32, copy=False)
 
 
-class RuntimeTruthPrivateFieldTrap(SimpleNamespace):
+class RuntimeTruthSourceTrap:
+    def __init__(
+        self,
+        *,
+        device_info: DeviceInfo | None = None,
+        stream_path: StreamPathFacts | None = None,
+        seal_path: SealPathFacts | None = None,
+        tail_trim: TailTrimFacts | None = None,
+        interim: InterimTranscriptRuntimeFacts | None = None,
+        overlay_transport: OverlayTransportFacts | None = None,
+    ) -> None:
+        self._device_info = device_info or DeviceInfo(
+            requested_device="cpu",
+            effective_device="cpu",
+        )
+        self._stream_path = stream_path or StreamPathFacts(
+            streaming_enabled=False,
+            helper_active=False,
+            helper_scope="live_session_only",
+            helper_class_name=None,
+            fallback_reason=None,
+            chunk_secs=None,
+            path_executed=False,
+            chunks_processed=0,
+        )
+        self._seal_path = seal_path or SealPathFacts()
+        self._tail_trim = tail_trim or TailTrimFacts(
+            tail_trim_mode="rms",
+            vad_enabled=False,
+            vad_active=False,
+            vad_fallback_reason=None,
+        )
+        self._interim = interim or InterimTranscriptRuntimeFacts(
+            enabled=False,
+            last_source=None,
+            live_chunks_processed=0,
+            live_updates_emitted=0,
+            live_failed=False,
+            stop_replay_chunks_processed=0,
+            stop_replay_updates_emitted=0,
+            stop_replay_failed=False,
+            source_fallback_reason=None,
+        )
+        self._overlay_transport = overlay_transport or OverlayTransportFacts(enabled=False)
+
     def __getattr__(self, name: str) -> Any:
-        private_stream_prefixes = ("_current_" + "stream", "_last_" + "stream")
-        if name.startswith(private_stream_prefixes):
-            raise AssertionError(f"runtime truth probed old Stream path field {name}")
-        private_interim_fields = (
-            "_interim_transcript_by_session",
-            "_last_interim_transcript_runtime_facts",
-        )
-        if name in private_interim_fields:
-            raise AssertionError(f"runtime truth probed old interim transcript field {name}")
-        private_seal_fields = (
-            "_last_audio_ms",
-            "_last_audio_stop_ms",
-            "_last_finalize_ms",
-            "_last_infer_ms",
-            "_last_send_ms",
-        )
-        if name in private_seal_fields:
-            raise AssertionError(f"runtime truth probed old Seal path field {name}")
-        raise AttributeError(name)
+        raise AssertionError(f"runtime truth probed non-interface field {name}")
+
+    def runtime_truth_device_info(self) -> DeviceInfo:
+        return self._device_info
+
+    def runtime_truth_stream_path_facts(self) -> StreamPathFacts:
+        return self._stream_path
+
+    def runtime_truth_seal_path_facts(self) -> SealPathFacts:
+        return self._seal_path
+
+    def runtime_truth_tail_trim_facts(self) -> TailTrimFacts:
+        return self._tail_trim
+
+    def runtime_truth_interim_transcript_facts(self) -> InterimTranscriptRuntimeFacts:
+        return self._interim
+
+    def runtime_truth_overlay_transport_facts(self) -> OverlayTransportFacts:
+        return self._overlay_transport
 
 
 def _build_server(
@@ -158,10 +208,8 @@ def _status(orchestrator: SessionOrchestrator) -> StatusMessage:
 
 
 def _truth(orchestrator: SessionOrchestrator) -> RuntimeTruth:
-    return snapshot(
-        orchestrator,
-        last_trim_outcome=orchestrator.tail_trimmer.last_outcome,
-        overlay_events_enabled=orchestrator.settings.overlay_events_enabled,
+    return orchestrator.runtime_truth(
+        overlay_events_enabled=orchestrator.settings.overlay_events_enabled
     )
 
 
@@ -253,22 +301,20 @@ def test_runtime_truth_log_record_contains_helper_expected_fields() -> None:
 
 
 def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> None:
-    orchestrator = cast(
-        SessionOrchestrator,
-        SimpleNamespace(
-            settings=SimpleNamespace(
-                streaming_enabled=True, chunk_secs=None, overlay_events_enabled=False
-            ),
-            streaming_transcriber=None,
-        ),
-    )
     truth = snapshot(
-        orchestrator,
-        last_trim_outcome=SimpleNamespace(
-            tail_trim_mode="rms",
-            vad_active=False,
-            vad_fallback_reason=None,
-        ),
+        RuntimeTruthSourceTrap(
+            device_info=DeviceInfo(requested_device=None, effective_device=None),
+            stream_path=StreamPathFacts(
+                streaming_enabled=True,
+                helper_active=False,
+                helper_scope="live_session_only",
+                helper_class_name=None,
+                fallback_reason="streaming_transcriber_unavailable",
+                chunk_secs=None,
+                path_executed=False,
+                chunks_processed=0,
+            ),
+        )
     )
 
     assert truth.device is None
@@ -278,36 +324,19 @@ def test_runtime_truth_preserves_missing_optional_device_and_chunk_values() -> N
 
 
 def test_runtime_truth_reads_stream_path_interface_instead_of_orchestrator_fields() -> None:
-    runtime_facts = StreamPathRuntimeFacts(
-        streaming_enabled=True,
-        helper_active=True,
-        helper_scope="live_session_only",
-        helper_class_name="InterfaceHelper",
-        fallback_reason="interface:fallback",
-        chunk_secs=1.25,
-        path_executed=True,
-        chunks_processed=3,
-    )
-    orchestrator = cast(
-        SessionOrchestrator,
-        RuntimeTruthPrivateFieldTrap(
-            settings=SimpleNamespace(
-                streaming_enabled=True,
-                chunk_secs=9.99,
-                overlay_events_enabled=False,
-            ),
-            streaming_transcriber=None,
-            stream_path_runtime_facts_for_runtime=lambda: runtime_facts,
-        ),
-    )
-
     truth = snapshot(
-        orchestrator,
-        last_trim_outcome=SimpleNamespace(
-            tail_trim_mode="rms",
-            vad_active=False,
-            vad_fallback_reason=None,
-        ),
+        RuntimeTruthSourceTrap(
+            stream_path=StreamPathFacts(
+                streaming_enabled=True,
+                helper_active=True,
+                helper_scope="live_session_only",
+                helper_class_name="InterfaceHelper",
+                fallback_reason="interface:fallback",
+                chunk_secs=1.25,
+                path_executed=True,
+                chunks_processed=3,
+            ),
+        )
     )
 
     assert truth.stream_helper_active is True
@@ -330,27 +359,7 @@ def test_runtime_truth_reads_interim_interface_instead_of_orchestrator_fields() 
         stop_replay_failed=True,
         source_fallback_reason="stop_replay_transcribe_error:RuntimeError",
     )
-    orchestrator = cast(
-        SessionOrchestrator,
-        RuntimeTruthPrivateFieldTrap(
-            settings=SimpleNamespace(
-                streaming_enabled=False,
-                chunk_secs=None,
-                overlay_events_enabled=True,
-            ),
-            streaming_transcriber=None,
-            interim_transcript_runtime_facts_for_runtime=lambda: interim_facts,
-        ),
-    )
-
-    truth = snapshot(
-        orchestrator,
-        last_trim_outcome=SimpleNamespace(
-            tail_trim_mode="rms",
-            vad_active=False,
-            vad_fallback_reason=None,
-        ),
-    )
+    truth = snapshot(RuntimeTruthSourceTrap(interim=interim_facts))
 
     assert truth.interim_transcript_enabled is True
     assert truth.interim_transcript_last_source == "stop_replay"
@@ -368,34 +377,23 @@ def test_runtime_truth_reads_interim_interface_instead_of_orchestrator_fields() 
 
 
 def test_runtime_truth_reads_seal_path_interface() -> None:
-    runtime_facts = SealPathRuntimeFacts(
-        finalization_mode="offline_seal",
-        final_audio_source="canonical_session_audio",
-    )
-    orchestrator = cast(
-        SessionOrchestrator,
-        RuntimeTruthPrivateFieldTrap(
-            settings=SimpleNamespace(
-                streaming_enabled=False,
-                chunk_secs=None,
-                overlay_events_enabled=False,
-            ),
-            streaming_transcriber=None,
-            seal_path_runtime_facts_for_runtime=lambda: runtime_facts,
-        ),
-    )
-
     truth = snapshot(
-        orchestrator,
-        last_trim_outcome=SimpleNamespace(
-            tail_trim_mode="rms",
-            vad_active=False,
-            vad_fallback_reason=None,
-        ),
+        RuntimeTruthSourceTrap(
+            seal_path=SealPathFacts(
+                finalization_mode="offline_seal",
+                final_audio_source="canonical_session_audio",
+            )
+        )
     )
 
     assert truth.finalization_mode == "offline_seal"
     assert truth.final_audio_source == "canonical_session_audio"
+
+
+def test_runtime_truth_reads_overlay_transport_interface() -> None:
+    truth = snapshot(RuntimeTruthSourceTrap(overlay_transport=OverlayTransportFacts(enabled=True)))
+
+    assert truth.overlay_events_enabled is True
 
 
 def test_interim_runtime_syncs_cached_session_config() -> None:
@@ -413,30 +411,14 @@ def test_interim_runtime_syncs_cached_session_config() -> None:
     assert runtime.session_runtime_facts(session_id).enabled is True
 
 
-def test_runtime_truth_ignores_invalid_chunk_secs_values() -> None:
+def test_stream_runtime_ignores_invalid_chunk_secs_values() -> None:
     for chunk_secs in ("not-a-number", "nan", "inf", float("nan"), float("inf"), True):
-        orchestrator = cast(
-            SessionOrchestrator,
-            SimpleNamespace(
-                settings=SimpleNamespace(
-                    streaming_enabled=True,
-                    chunk_secs=chunk_secs,
-                    overlay_events_enabled=False,
-                ),
-                streaming_transcriber=None,
-            ),
+        runtime = StreamPathRuntime.from_settings(
+            SimpleNamespace(streaming_enabled=True, chunk_secs=chunk_secs),
+            streaming_transcriber=None,
         )
 
-        truth = snapshot(
-            orchestrator,
-            last_trim_outcome=SimpleNamespace(
-                tail_trim_mode="rms",
-                vad_active=False,
-                vad_fallback_reason=None,
-            ),
-        )
-
-        assert truth.chunk_secs is None
+        assert runtime.facts(active_session=False).chunk_secs is None
 
 
 def test_status_vad_enabled_pending_load_is_explicit() -> None:
