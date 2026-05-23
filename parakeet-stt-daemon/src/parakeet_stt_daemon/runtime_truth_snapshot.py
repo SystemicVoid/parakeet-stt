@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal, Protocol
 
 from .messages import StatusMessage
 from .overlay_interim import InterimTranscriptRuntimeFacts, InterimTranscriptSource
-from .session import SealPathRuntimeFacts, SessionState, StreamPathRuntimeFacts
+from .session import SessionState
 from .tail_trim import TailTrimMode
 
 StreamHelperScope = Literal["live_session_only"]
@@ -43,8 +42,14 @@ class SealPathFacts:
 @dataclass(frozen=True, slots=True)
 class TailTrimFacts:
     tail_trim_mode: TailTrimMode
+    vad_enabled: bool
     vad_active: bool
     vad_fallback_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayTransportFacts:
+    enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +71,22 @@ class RuntimeTruthMetrics:
     last_audio_ms: int | None = None
     last_infer_ms: int | None = None
     last_send_ms: int | None = None
+
+
+class RuntimeTruthSource(Protocol):
+    """Typed source for Daemon runtime truth facts."""
+
+    def runtime_truth_device_info(self) -> DeviceInfo: ...
+
+    def runtime_truth_stream_path_facts(self) -> StreamPathFacts: ...
+
+    def runtime_truth_seal_path_facts(self) -> SealPathFacts: ...
+
+    def runtime_truth_tail_trim_facts(self) -> TailTrimFacts: ...
+
+    def runtime_truth_interim_transcript_facts(self) -> InterimTranscriptRuntimeFacts: ...
+
+    def runtime_truth_overlay_transport_facts(self) -> OverlayTransportFacts: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,25 +219,14 @@ class RuntimeTruth:
 
 
 def snapshot(
-    orchestrator: Any,
-    *,
-    stream_path: StreamPathFacts | None = None,
-    seal_path: SealPathFacts | None = None,
-    last_trim_outcome: object | None = None,
-    device_info: DeviceInfo | None = None,
-    overlay_events_enabled: bool | None = None,
+    source: RuntimeTruthSource,
 ) -> RuntimeTruth:
-    settings = orchestrator.settings
-    stream_path = stream_path or _stream_path_facts(orchestrator)
-    seal_path = seal_path or _seal_path_facts(orchestrator)
-    tail_trim = _tail_trim_facts(orchestrator, last_trim_outcome)
-    device_info = device_info or _device_info(orchestrator)
-    overlay_enabled = (
-        bool(getattr(settings, "overlay_events_enabled", False))
-        if overlay_events_enabled is None
-        else overlay_events_enabled
-    )
-    interim = _interim_transcript_facts(orchestrator, enabled=overlay_enabled)
+    device_info = source.runtime_truth_device_info()
+    stream_path = source.runtime_truth_stream_path_facts()
+    seal_path = source.runtime_truth_seal_path_facts()
+    tail_trim = source.runtime_truth_tail_trim_facts()
+    interim = source.runtime_truth_interim_transcript_facts()
+    overlay_transport = source.runtime_truth_overlay_transport_facts()
     return RuntimeTruth(
         device=device_info.requested_device,
         effective_device=device_info.effective_device,
@@ -230,7 +240,7 @@ def snapshot(
         finalization_mode=seal_path.finalization_mode,
         final_audio_source=seal_path.final_audio_source,
         tail_trim_mode=tail_trim.tail_trim_mode,
-        vad_enabled=bool(getattr(orchestrator, "_vad_enabled", False)),
+        vad_enabled=tail_trim.vad_enabled,
         vad_active=tail_trim.vad_active,
         vad_fallback_reason=tail_trim.vad_fallback_reason,
         interim_transcript_enabled=interim.enabled,
@@ -243,141 +253,13 @@ def snapshot(
         interim_transcript_live_failed=interim.live_failed,
         interim_transcript_stop_replay_failed=interim.stop_replay_failed,
         interim_transcript_source_fallback_reason=interim.source_fallback_reason,
-        overlay_events_enabled=overlay_enabled,
+        overlay_events_enabled=overlay_transport.enabled,
         chunk_secs=stream_path.chunk_secs,
     )
 
 
 def format_log_record(record: dict[str, object]) -> str:
     return ", ".join(f"{key}={_format_log_value(value)}" for key, value in record.items())
-
-
-def _empty_interim_transcript_facts(*, enabled: bool) -> InterimTranscriptRuntimeFacts:
-    return InterimTranscriptRuntimeFacts(
-        enabled=enabled,
-        last_source=None,
-        live_chunks_processed=0,
-        live_updates_emitted=0,
-        live_failed=False,
-        stop_replay_chunks_processed=0,
-        stop_replay_updates_emitted=0,
-        stop_replay_failed=False,
-        source_fallback_reason=None,
-    )
-
-
-def _interim_transcript_facts(
-    orchestrator: Any,
-    *,
-    enabled: bool,
-) -> InterimTranscriptRuntimeFacts:
-    getter = getattr(orchestrator, "interim_transcript_runtime_facts_for_runtime", None)
-    if not callable(getter):
-        return _empty_interim_transcript_facts(enabled=enabled)
-    try:
-        facts = getter()
-    except Exception:  # noqa: BLE001
-        return _empty_interim_transcript_facts(enabled=enabled)
-    if isinstance(facts, InterimTranscriptRuntimeFacts):
-        return facts
-    return _empty_interim_transcript_facts(enabled=enabled)
-
-
-def _device_info(orchestrator: Any) -> DeviceInfo:
-    settings = orchestrator.settings
-    requested = _string_or_none(
-        getattr(orchestrator, "_requested_device", getattr(settings, "device", None))
-    )
-    effective = _string_or_none(getattr(orchestrator, "_effective_device", requested))
-    return DeviceInfo(requested_device=requested, effective_device=effective)
-
-
-def _stream_path_facts(orchestrator: Any) -> StreamPathFacts:
-    settings = orchestrator.settings
-    streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
-    chunk_secs = _chunk_secs_or_none(settings)
-    getter = getattr(orchestrator, "stream_path_runtime_facts_for_runtime", None)
-    if callable(getter):
-        try:
-            runtime_facts = getter()
-        except Exception:  # noqa: BLE001
-            runtime_facts = None
-        if isinstance(runtime_facts, StreamPathRuntimeFacts):
-            return StreamPathFacts(
-                streaming_enabled=runtime_facts.streaming_enabled,
-                helper_active=runtime_facts.helper_active,
-                helper_scope=runtime_facts.helper_scope,
-                helper_class_name=runtime_facts.helper_class_name,
-                fallback_reason=runtime_facts.fallback_reason,
-                chunk_secs=runtime_facts.chunk_secs,
-                path_executed=runtime_facts.path_executed,
-                chunks_processed=runtime_facts.chunks_processed,
-            )
-    streaming_transcriber = getattr(orchestrator, "streaming_transcriber", None)
-    if not streaming_enabled:
-        return StreamPathFacts(
-            streaming_enabled=False,
-            helper_active=False,
-            helper_scope="live_session_only",
-            helper_class_name=None,
-            fallback_reason=None,
-            chunk_secs=None,
-            path_executed=False,
-            chunks_processed=0,
-        )
-    if streaming_transcriber is None:
-        return StreamPathFacts(
-            streaming_enabled=True,
-            helper_active=False,
-            helper_scope="live_session_only",
-            helper_class_name=None,
-            fallback_reason="streaming_transcriber_unavailable",
-            chunk_secs=chunk_secs,
-            path_executed=False,
-            chunks_processed=0,
-        )
-    fallback_reason = getattr(streaming_transcriber, "fallback_reason", None)
-    return StreamPathFacts(
-        streaming_enabled=True,
-        helper_active=bool(getattr(streaming_transcriber, "helper_active", False)),
-        helper_scope="live_session_only",
-        helper_class_name=_string_or_none(
-            getattr(streaming_transcriber, "_helper_class_name", None)
-        ),
-        fallback_reason=fallback_reason,
-        chunk_secs=chunk_secs,
-        path_executed=False,
-        chunks_processed=0,
-    )
-
-
-def _seal_path_facts(orchestrator: Any) -> SealPathFacts:
-    getter = getattr(orchestrator, "seal_path_runtime_facts_for_runtime", None)
-    if callable(getter):
-        try:
-            runtime_facts = getter()
-        except Exception:  # noqa: BLE001
-            runtime_facts = None
-        if isinstance(runtime_facts, SealPathRuntimeFacts):
-            return SealPathFacts(
-                finalization_mode=runtime_facts.finalization_mode,
-                final_audio_source=runtime_facts.final_audio_source,
-            )
-    return SealPathFacts()
-
-
-def _tail_trim_facts(orchestrator: Any, last_trim_outcome: object | None) -> TailTrimFacts:
-    outcome = last_trim_outcome
-    if outcome is None:
-        tail_trimmer = getattr(orchestrator, "tail_trimmer", None)
-        outcome = getattr(tail_trimmer, "last_outcome", None)
-    if outcome is None and hasattr(orchestrator, "_tail_trimmer_for_runtime"):
-        outcome = orchestrator._tail_trimmer_for_runtime().last_outcome
-    return TailTrimFacts(
-        tail_trim_mode=getattr(outcome, "tail_trim_mode", "rms"),
-        vad_active=bool(getattr(outcome, "vad_active", False)),
-        vad_fallback_reason=getattr(outcome, "vad_fallback_reason", None),
-    )
 
 
 def _format_log_value(value: object) -> str:
@@ -388,36 +270,17 @@ def _format_log_value(value: object) -> str:
     return str(value)
 
 
-def _string_or_none(value: object) -> str | None:
-    if value is None:
-        return None
-    return str(value)
-
-
-def _chunk_secs_or_none(settings: object) -> float | None:
-    value = getattr(settings, "chunk_secs", None)
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(parsed):
-        return None
-    return parsed
-
-
 class RuntimeTruthSnapshot:
     snapshot = staticmethod(snapshot)
 
 
 __all__ = [
     "DeviceInfo",
+    "OverlayTransportFacts",
     "RuntimeTruth",
     "RuntimeTruthMetrics",
     "RuntimeTruthSnapshot",
+    "RuntimeTruthSource",
     "RuntimeTruthState",
     "SealPathFacts",
     "StreamPathFacts",

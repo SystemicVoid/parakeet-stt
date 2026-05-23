@@ -46,9 +46,14 @@ from .model import (
     load_parakeet_model,
 )
 from .runtime_truth_snapshot import (
+    DeviceInfo,
+    OverlayTransportFacts,
     RuntimeTruth,
     RuntimeTruthMetrics,
     RuntimeTruthState,
+    SealPathFacts,
+    StreamPathFacts,
+    TailTrimFacts,
     format_log_record,
 )
 from .runtime_truth_snapshot import (
@@ -99,6 +104,30 @@ class AbortSessionIntent:
     owner_token: int
     event_sink: EventSink
     reason: Literal["timeout", "user", "error"]
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonRuntimeTruthSource:
+    orchestrator: SessionOrchestrator
+    overlay_events_enabled: bool
+
+    def runtime_truth_device_info(self) -> DeviceInfo:
+        return self.orchestrator.runtime_truth_device_info_for_runtime()
+
+    def runtime_truth_stream_path_facts(self) -> StreamPathFacts:
+        return self.orchestrator.runtime_truth_stream_path_facts_for_runtime()
+
+    def runtime_truth_seal_path_facts(self) -> SealPathFacts:
+        return self.orchestrator.runtime_truth_seal_path_facts_for_runtime()
+
+    def runtime_truth_tail_trim_facts(self) -> TailTrimFacts:
+        return self.orchestrator.runtime_truth_tail_trim_facts_for_runtime()
+
+    def runtime_truth_interim_transcript_facts(self) -> InterimTranscriptRuntimeFacts:
+        return self.orchestrator.interim_transcript_runtime_facts_for_runtime()
+
+    def runtime_truth_overlay_transport_facts(self) -> OverlayTransportFacts:
+        return OverlayTransportFacts(enabled=self.overlay_events_enabled)
 
 
 class SessionOrchestrator:
@@ -797,11 +826,47 @@ class SessionOrchestrator:
         interim_runtime.clear_session(session_id)
 
     def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
-        seal_path_runtime = self._seal_path_runtime_for_runtime()
         return runtime_truth_snapshot(
-            self,
-            last_trim_outcome=seal_path_runtime.last_tail_trim_outcome,
-            overlay_events_enabled=overlay_events_enabled,
+            DaemonRuntimeTruthSource(
+                orchestrator=self,
+                overlay_events_enabled=overlay_events_enabled,
+            )
+        )
+
+    def runtime_truth_device_info_for_runtime(self) -> DeviceInfo:
+        return DeviceInfo(
+            requested_device=self._requested_device,
+            effective_device=self._effective_device,
+        )
+
+    def runtime_truth_stream_path_facts_for_runtime(self) -> StreamPathFacts:
+        facts = self.stream_path_runtime_facts_for_runtime()
+        return StreamPathFacts(
+            streaming_enabled=facts.streaming_enabled,
+            helper_active=facts.helper_active,
+            helper_scope=facts.helper_scope,
+            helper_class_name=facts.helper_class_name,
+            fallback_reason=facts.fallback_reason,
+            chunk_secs=facts.chunk_secs,
+            path_executed=facts.path_executed,
+            chunks_processed=facts.chunks_processed,
+        )
+
+    def runtime_truth_seal_path_facts_for_runtime(self) -> SealPathFacts:
+        facts = self.seal_path_runtime_facts_for_runtime()
+        return SealPathFacts(
+            finalization_mode=facts.finalization_mode,
+            final_audio_source=facts.final_audio_source,
+        )
+
+    def runtime_truth_tail_trim_facts_for_runtime(self) -> TailTrimFacts:
+        tail_trimmer = self._tail_trimmer_for_runtime()
+        outcome = tail_trimmer.last_outcome
+        return TailTrimFacts(
+            tail_trim_mode=outcome.tail_trim_mode,
+            vad_enabled=tail_trimmer.vad_enabled,
+            vad_active=outcome.vad_active,
+            vad_fallback_reason=outcome.vad_fallback_reason,
         )
 
     def stream_path_runtime_facts_for_runtime(self) -> StreamPathRuntimeFacts:
