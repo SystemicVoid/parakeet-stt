@@ -64,6 +64,8 @@ known-first-party = ["check_model_lib", "parakeet_stt_daemon"]
 
 [tool.deptry]
 known_first_party = ["check_model_lib", "parakeet_stt_daemon"]
+# Required indirectly by silero_vad.load_silero_vad(onnx=True).
+per_rule_ignores = { DEP002 = ["onnxruntime"] }
 
 [tool.hatch.metadata]
 allow-direct-references = true
