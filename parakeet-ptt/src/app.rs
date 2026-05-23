@@ -20,7 +20,8 @@ use crate::audio_feedback::AudioFeedback;
 use crate::client::WsClient;
 use crate::client_session::{
     classify_error_code, handle_server_message, ClientFocusRouter, ClientInjectionDispatcher,
-    ClientLlmQueryRuntime, ClientSessionRuntime, LlmProgressOutcome, LlmQueryRequest,
+    ClientLlmQueryRuntime, ClientSessionAction, ClientSessionIgnoredHotkeyReason,
+    ClientSessionRuntime, ClientSessionStartBlocker, LlmProgressOutcome, LlmQueryRequest,
     SessionIntent,
 };
 use crate::config::ClientConfig;
@@ -466,59 +467,107 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                                     HotkeyEvent::Down { intent } => {
                                         let intent = session_intent_from_hotkey(intent);
                                         hotkey_intent_diagnostics.note_hotkey_down(intent);
-                                        if llm_query_runtime.is_busy() {
-                                            warn!("ignoring hotkey down while LLM response is in progress");
-                                            let busy = llm_query_runtime.note_busy_overlay_rejection();
-                                            overlay_router.route_llm_answer_state_with_output_hint(
-                                                busy.session_id,
-                                                busy.seq,
-                                                busy.state,
-                                                || focus_router.next_overlay_output_hint(),
-                                            );
-                                            overlay_router.route_session_ended(
-                                                None,
-                                                busy.session_id,
-                                                Some("busy".to_string()),
-                                            );
-                                            focus_router.reset_overlay_target();
-                                            hotkey_intent_diagnostics.note_llm_busy_reject();
-                                            hotkey_intent_diagnostics.maybe_log_summary("hotkey_down_busy");
-                                            continue;
-                                        }
-                                        if let Some(session_id) = session_runtime.begin_listening(intent) {
-                                            let message = start_message(session_id, Some("auto".to_string()));
-                                            send_message(daemon.as_mut(), &message).await?;
-                                            info!(session = %session_id, ?intent, "start_session sent (hotkey down)");
-                                        } else {
-                                            hotkey_intent_diagnostics.note_hotkey_down_ignored();
-                                            debug!(
-                                                state = session_runtime.state_label(),
-                                                active_session = ?session_runtime.active_session_id(),
-                                                active_intent = ?session_runtime.active_intent(),
-                                                llm_busy = llm_query_runtime.is_busy(),
-                                                "ignoring hotkey down because client is not idle"
-                                            );
+                                        let start_blocker = llm_query_runtime
+                                            .is_busy()
+                                            .then_some(ClientSessionStartBlocker::LlmBusy);
+                                        match session_runtime
+                                            .handle_hotkey_down(intent, start_blocker)
+                                        {
+                                            ClientSessionAction::StartSession {
+                                                session_id,
+                                                intent,
+                                            } => {
+                                                let message =
+                                                    start_message(session_id, Some("auto".to_string()));
+                                                send_message(daemon.as_mut(), &message).await?;
+                                                info!(
+                                                    session = %session_id,
+                                                    ?intent,
+                                                    "start_session sent (hotkey down)"
+                                                );
+                                            }
+                                            ClientSessionAction::IgnoreHotkeyDown {
+                                                reason: ClientSessionIgnoredHotkeyReason::LlmBusy,
+                                                ..
+                                            } => {
+                                                warn!(
+                                                    "ignoring hotkey down while LLM response is in progress"
+                                                );
+                                                let busy =
+                                                    llm_query_runtime.note_busy_overlay_rejection();
+                                                overlay_router
+                                                    .route_llm_answer_state_with_output_hint(
+                                                        busy.session_id,
+                                                        busy.seq,
+                                                        busy.state,
+                                                        || focus_router.next_overlay_output_hint(),
+                                                    );
+                                                overlay_router.route_session_ended(
+                                                    None,
+                                                    busy.session_id,
+                                                    Some("busy".to_string()),
+                                                );
+                                                focus_router.reset_overlay_target();
+                                                hotkey_intent_diagnostics.note_llm_busy_reject();
+                                                hotkey_intent_diagnostics
+                                                    .maybe_log_summary("hotkey_down_busy");
+                                                continue;
+                                            }
+                                            ClientSessionAction::IgnoreHotkeyDown {
+                                                reason,
+                                                snapshot,
+                                            } => {
+                                                hotkey_intent_diagnostics.note_hotkey_down_ignored();
+                                                debug!(
+                                                    state = snapshot.state,
+                                                    active_session = ?snapshot.active_session_id,
+                                                    active_intent = ?snapshot.active_intent,
+                                                    llm_busy = llm_query_runtime.is_busy(),
+                                                    reason = reason.as_str(),
+                                                    "ignoring hotkey down because client is not idle"
+                                                );
+                                            }
+                                            other => {
+                                                unreachable!("hotkey down produced non-down action: {other:?}");
+                                            }
                                         }
                                         hotkey_intent_diagnostics.maybe_log_summary("hotkey_down");
                                     }
                                     HotkeyEvent::Up => {
                                         hotkey_intent_diagnostics.note_hotkey_up();
-                                        if let Some(session_id) = session_runtime.stop_listening() {
-                                            let message = stop_message(session_id);
-                                            send_message(daemon.as_mut(), &message).await?;
-                                            let stop_sent_at = TokioInstant::now();
-                                            focus_router.record_stop_target(session_id, stop_sent_at);
-                                            session_runtime.record_stop_message_sent(session_id, stop_sent_at);
-                                            info!(session = %session_id, "stop_session sent (hotkey up)");
-                                        } else {
-                                            hotkey_intent_diagnostics.note_hotkey_up_ignored();
-                                            debug!(
-                                                state = session_runtime.state_label(),
-                                                active_session = ?session_runtime.active_session_id(),
-                                                active_intent = ?session_runtime.active_intent(),
-                                                llm_busy = llm_query_runtime.is_busy(),
-                                                "ignoring hotkey up because no listening session is active"
-                                            );
+                                        match session_runtime.handle_hotkey_up() {
+                                            ClientSessionAction::StopSession { session_id } => {
+                                                let message = stop_message(session_id);
+                                                send_message(daemon.as_mut(), &message).await?;
+                                                let stop_sent_at = TokioInstant::now();
+                                                focus_router
+                                                    .record_stop_target(session_id, stop_sent_at);
+                                                session_runtime.record_stop_message_sent(
+                                                    session_id,
+                                                    stop_sent_at,
+                                                );
+                                                info!(
+                                                    session = %session_id,
+                                                    "stop_session sent (hotkey up)"
+                                                );
+                                            }
+                                            ClientSessionAction::IgnoreHotkeyUp {
+                                                reason,
+                                                snapshot,
+                                            } => {
+                                                hotkey_intent_diagnostics.note_hotkey_up_ignored();
+                                                debug!(
+                                                    state = snapshot.state,
+                                                    active_session = ?snapshot.active_session_id,
+                                                    active_intent = ?snapshot.active_intent,
+                                                    llm_busy = llm_query_runtime.is_busy(),
+                                                    reason = reason.as_str(),
+                                                    "ignoring hotkey up because no listening session is active"
+                                                );
+                                            }
+                                            other => {
+                                                unreachable!("hotkey up produced non-up action: {other:?}");
+                                            }
                                         }
                                         hotkey_intent_diagnostics.maybe_log_summary("hotkey_up");
                                     }
@@ -642,7 +691,11 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                     warn!("session loop ended with error: {err}");
                 }
                 hotkey_intent_diagnostics.log_summary("daemon_connection_drop");
-                session_runtime.reset_for_connection_drop();
+                let reset_action = session_runtime.handle_connection_drop();
+                debug!(
+                    ?reset_action,
+                    "client session coordinator reset after daemon connection drop"
+                );
                 llm_query_runtime.reset_for_connection_drop();
                 focus_router.reset_for_connection_drop();
                 warn!("Reconnecting to daemon after drop");
@@ -1159,6 +1212,35 @@ mod tests {
             }
             other => panic!("expected start_session, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_hotkey_release_sends_stop_session_message() {
+        let (config, ports, mut runtime) =
+            ClientRuntimeHarness::new(test_app_config()).into_parts();
+
+        let app_task = tokio::spawn(run(config, ports));
+        runtime.send_hotkey_down(HotkeyIntent::Dictate);
+        let start = runtime.next_sent_message(Duration::from_millis(250)).await;
+        let active_session_id = match start {
+            ClientMessage::StartSession { session_id, .. } => session_id,
+            other => panic!("expected start_session, got {other:?}"),
+        };
+
+        runtime.send_hotkey_up();
+        let stop = runtime.next_sent_message(Duration::from_millis(250)).await;
+        app_task.abort();
+
+        match stop {
+            ClientMessage::StopSession { session_id, .. } => {
+                assert_eq!(session_id, active_session_id);
+            }
+            other => panic!("expected stop_session, got {other:?}"),
+        }
+        assert!(
+            runtime.recorded_injections().is_empty(),
+            "stop-session hotkey path should not enqueue Injection"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

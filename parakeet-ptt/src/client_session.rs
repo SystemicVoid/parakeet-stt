@@ -68,6 +68,47 @@ pub(crate) struct ClientSessionRuntime {
     last_stop_message: Option<(Uuid, TokioInstant)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSessionStartBlocker {
+    LlmBusy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSessionIgnoredHotkeyReason {
+    LlmBusy,
+    NotIdle,
+    NotListening,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientSessionSnapshot {
+    pub(crate) state: &'static str,
+    pub(crate) active_session_id: Option<Uuid>,
+    pub(crate) active_intent: Option<SessionIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientSessionAction {
+    StartSession {
+        session_id: Uuid,
+        intent: SessionIntent,
+    },
+    StopSession {
+        session_id: Uuid,
+    },
+    IgnoreHotkeyDown {
+        reason: ClientSessionIgnoredHotkeyReason,
+        snapshot: ClientSessionSnapshot,
+    },
+    IgnoreHotkeyUp {
+        reason: ClientSessionIgnoredHotkeyReason,
+        snapshot: ClientSessionSnapshot,
+    },
+    ResetForConnectionDrop {
+        before: ClientSessionSnapshot,
+    },
+}
+
 #[derive(Debug, Default)]
 struct LlmSessionRuntime {
     busy: bool,
@@ -277,6 +318,24 @@ impl LlmQueryRequest {
             transcript,
             daemon_latency_ms,
             daemon_audio_ms,
+        }
+    }
+}
+
+impl ClientSessionIgnoredHotkeyReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LlmBusy => "llm_busy",
+            Self::NotIdle => "not_idle",
+            Self::NotListening => "not_listening",
+        }
+    }
+}
+
+impl From<ClientSessionStartBlocker> for ClientSessionIgnoredHotkeyReason {
+    fn from(blocker: ClientSessionStartBlocker) -> Self {
+        match blocker {
+            ClientSessionStartBlocker::LlmBusy => Self::LlmBusy,
         }
     }
 }
@@ -901,6 +960,43 @@ impl ClientSessionRuntime {
         }
     }
 
+    pub(crate) fn handle_hotkey_down(
+        &mut self,
+        intent: SessionIntent,
+        start_blocker: Option<ClientSessionStartBlocker>,
+    ) -> ClientSessionAction {
+        if let Some(start_blocker) = start_blocker {
+            return ClientSessionAction::IgnoreHotkeyDown {
+                reason: start_blocker.into(),
+                snapshot: self.snapshot(),
+            };
+        }
+
+        match self.begin_listening(intent) {
+            Some(session_id) => ClientSessionAction::StartSession { session_id, intent },
+            None => ClientSessionAction::IgnoreHotkeyDown {
+                reason: ClientSessionIgnoredHotkeyReason::NotIdle,
+                snapshot: self.snapshot(),
+            },
+        }
+    }
+
+    pub(crate) fn handle_hotkey_up(&mut self) -> ClientSessionAction {
+        match self.stop_listening() {
+            Some(session_id) => ClientSessionAction::StopSession { session_id },
+            None => ClientSessionAction::IgnoreHotkeyUp {
+                reason: ClientSessionIgnoredHotkeyReason::NotListening,
+                snapshot: self.snapshot(),
+            },
+        }
+    }
+
+    pub(crate) fn handle_connection_drop(&mut self) -> ClientSessionAction {
+        let before = self.snapshot();
+        self.reset_for_connection_drop();
+        ClientSessionAction::ResetForConnectionDrop { before }
+    }
+
     pub(crate) fn begin_listening(&mut self, intent: SessionIntent) -> Option<Uuid> {
         let session_id = self.state.begin_listening()?;
         self.active_intent = Some(intent);
@@ -937,6 +1033,14 @@ impl ClientSessionRuntime {
 
     pub(crate) fn state_label(&self) -> &'static str {
         state_label(&self.state)
+    }
+
+    fn snapshot(&self) -> ClientSessionSnapshot {
+        ClientSessionSnapshot {
+            state: self.state_label(),
+            active_session_id: self.active_session_id(),
+            active_intent: self.active_intent(),
+        }
     }
 
     pub(crate) fn final_result_belongs_to_active_session(&self, session_id: Uuid) -> bool {
@@ -1166,9 +1270,11 @@ mod tests {
 
     use super::{
         handle_server_message, parent_focus_from_observation, ClientFocusRouter,
-        ClientInjectionDispatcher, ClientLlmQueryRuntime, ClientSessionRuntime,
-        InjectionDispatchOutcome, LlmAnswerInjection, LlmCompletionContext, LlmDeltaOverlay,
-        LlmProgressOutcome, LlmQueryRequest, LlmStateOverlay, SessionIntent,
+        ClientInjectionDispatcher, ClientLlmQueryRuntime, ClientSessionAction,
+        ClientSessionIgnoredHotkeyReason, ClientSessionRuntime, ClientSessionSnapshot,
+        ClientSessionStartBlocker, InjectionDispatchOutcome, LlmAnswerInjection,
+        LlmCompletionContext, LlmDeltaOverlay, LlmProgressOutcome, LlmQueryRequest,
+        LlmStateOverlay, SessionIntent,
     };
 
     type TestBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1350,6 +1456,127 @@ mod tests {
             .expect("state should stop listening");
         runtime.record_stop_message_sent(session_id, stopped_at);
         (runtime, session_id)
+    }
+
+    #[test]
+    fn client_session_coordinator_starts_idle_session_once() {
+        let mut runtime = ClientSessionRuntime::new();
+
+        let session_id = match runtime.handle_hotkey_down(SessionIntent::Dictate, None) {
+            ClientSessionAction::StartSession { session_id, intent } => {
+                assert_eq!(intent, SessionIntent::Dictate);
+                session_id
+            }
+            other => panic!("expected start_session action, got {other:?}"),
+        };
+
+        assert_eq!(runtime.state_label(), "listening");
+        assert_eq!(runtime.active_session_id(), Some(session_id));
+        assert_eq!(runtime.active_intent(), Some(SessionIntent::Dictate));
+        assert_eq!(
+            runtime.handle_hotkey_down(SessionIntent::Dictate, None),
+            ClientSessionAction::IgnoreHotkeyDown {
+                reason: ClientSessionIgnoredHotkeyReason::NotIdle,
+                snapshot: ClientSessionSnapshot {
+                    state: "listening",
+                    active_session_id: Some(session_id),
+                    active_intent: Some(SessionIntent::Dictate),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn client_session_coordinator_stops_active_session_once() {
+        let mut runtime = ClientSessionRuntime::new();
+        let session_id = match runtime.handle_hotkey_down(SessionIntent::Dictate, None) {
+            ClientSessionAction::StartSession { session_id, .. } => session_id,
+            other => panic!("expected start_session action, got {other:?}"),
+        };
+
+        assert_eq!(
+            runtime.handle_hotkey_up(),
+            ClientSessionAction::StopSession { session_id }
+        );
+        assert_eq!(runtime.state_label(), "waiting_result");
+        assert_eq!(runtime.active_session_id(), Some(session_id));
+        assert_eq!(
+            runtime.handle_hotkey_up(),
+            ClientSessionAction::IgnoreHotkeyUp {
+                reason: ClientSessionIgnoredHotkeyReason::NotListening,
+                snapshot: ClientSessionSnapshot {
+                    state: "waiting_result",
+                    active_session_id: Some(session_id),
+                    active_intent: Some(SessionIntent::Dictate),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn client_session_coordinator_ignores_out_of_order_hotkey_up() {
+        let mut runtime = ClientSessionRuntime::new();
+
+        assert_eq!(
+            runtime.handle_hotkey_up(),
+            ClientSessionAction::IgnoreHotkeyUp {
+                reason: ClientSessionIgnoredHotkeyReason::NotListening,
+                snapshot: ClientSessionSnapshot {
+                    state: "idle",
+                    active_session_id: None,
+                    active_intent: None,
+                },
+            }
+        );
+        assert_eq!(runtime.state_label(), "idle");
+        assert_eq!(runtime.active_session_id(), None);
+        assert_eq!(runtime.active_intent(), None);
+    }
+
+    #[test]
+    fn client_session_coordinator_rejects_hotkey_down_when_start_blocked() {
+        let mut runtime = ClientSessionRuntime::new();
+
+        assert_eq!(
+            runtime.handle_hotkey_down(
+                SessionIntent::LlmQuery,
+                Some(ClientSessionStartBlocker::LlmBusy),
+            ),
+            ClientSessionAction::IgnoreHotkeyDown {
+                reason: ClientSessionIgnoredHotkeyReason::LlmBusy,
+                snapshot: ClientSessionSnapshot {
+                    state: "idle",
+                    active_session_id: None,
+                    active_intent: None,
+                },
+            }
+        );
+        assert_eq!(runtime.state_label(), "idle");
+        assert_eq!(runtime.active_session_id(), None);
+        assert_eq!(runtime.active_intent(), None);
+    }
+
+    #[test]
+    fn client_session_coordinator_reset_action_clears_connection_state() {
+        let stop_message_at = TokioInstant::now();
+        let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
+
+        assert_eq!(
+            runtime.handle_connection_drop(),
+            ClientSessionAction::ResetForConnectionDrop {
+                before: ClientSessionSnapshot {
+                    state: "waiting_result",
+                    active_session_id: Some(session_id),
+                    active_intent: Some(SessionIntent::Dictate),
+                },
+            }
+        );
+
+        assert_eq!(runtime.state_label(), "idle");
+        assert_eq!(runtime.active_session_id(), None);
+        assert_eq!(runtime.active_intent(), None);
+        assert_eq!(runtime.last_hotkey_up_at, None);
+        assert_eq!(runtime.last_stop_message, None);
     }
 
     fn test_focus_snapshot(output_name: Option<&str>) -> FocusSnapshot {
