@@ -47,6 +47,7 @@ from .model import (
 )
 from .runtime_truth_snapshot import (
     DeviceInfo,
+    InterimTranscriptFacts,
     OverlayTransportFacts,
     RuntimeTruth,
     RuntimeTruthMetrics,
@@ -109,7 +110,7 @@ class AbortSessionIntent:
 @dataclass(frozen=True, slots=True)
 class DaemonRuntimeTruthSource:
     orchestrator: SessionOrchestrator
-    overlay_events_enabled: bool
+    overlay_events_enabled: bool | None
 
     def runtime_truth_device_info(self) -> DeviceInfo:
         return self.orchestrator.runtime_truth_device_info_for_runtime()
@@ -123,11 +124,14 @@ class DaemonRuntimeTruthSource:
     def runtime_truth_tail_trim_facts(self) -> TailTrimFacts:
         return self.orchestrator.runtime_truth_tail_trim_facts_for_runtime()
 
-    def runtime_truth_interim_transcript_facts(self) -> InterimTranscriptRuntimeFacts:
+    def runtime_truth_interim_transcript_facts(
+        self,
+    ) -> InterimTranscriptRuntimeFacts | InterimTranscriptFacts:
         return self.orchestrator.interim_transcript_runtime_facts_for_runtime()
 
     def runtime_truth_overlay_transport_facts(self) -> OverlayTransportFacts:
-        return OverlayTransportFacts(enabled=self.overlay_events_enabled)
+        enabled = self.overlay_events_enabled
+        return OverlayTransportFacts(enabled=enabled if isinstance(enabled, bool) else None)
 
 
 class SessionOrchestrator:
@@ -732,11 +736,29 @@ class SessionOrchestrator:
     ) -> InterimTranscriptRuntimeFacts:
         return self._interim_transcript_runtime_for_runtime().session_runtime_facts(session_id)
 
-    def interim_transcript_runtime_facts_for_runtime(self) -> InterimTranscriptRuntimeFacts:
+    def interim_transcript_runtime_facts_for_runtime(
+        self,
+    ) -> InterimTranscriptRuntimeFacts | InterimTranscriptFacts:
         active = self.sessions.active
-        return self._interim_transcript_runtime_for_runtime().facts(
-            active_session_id=active.session_id if active is not None else None
+        runtime = getattr(self, "interim_transcript_runtime", None)
+        if not isinstance(runtime, InterimTranscriptRuntime):
+            return InterimTranscriptFacts(
+                enabled=_runtime_bool(getattr(self.settings, "overlay_events_enabled", None)),
+                last_source=None,
+                live_chunks_processed=None,
+                live_updates_emitted=None,
+                live_failed=None,
+                stop_replay_chunks_processed=None,
+                stop_replay_updates_emitted=None,
+                stop_replay_failed=None,
+                source_fallback_reason="runtime_truth_unavailable:interim_transcript_runtime",
+            )
+        audio = getattr(self, "audio", None)
+        runtime.sync_from_runtime(
+            settings=self.settings,
+            sample_rate=int(getattr(audio, "sample_rate", 16_000)),
         )
+        return runtime.facts(active_session_id=active.session_id if active is not None else None)
 
     async def _emit_interim_state(
         self,
@@ -825,7 +847,7 @@ class SessionOrchestrator:
         await self.sessions.clear(session_id, owner_token=owner_token)
         interim_runtime.clear_session(session_id)
 
-    def runtime_truth(self, *, overlay_events_enabled: bool) -> RuntimeTruth:
+    def runtime_truth(self, *, overlay_events_enabled: bool | None) -> RuntimeTruth:
         return runtime_truth_snapshot(
             DaemonRuntimeTruthSource(
                 orchestrator=self,
@@ -834,13 +856,31 @@ class SessionOrchestrator:
         )
 
     def runtime_truth_device_info_for_runtime(self) -> DeviceInfo:
+        requested_device = getattr(self, "_requested_device", None)
+        effective_device = getattr(self, "_effective_device", None)
         return DeviceInfo(
-            requested_device=self._requested_device,
-            effective_device=self._effective_device,
+            requested_device=str(requested_device) if requested_device is not None else None,
+            effective_device=str(effective_device) if effective_device is not None else None,
         )
 
     def runtime_truth_stream_path_facts_for_runtime(self) -> StreamPathFacts:
-        facts = self.stream_path_runtime_facts_for_runtime()
+        runtime = getattr(self, "stream_path_runtime", None)
+        if not isinstance(runtime, StreamPathRuntime):
+            return StreamPathFacts(
+                streaming_enabled=_runtime_bool(getattr(self.settings, "streaming_enabled", None)),
+                helper_active=False,
+                helper_scope="live_session_only",
+                helper_class_name=None,
+                fallback_reason="runtime_truth_unavailable:stream_path_runtime",
+                chunk_secs=None,
+                path_executed=False,
+                chunks_processed=0,
+            )
+        runtime.sync_from_runtime(
+            settings=self.settings,
+            streaming_transcriber=getattr(self, "streaming_transcriber", None),
+        )
+        facts = runtime.facts(active_session=self.sessions.active is not None)
         return StreamPathFacts(
             streaming_enabled=facts.streaming_enabled,
             helper_active=facts.helper_active,
@@ -853,14 +893,24 @@ class SessionOrchestrator:
         )
 
     def runtime_truth_seal_path_facts_for_runtime(self) -> SealPathFacts:
-        facts = self.seal_path_runtime_facts_for_runtime()
+        runtime = getattr(self, "seal_path_runtime", None)
+        if not isinstance(runtime, SealPathRuntime):
+            return SealPathFacts(finalization_mode=None, final_audio_source=None)
+        facts = runtime.facts()
         return SealPathFacts(
             finalization_mode=facts.finalization_mode,
             final_audio_source=facts.final_audio_source,
         )
 
     def runtime_truth_tail_trim_facts_for_runtime(self) -> TailTrimFacts:
-        tail_trimmer = self._tail_trimmer_for_runtime()
+        tail_trimmer = getattr(self, "tail_trimmer", None)
+        if not isinstance(tail_trimmer, SealPathTailTrimmer):
+            return TailTrimFacts(
+                tail_trim_mode=None,
+                vad_enabled=_runtime_bool(getattr(self, "_vad_enabled", None)),
+                vad_active=False,
+                vad_fallback_reason="runtime_truth_unavailable:tail_trimmer",
+            )
         outcome = tail_trimmer.last_outcome
         return TailTrimFacts(
             tail_trim_mode=outcome.tail_trim_mode,
@@ -1044,6 +1094,10 @@ class SessionOrchestrator:
                 release_device_cache=runtime.release_device_cache,
             )
         return runtime
+
+
+def _runtime_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 __all__ = [
