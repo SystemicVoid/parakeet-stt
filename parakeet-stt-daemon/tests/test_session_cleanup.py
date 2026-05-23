@@ -22,8 +22,16 @@ from parakeet_stt_daemon.messages import (
     StopSession,
 )
 from parakeet_stt_daemon.server import DaemonServer
-from parakeet_stt_daemon.session import SealPathFinalizationResult, Session, SessionManager
+from parakeet_stt_daemon.session import (
+    InterimTranscriptRuntime,
+    SealPathFinalizationResult,
+    SealPathRuntime,
+    Session,
+    SessionManager,
+    StreamPathRuntime,
+)
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
 class FakeAudio:
@@ -167,12 +175,27 @@ def _build_server() -> DaemonServer:
     orchestrator._active_stream = object()
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
+    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
+        orchestrator.settings,
+        orchestrator.streaming_transcriber,
+    )
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
     orchestrator._session_sample_limit = 1_440_000
     orchestrator._session_age_limit_ms = 90_000
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
+    orchestrator._vad_enabled = False
+    orchestrator.tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+    orchestrator.seal_path_runtime = SealPathRuntime(
+        sample_rate=FakeAudio.sample_rate,
+        tail_trimmer=orchestrator.tail_trimmer,
+        release_device_cache=lambda _device: None,
+    )
+    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+        orchestrator.settings,
+        sample_rate=FakeAudio.sample_rate,
+    )
 
     async def fake_collect_interim_text_updates(
         _session_id: UUID, _ready_chunks: list[object]

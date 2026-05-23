@@ -15,6 +15,8 @@ from parakeet_stt_daemon.runtime_truth_snapshot import (
     DeviceInfo,
     OverlayTransportFacts,
     RuntimeTruth,
+    RuntimeTruthMetrics,
+    RuntimeTruthState,
     SealPathFacts,
     StreamPathFacts,
     TailTrimFacts,
@@ -27,6 +29,7 @@ from parakeet_stt_daemon.session import (
     SealPathRuntime,
     Session,
     SessionManager,
+    SessionState,
     StreamPathRuntime,
 )
 from parakeet_stt_daemon.session_orchestrator import SessionOrchestrator
@@ -146,6 +149,31 @@ class RuntimeTruthSourceTrap:
         return self._overlay_transport
 
 
+class RuntimeTruthUnavailableSource:
+    def runtime_truth_device_info(self) -> DeviceInfo:
+        raise RuntimeError("device unavailable")
+
+    def runtime_truth_stream_path_facts(self) -> StreamPathFacts:
+        raise RuntimeError("stream path unavailable")
+
+    def runtime_truth_seal_path_facts(self) -> SealPathFacts:
+        raise RuntimeError("seal path unavailable")
+
+    def runtime_truth_tail_trim_facts(self) -> TailTrimFacts:
+        raise RuntimeError("tail trim unavailable")
+
+    def runtime_truth_interim_transcript_facts(self) -> InterimTranscriptRuntimeFacts:
+        raise RuntimeError("interim transcript unavailable")
+
+    def runtime_truth_overlay_transport_facts(self) -> OverlayTransportFacts:
+        raise RuntimeError("overlay transport unavailable")
+
+
+class RuntimeTruthDeviceUnavailableSource(RuntimeTruthSourceTrap):
+    def runtime_truth_device_info(self) -> DeviceInfo:
+        raise RuntimeError("device unavailable")
+
+
 def _build_server(
     *,
     streaming_enabled: bool = True,
@@ -171,6 +199,10 @@ def _build_server(
     orchestrator._active_stream = None
     orchestrator._stream_drain_task = None
     orchestrator._stream_drain_running = False
+    orchestrator.stream_path_runtime = StreamPathRuntime.from_settings(
+        orchestrator.settings,
+        streaming_transcriber,
+    )
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._vad_enabled = vad_enabled
@@ -184,6 +216,10 @@ def _build_server(
         sample_rate=FakeAudio.sample_rate,
         tail_trimmer=orchestrator.tail_trimmer,
         release_device_cache=lambda _device: None,
+    )
+    orchestrator.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
+        orchestrator.settings,
+        sample_rate=FakeAudio.sample_rate,
     )
     return cast(SessionOrchestrator, orchestrator)
 
@@ -394,6 +430,117 @@ def test_runtime_truth_reads_overlay_transport_interface() -> None:
     truth = snapshot(RuntimeTruthSourceTrap(overlay_transport=OverlayTransportFacts(enabled=True)))
 
     assert truth.overlay_events_enabled is True
+
+
+def test_runtime_truth_marks_unavailable_fact_sources_explicitly() -> None:
+    truth = snapshot(RuntimeTruthUnavailableSource())
+    status = truth.to_status(
+        RuntimeTruthState(
+            state=SessionState.IDLE,
+            sessions_active=0,
+            active_session_age_ms=None,
+        ),
+        RuntimeTruthMetrics(),
+    )
+    log_record = truth.to_log_record()
+
+    StatusMessage.model_validate(status.model_dump(mode="json"))
+    assert truth.degraded is True
+    assert status.device is None
+    assert status.effective_device is None
+    assert status.streaming_enabled is None
+    assert status.stream_helper_active is None
+    assert status.stream_fallback_reason == "runtime_truth_unavailable:stream_path:RuntimeError"
+    assert status.stream_path_executed is None
+    assert status.stream_chunks_processed is None
+    assert status.finalization_mode is None
+    assert status.final_audio_source is None
+    assert status.tail_trim_mode is None
+    assert status.vad_enabled is None
+    assert status.vad_active is None
+    assert status.vad_fallback_reason == "runtime_truth_unavailable:tail_trim_vad:RuntimeError"
+    assert status.interim_transcript_enabled is None
+    assert status.interim_transcript_updates_emitted is None
+    assert (
+        status.interim_transcript_source_fallback_reason
+        == "runtime_truth_unavailable:interim_transcript:RuntimeError"
+    )
+    assert status.overlay_events_enabled is None
+    assert (
+        log_record["stream_fallback_reason"] == "runtime_truth_unavailable:stream_path:RuntimeError"
+    )
+    assert (
+        log_record["interim_transcript_source_fallback_reason"]
+        == "runtime_truth_unavailable:interim_transcript:RuntimeError"
+    )
+    assert log_record["overlay_events_enabled"] is None
+
+
+def test_runtime_truth_marks_device_only_unavailable_as_degraded() -> None:
+    truth = snapshot(RuntimeTruthDeviceUnavailableSource())
+    status = truth.to_status(
+        RuntimeTruthState(
+            state=SessionState.IDLE,
+            sessions_active=0,
+            active_session_age_ms=None,
+        ),
+        RuntimeTruthMetrics(),
+    )
+
+    StatusMessage.model_validate(status.model_dump(mode="json"))
+    assert status.device is None
+    assert status.effective_device is None
+    assert status.stream_fallback_reason is None
+    assert status.finalization_mode == "offline_seal"
+    assert status.overlay_events_enabled is False
+    assert truth.degraded is True
+
+
+def test_orchestrator_runtime_truth_marks_missing_runtime_owners_explicitly() -> None:
+    server = _build_server(
+        streaming_enabled=True,
+        overlay_events_enabled=True,
+        vad_enabled=True,
+    )
+    for attr in (
+        "_effective_device",
+        "_requested_device",
+        "interim_transcript_runtime",
+        "seal_path_runtime",
+        "stream_path_runtime",
+        "tail_trimmer",
+    ):
+        delattr(server, attr)
+
+    truth = server.runtime_truth(overlay_events_enabled=cast(Any, None))
+    status = truth.to_status(server.runtime_status_state(), RuntimeTruthMetrics())
+    log_record = truth.to_log_record()
+
+    StatusMessage.model_validate(status.model_dump(mode="json"))
+    assert truth.degraded is True
+    assert status.device is None
+    assert status.effective_device is None
+    assert status.streaming_enabled is True
+    assert status.stream_helper_active is False
+    assert status.stream_fallback_reason == "runtime_truth_unavailable:stream_path_runtime"
+    assert status.stream_path_executed is False
+    assert status.stream_chunks_processed == 0
+    assert status.finalization_mode is None
+    assert status.final_audio_source is None
+    assert status.tail_trim_mode is None
+    assert status.vad_enabled is True
+    assert status.vad_active is False
+    assert status.vad_fallback_reason == "runtime_truth_unavailable:tail_trimmer"
+    assert status.interim_transcript_enabled is True
+    assert status.interim_transcript_live_chunks_processed is None
+    assert (
+        status.interim_transcript_source_fallback_reason
+        == "runtime_truth_unavailable:interim_transcript_runtime"
+    )
+    assert status.overlay_events_enabled is None
+    assert log_record["finalization_mode"] is None
+    assert log_record["stream_fallback_reason"] == ("runtime_truth_unavailable:stream_path_runtime")
+    assert log_record["vad_fallback_reason"] == "runtime_truth_unavailable:tail_trimmer"
 
 
 def test_interim_runtime_syncs_cached_session_config() -> None:
