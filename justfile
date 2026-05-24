@@ -75,8 +75,11 @@ runbook:
       "8) Promotion gate: just phase6-promotion 3" \
       "9) Stop helper stack: just stop"
 
+daemon-resource-soak:
+    @bash -lc 'cd "{{daemon_dir}}" && uv run pytest tests/test_session_orchestrator.py::test_phase6_resource_limit_soak_stops_retaining_audio_and_emits_limit_signal --capture=tee-sys'
+
 phase6-contract:
-    @bash -lc 'cd "{{repo_root}}" && echo ">>> daemon overlay contract suite" && cd parakeet-stt-daemon && uv run pytest tests/test_overlay_event_stream.py && echo ">>> ptt mixed-version + overlay fault-isolation suite" && cd ../parakeet-ptt && cargo test decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages && cargo test mixed_stream_enqueues_exactly_one_final_result && cargo test overlay_crash_restart_replays_current_state_and_preserves_final_injection && cargo test repeated_overlay_failures_remain_non_fatal_to_final_injection'
+    @bash -lc 'cd "{{repo_root}}" && echo ">>> daemon resource-limit soak" && just daemon-resource-soak && echo ">>> daemon overlay contract suite" && cd parakeet-stt-daemon && uv run pytest tests/test_overlay_event_stream.py && echo ">>> ptt mixed-version + overlay fault-isolation suite" && cd ../parakeet-ptt && cargo test decode_server_message_mixed_version_stream_tolerates_unknown_between_known_messages && cargo test mixed_stream_enqueues_exactly_one_final_result && cargo test overlay_crash_restart_replays_current_state_and_preserves_final_injection && cargo test repeated_overlay_failures_remain_non_fatal_to_final_injection'
 
 phase6-promotion runs="3":
     @bash -lc 'cd "{{repo_root}}" && runs="{{runs}}" && if ! [[ "$runs" =~ ^[0-9]+$ ]] || (( runs < 3 )); then echo "runs must be an integer >= 3" >&2; exit 1; fi && outfile="/tmp/parakeet-overlay-phase6-gate-$(date +%Y%m%d-%H%M%S).log" && { echo ">>> phase6 promotion gate (${runs} clean runs required)"; for run in $(seq 1 "$runs"); do echo ""; echo "=== reliability run ${run}/${runs} ==="; just phase6-contract; done; echo ""; echo "=== stream/seal regression gate ==="; just eval compare; echo ""; echo "artifact=$outfile"; } 2>&1 | tee "$outfile"'

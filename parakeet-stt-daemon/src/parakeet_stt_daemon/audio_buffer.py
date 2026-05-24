@@ -108,7 +108,6 @@ class SessionAudioBuffer:
             )
         else:
             self._stream_buffer = np.zeros((0,), dtype=np.float32)
-        self._enforce_session_sample_limit()
 
     def stop_session(self) -> np.ndarray:
         """Stop accumulation and return the captured samples."""
@@ -249,7 +248,8 @@ class SessionAudioBuffer:
     def _clip_chunk_to_session_limit(self, chunk: np.ndarray) -> np.ndarray | None:
         if self._max_session_samples is None:
             return chunk
-        remaining = self._max_session_samples - self._session_samples
+        retained_samples = self._session_pre_roll_samples + self._session_samples
+        remaining = self._max_session_samples - retained_samples
         if remaining <= 0:
             self._session_limit_exceeded = True
             self._session_active = False
@@ -261,7 +261,8 @@ class SessionAudioBuffer:
     def _enforce_session_sample_limit(self) -> None:
         if self._max_session_samples is None:
             return
-        if self._session_samples < self._max_session_samples:
+        retained_samples = self._session_pre_roll_samples + self._session_samples
+        if retained_samples < self._max_session_samples:
             return
         self._session_limit_exceeded = True
         self._session_active = False
