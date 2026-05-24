@@ -1160,6 +1160,15 @@ fn log_injector_subprocess_stderr(session_id: Uuid, origin: InjectionOrigin, std
                         route_class = report.route_class,
                         route_primary = report.route_primary,
                         route_adaptive_fallback = ?report.route_adaptive_fallback,
+                        route_focus_confidence = report
+                            .route_decision
+                            .as_ref()
+                            .map(|decision| decision.focus_confidence.as_report_str()),
+                        route_output_name = report
+                            .route_decision
+                            .as_ref()
+                            .and_then(|decision| decision.output_name.as_deref()),
+                        route_decision = ?report.route_decision,
                         route_reason = report.route_reason,
                         error = ?report.error,
                         backend_attempt_count = report.backend_attempts.len(),

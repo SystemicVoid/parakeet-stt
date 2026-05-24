@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ClipboardOptions, PasteShortcut};
-use crate::routing::decide_route;
+use crate::routing::{decide_route_for_focus, FocusConfidence, FocusRouteInput, RouteDecision};
 use crate::surface_focus::{FocusSnapshot, WaylandFocusCache, WaylandFocusObservation};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +107,8 @@ pub(crate) struct InjectorChildReport {
     pub child_focus_source_selected: String,
     pub child_focus_wayland_cache_age_ms: Option<u64>,
     pub child_focus_wayland_fallback_reason: Option<String>,
+    #[serde(default)]
+    pub route_decision: Option<RouteDecision>,
     pub route_focus_source: String,
     pub route_class: String,
     pub route_primary: String,
@@ -639,6 +641,7 @@ pub struct ClipboardInjector {
 struct FocusResolutionOutcome {
     snapshot: Option<FocusSnapshot>,
     source_selected: &'static str,
+    confidence: FocusConfidence,
     wayland_cache_age_ms: Option<u64>,
     wayland_fallback_reason: Option<&'static str>,
 }
@@ -753,8 +756,29 @@ impl ClipboardInjector {
         }
     }
 
-    fn route_class_name(route: &crate::routing::RouteDecision) -> String {
-        format!("{:?}", route.class)
+    fn legacy_route_fields(
+        route_decision: Option<&RouteDecision>,
+    ) -> (String, String, String, Option<String>, String) {
+        let Some(route_decision) = route_decision else {
+            return (
+                Self::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
+                Self::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
+                Self::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
+                None,
+                Self::ROUTE_REASON_NOT_APPLICABLE.to_string(),
+            );
+        };
+
+        (
+            route_decision.source.clone(),
+            route_decision.route_class_name().to_string(),
+            Self::shortcut_name(route_decision.shortcut_plan.primary),
+            route_decision
+                .shortcut_plan
+                .adaptive_fallback
+                .map(Self::shortcut_name),
+            route_decision.reason.clone(),
+        )
     }
 
     fn backend_attempt_report(
@@ -818,6 +842,14 @@ impl ClipboardInjector {
             outcome = report.outcome,
             route_class = report.route_class,
             route_primary = report.route_primary,
+            route_focus_confidence = report
+                .route_decision
+                .as_ref()
+                .map(|decision| decision.focus_confidence.as_report_str()),
+            route_output_name = report
+                .route_decision
+                .as_ref()
+                .and_then(|decision| decision.output_name.as_deref()),
             backend_attempt_count = report.backend_attempts.len(),
             elapsed_ms_total = report.elapsed_ms_total,
             "injector report"
@@ -1415,6 +1447,7 @@ impl ClipboardInjector {
             return FocusResolutionOutcome {
                 snapshot: None,
                 source_selected: "wayland_unavailable",
+                confidence: FocusConfidence::Unavailable,
                 wayland_cache_age_ms: None,
                 wayland_fallback_reason: Some("wayland_cache_not_initialized"),
             };
@@ -1426,6 +1459,7 @@ impl ClipboardInjector {
             } => FocusResolutionOutcome {
                 snapshot: Some(snapshot),
                 source_selected: "wayland_cache",
+                confidence: FocusConfidence::Fresh,
                 wayland_cache_age_ms: Some(cache_age_ms),
                 wayland_fallback_reason: None,
             },
@@ -1436,6 +1470,7 @@ impl ClipboardInjector {
             } => FocusResolutionOutcome {
                 snapshot: Some(snapshot),
                 source_selected: "wayland_cache_low_confidence",
+                confidence: FocusConfidence::LowConfidence,
                 wayland_cache_age_ms: Some(cache_age_ms),
                 wayland_fallback_reason: Some(reason),
             },
@@ -1445,6 +1480,7 @@ impl ClipboardInjector {
             } => FocusResolutionOutcome {
                 snapshot: None,
                 source_selected: "wayland_unavailable",
+                confidence: FocusConfidence::Unavailable,
                 wayland_cache_age_ms: cache_age_ms,
                 wayland_fallback_reason: Some(reason),
             },
@@ -1468,11 +1504,7 @@ impl TextInjector for ClipboardInjector {
         let mut child_focus_source_selected = "not_resolved".to_string();
         let mut child_focus_wayland_cache_age_ms = None;
         let mut child_focus_wayland_fallback_reason = None;
-        let mut route_focus_source = Self::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string();
-        let mut route_class = Self::ROUTE_CLASS_NOT_APPLICABLE.to_string();
-        let mut route_primary = Self::ROUTE_PRIMARY_NOT_APPLICABLE.to_string();
-        let mut route_adaptive_fallback = None;
-        let mut route_reason = Self::ROUTE_REASON_NOT_APPLICABLE.to_string();
+        let mut route_decision = None;
         let mut post_clipboard_matches = None;
         let emit_report = |outcome: InjectionOutcome,
                            error: Option<String>,
@@ -1484,12 +1516,15 @@ impl TextInjector for ClipboardInjector {
                            child_focus_source_selected: &str,
                            child_focus_wayland_cache_age_ms: Option<u64>,
                            child_focus_wayland_fallback_reason: Option<String>,
-                           route_focus_source: &str,
-                           route_class: &str,
-                           route_primary: &str,
-                           route_adaptive_fallback: Option<String>,
-                           route_reason: &str,
+                           route_decision: Option<RouteDecision>,
                            backend_attempts: Vec<BackendAttemptReport>| {
+            let (
+                route_focus_source,
+                route_class,
+                route_primary,
+                route_adaptive_fallback,
+                route_reason,
+            ) = Self::legacy_route_fields(route_decision.as_ref());
             Self::emit_report(&InjectorChildReport {
                 session_id,
                 origin: origin.clone(),
@@ -1507,11 +1542,12 @@ impl TextInjector for ClipboardInjector {
                 child_focus_source_selected: child_focus_source_selected.to_string(),
                 child_focus_wayland_cache_age_ms,
                 child_focus_wayland_fallback_reason,
-                route_focus_source: route_focus_source.to_string(),
-                route_class: route_class.to_string(),
-                route_primary: route_primary.to_string(),
+                route_decision,
+                route_focus_source,
+                route_class,
+                route_primary,
                 route_adaptive_fallback,
-                route_reason: route_reason.to_string(),
+                route_reason,
                 backend_attempts,
                 elapsed_ms_total: started.elapsed().as_millis() as u64,
             });
@@ -1592,11 +1628,7 @@ impl TextInjector for ClipboardInjector {
                     &child_focus_source_selected,
                     child_focus_wayland_cache_age_ms,
                     child_focus_wayland_fallback_reason.clone(),
-                    &route_focus_source,
-                    &route_class,
-                    &route_primary,
-                    route_adaptive_fallback.clone(),
-                    &route_reason,
+                    route_decision.clone(),
                     backend_attempts,
                 );
                 return Err(err);
@@ -1684,11 +1716,7 @@ impl TextInjector for ClipboardInjector {
                 &child_focus_source_selected,
                 child_focus_wayland_cache_age_ms,
                 child_focus_wayland_fallback_reason.clone(),
-                &route_focus_source,
-                &route_class,
-                &route_primary,
-                route_adaptive_fallback.clone(),
-                &route_reason,
+                route_decision.clone(),
                 backend_attempts,
             );
             info!(
@@ -1710,61 +1738,74 @@ impl TextInjector for ClipboardInjector {
 
         let (route_primary_shortcut, route_adaptive_fallback_shortcut) =
             if let Some(forced_shortcut) = self.forced_shortcut {
-                route_focus_source = "forced_shortcut".to_string();
-                route_class = "Forced".to_string();
-                route_primary = Self::shortcut_name(forced_shortcut);
-                route_adaptive_fallback = None;
-                route_reason = "forced_diagnostic_shortcut".to_string();
+                let route = RouteDecision::forced(
+                    "forced_shortcut",
+                    child_focus.confidence,
+                    child_focus
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.output_name.as_ref().cloned()),
+                    forced_shortcut,
+                    "forced_diagnostic_shortcut",
+                );
+                let shortcuts = route.shortcut_plan;
                 info!(
                     trace_id,
                     forced_shortcut = ?forced_shortcut,
                     focus_source_selected = child_focus_source_selected,
+                    route_source = route.source.as_str(),
+                    route_focus_confidence = route.focus_confidence.as_report_str(),
+                    route_output_name = route.output_name.as_deref(),
                     focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
                     focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
                     "using forced diagnostic route shortcut override"
                 );
-                (forced_shortcut, None)
+                route_decision = Some(route);
+                (shortcuts.primary, shortcuts.adaptive_fallback)
             } else {
-                route_focus_source = child_focus_source_selected.clone();
-                let route = decide_route(child_focus.snapshot.as_ref());
-                route_class = Self::route_class_name(&route);
-                route_primary = Self::shortcut_name(route.primary);
-                route_adaptive_fallback = route.adaptive_fallback.map(Self::shortcut_name);
-                route_reason = route.reason.to_string();
+                let route = decide_route_for_focus(FocusRouteInput::new(
+                    child_focus.snapshot.as_ref(),
+                    child_focus.source_selected,
+                    child_focus.confidence,
+                ));
+                let shortcuts = route.shortcut_plan;
 
                 if let Some(snapshot) = child_focus.snapshot.as_ref() {
                     info!(
                         trace_id,
-                        focus_source_selected = route_focus_source,
+                        focus_source_selected = route.source.as_str(),
                         focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
                         focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
                         resolver = snapshot.resolver,
                         focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
                         focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
+                        focus_output_name = route.output_name.as_deref(),
                         focus_active = snapshot.active,
                         focus_focused = snapshot.focused,
-                        route_class = ?route.class,
-                        route_primary = ?route.primary,
-                        route_adaptive_fallback = ?route.adaptive_fallback,
-                        route_low_confidence = route.low_confidence,
-                        route_reason = route.reason,
+                        route_class = ?route.surface_class,
+                        route_primary = ?route.shortcut_plan.primary,
+                        route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
+                        route_focus_confidence = route.focus_confidence.as_report_str(),
+                        route_reason = %route.reason,
                         "resolved focused surface for adaptive routing"
                     );
                 } else {
                     info!(
                         trace_id,
-                        focus_source_selected = route_focus_source,
+                        focus_source_selected = route.source.as_str(),
                         focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
                         focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
-                        route_class = ?route.class,
-                        route_primary = ?route.primary,
-                        route_adaptive_fallback = ?route.adaptive_fallback,
-                        route_low_confidence = route.low_confidence,
-                        route_reason = route.reason,
+                        route_class = ?route.surface_class,
+                        route_primary = ?route.shortcut_plan.primary,
+                        route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
+                        route_focus_confidence = route.focus_confidence.as_report_str(),
+                        route_output_name = route.output_name.as_deref(),
+                        route_reason = %route.reason,
                         "no focused surface metadata; using unknown routing fallback"
                     );
                 }
-                (route.primary, route.adaptive_fallback)
+                route_decision = Some(route);
+                (shortcuts.primary, shortcuts.adaptive_fallback)
             };
 
         // 3. Send routed paste shortcut(s).
@@ -1806,11 +1847,7 @@ impl TextInjector for ClipboardInjector {
                 &child_focus_source_selected,
                 child_focus_wayland_cache_age_ms,
                 child_focus_wayland_fallback_reason.clone(),
-                &route_focus_source,
-                &route_class,
-                &route_primary,
-                route_adaptive_fallback.clone(),
-                &route_reason,
+                route_decision.clone(),
                 backend_attempts,
             );
             return Err(anyhow::anyhow!("{err_text}"));
@@ -1915,11 +1952,7 @@ impl TextInjector for ClipboardInjector {
             &child_focus_source_selected,
             child_focus_wayland_cache_age_ms,
             child_focus_wayland_fallback_reason,
-            &route_focus_source,
-            &route_class,
-            &route_primary,
-            route_adaptive_fallback,
-            &route_reason,
+            route_decision,
             backend_attempts,
         );
 
@@ -1949,6 +1982,7 @@ mod tests {
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
+    use crate::routing::{FocusConfidence, RouteDecision, ShortcutPlan, SurfaceClass};
     use crate::surface_focus::FocusSnapshot;
     use evdev::Key;
     #[cfg(unix)]
@@ -2349,6 +2383,17 @@ mod tests {
             child_focus_source_selected: "wayland".to_string(),
             child_focus_wayland_cache_age_ms: Some(5),
             child_focus_wayland_fallback_reason: None,
+            route_decision: Some(RouteDecision {
+                source: "wayland".to_string(),
+                focus_confidence: FocusConfidence::Fresh,
+                surface_class: SurfaceClass::Terminal,
+                shortcut_plan: ShortcutPlan {
+                    primary: PasteShortcut::CtrlShiftV,
+                    adaptive_fallback: Some(PasteShortcut::CtrlV),
+                },
+                output_name: Some("DP-1".to_string()),
+                reason: "focused terminal".to_string(),
+            }),
             route_focus_source: "wayland".to_string(),
             route_class: "Terminal".to_string(),
             route_primary: "CtrlShiftV".to_string(),
@@ -2388,6 +2433,18 @@ mod tests {
                 .resolver,
             "after"
         );
+        let route_decision = decoded
+            .route_decision
+            .as_ref()
+            .expect("route decision should round-trip");
+        assert_eq!(route_decision.source, "wayland");
+        assert_eq!(route_decision.focus_confidence, FocusConfidence::Fresh);
+        assert_eq!(route_decision.surface_class, SurfaceClass::Terminal);
+        assert_eq!(
+            route_decision.shortcut_plan.primary,
+            PasteShortcut::CtrlShiftV
+        );
+        assert_eq!(route_decision.output_name.as_deref(), Some("DP-1"));
     }
 
     #[test]
@@ -2411,6 +2468,7 @@ mod tests {
             child_focus_source_selected: "not_resolved".to_string(),
             child_focus_wayland_cache_age_ms: None,
             child_focus_wayland_fallback_reason: None,
+            route_decision: None,
             route_focus_source: ClipboardInjector::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
             route_class: ClipboardInjector::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
             route_primary: ClipboardInjector::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
