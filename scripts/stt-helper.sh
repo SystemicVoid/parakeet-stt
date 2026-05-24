@@ -1552,7 +1552,7 @@ Commands:
   logs [client|daemon|both]
                          Tail logs (default: both).
   show | attach          Attach to tmux session.
-  tmux [attach|kill]     Attach/kill helper tmux session.
+  tmux [attach|kill]     Attach/kill existing helper tmux session; launch with 'stt start'.
   check                  Run daemon health check.
   diag-injector [opts]   Run clipboard injector diagnostics.
   help [start|llm]       Show this help or command-specific help.
@@ -2282,7 +2282,9 @@ EOF
                 pgrep -af "[p]arakeet" | sed 's/^/     /'
             fi
             if _tmux_has_session "$TMUX_SESSION"; then
-                echo "   - tmux session: $TMUX_SESSION"
+                echo "   - tmux session: $TMUX_SESSION (attach/kill only; launch with 'stt start')"
+            else
+                echo "   - tmux session: none (attach/kill only; launch with 'stt start')"
             fi
             if [ -n "$daemon_runtime_truth" ]; then
                 _print_daemon_runtime_truth "$daemon_runtime_truth"
@@ -2291,68 +2293,37 @@ EOF
             fi
             ;;
         tmux)
-            _tmux_require || return 1
             local action="${1:-attach}"
-            if _tmux_has_session "$TMUX_SESSION"; then
-                if [ "$action" = "kill" ]; then
-                    tmux kill-session -t "$TMUX_SESSION"
-                    echo "Killed tmux session '$TMUX_SESSION'."
-                    return 0
-                fi
-                echo "Attaching to existing tmux session '$TMUX_SESSION'..."
-                tmux attach -t "$TMUX_SESSION"
-                return $?
-            fi
-
-            if pgrep -af "[p]arakeet-stt-daemon" >/dev/null || pgrep -af "[p]arakeet-ptt" >/dev/null; then
-                echo "Warning: parakeet processes already running; use 'stt stop' first to avoid duplicates."
-            fi
-
-            if ! _resolve_port; then
-                return 1
-            fi
-
-            echo "Creating tmux session '$TMUX_SESSION' (daemon | client | logs)..."
-            echo "--- tmux session start: $(date -Is) ---" >> "$LOG_DAEMON"
-            echo "--- tmux session start: $(date -Is) ---" >> "$LOG_CLIENT"
-            _daemon_lifecycle_persist_current_authority
-
-            local daemon_streaming_enabled="$default_daemon_streaming_enabled"
-            local injection_mode paste_backend_failure_policy
-            local uinput_dwell_ms paste_seat paste_write_primary
-            local completion_sound completion_sound_path completion_sound_volume overlay_enabled overlay_adaptive_width
-            local llm_pre_modifier_key llm_base_url llm_model llm_timeout_seconds llm_max_tokens llm_temperature llm_system_prompt llm_overlay_stream
-            local ptt_rustflags="$default_ptt_rustflags"
-            local ptt_runner_preference="$default_ptt_runner_preference"
-            _load_start_vars_from_defaults
-
-            local daemon_overlay_events_enabled="$overlay_enabled"
-            local daemon_cmd="RUST_LOG=\"$RUST_LOG\" UV_CACHE_DIR=\"$REPO_ROOT/.uv-cache\" PARAKEET_STREAMING_ENABLED=\"$daemon_streaming_enabled\" PARAKEET_OVERLAY_EVENTS_ENABLED=\"$daemon_overlay_events_enabled\" PARAKEET_HOST=\"$HOST\" PARAKEET_PORT=\"$PORT\" PARAKEET_SILENCE_FLOOR_DB=-60.0 uv run parakeet-stt-daemon --host \"$HOST\" --port \"$PORT\" --device \"$default_daemon_device\" >> \"$LOG_DAEMON\" 2>&1"
-
-            if [ "$ptt_runner_preference" != "cargo" ] && [ "$ptt_runner_preference" != "release" ]; then
-                echo "   - Invalid PARAKEET_PTT_RUNNER_PREFERENCE='$ptt_runner_preference'; defaulting to cargo."
-                ptt_runner_preference="cargo"
-            fi
-
-            local -a ptt_args
-            _build_ptt_args ptt_args
-            local ptt_args_shell
-            ptt_args_shell="$(_args_to_shell_words ptt_args)"
-
-            local runner_mode
-            runner_mode="$(_select_client_runner_mode "$CLIENT_DIR/target/release/parakeet-ptt" "$ptt_runner_preference")"
-            if [ "$ptt_runner_preference" = "release" ] && [ "$runner_mode" = "cargo" ] && [ -x "$CLIENT_DIR/target/release/parakeet-ptt" ]; then
-                echo "[helper] release binary missing expected start flags; falling back to cargo run --release --bin parakeet-ptt" >> "$LOG_CLIENT"
-            fi
-
-            local client_cmd
-            client_cmd="$(_build_client_cmd)"
-
-            tmux new-session -d -s "$TMUX_SESSION" -n daemon -c "$DAEMON_DIR" "$daemon_cmd"
-            tmux new-window -t "$TMUX_SESSION" -n client -c "$CLIENT_DIR" "LOG_CLIENT=\"$LOG_CLIENT\" RUNNER_MODE=\"$runner_mode\" PTT_RUSTFLAGS=\"$ptt_rustflags\" PTT_ARGS_SHELL=\"$ptt_args_shell\" RUST_LOG=\"$RUST_LOG\" PARAKEET_OVERLAY_MODE=\"${PARAKEET_OVERLAY_MODE:-}\" bash -lc '$client_cmd'"
-            tmux new-window -t "$TMUX_SESSION" -n logs -c /tmp "tail -f \"$LOG_DAEMON\" \"$LOG_CLIENT\""
-            tmux select-window -t "$TMUX_SESSION:daemon"
-            tmux attach -t "$TMUX_SESSION"
+            case "$action" in
+                attach|show|"")
+                    _tmux_require || return 1
+                    if _tmux_has_session "$TMUX_SESSION"; then
+                        echo "Attaching to existing tmux session '$TMUX_SESSION'..."
+                        tmux attach -t "$TMUX_SESSION"
+                        return $?
+                    fi
+                    echo "No tmux session '$TMUX_SESSION' found. Start with 'stt start'."
+                    ;;
+                kill)
+                    _tmux_require || return 1
+                    if _tmux_has_session "$TMUX_SESSION"; then
+                        tmux kill-session -t "$TMUX_SESSION"
+                        echo "Killed tmux session '$TMUX_SESSION'."
+                        return 0
+                    fi
+                    echo "No tmux session '$TMUX_SESSION' found. Start with 'stt start'."
+                    ;;
+                help|--help|-h)
+                    echo "Usage: stt tmux [attach|kill]"
+                    echo "Attach or kill the helper tmux session created by 'stt start'."
+                    ;;
+                *)
+                    echo "Unknown tmux action: $action"
+                    echo "Usage: stt tmux [attach|kill]"
+                    echo "Launch with 'stt start'; this command does not start daemon/client."
+                    return 1
+                    ;;
+            esac
             ;;
         check)
             echo ">>> Health check (daemon --check)..."

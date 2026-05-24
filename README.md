@@ -132,7 +132,7 @@ Primary helper commands:
 
 - `stt start|restart|stop|status`
 - `stt llm [start|stop|restart|status|logs|show]` (managed llama-server + STT)
-- `stt show` (attach tmux)
+- `stt show` / `stt tmux [attach|kill]` (attach/kill existing helper tmux; launch with `stt start`)
 - `stt logs [client|daemon|both]`
 - `stt check` (daemon health)
 - `stt diag-injector` (injection diagnostics)
