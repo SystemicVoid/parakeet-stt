@@ -167,16 +167,11 @@ impl WaylandFocusCache {
     }
 
     pub fn current_output_name(&self) -> Option<String> {
-        match self.observe(1_500, 250) {
-            WaylandFocusObservation::Fresh { snapshot, .. } => snapshot.output_name,
-            WaylandFocusObservation::LowConfidence {
-                snapshot,
-                reason: "wayland_transition_no_activated" | "wayland_cache_stale",
-                ..
-            } => snapshot.output_name,
-            WaylandFocusObservation::Unavailable { .. } => None,
-            WaylandFocusObservation::LowConfidence { .. } => None,
-        }
+        let observation = crate::routing::FocusObservation::from_wayland(self.observe(
+            crate::routing::OVERLAY_OUTPUT_STALE_MS,
+            crate::routing::OVERLAY_OUTPUT_TRANSITION_GRACE_MS,
+        ));
+        crate::routing::decide_overlay_output_target(&observation)
     }
 }
 

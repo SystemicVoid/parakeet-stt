@@ -23,8 +23,12 @@ use crate::injector_runtime::{
 use crate::llm::{sanitize_model_answer, LlmAnswerer, LlmProgress};
 use crate::overlay_router::{OverlayRouter, OverlaySink};
 use crate::protocol::ServerMessage;
+use crate::routing::{
+    decide_overlay_output_target, FocusObservation, OVERLAY_OUTPUT_STALE_MS,
+    OVERLAY_OUTPUT_TRANSITION_GRACE_MS,
+};
 use crate::state::PttState;
-use crate::surface_focus::{WaylandFocusCache, WaylandFocusObservation};
+use crate::surface_focus::WaylandFocusCache;
 
 const PARENT_FOCUS_STALE_MS: u64 = 30_000;
 const PARENT_FOCUS_TRANSITION_GRACE_MS: u64 = 500;
@@ -257,7 +261,12 @@ impl ClientFocusRouter {
     }
 
     pub(crate) fn next_overlay_output_hint(&mut self) -> Option<String> {
-        let output_name = self.focus_cache.as_ref()?.current_output_name();
+        let output_name = self.focus_cache.as_ref().and_then(|cache| {
+            let observation = FocusObservation::from_wayland(
+                cache.observe(OVERLAY_OUTPUT_STALE_MS, OVERLAY_OUTPUT_TRANSITION_GRACE_MS),
+            );
+            decide_overlay_output_target(&observation)
+        });
         self.next_overlay_output_hint_from(output_name)
     }
 
@@ -273,10 +282,10 @@ impl ClientFocusRouter {
 
     fn capture_parent_focus(&self) -> Option<ParentFocusCapture> {
         let cache = self.focus_cache.as_ref()?;
-        Some(parent_focus_from_observation(cache.observe(
-            PARENT_FOCUS_STALE_MS,
-            PARENT_FOCUS_TRANSITION_GRACE_MS,
-        )))
+        let observation = FocusObservation::from_wayland(
+            cache.observe(PARENT_FOCUS_STALE_MS, PARENT_FOCUS_TRANSITION_GRACE_MS),
+        );
+        Some(parent_focus_from_observation(observation))
     }
 
     fn take_captured_parent_focus_for_enqueue(
@@ -308,6 +317,14 @@ impl ClientFocusRouter {
     #[cfg(test)]
     fn next_overlay_output_hint_for_tests(&mut self, output_name: Option<&str>) -> Option<String> {
         self.next_overlay_output_hint_from(output_name.map(str::to_string))
+    }
+
+    #[cfg(test)]
+    fn next_overlay_output_hint_from_observation_for_tests(
+        &mut self,
+        observation: FocusObservation,
+    ) -> Option<String> {
+        self.next_overlay_output_hint_from(decide_overlay_output_target(&observation))
     }
 }
 
@@ -978,39 +995,13 @@ fn log_dispatch_worker_gone(session_id: Uuid, origin: InjectionOrigin) {
     }
 }
 
-fn parent_focus_from_observation(observation: WaylandFocusObservation) -> ParentFocusCapture {
-    match observation {
-        WaylandFocusObservation::Fresh {
-            snapshot,
-            cache_age_ms,
-        } => ParentFocusCapture {
-            snapshot: Some(snapshot),
-            source_selected: "wayland_cache".to_string(),
-            wayland_cache_age_ms: Some(cache_age_ms),
-            wayland_fallback_reason: None,
-            captured_elapsed_ms: Some(0),
-        },
-        WaylandFocusObservation::LowConfidence {
-            snapshot,
-            cache_age_ms,
-            reason,
-        } => ParentFocusCapture {
-            snapshot: Some(snapshot),
-            source_selected: "wayland_cache_low_confidence".to_string(),
-            wayland_cache_age_ms: Some(cache_age_ms),
-            wayland_fallback_reason: Some(reason.to_string()),
-            captured_elapsed_ms: Some(0),
-        },
-        WaylandFocusObservation::Unavailable {
-            reason,
-            cache_age_ms,
-        } => ParentFocusCapture {
-            snapshot: None,
-            source_selected: "wayland_unavailable".to_string(),
-            wayland_cache_age_ms: cache_age_ms,
-            wayland_fallback_reason: Some(reason.to_string()),
-            captured_elapsed_ms: Some(0),
-        },
+fn parent_focus_from_observation(observation: FocusObservation) -> ParentFocusCapture {
+    ParentFocusCapture {
+        snapshot: observation.snapshot,
+        source_selected: observation.source_selected.to_string(),
+        wayland_cache_age_ms: observation.wayland_cache_age_ms,
+        wayland_fallback_reason: observation.wayland_fallback_reason.map(str::to_string),
+        captured_elapsed_ms: Some(0),
     }
 }
 
@@ -1371,6 +1362,7 @@ mod tests {
         RuntimeOverlaySink,
     };
     use crate::protocol::ServerMessage;
+    use crate::routing::FocusObservation;
     use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
     use anyhow::anyhow;
     use tokio::sync::mpsc;
@@ -1757,11 +1749,13 @@ mod tests {
     #[test]
     fn client_focus_router_maps_parent_focus_for_injection() {
         let session_id = Uuid::new_v4();
-        let parent_focus = parent_focus_from_observation(WaylandFocusObservation::LowConfidence {
-            snapshot: test_focus_snapshot(Some("DP-1")),
-            cache_age_ms: 17,
-            reason: "within_transition_grace",
-        });
+        let parent_focus = parent_focus_from_observation(FocusObservation::from_wayland(
+            WaylandFocusObservation::LowConfidence {
+                snapshot: test_focus_snapshot(Some("DP-1")),
+                cache_age_ms: 17,
+                reason: "within_transition_grace",
+            },
+        ));
         let mut focus_router = ClientFocusRouter::default();
         focus_router.record_parent_focus_for_tests(
             session_id,
@@ -1817,6 +1811,52 @@ mod tests {
         assert_eq!(
             focus_router.next_overlay_output_hint_for_tests(Some("HDMI-A-1")),
             Some("HDMI-A-1".to_string())
+        );
+    }
+
+    #[test]
+    fn client_focus_router_uses_shared_observation_for_overlay_hints() {
+        let mut focus_router = ClientFocusRouter::default();
+        let fresh = FocusObservation::from_wayland(WaylandFocusObservation::Fresh {
+            snapshot: test_focus_snapshot(Some("DP-1")),
+            cache_age_ms: 5,
+        });
+        assert_eq!(
+            focus_router.next_overlay_output_hint_from_observation_for_tests(fresh),
+            Some("DP-1".to_string())
+        );
+
+        let duplicate_low_confidence =
+            FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
+                snapshot: test_focus_snapshot(Some("DP-1")),
+                cache_age_ms: 1_600,
+                reason: "wayland_cache_stale",
+            });
+        assert_eq!(
+            focus_router
+                .next_overlay_output_hint_from_observation_for_tests(duplicate_low_confidence),
+            None
+        );
+
+        let low_confidence_new_output =
+            FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
+                snapshot: test_focus_snapshot(Some("HDMI-A-1")),
+                cache_age_ms: 12,
+                reason: "wayland_transition_no_activated",
+            });
+        assert_eq!(
+            focus_router
+                .next_overlay_output_hint_from_observation_for_tests(low_confidence_new_output),
+            Some("HDMI-A-1".to_string())
+        );
+
+        let unavailable = FocusObservation::from_wayland(WaylandFocusObservation::Unavailable {
+            reason: "wayland_cache_uninitialized",
+            cache_age_ms: None,
+        });
+        assert_eq!(
+            focus_router.next_overlay_output_hint_from_observation_for_tests(unavailable),
+            None
         );
     }
 
@@ -2244,10 +2284,12 @@ mod tests {
         let dispatcher = ClientInjectionDispatcher::new(worker);
         let session_id = Uuid::new_v4();
         let mut focus_router = ClientFocusRouter::default();
-        let parent_focus = parent_focus_from_observation(WaylandFocusObservation::Fresh {
-            snapshot: test_focus_snapshot(Some("DP-1")),
-            cache_age_ms: 8,
-        });
+        let parent_focus = parent_focus_from_observation(FocusObservation::from_wayland(
+            WaylandFocusObservation::Fresh {
+                snapshot: test_focus_snapshot(Some("DP-1")),
+                cache_age_ms: 8,
+            },
+        ));
         focus_router.record_parent_focus_for_tests(
             session_id,
             parent_focus,
@@ -2341,10 +2383,12 @@ mod tests {
         let mut focus_router = ClientFocusRouter::default();
         focus_router.record_parent_focus_for_tests(
             session_id,
-            parent_focus_from_observation(WaylandFocusObservation::Fresh {
-                snapshot: test_focus_snapshot(Some("DP-1")),
-                cache_age_ms: 3,
-            }),
+            parent_focus_from_observation(FocusObservation::from_wayland(
+                WaylandFocusObservation::Fresh {
+                    snapshot: test_focus_snapshot(Some("DP-1")),
+                    cache_age_ms: 3,
+                },
+            )),
             TokioInstant::now() - Duration::from_millis(10),
         );
 
