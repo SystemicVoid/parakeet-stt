@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ClipboardOptions, PasteShortcut};
-use crate::routing::{decide_route_for_focus, FocusConfidence, FocusRouteInput, RouteDecision};
-use crate::surface_focus::{FocusSnapshot, WaylandFocusCache, WaylandFocusObservation};
+use crate::routing::{decide_route_for_focus, FocusObservation, RouteDecision};
+use crate::surface_focus::{FocusSnapshot, WaylandFocusCache};
 
 static INJECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -635,15 +635,6 @@ pub struct ClipboardInjector {
     wayland_focus_cache: Option<WaylandFocusCache>,
     context: Option<InjectorContext>,
     forced_shortcut: Option<PasteShortcut>,
-}
-
-#[derive(Debug, Clone)]
-struct FocusResolutionOutcome {
-    snapshot: Option<FocusSnapshot>,
-    source_selected: &'static str,
-    confidence: FocusConfidence,
-    wayland_cache_age_ms: Option<u64>,
-    wayland_fallback_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1442,49 +1433,13 @@ impl ClipboardInjector {
         Self::stop_foreground_source(primary_source, trace_id, "primary");
     }
 
-    fn resolve_focus_metadata(&self, _trace_id: u64) -> FocusResolutionOutcome {
+    fn resolve_focus_metadata(&self, _trace_id: u64) -> FocusObservation {
         let Some(cache) = self.wayland_focus_cache.as_ref() else {
-            return FocusResolutionOutcome {
-                snapshot: None,
-                source_selected: "wayland_unavailable",
-                confidence: FocusConfidence::Unavailable,
-                wayland_cache_age_ms: None,
-                wayland_fallback_reason: Some("wayland_cache_not_initialized"),
-            };
+            return FocusObservation::unavailable("wayland_cache_not_initialized", None);
         };
-        match cache.observe(Self::WAYLAND_STALE_MS, Self::WAYLAND_TRANSITION_GRACE_MS) {
-            WaylandFocusObservation::Fresh {
-                snapshot,
-                cache_age_ms,
-            } => FocusResolutionOutcome {
-                snapshot: Some(snapshot),
-                source_selected: "wayland_cache",
-                confidence: FocusConfidence::Fresh,
-                wayland_cache_age_ms: Some(cache_age_ms),
-                wayland_fallback_reason: None,
-            },
-            WaylandFocusObservation::LowConfidence {
-                snapshot,
-                cache_age_ms,
-                reason,
-            } => FocusResolutionOutcome {
-                snapshot: Some(snapshot),
-                source_selected: "wayland_cache_low_confidence",
-                confidence: FocusConfidence::LowConfidence,
-                wayland_cache_age_ms: Some(cache_age_ms),
-                wayland_fallback_reason: Some(reason),
-            },
-            WaylandFocusObservation::Unavailable {
-                reason,
-                cache_age_ms,
-            } => FocusResolutionOutcome {
-                snapshot: None,
-                source_selected: "wayland_unavailable",
-                confidence: FocusConfidence::Unavailable,
-                wayland_cache_age_ms: cache_age_ms,
-                wayland_fallback_reason: Some(reason),
-            },
-        }
+        FocusObservation::from_wayland(
+            cache.observe(Self::WAYLAND_STALE_MS, Self::WAYLAND_TRANSITION_GRACE_MS),
+        )
     }
 }
 
@@ -1763,11 +1718,7 @@ impl TextInjector for ClipboardInjector {
                 route_decision = Some(route);
                 (shortcuts.primary, shortcuts.adaptive_fallback)
             } else {
-                let route = decide_route_for_focus(FocusRouteInput::new(
-                    child_focus.snapshot.as_ref(),
-                    child_focus.source_selected,
-                    child_focus.confidence,
-                ));
+                let route = decide_route_for_focus(child_focus.route_input());
                 let shortcuts = route.shortcut_plan;
 
                 if let Some(snapshot) = child_focus.snapshot.as_ref() {

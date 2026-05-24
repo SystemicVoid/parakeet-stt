@@ -60,6 +60,9 @@ pub enum WaylandFocusObservation {
     },
 }
 
+pub const WAYLAND_FOCUS_REASON_CACHE_STALE: &str = "wayland_cache_stale";
+pub const WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED: &str = "wayland_transition_no_activated";
+
 #[derive(Debug, Clone)]
 pub struct WaylandFocusCache {
     shared: Arc<Mutex<WaylandFocusSharedState>>,
@@ -123,7 +126,7 @@ impl WaylandFocusCache {
                 return WaylandFocusObservation::LowConfidence {
                     snapshot: active.to_focus_snapshot(true),
                     cache_age_ms,
-                    reason: "wayland_cache_stale",
+                    reason: WAYLAND_FOCUS_REASON_CACHE_STALE,
                 };
             }
             return WaylandFocusObservation::Fresh {
@@ -134,7 +137,7 @@ impl WaylandFocusCache {
 
         if cache_age_ms > stale_ms.max(1) {
             return WaylandFocusObservation::Unavailable {
-                reason: "wayland_cache_stale",
+                reason: WAYLAND_FOCUS_REASON_CACHE_STALE,
                 cache_age_ms: Some(cache_age_ms),
             };
         }
@@ -155,7 +158,7 @@ impl WaylandFocusCache {
                 return WaylandFocusObservation::LowConfidence {
                     snapshot: last_activated.to_focus_snapshot(false),
                     cache_age_ms,
-                    reason: "wayland_transition_no_activated",
+                    reason: WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
                 };
             }
         }
@@ -167,16 +170,11 @@ impl WaylandFocusCache {
     }
 
     pub fn current_output_name(&self) -> Option<String> {
-        match self.observe(1_500, 250) {
-            WaylandFocusObservation::Fresh { snapshot, .. } => snapshot.output_name,
-            WaylandFocusObservation::LowConfidence {
-                snapshot,
-                reason: "wayland_transition_no_activated" | "wayland_cache_stale",
-                ..
-            } => snapshot.output_name,
-            WaylandFocusObservation::Unavailable { .. } => None,
-            WaylandFocusObservation::LowConfidence { .. } => None,
-        }
+        let observation = crate::routing::FocusObservation::from_wayland(self.observe(
+            crate::routing::OVERLAY_OUTPUT_STALE_MS,
+            crate::routing::OVERLAY_OUTPUT_TRANSITION_GRACE_MS,
+        ));
+        crate::routing::decide_overlay_output_target(&observation)
     }
 }
 
@@ -596,7 +594,8 @@ fn parse_cosmic_state_has_activated(state: &[u8]) -> bool {
 mod tests {
     use super::{
         parse_cosmic_state_has_activated, CachedToplevel, WaylandFocusCache,
-        WaylandFocusObservation, WaylandFocusSharedState,
+        WaylandFocusObservation, WaylandFocusSharedState, WAYLAND_FOCUS_REASON_CACHE_STALE,
+        WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -638,7 +637,7 @@ mod tests {
             } => {
                 assert!(snapshot.focused);
                 assert_eq!(snapshot.resolver, "wayland");
-                assert_eq!(reason, "wayland_cache_stale");
+                assert_eq!(reason, WAYLAND_FOCUS_REASON_CACHE_STALE);
             }
             _ => panic!("expected stale active cache to be low confidence"),
         }
@@ -671,7 +670,7 @@ mod tests {
             } => {
                 assert!(!snapshot.focused);
                 assert_eq!(snapshot.resolver, "wayland");
-                assert_eq!(reason, "wayland_transition_no_activated");
+                assert_eq!(reason, WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED);
             }
             _ => panic!("expected low-confidence transition snapshot"),
         }
