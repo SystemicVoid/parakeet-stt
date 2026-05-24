@@ -1,5 +1,8 @@
 use crate::config::PasteShortcut;
-use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
+use crate::surface_focus::{
+    FocusSnapshot, WaylandFocusObservation, WAYLAND_FOCUS_REASON_CACHE_STALE,
+    WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
+};
 use serde::{Deserialize, Serialize};
 
 pub const OVERLAY_OUTPUT_STALE_MS: u64 = 1_500;
@@ -254,7 +257,9 @@ pub fn decide_overlay_output_target(observation: &FocusObservation) -> Option<St
         FocusConfidence::LowConfidence
             if matches!(
                 observation.wayland_fallback_reason,
-                Some("wayland_transition_no_activated" | "wayland_cache_stale")
+                Some(
+                    WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED | WAYLAND_FOCUS_REASON_CACHE_STALE
+                )
             ) =>
         {
             observation
@@ -357,7 +362,10 @@ mod tests {
         FocusConfidence, FocusObservation, FocusRouteInput, SurfaceClass,
     };
     use crate::config::PasteShortcut;
-    use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
+    use crate::surface_focus::{
+        FocusSnapshot, WaylandFocusObservation, WAYLAND_FOCUS_REASON_CACHE_STALE,
+        WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
+    };
 
     fn snapshot(
         app_name: &str,
@@ -606,7 +614,7 @@ mod tests {
             FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
                 snapshot: stale,
                 cache_age_ms: 1_600,
-                reason: "wayland_cache_stale",
+                reason: WAYLAND_FOCUS_REASON_CACHE_STALE,
             });
         assert_eq!(
             decide_overlay_output_target(&stale_observation).as_deref(),
@@ -619,7 +627,7 @@ mod tests {
             FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
                 snapshot: transition,
                 cache_age_ms: 12,
-                reason: "wayland_transition_no_activated",
+                reason: WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
             });
         assert_eq!(
             decide_overlay_output_target(&transition_observation).as_deref(),
