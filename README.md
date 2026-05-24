@@ -226,6 +226,7 @@ Overlay reliability gates (repo root):
 ```bash
 just daemon-resource-soak
 just daemon-inference-overlap
+just daemon-multiclient-ownership
 just phase6-contract
 just phase6-promotion 3
 ```
@@ -233,6 +234,8 @@ just phase6-promotion 3
 count, active Session state, and termination evidence for the Session sample cap.
 It also includes the Stream/Seal inference-overlap stress, which prints call-order
 evidence for live interim, Stream helper feed, and Seal finalization serialization.
+The multi-client ownership check prints owner token and Session transition evidence
+for reconnect, non-owner stop/abort/disconnect, and fresh-client finalization flows.
 Hook stages are split for speed:
 - `pre-commit`: maintenance cadence reminder, `ruff format`, `ruff check`, `ty check`, `cargo fmt`
 - `pre-push`: `pytest`, `cargo clippy`, `cargo test`

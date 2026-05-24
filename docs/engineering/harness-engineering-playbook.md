@@ -108,6 +108,9 @@ just daemon-resource-soak
 
 # Release/promotion Stream/Seal inference-overlap guard
 just daemon-inference-overlap
+
+# Release/promotion multi-client reconnect ownership guard
+just daemon-multiclient-ownership
 ```
 
 ## Local STT Eval Policy
