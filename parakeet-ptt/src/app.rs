@@ -463,7 +463,7 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
                         tokio::select! {
                             Some(evt) = hk_rx.recv() => {
                                 match evt {
-                                    HotkeyEvent::Down { intent } => {
+                                    HotkeyEvent::Down { intent, .. } => {
                                         let intent = session_intent_from_hotkey(intent);
                                         hotkey_intent_diagnostics.note_hotkey_down(intent);
                                         let start_blocker = llm_query_runtime

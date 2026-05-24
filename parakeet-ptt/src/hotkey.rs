@@ -24,9 +24,27 @@ pub enum HotkeyIntent {
     LlmQuery,
 }
 
+impl HotkeyIntent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dictate => "dictate",
+            Self::LlmQuery => "llm_query",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyAttachState {
+    Reconstructed,
+    Unreconstructed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    Down { intent: HotkeyIntent },
+    Down {
+        intent: HotkeyIntent,
+        attach_state: HotkeyAttachState,
+    },
     Up,
 }
 
@@ -72,12 +90,14 @@ struct HotkeyDiagnostics {
     listener_open_error_total: AtomicU64,
     listener_fetch_error_total: AtomicU64,
     listener_task_join_error_total: AtomicU64,
+    listener_attach_state_unavailable_total: AtomicU64,
     talk_down_raw_total: AtomicU64,
     talk_up_raw_total: AtomicU64,
     pre_modifier_down_raw_total: AtomicU64,
     pre_modifier_up_raw_total: AtomicU64,
     talk_down_emitted_total: AtomicU64,
     talk_down_llm_query_emitted_total: AtomicU64,
+    talk_down_degraded_attach_emitted_total: AtomicU64,
     talk_up_emitted_total: AtomicU64,
     channel_send_fail_total: AtomicU64,
 }
@@ -91,12 +111,14 @@ struct HotkeyDiagnosticsSnapshot {
     listener_open_error_total: u64,
     listener_fetch_error_total: u64,
     listener_task_join_error_total: u64,
+    listener_attach_state_unavailable_total: u64,
     talk_down_raw_total: u64,
     talk_up_raw_total: u64,
     pre_modifier_down_raw_total: u64,
     pre_modifier_up_raw_total: u64,
     talk_down_emitted_total: u64,
     talk_down_llm_query_emitted_total: u64,
+    talk_down_degraded_attach_emitted_total: u64,
     talk_up_emitted_total: u64,
     channel_send_fail_total: u64,
 }
@@ -132,6 +154,11 @@ impl HotkeyDiagnostics {
         }
     }
 
+    fn note_attach_state_unavailable(&self) {
+        self.listener_attach_state_unavailable_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn note_talk_down_raw(&self) {
         self.talk_down_raw_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -152,10 +179,17 @@ impl HotkeyDiagnostics {
 
     fn note_emitted_event(&self, event: HotkeyEvent) {
         match event {
-            HotkeyEvent::Down { intent } => {
+            HotkeyEvent::Down {
+                intent,
+                attach_state,
+            } => {
                 self.talk_down_emitted_total.fetch_add(1, Ordering::Relaxed);
                 if intent == HotkeyIntent::LlmQuery {
                     self.talk_down_llm_query_emitted_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if attach_state == HotkeyAttachState::Unreconstructed {
+                    self.talk_down_degraded_attach_emitted_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -180,6 +214,9 @@ impl HotkeyDiagnostics {
             listener_task_join_error_total: self
                 .listener_task_join_error_total
                 .load(Ordering::Relaxed),
+            listener_attach_state_unavailable_total: self
+                .listener_attach_state_unavailable_total
+                .load(Ordering::Relaxed),
             talk_down_raw_total: self.talk_down_raw_total.load(Ordering::Relaxed),
             talk_up_raw_total: self.talk_up_raw_total.load(Ordering::Relaxed),
             pre_modifier_down_raw_total: self.pre_modifier_down_raw_total.load(Ordering::Relaxed),
@@ -187,6 +224,9 @@ impl HotkeyDiagnostics {
             talk_down_emitted_total: self.talk_down_emitted_total.load(Ordering::Relaxed),
             talk_down_llm_query_emitted_total: self
                 .talk_down_llm_query_emitted_total
+                .load(Ordering::Relaxed),
+            talk_down_degraded_attach_emitted_total: self
+                .talk_down_degraded_attach_emitted_total
                 .load(Ordering::Relaxed),
             talk_up_emitted_total: self.talk_up_emitted_total.load(Ordering::Relaxed),
             channel_send_fail_total: self.channel_send_fail_total.load(Ordering::Relaxed),
@@ -204,12 +244,16 @@ impl HotkeyDiagnostics {
             listener_open_error_total = snapshot.listener_open_error_total,
             listener_fetch_error_total = snapshot.listener_fetch_error_total,
             listener_task_join_error_total = snapshot.listener_task_join_error_total,
+            listener_attach_state_unavailable_total =
+                snapshot.listener_attach_state_unavailable_total,
             talk_down_raw_total = snapshot.talk_down_raw_total,
             talk_up_raw_total = snapshot.talk_up_raw_total,
             pre_modifier_down_raw_total = snapshot.pre_modifier_down_raw_total,
             pre_modifier_up_raw_total = snapshot.pre_modifier_up_raw_total,
             talk_down_emitted_total = snapshot.talk_down_emitted_total,
             talk_down_llm_query_emitted_total = snapshot.talk_down_llm_query_emitted_total,
+            talk_down_degraded_attach_emitted_total =
+                snapshot.talk_down_degraded_attach_emitted_total,
             talk_up_emitted_total = snapshot.talk_up_emitted_total,
             channel_send_fail_total = snapshot.channel_send_fail_total,
             "hotkey listener diagnostics"
@@ -221,6 +265,7 @@ impl HotkeyDiagnostics {
 struct HotkeySharedState {
     talk_down_count: usize,
     pre_modifier_down_counts: HashMap<Key, usize>,
+    degraded_attach_pending: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -317,6 +362,16 @@ impl HotkeySharedState {
         }
         self.talk_down_count -= 1;
         self.talk_down_count == 0
+    }
+
+    fn note_degraded_attach(&mut self) {
+        self.degraded_attach_pending = true;
+    }
+
+    fn take_degraded_attach_pending(&mut self) -> bool {
+        let pending = self.degraded_attach_pending;
+        self.degraded_attach_pending = false;
+        pending
     }
 
     fn pre_modifier_active(&self) -> bool {
@@ -727,6 +782,14 @@ fn hotkey_listener_for_path(
             )
         }
         Err(err) => {
+            listener_context.diagnostics.note_attach_state_unavailable();
+            {
+                let mut state = listener_context
+                    .shared_state
+                    .lock()
+                    .expect("hotkey shared state lock poisoned");
+                state.note_degraded_attach();
+            }
             warn!(
                 path = %path.display(),
                 error = %err,
@@ -790,6 +853,7 @@ fn hotkey_listener_for_path(
                     };
 
                     if let Some(event) = event {
+                        maybe_log_degraded_attach_talk_down(&path, event);
                         listener_context.diagnostics.note_emitted_event(event);
                         if listener_context.tx.send(event).is_err() {
                             listener_context.diagnostics.note_send_failure();
@@ -868,7 +932,15 @@ fn derive_hotkey_event(
                 } else {
                     HotkeyIntent::Dictate
                 };
-                Some(HotkeyEvent::Down { intent })
+                let attach_state = if state.take_degraded_attach_pending() {
+                    HotkeyAttachState::Unreconstructed
+                } else {
+                    HotkeyAttachState::Reconstructed
+                };
+                Some(HotkeyEvent::Down {
+                    intent,
+                    attach_state,
+                })
             }
             0 if state.note_talk_up() => Some(HotkeyEvent::Up),
             _ => None,
@@ -876,6 +948,23 @@ fn derive_hotkey_event(
     }
 
     None
+}
+
+fn maybe_log_degraded_attach_talk_down(path: &Path, event: HotkeyEvent) {
+    let HotkeyEvent::Down {
+        intent,
+        attach_state: HotkeyAttachState::Unreconstructed,
+    } = event
+    else {
+        return;
+    };
+
+    warn!(
+        path = %path.display(),
+        captured_intent = intent.as_str(),
+        attach_state_reconstructed = false,
+        "hotkey talk-down after degraded attach; attach state could not be reconstructed"
+    );
 }
 
 fn find_hotkey_device_paths(talk_key: Key, llm_pre_modifier_keys: &[Key]) -> Result<Vec<PathBuf>> {
@@ -931,11 +1020,11 @@ fn is_event_device_path(path: &Path) -> bool {
 mod tests {
     use super::{
         derive_hotkey_event, handle_listener_exit, is_event_device_path,
-        is_ignored_hotkey_device_name, parse_key_name, parse_pre_modifier_key_names,
-        seed_listener_pre_modifier_state, validate_hotkey_binding_config, HotkeyDiagnostics,
-        HotkeyEvent, HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks,
-        ListenerExit, ListenerExitAction, ListenerExitCleanup, ListenerExitReason,
-        ListenerPressedState,
+        is_ignored_hotkey_device_name, maybe_log_degraded_attach_talk_down, parse_key_name,
+        parse_pre_modifier_key_names, seed_listener_pre_modifier_state,
+        validate_hotkey_binding_config, HotkeyAttachState, HotkeyDiagnostics, HotkeyEvent,
+        HotkeyIntent, HotkeyListenerContext, HotkeySharedState, HotkeyTasks, ListenerExit,
+        ListenerExitAction, ListenerExitCleanup, ListenerExitReason, ListenerPressedState,
     };
     use evdev::{AttributeSet, Key};
     use std::collections::HashSet;
@@ -945,6 +1034,60 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc::unbounded_channel;
     use tokio::task::yield_now;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct SharedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedLogBuffer {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogBuffer {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl std::io::Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock should be available")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_hotkey_logs(action: impl FnOnce()) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(SharedLogWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, action);
+
+        let bytes = buffer
+            .lock()
+            .expect("log buffer lock should be available")
+            .clone();
+        String::from_utf8(bytes).expect("captured logs should be UTF-8")
+    }
 
     #[test]
     fn parse_key_name_accepts_known_aliases() {
@@ -1120,7 +1263,8 @@ mod tests {
                 1
             ),
             Some(HotkeyEvent::Down {
-                intent: HotkeyIntent::LlmQuery
+                intent: HotkeyIntent::LlmQuery,
+                attach_state: HotkeyAttachState::Reconstructed,
             })
         );
     }
@@ -1174,8 +1318,141 @@ mod tests {
                 1
             ),
             Some(HotkeyEvent::Down {
-                intent: HotkeyIntent::LlmQuery
+                intent: HotkeyIntent::LlmQuery,
+                attach_state: HotkeyAttachState::Reconstructed,
             })
+        );
+    }
+
+    #[test]
+    fn degraded_attach_marker_is_one_shot_on_next_talk_down() {
+        let mut state = HotkeySharedState::default();
+        let llm_pre_modifiers = vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT];
+        state.note_degraded_attach();
+
+        let first = derive_hotkey_event(
+            &mut state,
+            Key::KEY_RIGHTCTRL,
+            &llm_pre_modifiers,
+            Key::KEY_RIGHTCTRL,
+            1,
+        );
+
+        assert_eq!(
+            first,
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::Dictate,
+                attach_state: HotkeyAttachState::Unreconstructed,
+            })
+        );
+
+        let up = derive_hotkey_event(
+            &mut state,
+            Key::KEY_RIGHTCTRL,
+            &llm_pre_modifiers,
+            Key::KEY_RIGHTCTRL,
+            0,
+        );
+        assert_eq!(up, Some(HotkeyEvent::Up));
+
+        let second = derive_hotkey_event(
+            &mut state,
+            Key::KEY_RIGHTCTRL,
+            &llm_pre_modifiers,
+            Key::KEY_RIGHTCTRL,
+            1,
+        );
+
+        assert_eq!(
+            second,
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::Dictate,
+                attach_state: HotkeyAttachState::Reconstructed,
+            })
+        );
+    }
+
+    #[test]
+    fn degraded_attach_marker_is_shared_across_modifier_and_talk_listeners() {
+        let mut state = HotkeySharedState::default();
+        let llm_pre_modifiers = vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT];
+
+        // A modifier-capable listener can fail attach-state reconstruction while
+        // a separate talk-key listener later emits the hotkey down event.
+        state.note_degraded_attach();
+
+        assert_eq!(
+            derive_hotkey_event(
+                &mut state,
+                Key::KEY_RIGHTCTRL,
+                &llm_pre_modifiers,
+                Key::KEY_RIGHTCTRL,
+                1,
+            ),
+            Some(HotkeyEvent::Down {
+                intent: HotkeyIntent::Dictate,
+                attach_state: HotkeyAttachState::Unreconstructed,
+            })
+        );
+    }
+
+    #[test]
+    fn degraded_attach_diagnostic_log_names_intent_and_unreconstructed_state() {
+        let logs = capture_hotkey_logs(|| {
+            maybe_log_degraded_attach_talk_down(
+                Path::new("/dev/input/event42"),
+                HotkeyEvent::Down {
+                    intent: HotkeyIntent::Dictate,
+                    attach_state: HotkeyAttachState::Unreconstructed,
+                },
+            );
+        });
+
+        assert!(logs.contains("attach state could not be reconstructed"));
+        assert!(logs.contains("captured_intent"));
+        assert!(logs.contains("dictate"));
+        assert!(logs.contains("attach_state_reconstructed=false"));
+        assert!(logs.contains("/dev/input/event42"));
+    }
+
+    #[test]
+    fn normal_seeded_attach_path_does_not_emit_degraded_diagnostic() {
+        let mut state = HotkeySharedState::default();
+        let mut pressed = ListenerPressedState::default();
+        let mut key_state = AttributeSet::new();
+        key_state.insert(Key::KEY_LEFTSHIFT);
+
+        assert_eq!(
+            seed_listener_pre_modifier_state(
+                &mut state,
+                &mut pressed,
+                &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+                &key_state,
+            ),
+            1
+        );
+        let event = derive_hotkey_event(
+            &mut state,
+            Key::KEY_RIGHTCTRL,
+            &[Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+            Key::KEY_RIGHTCTRL,
+            1,
+        )
+        .expect("talk down should emit a hotkey event");
+
+        assert_eq!(
+            event,
+            HotkeyEvent::Down {
+                intent: HotkeyIntent::LlmQuery,
+                attach_state: HotkeyAttachState::Reconstructed,
+            }
+        );
+        let logs = capture_hotkey_logs(|| {
+            maybe_log_degraded_attach_talk_down(Path::new("/dev/input/event7"), event);
+        });
+        assert!(
+            !logs.contains("attach state could not be reconstructed"),
+            "normal seeded attach path should not log degraded diagnostics: {logs}"
         );
     }
 
@@ -1268,7 +1545,8 @@ mod tests {
                 1
             ),
             Some(HotkeyEvent::Down {
-                intent: HotkeyIntent::Dictate
+                intent: HotkeyIntent::Dictate,
+                attach_state: HotkeyAttachState::Reconstructed,
             })
         );
     }
