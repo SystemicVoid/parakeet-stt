@@ -1363,7 +1363,10 @@ mod tests {
     };
     use crate::protocol::ServerMessage;
     use crate::routing::FocusObservation;
-    use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
+    use crate::surface_focus::{
+        FocusSnapshot, WaylandFocusObservation, WAYLAND_FOCUS_REASON_CACHE_STALE,
+        WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
+    };
     use anyhow::anyhow;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Instant as TokioInstant};
@@ -1830,7 +1833,7 @@ mod tests {
             FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
                 snapshot: test_focus_snapshot(Some("DP-1")),
                 cache_age_ms: 1_600,
-                reason: "wayland_cache_stale",
+                reason: WAYLAND_FOCUS_REASON_CACHE_STALE,
             });
         assert_eq!(
             focus_router
@@ -1842,7 +1845,7 @@ mod tests {
             FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
                 snapshot: test_focus_snapshot(Some("HDMI-A-1")),
                 cache_age_ms: 12,
-                reason: "wayland_transition_no_activated",
+                reason: WAYLAND_FOCUS_REASON_TRANSITION_NO_ACTIVATED,
             });
         assert_eq!(
             focus_router
