@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import UUID
 
 import numpy as np
@@ -81,6 +82,7 @@ from .tail_trim import SealPathTailTrimmer
 SESSION_GUARD_POLL_SECS = 0.1
 SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
+_InferenceResult = TypeVar("_InferenceResult")
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,16 +709,17 @@ class SessionOrchestrator:
             self._inference_lock = lock
         return lock
 
-    async def _transcribe_samples_serialized(self, samples: np.ndarray) -> str:
+    async def _run_inference_call_serialized(
+        self,
+        call: Callable[..., _InferenceResult],
+        *args: object,
+        **kwargs: object,
+    ) -> _InferenceResult:
         loop = asyncio.get_running_loop()
         async with self._inference_lock_for_runtime():
             inference = loop.run_in_executor(
                 None,
-                partial(
-                    self.transcriber.transcribe_samples,
-                    samples,
-                    sample_rate=self.audio.sample_rate,
-                ),
+                partial(call, *args, **kwargs),
             )
             try:
                 return await asyncio.shield(inference)
@@ -729,6 +732,13 @@ class SessionOrchestrator:
                         exc.__class__.__name__,
                     )
                 raise
+
+    async def _transcribe_samples_serialized(self, samples: np.ndarray) -> str:
+        return await self._run_inference_call_serialized(
+            self.transcriber.transcribe_samples,
+            samples,
+            sample_rate=self.audio.sample_rate,
+        )
 
     def interim_transcript_runtime_facts(
         self,
@@ -999,8 +1009,7 @@ class SessionOrchestrator:
         )
 
     async def _feed_stream_chunk(self, stream: ParakeetStreamingSession, chunk: np.ndarray) -> None:
-        async with self._inference_lock_for_runtime():
-            processed = await asyncio.to_thread(stream.feed, chunk)
+        processed = await self._run_inference_call_serialized(stream.feed, chunk)
         if processed:
             self._stream_path_runtime_for_runtime().record_chunk_processed()
             return
