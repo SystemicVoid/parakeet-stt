@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -154,10 +155,32 @@ def _start_event(session_id: UUID) -> dict[str, object]:
     return _start_message(session_id).model_dump(mode="json")
 
 
-def _build_server() -> DaemonServer:
+def _stop_message(session_id: UUID) -> StopSession:
+    return StopSession(
+        type=ClientMessageType.STOP_SESSION,
+        session_id=session_id,
+        timestamp=datetime.now(tz=UTC),
+    )
+
+
+def _abort_message(session_id: UUID) -> AbortSession:
+    return AbortSession(
+        type=ClientMessageType.ABORT_SESSION,
+        session_id=session_id,
+        reason="user",
+        timestamp=datetime.now(tz=UTC),
+    )
+
+
+def _build_server(*, overlay_events_enabled: bool = False) -> DaemonServer:
     server = cast(Any, DaemonServer.__new__(DaemonServer))
     orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
-    settings = ServerSettings(device="cpu", status_enabled=True, streaming_enabled=False)
+    settings = ServerSettings(
+        device="cpu",
+        status_enabled=True,
+        streaming_enabled=False,
+        overlay_events_enabled=overlay_events_enabled,
+    )
     server.settings = settings
     server.orchestrator = orchestrator
     server.event_sinks = WebSocketEventSinkState(
@@ -307,6 +330,147 @@ def test_disconnect_cleans_active_session_state() -> None:
         assert server.orchestrator._stream_drain_task is None
         assert drain_task.cancel_called is True
         assert drain_task.awaited is True
+
+    asyncio.run(scenario())
+
+
+def test_phase6_multiclient_reconnect_ownership_gate() -> None:
+    async def scenario() -> None:
+        server = _build_server(overlay_events_enabled=True)
+        audio = cast(FakeAudio, server.orchestrator.audio)
+        owner = FakeWebSocket([WebSocketDisconnect()])
+        non_owner = FakeWebSocket([WebSocketDisconnect()])
+        fresh = FakeWebSocket([])
+        owner_session_id = uuid4()
+        attempted_session_id = uuid4()
+        fresh_session_id = uuid4()
+        transitions: list[dict[str, object]] = []
+
+        def record_transition(label: str) -> None:
+            active = server.orchestrator.sessions.active
+            transitions.append(
+                {
+                    "active": active is not None,
+                    "label": label,
+                    "owner_token": active.owner_token if active is not None else None,
+                    "session_id": str(active.session_id) if active is not None else None,
+                }
+            )
+
+        await _dispatch_message(server, owner, _start_message(owner_session_id))
+        record_transition("owner_started")
+        active = server.orchestrator.sessions.active
+        assert active is not None
+        owner_token = active.owner_token
+
+        await _dispatch_message(server, non_owner, _start_message(attempted_session_id))
+        record_transition("non_owner_start_rejected")
+        await _dispatch_message(server, non_owner, _stop_message(owner_session_id))
+        record_transition("non_owner_stop_rejected")
+        await _dispatch_message(server, non_owner, _abort_message(owner_session_id))
+        record_transition("non_owner_abort_rejected")
+        await server.handle_websocket(cast(Any, non_owner))
+        record_transition("non_owner_disconnect_ignored")
+
+        active = server.orchestrator.sessions.active
+        assert active is not None
+        assert active.session_id == owner_session_id
+        assert active.owner_token == owner_token
+        assert audio.abort_calls == 0
+        assert audio.stop_calls == 0
+        non_owner_error_codes = [
+            payload["code"] for payload in non_owner.sent_json if payload["type"] == "error"
+        ]
+        assert non_owner_error_codes == [
+            "SESSION_BUSY",
+            "SESSION_NOT_FOUND",
+            "SESSION_NOT_FOUND",
+        ]
+
+        await server.handle_websocket(cast(Any, owner))
+        record_transition("owner_disconnect_cleared")
+        assert server.orchestrator.sessions.active is None
+        assert audio.abort_calls == 1
+
+        await _dispatch_message(server, fresh, _start_message(fresh_session_id))
+        record_transition("fresh_started")
+        await _dispatch_message(server, fresh, _stop_message(fresh_session_id))
+        record_transition("fresh_finalized")
+
+        fresh_types = [payload["type"] for payload in fresh.sent_json]
+        evidence = {
+            "fresh_finalized": "final_result" in fresh_types and fresh_types[-1] == "session_ended",
+            "fresh_owner_token": id(fresh),
+            "non_owner_error_codes": non_owner_error_codes,
+            "non_owner_token": id(non_owner),
+            "owner_abort_cleanup_count": audio.abort_calls,
+            "owner_session_id": str(owner_session_id),
+            "owner_token": owner_token,
+            "stop_calls": audio.stop_calls,
+            "transitions": transitions,
+        }
+        print("multiclient_ownership_evidence=" + json.dumps(evidence, sort_keys=True))
+
+        assert server.orchestrator.sessions.active is None
+        assert audio.stop_calls == 1
+        assert fresh_types == [
+            "session_started",
+            "interim_state",
+            "interim_state",
+            "interim_state",
+            "final_result",
+            "session_ended",
+        ]
+        assert transitions == [
+            {
+                "active": True,
+                "label": "owner_started",
+                "owner_token": owner_token,
+                "session_id": str(owner_session_id),
+            },
+            {
+                "active": True,
+                "label": "non_owner_start_rejected",
+                "owner_token": owner_token,
+                "session_id": str(owner_session_id),
+            },
+            {
+                "active": True,
+                "label": "non_owner_stop_rejected",
+                "owner_token": owner_token,
+                "session_id": str(owner_session_id),
+            },
+            {
+                "active": True,
+                "label": "non_owner_abort_rejected",
+                "owner_token": owner_token,
+                "session_id": str(owner_session_id),
+            },
+            {
+                "active": True,
+                "label": "non_owner_disconnect_ignored",
+                "owner_token": owner_token,
+                "session_id": str(owner_session_id),
+            },
+            {
+                "active": False,
+                "label": "owner_disconnect_cleared",
+                "owner_token": None,
+                "session_id": None,
+            },
+            {
+                "active": True,
+                "label": "fresh_started",
+                "owner_token": id(fresh),
+                "session_id": str(fresh_session_id),
+            },
+            {
+                "active": False,
+                "label": "fresh_finalized",
+                "owner_token": None,
+                "session_id": None,
+            },
+        ]
 
     asyncio.run(scenario())
 
