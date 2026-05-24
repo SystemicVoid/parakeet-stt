@@ -658,7 +658,7 @@ struct BackendAttemptOutcome {
     uinput_metadata: Option<UinputAttemptMetadata>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InjectionOutcome {
     SuccessAssumed,
     ClipboardNotReady,
@@ -678,6 +678,168 @@ impl InjectionOutcome {
             Self::CopyOnly => "copy_only",
             Self::ClipboardWriteFailed => "clipboard_write_failed",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardReadiness {
+    ready: bool,
+    probe_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteShortcutAttempt {
+    route_attempt_name: &'static str,
+    route_attempt_index: usize,
+    route_attempt_total: usize,
+    shortcut: PasteShortcut,
+}
+
+#[derive(Debug)]
+struct InjectionReportAssembly {
+    session_id: Option<Uuid>,
+    origin: Option<String>,
+    trace_id: u64,
+    outcome: InjectionOutcome,
+    error: Option<String>,
+    requested_len: usize,
+    requested_fingerprint: String,
+    clipboard_readiness: ClipboardReadiness,
+    post_clipboard_matches: Option<bool>,
+    parent_focus: Option<ParentFocusCapture>,
+    child_focus_before: Option<FocusSnapshot>,
+    child_focus_after: Option<FocusSnapshot>,
+    child_focus_source_selected: String,
+    child_focus_wayland_cache_age_ms: Option<u64>,
+    child_focus_wayland_fallback_reason: Option<String>,
+    route_decision: Option<RouteDecision>,
+    backend_attempts: Vec<BackendAttemptReport>,
+    elapsed_ms_total: u64,
+}
+
+struct InjectionTransactionPolicy;
+
+impl InjectionTransactionPolicy {
+    fn outcome_after_clipboard_readiness(readiness: ClipboardReadiness) -> InjectionOutcome {
+        if readiness.ready {
+            InjectionOutcome::SuccessAssumed
+        } else {
+            InjectionOutcome::ClipboardNotReady
+        }
+    }
+
+    fn decide_route(
+        focus: &FocusObservation,
+        forced_shortcut: Option<PasteShortcut>,
+    ) -> RouteDecision {
+        if let Some(forced_shortcut) = forced_shortcut {
+            return RouteDecision::forced(
+                "forced_shortcut",
+                focus.confidence,
+                focus
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.output_name.as_ref().cloned()),
+                forced_shortcut,
+                "forced_diagnostic_shortcut",
+            );
+        }
+
+        decide_route_for_focus(focus.route_input())
+    }
+
+    fn route_shortcut_attempts(
+        primary: PasteShortcut,
+        adaptive_fallback: Option<PasteShortcut>,
+    ) -> Vec<RouteShortcutAttempt> {
+        let total = if adaptive_fallback.is_some() { 2 } else { 1 };
+        let mut attempts = Vec::with_capacity(total);
+        attempts.push(RouteShortcutAttempt {
+            route_attempt_name: "primary",
+            route_attempt_index: 1,
+            route_attempt_total: total,
+            shortcut: primary,
+        });
+        if let Some(shortcut) = adaptive_fallback {
+            attempts.push(RouteShortcutAttempt {
+                route_attempt_name: "adaptive_fallback",
+                route_attempt_index: 2,
+                route_attempt_total: total,
+                shortcut,
+            });
+        }
+        attempts
+    }
+
+    fn legacy_route_fields(
+        route_decision: Option<&RouteDecision>,
+    ) -> (String, String, String, Option<String>, String) {
+        let Some(route_decision) = route_decision else {
+            return (
+                ClipboardInjector::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
+                ClipboardInjector::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
+                ClipboardInjector::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
+                None,
+                ClipboardInjector::ROUTE_REASON_NOT_APPLICABLE.to_string(),
+            );
+        };
+
+        (
+            route_decision.source.clone(),
+            route_decision.route_class_name().to_string(),
+            ClipboardInjector::shortcut_name(route_decision.shortcut_plan.primary),
+            route_decision
+                .shortcut_plan
+                .adaptive_fallback
+                .map(ClipboardInjector::shortcut_name),
+            route_decision.reason.clone(),
+        )
+    }
+
+    fn assemble_report(input: InjectionReportAssembly) -> InjectorChildReport {
+        let (route_focus_source, route_class, route_primary, route_adaptive_fallback, route_reason) =
+            Self::legacy_route_fields(input.route_decision.as_ref());
+
+        InjectorChildReport {
+            session_id: input.session_id,
+            origin: input.origin,
+            trace_id: input.trace_id,
+            outcome: input.outcome.as_str().to_string(),
+            error: input.error,
+            requested_len: input.requested_len,
+            requested_fingerprint: input.requested_fingerprint,
+            clipboard_ready: input.clipboard_readiness.ready,
+            clipboard_probe_count: input.clipboard_readiness.probe_count,
+            post_clipboard_matches: input.post_clipboard_matches,
+            parent_focus: input.parent_focus,
+            child_focus_before: input.child_focus_before,
+            child_focus_after: input.child_focus_after,
+            child_focus_source_selected: input.child_focus_source_selected,
+            child_focus_wayland_cache_age_ms: input.child_focus_wayland_cache_age_ms,
+            child_focus_wayland_fallback_reason: input.child_focus_wayland_fallback_reason,
+            route_decision: input.route_decision,
+            route_focus_source,
+            route_class,
+            route_primary,
+            route_adaptive_fallback,
+            route_reason,
+            backend_attempts: input.backend_attempts,
+            elapsed_ms_total: input.elapsed_ms_total,
+        }
+    }
+}
+
+struct WaylandInjectionFocusProvider<'a> {
+    cache: Option<&'a WaylandFocusCache>,
+}
+
+impl WaylandInjectionFocusProvider<'_> {
+    fn observe(&self, stale_ms: u64, transition_grace_ms: u64) -> FocusObservation {
+        let Some(cache) = self.cache else {
+            return FocusObservation::unavailable("wayland_cache_not_initialized", None);
+        };
+
+        FocusObservation::from_wayland(cache.observe(stale_ms, transition_grace_ms))
     }
 }
 
@@ -745,31 +907,6 @@ impl ClipboardInjector {
             PasteShortcut::CtrlV => "CtrlV".to_string(),
             PasteShortcut::CtrlShiftV => "CtrlShiftV".to_string(),
         }
-    }
-
-    fn legacy_route_fields(
-        route_decision: Option<&RouteDecision>,
-    ) -> (String, String, String, Option<String>, String) {
-        let Some(route_decision) = route_decision else {
-            return (
-                Self::ROUTE_FOCUS_SOURCE_NOT_APPLICABLE.to_string(),
-                Self::ROUTE_CLASS_NOT_APPLICABLE.to_string(),
-                Self::ROUTE_PRIMARY_NOT_APPLICABLE.to_string(),
-                None,
-                Self::ROUTE_REASON_NOT_APPLICABLE.to_string(),
-            );
-        };
-
-        (
-            route_decision.source.clone(),
-            route_decision.route_class_name().to_string(),
-            Self::shortcut_name(route_decision.shortcut_plan.primary),
-            route_decision
-                .shortcut_plan
-                .adaptive_fallback
-                .map(Self::shortcut_name),
-            route_decision.reason.clone(),
-        )
     }
 
     fn backend_attempt_report(
@@ -1264,48 +1401,43 @@ impl ClipboardInjector {
         adaptive_fallback: Option<PasteShortcut>,
         backend_attempts: &mut Vec<BackendAttemptReport>,
     ) -> Result<()> {
-        let mut attempts = vec![("primary", primary)];
-        if let Some(fallback) = adaptive_fallback {
-            attempts.push(("adaptive_fallback", fallback));
-        }
-
         let stage_started = Self::stage_start(
             trace_id,
             InjectionStage::RouteShortcut,
             "starting routed shortcut stage",
         );
         let mut errors = Vec::new();
-        let total = attempts.len();
-        for (index, (attempt_name, shortcut)) in attempts.iter().enumerate() {
-            let route_attempt_index = index + 1;
-            if index > 0 {
+        for attempt in
+            InjectionTransactionPolicy::route_shortcut_attempts(primary, adaptive_fallback)
+        {
+            if attempt.route_attempt_index > 1 {
                 info!(
                     trace_id,
                     stage = STAGE_ROUTE_SHORTCUT,
-                    route_attempt = *attempt_name,
-                    route_attempt_index,
-                    route_attempt_total = total,
-                    route_shortcut = ?shortcut,
+                    route_attempt = attempt.route_attempt_name,
+                    route_attempt_index = attempt.route_attempt_index,
+                    route_attempt_total = attempt.route_attempt_total,
+                    route_shortcut = ?attempt.shortcut,
                     "attempting adaptive route fallback shortcut"
                 );
             }
 
             match self.run_shortcut_for_route(
                 trace_id,
-                attempt_name,
-                route_attempt_index,
-                total,
-                *shortcut,
+                attempt.route_attempt_name,
+                attempt.route_attempt_index,
+                attempt.route_attempt_total,
+                attempt.shortcut,
                 backend_attempts,
             ) {
                 Ok(()) => {
                     debug!(
                         trace_id,
                         stage = STAGE_ROUTE_SHORTCUT,
-                        route_attempt = *attempt_name,
-                        route_attempt_index,
-                        route_attempt_total = total,
-                        route_shortcut = ?shortcut,
+                        route_attempt = attempt.route_attempt_name,
+                        route_attempt_index = attempt.route_attempt_index,
+                        route_attempt_total = attempt.route_attempt_total,
+                        route_shortcut = ?attempt.shortcut,
                         "route shortcut attempt succeeded"
                     );
                     Self::stage_success(
@@ -1321,14 +1453,17 @@ impl ClipboardInjector {
                     warn!(
                         trace_id,
                         stage = STAGE_ROUTE_SHORTCUT,
-                        route_attempt = *attempt_name,
-                        route_attempt_index,
-                        route_attempt_total = total,
-                        route_shortcut = ?shortcut,
+                        route_attempt = attempt.route_attempt_name,
+                        route_attempt_index = attempt.route_attempt_index,
+                        route_attempt_total = attempt.route_attempt_total,
+                        route_shortcut = ?attempt.shortcut,
                         error = %err_text,
                         "route shortcut attempt failed"
                     );
-                    errors.push(format!("{attempt_name}({shortcut:?}): {err_text}"));
+                    errors.push(format!(
+                        "{}({:?}): {err_text}",
+                        attempt.route_attempt_name, attempt.shortcut
+                    ));
                 }
             }
         }
@@ -1434,12 +1569,10 @@ impl ClipboardInjector {
     }
 
     fn resolve_focus_metadata(&self, _trace_id: u64) -> FocusObservation {
-        let Some(cache) = self.wayland_focus_cache.as_ref() else {
-            return FocusObservation::unavailable("wayland_cache_not_initialized", None);
-        };
-        FocusObservation::from_wayland(
-            cache.observe(Self::WAYLAND_STALE_MS, Self::WAYLAND_TRANSITION_GRACE_MS),
-        )
+        WaylandInjectionFocusProvider {
+            cache: self.wayland_focus_cache.as_ref(),
+        }
+        .observe(Self::WAYLAND_STALE_MS, Self::WAYLAND_TRANSITION_GRACE_MS)
     }
 }
 
@@ -1473,23 +1606,18 @@ impl TextInjector for ClipboardInjector {
                            child_focus_wayland_fallback_reason: Option<String>,
                            route_decision: Option<RouteDecision>,
                            backend_attempts: Vec<BackendAttemptReport>| {
-            let (
-                route_focus_source,
-                route_class,
-                route_primary,
-                route_adaptive_fallback,
-                route_reason,
-            ) = Self::legacy_route_fields(route_decision.as_ref());
-            Self::emit_report(&InjectorChildReport {
+            let report = InjectionTransactionPolicy::assemble_report(InjectionReportAssembly {
                 session_id,
                 origin: origin.clone(),
                 trace_id,
-                outcome: outcome.as_str().to_string(),
+                outcome,
                 error,
                 requested_len: text.len(),
                 requested_fingerprint: requested_fingerprint.clone(),
-                clipboard_ready,
-                clipboard_probe_count,
+                clipboard_readiness: ClipboardReadiness {
+                    ready: clipboard_ready,
+                    probe_count: clipboard_probe_count,
+                },
                 post_clipboard_matches,
                 parent_focus: parent_focus.clone(),
                 child_focus_before,
@@ -1498,14 +1626,10 @@ impl TextInjector for ClipboardInjector {
                 child_focus_wayland_cache_age_ms,
                 child_focus_wayland_fallback_reason,
                 route_decision,
-                route_focus_source,
-                route_class,
-                route_primary,
-                route_adaptive_fallback,
-                route_reason,
                 backend_attempts,
                 elapsed_ms_total: started.elapsed().as_millis() as u64,
             });
+            Self::emit_report(&report);
         };
 
         self.log_injection_start(trace_id, text, &requested_fingerprint);
@@ -1602,8 +1726,11 @@ impl TextInjector for ClipboardInjector {
             Duration::from_millis(Self::CLIPBOARD_READY_TIMEOUT_MS),
             trace_id,
         );
+        let clipboard_readiness = ClipboardReadiness { ready, probe_count };
 
-        let mut outcome = if ready {
+        let mut outcome =
+            InjectionTransactionPolicy::outcome_after_clipboard_readiness(clipboard_readiness);
+        if ready {
             Self::stage_success(
                 trace_id,
                 InjectionStage::ClipboardReady,
@@ -1619,10 +1746,9 @@ impl TextInjector for ClipboardInjector {
                 stored_fingerprint = %observed
                     .as_ref()
                     .map(|value| fingerprint(value))
-                    .unwrap_or_else(|| "none".to_string()),
+                .unwrap_or_else(|| "none".to_string()),
                 "clipboard became ready with requested text"
             );
-            InjectionOutcome::SuccessAssumed
         } else {
             let stage_error = format!(
                 "clipboard did not match requested text before timeout (timeout_ms={})",
@@ -1650,8 +1776,7 @@ impl TextInjector for ClipboardInjector {
                 timeout_ms = Self::CLIPBOARD_READY_TIMEOUT_MS,
                 "clipboard did not match requested text before timeout; continuing in degraded mode"
             );
-            InjectionOutcome::ClipboardNotReady
-        };
+        }
 
         if self.copy_only {
             self.transfer_to_background_if_needed(
@@ -1691,73 +1816,57 @@ impl TextInjector for ClipboardInjector {
         child_focus_wayland_fallback_reason =
             child_focus.wayland_fallback_reason.map(str::to_string);
 
-        let (route_primary_shortcut, route_adaptive_fallback_shortcut) =
-            if let Some(forced_shortcut) = self.forced_shortcut {
-                let route = RouteDecision::forced(
-                    "forced_shortcut",
-                    child_focus.confidence,
-                    child_focus
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.output_name.as_ref().cloned()),
-                    forced_shortcut,
-                    "forced_diagnostic_shortcut",
-                );
-                let shortcuts = route.shortcut_plan;
-                info!(
-                    trace_id,
-                    forced_shortcut = ?forced_shortcut,
-                    focus_source_selected = child_focus_source_selected,
-                    route_source = route.source.as_str(),
-                    route_focus_confidence = route.focus_confidence.as_report_str(),
-                    route_output_name = route.output_name.as_deref(),
-                    focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
-                    focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
-                    "using forced diagnostic route shortcut override"
-                );
-                route_decision = Some(route);
-                (shortcuts.primary, shortcuts.adaptive_fallback)
-            } else {
-                let route = decide_route_for_focus(child_focus.route_input());
-                let shortcuts = route.shortcut_plan;
-
-                if let Some(snapshot) = child_focus.snapshot.as_ref() {
-                    info!(
-                        trace_id,
-                        focus_source_selected = route.source.as_str(),
-                        focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
-                        focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
-                        resolver = snapshot.resolver,
-                        focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
-                        focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
-                        focus_output_name = route.output_name.as_deref(),
-                        focus_active = snapshot.active,
-                        focus_focused = snapshot.focused,
-                        route_class = ?route.surface_class,
-                        route_primary = ?route.shortcut_plan.primary,
-                        route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
-                        route_focus_confidence = route.focus_confidence.as_report_str(),
-                        route_reason = %route.reason,
-                        "resolved focused surface for adaptive routing"
-                    );
-                } else {
-                    info!(
-                        trace_id,
-                        focus_source_selected = route.source.as_str(),
-                        focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
-                        focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
-                        route_class = ?route.surface_class,
-                        route_primary = ?route.shortcut_plan.primary,
-                        route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
-                        route_focus_confidence = route.focus_confidence.as_report_str(),
-                        route_output_name = route.output_name.as_deref(),
-                        route_reason = %route.reason,
-                        "no focused surface metadata; using unknown routing fallback"
-                    );
-                }
-                route_decision = Some(route);
-                (shortcuts.primary, shortcuts.adaptive_fallback)
-            };
+        let route = InjectionTransactionPolicy::decide_route(&child_focus, self.forced_shortcut);
+        let shortcuts = route.shortcut_plan;
+        if let Some(forced_shortcut) = self.forced_shortcut {
+            info!(
+                trace_id,
+                forced_shortcut = ?forced_shortcut,
+                focus_source_selected = child_focus_source_selected,
+                route_source = route.source.as_str(),
+                route_focus_confidence = route.focus_confidence.as_report_str(),
+                route_output_name = route.output_name.as_deref(),
+                focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                "using forced diagnostic route shortcut override"
+            );
+        } else if let Some(snapshot) = child_focus.snapshot.as_ref() {
+            info!(
+                trace_id,
+                focus_source_selected = route.source.as_str(),
+                focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                resolver = snapshot.resolver,
+                focus_app = snapshot.app_name.as_deref().unwrap_or("<unknown>"),
+                focus_object = snapshot.object_name.as_deref().unwrap_or("<unknown>"),
+                focus_output_name = route.output_name.as_deref(),
+                focus_active = snapshot.active,
+                focus_focused = snapshot.focused,
+                route_class = ?route.surface_class,
+                route_primary = ?route.shortcut_plan.primary,
+                route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
+                route_focus_confidence = route.focus_confidence.as_report_str(),
+                route_reason = %route.reason,
+                "resolved focused surface for adaptive routing"
+            );
+        } else {
+            info!(
+                trace_id,
+                focus_source_selected = route.source.as_str(),
+                focus_wayland_cache_age_ms = ?child_focus_wayland_cache_age_ms,
+                focus_wayland_fallback_reason = ?child_focus_wayland_fallback_reason,
+                route_class = ?route.surface_class,
+                route_primary = ?route.shortcut_plan.primary,
+                route_adaptive_fallback = ?route.shortcut_plan.adaptive_fallback,
+                route_focus_confidence = route.focus_confidence.as_report_str(),
+                route_output_name = route.output_name.as_deref(),
+                route_reason = %route.reason,
+                "no focused surface metadata; using unknown routing fallback"
+            );
+        }
+        route_decision = Some(route);
+        let route_primary_shortcut = shortcuts.primary;
+        let route_adaptive_fallback_shortcut = shortcuts.adaptive_fallback;
 
         // 3. Send routed paste shortcut(s).
         if let Err(err) = self.run_route_shortcuts(
@@ -1927,13 +2036,16 @@ fn fingerprint(text: &str) -> String {
 mod tests {
     use super::{
         configure_subprocess_process_group, BackendAttemptOutcome, ClipboardInjector,
-        InjectionOutcome, InjectorChildReport, ParentFocusCapture, PasteKeySender,
+        ClipboardReadiness, InjectionOutcome, InjectionReportAssembly, InjectionTransactionPolicy,
+        InjectorChildReport, ParentFocusCapture, PasteKeySender, RouteShortcutAttempt,
         ShortcutAttemptContext, UinputAttemptMetadata, UinputChordSender, UinputKeyEmitter,
     };
     use crate::config::{
         ClipboardOptions, PasteBackendFailurePolicy, PasteKeyBackend, PasteShortcut,
     };
-    use crate::routing::{FocusConfidence, RouteDecision, ShortcutPlan, SurfaceClass};
+    use crate::routing::{
+        FocusConfidence, FocusObservation, RouteDecision, ShortcutPlan, SurfaceClass,
+    };
     use crate::surface_focus::FocusSnapshot;
     use evdev::Key;
     #[cfg(unix)]
@@ -2440,6 +2552,259 @@ mod tests {
         );
         assert_eq!(decoded.route_primary, "N/A");
         assert_eq!(decoded.route_adaptive_fallback, None);
+    }
+
+    #[test]
+    fn transaction_policy_plans_route_fallback_without_shortcut_sender() {
+        let focus = FocusObservation {
+            snapshot: Some(test_focus_snapshot("wayland")),
+            source_selected: "wayland_cache",
+            confidence: FocusConfidence::Fresh,
+            wayland_cache_age_ms: Some(8),
+            wayland_fallback_reason: None,
+        };
+
+        let route = InjectionTransactionPolicy::decide_route(&focus, None);
+        assert_eq!(route.surface_class, SurfaceClass::Terminal);
+        assert_eq!(route.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            route.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+
+        assert_eq!(
+            InjectionTransactionPolicy::route_shortcut_attempts(
+                route.shortcut_plan.primary,
+                route.shortcut_plan.adaptive_fallback,
+            ),
+            vec![
+                RouteShortcutAttempt {
+                    route_attempt_name: "primary",
+                    route_attempt_index: 1,
+                    route_attempt_total: 2,
+                    shortcut: PasteShortcut::CtrlShiftV,
+                },
+                RouteShortcutAttempt {
+                    route_attempt_name: "adaptive_fallback",
+                    route_attempt_index: 2,
+                    route_attempt_total: 2,
+                    shortcut: PasteShortcut::CtrlV,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_policy_preserves_clipboard_readiness_outcomes_without_clipboard_io() {
+        assert_eq!(
+            InjectionTransactionPolicy::outcome_after_clipboard_readiness(ClipboardReadiness {
+                ready: true,
+                probe_count: 2,
+            }),
+            InjectionOutcome::SuccessAssumed
+        );
+        assert_eq!(
+            InjectionTransactionPolicy::outcome_after_clipboard_readiness(ClipboardReadiness {
+                ready: false,
+                probe_count: 8,
+            }),
+            InjectionOutcome::ClipboardNotReady
+        );
+    }
+
+    #[test]
+    fn transaction_policy_assembles_success_report_without_os_adapters() {
+        let backend_attempt = ClipboardInjector::backend_attempt_report(
+            ShortcutAttemptContext {
+                route_attempt_name: "primary",
+                route_attempt_index: 1,
+                route_attempt_total: 1,
+                backend_attempt_index: 1,
+                backend_attempt_total: 1,
+            },
+            "uinput",
+            "CtrlV",
+            BackendAttemptOutcome {
+                status: "ok",
+                duration_ms: 4,
+                exit_status: None,
+                stderr_excerpt: None,
+                warning_tags: Vec::new(),
+                backend_config: Some("dwell_ms=1".to_string()),
+                error: None,
+                uinput_metadata: None,
+            },
+        );
+        let report = InjectionTransactionPolicy::assemble_report(InjectionReportAssembly {
+            session_id: Some(Uuid::nil()),
+            origin: Some("raw_final_result".to_string()),
+            trace_id: 101,
+            outcome: InjectionOutcome::SuccessAssumed,
+            error: None,
+            requested_len: 11,
+            requested_fingerprint: "fingerprint".to_string(),
+            clipboard_readiness: ClipboardReadiness {
+                ready: true,
+                probe_count: 2,
+            },
+            post_clipboard_matches: Some(true),
+            parent_focus: Some(ParentFocusCapture {
+                snapshot: Some(test_focus_snapshot("parent")),
+                source_selected: "wayland".to_string(),
+                wayland_cache_age_ms: Some(3),
+                wayland_fallback_reason: None,
+                captured_elapsed_ms: Some(5),
+            }),
+            child_focus_before: Some(test_focus_snapshot("before")),
+            child_focus_after: Some(test_focus_snapshot("after")),
+            child_focus_source_selected: "wayland_cache".to_string(),
+            child_focus_wayland_cache_age_ms: Some(8),
+            child_focus_wayland_fallback_reason: None,
+            route_decision: Some(RouteDecision {
+                source: "wayland_cache".to_string(),
+                focus_confidence: FocusConfidence::Fresh,
+                surface_class: SurfaceClass::General,
+                shortcut_plan: ShortcutPlan {
+                    primary: PasteShortcut::CtrlV,
+                    adaptive_fallback: None,
+                },
+                output_name: Some("DP-1".to_string()),
+                reason: "focused general surface".to_string(),
+            }),
+            backend_attempts: vec![backend_attempt],
+            elapsed_ms_total: 17,
+        });
+
+        assert_eq!(report.outcome, "success_assumed");
+        assert!(report.clipboard_ready);
+        assert_eq!(report.clipboard_probe_count, 2);
+        assert_eq!(report.route_focus_source, "wayland_cache");
+        assert_eq!(report.route_class, "General");
+        assert_eq!(report.route_primary, "CtrlV");
+        assert_eq!(report.route_adaptive_fallback, None);
+        assert_eq!(report.backend_attempts.len(), 1);
+        assert_eq!(report.child_focus_source_selected, "wayland_cache");
+    }
+
+    #[test]
+    fn transaction_policy_assembles_backend_failure_report_without_shortcut_sender() {
+        let route_decision = RouteDecision {
+            source: "wayland_cache".to_string(),
+            focus_confidence: FocusConfidence::Fresh,
+            surface_class: SurfaceClass::Terminal,
+            shortcut_plan: ShortcutPlan {
+                primary: PasteShortcut::CtrlShiftV,
+                adaptive_fallback: Some(PasteShortcut::CtrlV),
+            },
+            output_name: Some("DP-1".to_string()),
+            reason: "focused terminal".to_string(),
+        };
+        let backend_attempts = InjectionTransactionPolicy::route_shortcut_attempts(
+            route_decision.shortcut_plan.primary,
+            route_decision.shortcut_plan.adaptive_fallback,
+        )
+        .into_iter()
+        .map(|attempt| {
+            ClipboardInjector::backend_attempt_report(
+                ShortcutAttemptContext {
+                    route_attempt_name: attempt.route_attempt_name,
+                    route_attempt_index: attempt.route_attempt_index,
+                    route_attempt_total: attempt.route_attempt_total,
+                    backend_attempt_index: 1,
+                    backend_attempt_total: 1,
+                },
+                "disabled",
+                &ClipboardInjector::shortcut_name(attempt.shortcut),
+                BackendAttemptOutcome {
+                    status: "error",
+                    duration_ms: 1,
+                    exit_status: None,
+                    stderr_excerpt: None,
+                    warning_tags: Vec::new(),
+                    backend_config: None,
+                    error: Some("stage=backend paste key sender is disabled".to_string()),
+                    uinput_metadata: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let report = InjectionTransactionPolicy::assemble_report(InjectionReportAssembly {
+            session_id: None,
+            origin: None,
+            trace_id: 202,
+            outcome: InjectionOutcome::ChordFailed,
+            error: None,
+            requested_len: 4,
+            requested_fingerprint: "deadbeef".to_string(),
+            clipboard_readiness: ClipboardReadiness {
+                ready: true,
+                probe_count: 1,
+            },
+            post_clipboard_matches: None,
+            parent_focus: None,
+            child_focus_before: Some(test_focus_snapshot("before")),
+            child_focus_after: None,
+            child_focus_source_selected: "wayland_cache".to_string(),
+            child_focus_wayland_cache_age_ms: Some(9),
+            child_focus_wayland_fallback_reason: None,
+            route_decision: Some(route_decision),
+            backend_attempts,
+            elapsed_ms_total: 12,
+        });
+
+        assert_eq!(report.outcome, "chord_failed");
+        assert_eq!(report.route_primary, "CtrlShiftV");
+        assert_eq!(report.route_adaptive_fallback.as_deref(), Some("CtrlV"));
+        assert_eq!(report.backend_attempts.len(), 2);
+        assert_eq!(report.backend_attempts[0].route_attempt_name, "primary");
+        assert_eq!(
+            report.backend_attempts[1].route_attempt_name,
+            "adaptive_fallback"
+        );
+        assert!(report
+            .backend_attempts
+            .iter()
+            .all(|attempt| attempt.status == "error"));
+    }
+
+    #[test]
+    fn transaction_policy_assembles_clipboard_write_failure_without_focus_or_route() {
+        let report = InjectionTransactionPolicy::assemble_report(InjectionReportAssembly {
+            session_id: Some(Uuid::nil()),
+            origin: Some("raw_final_result".to_string()),
+            trace_id: 303,
+            outcome: InjectionOutcome::ClipboardWriteFailed,
+            error: Some("failed to set clipboard contents".to_string()),
+            requested_len: 4,
+            requested_fingerprint: "deadbeef".to_string(),
+            clipboard_readiness: ClipboardReadiness {
+                ready: false,
+                probe_count: 0,
+            },
+            post_clipboard_matches: None,
+            parent_focus: None,
+            child_focus_before: None,
+            child_focus_after: None,
+            child_focus_source_selected: "not_resolved".to_string(),
+            child_focus_wayland_cache_age_ms: None,
+            child_focus_wayland_fallback_reason: None,
+            route_decision: None,
+            backend_attempts: Vec::new(),
+            elapsed_ms_total: 2,
+        });
+
+        assert_eq!(report.outcome, "clipboard_write_failed");
+        assert!(!report.clipboard_ready);
+        assert_eq!(report.clipboard_probe_count, 0);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("failed to set clipboard contents")
+        );
+        assert_eq!(report.route_focus_source, "n/a");
+        assert_eq!(report.route_class, "N/A");
+        assert_eq!(report.route_primary, "N/A");
+        assert_eq!(report.route_adaptive_fallback, None);
     }
 
     #[test]
