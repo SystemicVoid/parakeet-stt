@@ -1,6 +1,9 @@
 use crate::config::PasteShortcut;
-use crate::surface_focus::FocusSnapshot;
+use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
 use serde::{Deserialize, Serialize};
+
+pub const OVERLAY_OUTPUT_STALE_MS: u64 = 1_500;
+pub const OVERLAY_OUTPUT_TRANSITION_GRACE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SurfaceClass {
@@ -56,6 +59,68 @@ impl<'a> FocusRouteInput<'a> {
             source,
             confidence,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FocusObservation {
+    pub snapshot: Option<FocusSnapshot>,
+    pub source_selected: &'static str,
+    pub confidence: FocusConfidence,
+    pub wayland_cache_age_ms: Option<u64>,
+    pub wayland_fallback_reason: Option<&'static str>,
+}
+
+impl FocusObservation {
+    pub fn from_wayland(observation: WaylandFocusObservation) -> Self {
+        match observation {
+            WaylandFocusObservation::Fresh {
+                snapshot,
+                cache_age_ms,
+            } => Self {
+                snapshot: Some(snapshot),
+                source_selected: "wayland_cache",
+                confidence: FocusConfidence::Fresh,
+                wayland_cache_age_ms: Some(cache_age_ms),
+                wayland_fallback_reason: None,
+            },
+            WaylandFocusObservation::LowConfidence {
+                snapshot,
+                cache_age_ms,
+                reason,
+            } => Self {
+                snapshot: Some(snapshot),
+                source_selected: "wayland_cache_low_confidence",
+                confidence: FocusConfidence::LowConfidence,
+                wayland_cache_age_ms: Some(cache_age_ms),
+                wayland_fallback_reason: Some(reason),
+            },
+            WaylandFocusObservation::Unavailable {
+                reason,
+                cache_age_ms,
+            } => Self::unavailable(reason, cache_age_ms),
+        }
+    }
+
+    pub fn unavailable(
+        reason: &'static str,
+        wayland_cache_age_ms: Option<u64>,
+    ) -> FocusObservation {
+        Self {
+            snapshot: None,
+            source_selected: "wayland_unavailable",
+            confidence: FocusConfidence::Unavailable,
+            wayland_cache_age_ms,
+            wayland_fallback_reason: Some(reason),
+        }
+    }
+
+    pub fn route_input(&self) -> FocusRouteInput<'_> {
+        FocusRouteInput::new(
+            self.snapshot.as_ref(),
+            self.source_selected,
+            self.confidence,
+        )
     }
 }
 
@@ -180,6 +245,27 @@ pub fn decide_route_for_focus(input: FocusRouteInput<'_>) -> RouteDecision {
     }
 }
 
+pub fn decide_overlay_output_target(observation: &FocusObservation) -> Option<String> {
+    match observation.confidence {
+        FocusConfidence::Fresh => observation
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.output_name.clone()),
+        FocusConfidence::LowConfidence
+            if matches!(
+                observation.wayland_fallback_reason,
+                Some("wayland_transition_no_activated" | "wayland_cache_stale")
+            ) =>
+        {
+            observation
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.output_name.clone())
+        }
+        FocusConfidence::LowConfidence | FocusConfidence::Unavailable => None,
+    }
+}
+
 fn route_decision(
     input: FocusRouteInput<'_>,
     surface_class: SurfaceClass,
@@ -267,11 +353,11 @@ fn normalize_for_hint_match(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_surface_with_reason, decide_route_for_focus, FocusConfidence, FocusRouteInput,
-        SurfaceClass,
+        classify_surface_with_reason, decide_overlay_output_target, decide_route_for_focus,
+        FocusConfidence, FocusObservation, FocusRouteInput, SurfaceClass,
     };
     use crate::config::PasteShortcut;
-    use crate::surface_focus::FocusSnapshot;
+    use crate::surface_focus::{FocusSnapshot, WaylandFocusObservation};
 
     fn snapshot(
         app_name: &str,
@@ -471,5 +557,92 @@ mod tests {
         );
         assert_eq!(decision.output_name, None);
         assert_eq!(decision.reason, "adaptive unknown surface");
+    }
+
+    #[test]
+    fn shared_focus_observation_feeds_injection_route_and_overlay_target() {
+        let mut focus = snapshot(
+            "Ghostty",
+            "terminal",
+            "/com/mitchellh/ghostty/a11y/abc",
+            true,
+        );
+        focus.output_name = Some("DP-1".to_string());
+
+        let observation = FocusObservation::from_wayland(WaylandFocusObservation::Fresh {
+            snapshot: focus,
+            cache_age_ms: 8,
+        });
+        let route = decide_route_for_focus(observation.route_input());
+
+        assert_eq!(observation.source_selected, "wayland_cache");
+        assert_eq!(observation.confidence, FocusConfidence::Fresh);
+        assert_eq!(route.source, "wayland_cache");
+        assert_eq!(route.focus_confidence, FocusConfidence::Fresh);
+        assert_eq!(route.surface_class, SurfaceClass::Terminal);
+        assert_eq!(route.output_name.as_deref(), Some("DP-1"));
+        assert_eq!(
+            decide_overlay_output_target(&observation).as_deref(),
+            Some("DP-1")
+        );
+    }
+
+    #[test]
+    fn overlay_output_target_preserves_focus_confidence_rules() {
+        let mut fresh = snapshot("Code", "editor", "/org/example/code", true);
+        fresh.output_name = Some("DP-1".to_string());
+        let fresh_observation = FocusObservation::from_wayland(WaylandFocusObservation::Fresh {
+            snapshot: fresh,
+            cache_age_ms: 4,
+        });
+        assert_eq!(
+            decide_overlay_output_target(&fresh_observation).as_deref(),
+            Some("DP-1")
+        );
+
+        let mut stale = snapshot("Ghostty", "terminal", "/org/example/terminal", true);
+        stale.output_name = Some("HDMI-A-1".to_string());
+        let stale_observation =
+            FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
+                snapshot: stale,
+                cache_age_ms: 1_600,
+                reason: "wayland_cache_stale",
+            });
+        assert_eq!(
+            decide_overlay_output_target(&stale_observation).as_deref(),
+            Some("HDMI-A-1")
+        );
+
+        let mut transition = snapshot("Code", "editor", "/org/example/code", false);
+        transition.output_name = Some("DP-2".to_string());
+        let transition_observation =
+            FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
+                snapshot: transition,
+                cache_age_ms: 12,
+                reason: "wayland_transition_no_activated",
+            });
+        assert_eq!(
+            decide_overlay_output_target(&transition_observation).as_deref(),
+            Some("DP-2")
+        );
+
+        let mut low_confidence_other = snapshot("Code", "editor", "/org/example/code", true);
+        low_confidence_other.output_name = Some("DP-3".to_string());
+        let low_confidence_other_observation =
+            FocusObservation::from_wayland(WaylandFocusObservation::LowConfidence {
+                snapshot: low_confidence_other,
+                cache_age_ms: 12,
+                reason: "other_low_confidence_reason",
+            });
+        assert_eq!(
+            decide_overlay_output_target(&low_confidence_other_observation),
+            None
+        );
+
+        let unavailable = FocusObservation::from_wayland(WaylandFocusObservation::Unavailable {
+            reason: "wayland_cache_uninitialized",
+            cache_age_ms: None,
+        });
+        assert_eq!(decide_overlay_output_target(&unavailable), None);
     }
 }
