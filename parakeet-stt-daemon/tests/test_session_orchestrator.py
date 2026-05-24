@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
@@ -133,6 +134,114 @@ class FakeTranscriber:
     def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
         self.calls.append((samples.copy(), sample_rate))
         return self.text
+
+
+class InferenceOverlapProbe:
+    def __init__(self) -> None:
+        self.live_started = threading.Event()
+        self.release_live = threading.Event()
+        self.stream_feed_started = threading.Event()
+        self.release_stream_feed = threading.Event()
+        self.final_started = threading.Event()
+        self.order: list[str] = []
+        self.max_active_calls = 0
+        self._active_calls = 0
+        self._lock = threading.Lock()
+
+    def run(
+        self,
+        name: str,
+        *,
+        started: threading.Event | None = None,
+        release: threading.Event | None = None,
+        result: Any = None,
+    ) -> Any:
+        with self._lock:
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
+            self.order.append(f"{name}:start")
+        if started is not None:
+            started.set()
+        try:
+            if release is not None and not release.wait(timeout=2.0):
+                raise AssertionError(f"timed out waiting to release {name}")
+            return result
+        finally:
+            with self._lock:
+                self._active_calls -= 1
+                self.order.append(f"{name}:finish")
+
+
+class LiveFinalOverlapTranscriber:
+    def __init__(self, probe: InferenceOverlapProbe) -> None:
+        self.probe = probe
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del samples, sample_rate
+        with self._lock:
+            self.calls += 1
+            call_number = self.calls
+        if call_number == 1:
+            return cast(
+                str,
+                self.probe.run(
+                    "live",
+                    started=self.probe.live_started,
+                    release=self.probe.release_live,
+                    result="live interim",
+                ),
+            )
+        if call_number == 2:
+            return cast(
+                str,
+                self.probe.run("final", started=self.probe.final_started, result="final text"),
+            )
+        return cast(str, self.probe.run(f"unexpected_live_{call_number}", result="queued live"))
+
+
+class FinalOnlyOverlapTranscriber:
+    def __init__(self, probe: InferenceOverlapProbe) -> None:
+        self.probe = probe
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int = 16_000) -> str:
+        del samples, sample_rate
+        return cast(
+            str,
+            self.probe.run("final", started=self.probe.final_started, result="final text"),
+        )
+
+
+class BlockingStreamSession:
+    def __init__(self, probe: InferenceOverlapProbe) -> None:
+        self.probe = probe
+        self.feed_calls = 0
+        self.stream_fallback_reason: str | None = None
+
+    def feed(self, chunk: np.ndarray) -> bool:
+        del chunk
+        self.feed_calls += 1
+        return cast(
+            bool,
+            self.probe.run(
+                "stream_feed",
+                started=self.probe.stream_feed_started,
+                release=self.probe.release_stream_feed,
+                result=True,
+            ),
+        )
+
+
+class BlockingStreamingTranscriber:
+    helper_active = True
+    fallback_reason: str | None = None
+
+    def __init__(self, probe: InferenceOverlapProbe) -> None:
+        self.stream_session = BlockingStreamSession(probe)
+
+    def start_session(self, _sample_rate: int) -> BlockingStreamSession:
+        return self.stream_session
 
 
 class FakeSealPathRuntime(SealPathRuntime):
@@ -629,6 +738,149 @@ def test_phase6_resource_limit_soak_stops_retaining_audio_and_emits_limit_signal
         assert finals[-1].audio_ms == int((sample_cap * 1000) / sample_rate)
         assert ended
         assert ended[-1].reason == SessionEndReason.FINAL
+
+    asyncio.run(scenario())
+
+
+def test_phase6_stream_seal_live_interim_overlap_waits_for_in_flight_only() -> None:
+    async def scenario() -> None:
+        probe = InferenceOverlapProbe()
+        ready_live_chunks = [
+            np.full((400,), 0.2, dtype=np.float32),
+            np.full((400,), 0.3, dtype=np.float32),
+            np.full((400,), 0.4, dtype=np.float32),
+        ]
+        orchestrator = _build_orchestrator(
+            streaming_enabled=True,
+            stream_chunks=ready_live_chunks,
+        )
+        cast(Any, orchestrator).streaming_transcriber = FakeStreamingTranscriber(
+            helper_active=False,
+            fallback_reason="init_failed:stress",
+        )
+        tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+        orchestrator.tail_trimmer = tail_trimmer
+        orchestrator.seal_path_runtime = SealPathRuntime(
+            sample_rate=16_000,
+            tail_trimmer=tail_trimmer,
+            release_device_cache=lambda _device: None,
+        )
+        transcriber = LiveFinalOverlapTranscriber(probe)
+        cast(Any, orchestrator).transcriber = transcriber
+        sink = RecordingEventSink()
+        session_id = uuid4()
+
+        await _start(orchestrator, sink, session_id)
+        assert await asyncio.to_thread(probe.live_started.wait, 1.0)
+
+        stop_task = asyncio.create_task(
+            orchestrator.stop(
+                StopSessionIntent(
+                    session_id=session_id,
+                    owner_token=1,
+                    event_sink=sink,
+                    post_roll_secs=0.0,
+                )
+            )
+        )
+        for _ in range(20):
+            if probe.final_started.is_set():
+                break
+            await asyncio.sleep(0)
+        final_started_before_live_finished = probe.final_started.is_set()
+        probe.release_live.set()
+        await stop_task
+
+        truth = orchestrator.runtime_truth(overlay_events_enabled=True)
+        evidence = {
+            "calls": transcriber.calls,
+            "final_started_before_live_finished": final_started_before_live_finished,
+            "live_chunks_processed": truth.interim_transcript_live_chunks_processed,
+            "max_active_calls": probe.max_active_calls,
+            "order": probe.order,
+            "queued_live_chunks": len(ready_live_chunks)
+            - int(truth.interim_transcript_live_chunks_processed or 0),
+            "stop_replay_chunks_processed": truth.interim_transcript_stop_replay_chunks_processed,
+        }
+        print("inference_overlap_live_evidence=" + json.dumps(evidence, sort_keys=True))
+
+        assert final_started_before_live_finished is False
+        assert probe.order == ["live:start", "live:finish", "final:start", "final:finish"]
+        assert probe.max_active_calls == 1
+        assert transcriber.calls == 2
+        assert truth.interim_transcript_live_chunks_processed == 1
+        assert truth.interim_transcript_stop_replay_chunks_processed == 0
+        assert _events_of_type(sink, FinalResultEvent)
+        ended = _events_of_type(sink, SessionEndedEvent)
+        assert ended
+        assert ended[-1].reason == SessionEndReason.FINAL
+
+    asyncio.run(scenario())
+
+
+def test_stream_feed_cancellation_keeps_inference_gate_until_feed_finishes() -> None:
+    async def scenario() -> None:
+        probe = InferenceOverlapProbe()
+        orchestrator = _build_orchestrator(
+            streaming_enabled=True,
+            stream_chunks=[np.full((400,), 0.2, dtype=np.float32)],
+        )
+        streaming_transcriber = BlockingStreamingTranscriber(probe)
+        cast(Any, orchestrator).streaming_transcriber = streaming_transcriber
+        tail_trimmer = SealPathTailTrimmer(vad_enabled=False, silence_floor_db=-40.0)
+        orchestrator.tail_trimmer = tail_trimmer
+        orchestrator.seal_path_runtime = SealPathRuntime(
+            sample_rate=16_000,
+            tail_trimmer=tail_trimmer,
+            release_device_cache=lambda _device: None,
+        )
+        cast(Any, orchestrator).transcriber = FinalOnlyOverlapTranscriber(probe)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+
+        await _start(orchestrator, sink, session_id)
+        assert await asyncio.to_thread(probe.stream_feed_started.wait, 1.0)
+
+        stop_task = asyncio.create_task(
+            orchestrator.stop(
+                StopSessionIntent(
+                    session_id=session_id,
+                    owner_token=1,
+                    event_sink=sink,
+                    post_roll_secs=0.0,
+                )
+            )
+        )
+        try:
+            for _ in range(50):
+                if probe.final_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            final_started_before_stream_feed_finished = probe.final_started.is_set()
+        finally:
+            probe.release_stream_feed.set()
+            await stop_task
+
+        evidence = {
+            "final_started_before_stream_feed_finished": (
+                final_started_before_stream_feed_finished
+            ),
+            "max_active_calls": probe.max_active_calls,
+            "order": probe.order,
+            "stream_feed_calls": streaming_transcriber.stream_session.feed_calls,
+        }
+        print("inference_overlap_stream_feed_evidence=" + json.dumps(evidence, sort_keys=True))
+
+        assert final_started_before_stream_feed_finished is False
+        assert probe.order == [
+            "stream_feed:start",
+            "stream_feed:finish",
+            "final:start",
+            "final:finish",
+        ]
+        assert probe.max_active_calls == 1
+        assert streaming_transcriber.stream_session.feed_calls == 1
+        assert _events_of_type(sink, FinalResultEvent)
 
     asyncio.run(scenario())
 

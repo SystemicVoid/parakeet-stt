@@ -105,6 +105,9 @@ scripts/harness-maintenance.sh mark
 
 # Release/promotion resource guard
 just daemon-resource-soak
+
+# Release/promotion Stream/Seal inference-overlap guard
+just daemon-inference-overlap
 ```
 
 ## Local STT Eval Policy
