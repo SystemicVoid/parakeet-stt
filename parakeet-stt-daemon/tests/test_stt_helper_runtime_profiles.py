@@ -192,6 +192,61 @@ def _run_helper_help(topic: str) -> str:
     return completed.stdout
 
 
+def _run_helper_main_help() -> str:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt help",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    return completed.stdout
+
+
+def _run_stt_helper_command(
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PARAKEET_") and not key.startswith("_STT_")
+    }
+    env["PARAKEET_ROOT"] = str(REPO_ROOT)
+    env["_STT_SKIP_LOCAL_OVERRIDES"] = "1"
+    if extra_env:
+        env.update(extra_env)
+
+    command_line = " ".join(shlex.quote(arg) for arg in args)
+    command = [
+        "bash",
+        "-lc",
+        f"source {shlex.quote(str(HELPER_PATH))} && stt {command_line}",
+    ]
+    return subprocess.run(
+        command,
+        check=False,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+
 def _run_helper_operator_docs_start(*, skip_local_overrides: bool = True) -> str:
     env = {
         key: value
@@ -551,6 +606,15 @@ def test_llm_help_modes_are_generated_from_profile_metadata() -> None:
     _assert_profile_help_lines(help_text, profiles)
 
 
+def test_main_help_describes_tmux_as_attach_kill_only() -> None:
+    help_text = _run_helper_main_help()
+
+    assert (
+        "tmux [attach|kill]     Attach/kill existing helper tmux session; launch with 'stt start'."
+        in help_text
+    )
+
+
 @pytest.mark.parametrize("doc_path", [README_PATH, TROUBLESHOOTING_DOC_PATH])
 def test_operator_docs_start_reference_matches_helper_metadata(doc_path: Path) -> None:
     generated = _run_helper_operator_docs_start()
@@ -601,6 +665,110 @@ def test_operator_docs_start_reference_ignores_local_overrides() -> None:
         )
 
         assert _run_helper_operator_docs_start(skip_local_overrides=False) == expected
+
+
+@pytest.mark.parametrize("tmux_args", [(), ("attach",), ("kill",)])
+def test_tmux_surface_does_not_launch_runtime_when_session_is_absent(
+    tmp_path: Path,
+    tmux_args: tuple[str, ...],
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = tmp_path / "tmux.log"
+    _write_fake_command(
+        fake_bin,
+        "tmux",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$STT_TEST_TMUX_LOG"
+case "${1:-}" in
+    has-session)
+        exit 1
+        ;;
+    attach|kill-session)
+        exit 0
+        ;;
+esac
+exit 42
+""",
+    )
+    for command_name in ("lsof", "pgrep", "ss"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 1\n")
+
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "STT_TEST_TMUX_LOG": str(tmux_log),
+    }
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    daemon_log = Path("/tmp/parakeet-daemon.log")
+    client_log = Path("/tmp/parakeet-ptt.log")
+    with _preserve_paths(daemon_port_file, daemon_log, client_log):
+        completed = _run_stt_helper_command("tmux", *tmux_args, extra_env=env)
+
+    tmux_calls = tmux_log.read_text(encoding="utf-8").splitlines()
+    launch_calls = [
+        call
+        for call in tmux_calls
+        if call.startswith(("new-session", "new-window", "split-window", "select-window"))
+    ]
+
+    assert completed.returncode == 0
+    assert "No tmux session 'parakeet-stt' found." in completed.stdout
+    assert "Start with 'stt start'." in completed.stdout
+    assert "Creating tmux session" not in completed.stdout
+    assert launch_calls == []
+
+
+def test_tmux_case_is_attach_kill_only_without_start_runtime_wiring() -> None:
+    helper = HELPER_PATH.read_text(encoding="utf-8")
+    start = helper.index("        tmux)\n")
+    end = helper.index("        check)\n", start)
+    tmux_case = helper[start:end]
+
+    forbidden_fragments = [
+        "_resolve_port",
+        "_load_start_vars_from_defaults",
+        "_build_ptt_args",
+        "_build_client_cmd",
+        "_select_client_runner_mode",
+        "PARAKEET_STREAMING_ENABLED",
+        "uv run parakeet-stt-daemon",
+        "tmux new-session",
+        "tmux new-window",
+    ]
+
+    for fragment in forbidden_fragments:
+        assert fragment not in tmux_case
+
+
+def test_status_describes_absent_tmux_as_attach_kill_only(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command_name in ("curl", "lsof", "nc", "pgrep", "ss"):
+        _write_fake_command(fake_bin, command_name, "#!/usr/bin/env bash\nexit 1\n")
+    _write_fake_command(
+        fake_bin,
+        "tmux",
+        """#!/usr/bin/env bash
+if [ "${1:-}" = "has-session" ]; then
+    exit 1
+fi
+exit 42
+""",
+    )
+
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    client_pid_file = Path("/tmp/parakeet-ptt.pid")
+    daemon_pid_file = Path("/tmp/parakeet-daemon.pid")
+    daemon_port_file = Path("/tmp/parakeet-daemon.port")
+    with _preserve_paths(client_pid_file, daemon_pid_file, daemon_port_file):
+        client_pid_file.unlink(missing_ok=True)
+        daemon_pid_file.unlink(missing_ok=True)
+        daemon_port_file.unlink(missing_ok=True)
+
+        completed = _run_stt_helper_command("status", extra_env=env)
+
+    assert completed.returncode == 0
+    assert "tmux session: none (attach/kill only; launch with 'stt start')" in completed.stdout
 
 
 def test_llm_direct_profile_forwards_remaining_start_args_once(tmp_path: Path) -> None:
