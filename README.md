@@ -224,9 +224,12 @@ prek run --stage pre-push --all-files
 
 Overlay reliability gates (repo root):
 ```bash
+just daemon-resource-soak
 just phase6-contract
 just phase6-promotion 3
 ```
+`phase6-contract` includes the Daemon resource-limit soak; it prints retained sample
+count, active Session state, and termination evidence for the Session sample cap.
 Hook stages are split for speed:
 - `pre-commit`: maintenance cadence reminder, `ruff format`, `ruff check`, `ty check`, `cargo fmt`
 - `pre-push`: `pytest`, `cargo clippy`, `cargo test`

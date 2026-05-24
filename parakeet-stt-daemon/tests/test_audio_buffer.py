@@ -45,6 +45,29 @@ def test_post_start_audio_is_clipped_to_session_sample_limit() -> None:
     )
 
 
+def test_post_start_limit_accounts_for_seeded_pre_roll() -> None:
+    buffer = SessionAudioBuffer(
+        sample_rate=16_000,
+        dtype="float32",
+        max_session_samples=5,
+    )
+    buffer.ingest_chunk(np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    buffer.start_session()
+    buffer.ingest_chunk(np.array([0.4, 0.5, 0.6, 0.7], dtype=np.float32))
+
+    assert buffer.session_limit_exceeded() is True
+    result = buffer.stop_session_with_streaming()
+
+    assert result.pre_roll_samples == 3
+    assert result.post_start_samples == 2
+    assert result.captured_samples == 5
+    assert np.allclose(
+        result.audio_samples,
+        np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32),
+    )
+
+
 def test_stream_ready_chunks_and_tail_facts_include_seeded_pre_roll() -> None:
     buffer = SessionAudioBuffer(sample_rate=10, dtype="float32", pre_roll_seconds=1.0)
     buffer.configure_stream_chunk_size(4)

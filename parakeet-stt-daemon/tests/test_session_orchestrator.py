@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
@@ -11,7 +12,7 @@ import numpy as np
 from pytest import MonkeyPatch
 
 from parakeet_stt_daemon import session_orchestrator as orchestrator_module
-from parakeet_stt_daemon.audio import CaptureSessionResult
+from parakeet_stt_daemon.audio import AudioInput, CaptureSessionResult
 from parakeet_stt_daemon.config import ServerSettings
 from parakeet_stt_daemon.events import (
     FinalResultEvent,
@@ -85,6 +86,17 @@ class FakeAudio:
         return self.limit_exceeded
 
 
+class RecordingAudioInput(AudioInput):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.last_capture_result: CaptureSessionResult | None = None
+
+    def stop_session_with_streaming(self) -> CaptureSessionResult:
+        result = super().stop_session_with_streaming()
+        self.last_capture_result = result
+        return result
+
+
 class FakeStreamSession:
     def __init__(self, feed_results: list[bool] | None = None) -> None:
         self.feed_calls = 0
@@ -131,6 +143,7 @@ class FakeSealPathRuntime(SealPathRuntime):
             release_device_cache=lambda _device: None,
         )
         self.text = text
+        self.finalize_calls: list[np.ndarray] = []
 
     async def finalize(
         self,
@@ -140,6 +153,7 @@ class FakeSealPathRuntime(SealPathRuntime):
         effective_device: str,
     ) -> SealPathFinalizationResult | SealPathFinalizationFailure:
         del transcribe, effective_device
+        self.finalize_calls.append(audio_samples.copy())
         if audio_samples.size == 0:
             return SealPathFinalizationFailure(
                 code="AUDIO_DEVICE",
@@ -159,19 +173,26 @@ def _build_orchestrator(
     *,
     streaming_enabled: bool = False,
     max_session_seconds: float = 90.0,
+    max_session_samples: int | None = None,
+    audio: Any | None = None,
     samples: np.ndarray | None = None,
     stream_chunks: list[np.ndarray] | None = None,
 ) -> SessionOrchestrator:
     orchestrator = cast(Any, SessionOrchestrator.__new__(SessionOrchestrator))
+    audio_obj = (
+        audio if audio is not None else FakeAudio(samples=samples, stream_chunks=stream_chunks)
+    )
+    sample_rate = int(getattr(audio_obj, "sample_rate", FakeAudio.sample_rate))
     settings = ServerSettings(
         device="cpu",
         streaming_enabled=streaming_enabled,
         overlay_events_enabled=True,
         max_session_seconds=max_session_seconds,
+        max_session_samples=max_session_samples,
     )
     orchestrator.settings = settings
     orchestrator.sessions = SessionManager()
-    orchestrator.audio = FakeAudio(samples=samples, stream_chunks=stream_chunks)
+    orchestrator.audio = audio_obj
     orchestrator.model = object()
     orchestrator.transcriber = FakeTranscriber()
     orchestrator._session_lock = asyncio.Lock()
@@ -182,8 +203,12 @@ def _build_orchestrator(
     orchestrator._stream_drain_running = False
     orchestrator._session_guard_task = None
     orchestrator._session_guard_running = False
-    orchestrator._session_sample_limit = int(max_session_seconds * FakeAudio.sample_rate)
-    orchestrator._session_age_limit_ms = int(max_session_seconds * 1000)
+    duration_limit_samples = max(1, int(max_session_seconds * sample_rate))
+    explicit_sample_limit = (
+        int(max_session_samples) if max_session_samples is not None else duration_limit_samples
+    )
+    orchestrator._session_sample_limit = max(1, min(duration_limit_samples, explicit_sample_limit))
+    orchestrator._session_age_limit_ms = max(1, int(max_session_seconds * 1000))
     orchestrator._requested_device = "cpu"
     orchestrator._effective_device = "cpu"
     orchestrator._vad_enabled = False
@@ -516,6 +541,92 @@ def test_guard_loop_auto_stops_when_audio_sample_limit_is_exceeded(
         finals = _events_of_type(sink, FinalResultEvent)
         ended = _events_of_type(sink, SessionEndedEvent)
         assert len(finals) == 1
+        assert ended
+        assert ended[-1].reason == SessionEndReason.FINAL
+
+    asyncio.run(scenario())
+
+
+def test_phase6_resource_limit_soak_stops_retaining_audio_and_emits_limit_signal(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        sample_rate = 16_000
+        sample_cap = 64
+        chunk_frames = 16
+        pre_start_chunks = 10
+        post_start_chunks = 50
+        audio = RecordingAudioInput(
+            sample_rate=sample_rate,
+            channels=1,
+            pre_roll_seconds=0.002,
+            max_session_samples=sample_cap,
+        )
+        pre_roll_chunk = np.ones((chunk_frames, 1), dtype=np.float32)
+        for _ in range(pre_start_chunks):
+            audio._callback(
+                pre_roll_chunk,
+                frames=chunk_frames,
+                time=None,
+                status=cast(Any, 0),
+            )
+        orchestrator = _build_orchestrator(
+            max_session_seconds=90.0,
+            max_session_samples=sample_cap,
+            audio=audio,
+        )
+        seal_runtime = cast(FakeSealPathRuntime, orchestrator.seal_path_runtime)
+        sink = RecordingEventSink()
+        session_id = uuid4()
+        limit_exceeded_after_feed = False
+
+        async def fake_guard_sleep(_seconds: float) -> None:
+            nonlocal limit_exceeded_after_feed
+            chunk = np.ones((chunk_frames, 1), dtype=np.float32)
+            for _ in range(post_start_chunks):
+                audio._callback(chunk, frames=chunk_frames, time=None, status=cast(Any, 0))
+            limit_exceeded_after_feed = audio.session_limit_exceeded()
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(orchestrator_module, "_REAL_ASYNCIO_SLEEP", fake_guard_sleep)
+
+        await _start(orchestrator, sink, session_id)
+        for _ in range(20):
+            if orchestrator.sessions.active is None:
+                break
+            await asyncio.sleep(0)
+
+        warnings = _events_of_type(sink, SessionWarningEvent)
+        finals = _events_of_type(sink, FinalResultEvent)
+        ended = _events_of_type(sink, SessionEndedEvent)
+        capture_result = audio.last_capture_result
+        assert capture_result is not None
+        retained_samples = int(seal_runtime.finalize_calls[-1].size)
+        evidence = {
+            "active_session_after_guard": orchestrator.sessions.active is not None,
+            "fed_samples": (pre_start_chunks + post_start_chunks) * chunk_frames,
+            "limit_exceeded_after_feed": limit_exceeded_after_feed,
+            "post_start_fed_samples": post_start_chunks * chunk_frames,
+            "post_start_samples": capture_result.post_start_samples,
+            "pre_roll_samples": capture_result.pre_roll_samples,
+            "retained_samples": retained_samples,
+            "sample_cap": sample_cap,
+            "session_end_reason": str(ended[-1].reason) if ended else None,
+            "warning_count": len(warnings),
+        }
+        print("resource_limit_soak_evidence=" + json.dumps(evidence, sort_keys=True))
+
+        assert evidence["fed_samples"] > sample_cap
+        assert limit_exceeded_after_feed is True
+        assert capture_result.pre_roll_samples == 32
+        assert capture_result.post_start_samples == 32
+        assert retained_samples == sample_cap
+        assert capture_result.captured_samples == sample_cap
+        assert orchestrator.sessions.active is None
+        assert warnings
+        assert warnings[-1].warning == "approaching_limit"
+        assert finals
+        assert finals[-1].audio_ms == int((sample_cap * 1000) / sample_rate)
         assert ended
         assert ended[-1].reason == SessionEndReason.FINAL
 

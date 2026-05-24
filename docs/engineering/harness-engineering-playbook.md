@@ -102,6 +102,9 @@ scripts/harness-maintenance.sh check --threshold 10
 scripts/harness-maintenance.sh code-shape
 scripts/harness-maintenance.sh run
 scripts/harness-maintenance.sh mark
+
+# Release/promotion resource guard
+just daemon-resource-soak
 ```
 
 ## Local STT Eval Policy
