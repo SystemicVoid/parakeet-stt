@@ -1,20 +1,113 @@
 use crate::config::PasteShortcut;
 use crate::surface_focus::FocusSnapshot;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SurfaceClass {
     Terminal,
     General,
     Unknown,
+    Forced,
 }
 
-#[derive(Debug, Clone)]
-pub struct RouteDecision {
-    pub class: SurfaceClass,
+impl SurfaceClass {
+    pub fn as_report_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::General => "General",
+            Self::Unknown => "Unknown",
+            Self::Forced => "Forced",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FocusConfidence {
+    Fresh,
+    LowConfidence,
+    Unavailable,
+}
+
+impl FocusConfidence {
+    pub fn as_report_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::LowConfidence => "low_confidence",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FocusRouteInput<'a> {
+    pub snapshot: Option<&'a FocusSnapshot>,
+    pub source: &'a str,
+    pub confidence: FocusConfidence,
+}
+
+impl<'a> FocusRouteInput<'a> {
+    pub fn new(
+        snapshot: Option<&'a FocusSnapshot>,
+        source: &'a str,
+        confidence: FocusConfidence,
+    ) -> Self {
+        Self {
+            snapshot,
+            source,
+            confidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortcutPlan {
     pub primary: PasteShortcut,
     pub adaptive_fallback: Option<PasteShortcut>,
-    pub low_confidence: bool,
-    pub reason: &'static str,
+}
+
+impl ShortcutPlan {
+    fn new(primary: PasteShortcut, fallback: PasteShortcut) -> Self {
+        Self {
+            primary,
+            adaptive_fallback: dedup_fallback(primary, fallback),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteDecision {
+    pub source: String,
+    pub focus_confidence: FocusConfidence,
+    pub surface_class: SurfaceClass,
+    pub shortcut_plan: ShortcutPlan,
+    pub output_name: Option<String>,
+    pub reason: String,
+}
+
+impl RouteDecision {
+    pub fn forced(
+        source: impl Into<String>,
+        focus_confidence: FocusConfidence,
+        output_name: Option<String>,
+        primary: PasteShortcut,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            focus_confidence,
+            surface_class: SurfaceClass::Forced,
+            shortcut_plan: ShortcutPlan {
+                primary,
+                adaptive_fallback: None,
+            },
+            output_name,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn route_class_name(&self) -> &'static str {
+        self.surface_class.as_report_str()
+    }
 }
 
 const TERMINAL_SHORTCUT: PasteShortcut = PasteShortcut::CtrlShiftV;
@@ -58,50 +151,66 @@ const COSMIC_EDIT_HINTS: &[&str] = &[
     "cosmic text editor",
 ];
 
-pub fn decide_route(focus: Option<&FocusSnapshot>) -> RouteDecision {
-    if let Some(snapshot) = focus {
+pub fn decide_route_for_focus(input: FocusRouteInput<'_>) -> RouteDecision {
+    if let Some(snapshot) = input.snapshot {
         if !snapshot.focused {
             return unknown_route(
+                input,
                 "adaptive low-confidence focus snapshot (focused=false)",
-                true,
             );
         }
     }
 
-    let (class, class_reason) = classify_surface_with_reason(focus);
+    let (class, class_reason) = classify_surface_with_reason(input.snapshot);
     match class {
-        SurfaceClass::Terminal => RouteDecision {
+        SurfaceClass::Terminal => route_decision(
+            input,
             class,
-            primary: TERMINAL_SHORTCUT,
-            adaptive_fallback: dedup_fallback(TERMINAL_SHORTCUT, GENERAL_SHORTCUT),
-            low_confidence: false,
-            reason: class_reason,
-        },
-        SurfaceClass::General => RouteDecision {
+            ShortcutPlan::new(TERMINAL_SHORTCUT, GENERAL_SHORTCUT),
+            class_reason,
+        ),
+        SurfaceClass::General => route_decision(
+            input,
             class,
-            primary: GENERAL_SHORTCUT,
-            adaptive_fallback: dedup_fallback(GENERAL_SHORTCUT, TERMINAL_SHORTCUT),
-            low_confidence: false,
-            reason: class_reason,
-        },
-        SurfaceClass::Unknown => unknown_route(class_reason, false),
+            ShortcutPlan::new(GENERAL_SHORTCUT, TERMINAL_SHORTCUT),
+            class_reason,
+        ),
+        SurfaceClass::Unknown => unknown_route(input, class_reason),
+        SurfaceClass::Forced => unreachable!("forced routes are constructed explicitly"),
     }
 }
 
-fn unknown_route(reason: &'static str, low_confidence: bool) -> RouteDecision {
+fn route_decision(
+    input: FocusRouteInput<'_>,
+    surface_class: SurfaceClass,
+    shortcut_plan: ShortcutPlan,
+    reason: &'static str,
+) -> RouteDecision {
+    RouteDecision {
+        source: input.source.to_string(),
+        focus_confidence: input.confidence,
+        surface_class,
+        shortcut_plan,
+        output_name: input
+            .snapshot
+            .and_then(|snapshot| snapshot.output_name.as_ref().cloned()),
+        reason: reason.to_string(),
+    }
+}
+
+fn unknown_route(input: FocusRouteInput<'_>, reason: &'static str) -> RouteDecision {
     let alternate = if UNKNOWN_SHORTCUT != GENERAL_SHORTCUT {
         GENERAL_SHORTCUT
     } else {
         TERMINAL_SHORTCUT
     };
 
-    RouteDecision {
-        class: SurfaceClass::Unknown,
-        primary: UNKNOWN_SHORTCUT,
-        adaptive_fallback: dedup_fallback(UNKNOWN_SHORTCUT, alternate),
-        low_confidence,
+    route_decision(
+        input,
+        SurfaceClass::Unknown,
+        ShortcutPlan::new(UNKNOWN_SHORTCUT, alternate),
         reason,
-    }
+    )
 }
 
 fn dedup_fallback(primary: PasteShortcut, fallback: PasteShortcut) -> Option<PasteShortcut> {
@@ -157,7 +266,10 @@ fn normalize_for_hint_match(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_surface_with_reason, decide_route, SurfaceClass};
+    use super::{
+        classify_surface_with_reason, decide_route_for_focus, FocusConfidence, FocusRouteInput,
+        SurfaceClass,
+    };
     use crate::config::PasteShortcut;
     use crate::surface_focus::FocusSnapshot;
 
@@ -177,6 +289,19 @@ mod tests {
             active: true,
             resolver: "test".to_string(),
         }
+    }
+
+    fn decide_test_route(focus: &FocusSnapshot) -> super::RouteDecision {
+        let confidence = if focus.focused {
+            FocusConfidence::Fresh
+        } else {
+            FocusConfidence::LowConfidence
+        };
+        decide_route_for_focus(FocusRouteInput::new(
+            Some(focus),
+            "direct_snapshot",
+            confidence,
+        ))
     }
 
     #[test]
@@ -256,11 +381,14 @@ mod tests {
     #[test]
     fn adaptive_route_prefers_terminal_shortcut_for_terminals() {
         let focus = snapshot("Unnamed", "shell", "/com/mitchellh/ghostty/a11y/abc", true);
-        let decision = decide_route(Some(&focus));
-        assert_eq!(decision.class, SurfaceClass::Terminal);
-        assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
-        assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
-        assert!(!decision.low_confidence);
+        let decision = decide_test_route(&focus);
+        assert_eq!(decision.surface_class, SurfaceClass::Terminal);
+        assert_eq!(decision.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            decision.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+        assert_eq!(decision.focus_confidence, FocusConfidence::Fresh);
     }
 
     #[test]
@@ -271,19 +399,77 @@ mod tests {
             "/org/a11y/atspi/accessible/1",
             false,
         );
-        let decision = decide_route(Some(&focus));
-        assert_eq!(decision.class, SurfaceClass::Unknown);
-        assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
-        assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
-        assert!(decision.low_confidence);
+        let decision = decide_test_route(&focus);
+        assert_eq!(decision.surface_class, SurfaceClass::Unknown);
+        assert_eq!(decision.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            decision.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+        assert_eq!(decision.focus_confidence, FocusConfidence::LowConfidence);
+        assert_eq!(
+            decision.reason,
+            "adaptive low-confidence focus snapshot (focused=false)"
+        );
     }
 
     #[test]
     fn unknown_route_remains_terminal_first() {
         let focus = snapshot("mystery", "floating-tool", "/org/example/unknown", true);
-        let decision = decide_route(Some(&focus));
-        assert_eq!(decision.class, SurfaceClass::Unknown);
-        assert_eq!(decision.primary, PasteShortcut::CtrlShiftV);
-        assert_eq!(decision.adaptive_fallback, Some(PasteShortcut::CtrlV));
+        let decision = decide_test_route(&focus);
+        assert_eq!(decision.surface_class, SurfaceClass::Unknown);
+        assert_eq!(decision.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            decision.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+    }
+
+    #[test]
+    fn route_decision_carries_focus_source_confidence_output_and_reason() {
+        let mut focus = snapshot(
+            "Ghostty",
+            "terminal",
+            "/com/mitchellh/ghostty/a11y/abc",
+            true,
+        );
+        focus.output_name = Some("DP-1".to_string());
+
+        let decision = decide_route_for_focus(FocusRouteInput::new(
+            Some(&focus),
+            "wayland_cache_low_confidence",
+            FocusConfidence::LowConfidence,
+        ));
+
+        assert_eq!(decision.source, "wayland_cache_low_confidence");
+        assert_eq!(decision.focus_confidence, FocusConfidence::LowConfidence);
+        assert_eq!(decision.surface_class, SurfaceClass::Terminal);
+        assert_eq!(decision.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            decision.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+        assert_eq!(decision.output_name.as_deref(), Some("DP-1"));
+        assert_eq!(decision.reason, "adaptive terminal-like surface");
+    }
+
+    #[test]
+    fn route_decision_reports_unavailable_focus_as_unknown_route() {
+        let decision = decide_route_for_focus(FocusRouteInput::new(
+            None,
+            "wayland_unavailable",
+            FocusConfidence::Unavailable,
+        ));
+
+        assert_eq!(decision.source, "wayland_unavailable");
+        assert_eq!(decision.focus_confidence, FocusConfidence::Unavailable);
+        assert_eq!(decision.surface_class, SurfaceClass::Unknown);
+        assert_eq!(decision.shortcut_plan.primary, PasteShortcut::CtrlShiftV);
+        assert_eq!(
+            decision.shortcut_plan.adaptive_fallback,
+            Some(PasteShortcut::CtrlV)
+        );
+        assert_eq!(decision.output_name, None);
+        assert_eq!(decision.reason, "adaptive unknown surface");
     }
 }
