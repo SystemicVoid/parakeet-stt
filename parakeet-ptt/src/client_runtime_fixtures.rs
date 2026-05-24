@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::app::{ClientPorts, DaemonConnection, DaemonConnector, HotkeyRuntime, HotkeySource};
 use crate::audio_feedback::AudioFeedback;
 use crate::config::ClientConfig;
-use crate::hotkey::{HotkeyEvent, HotkeyIntent};
+use crate::hotkey::{HotkeyAttachState, HotkeyEvent, HotkeyIntent};
 use crate::injector_runtime::{
     InjectionJob, InjectionJobRunner, InjectionRunError, InjectionRunOutput,
 };
@@ -91,7 +91,10 @@ pub(crate) struct ClientRuntimeControls {
 impl ClientRuntimeControls {
     pub(crate) fn send_hotkey_down(&self, intent: HotkeyIntent) {
         self.hotkey_tx
-            .send(HotkeyEvent::Down { intent })
+            .send(HotkeyEvent::Down {
+                intent,
+                attach_state: HotkeyAttachState::Reconstructed,
+            })
             .expect("test hotkey event should send");
     }
 
