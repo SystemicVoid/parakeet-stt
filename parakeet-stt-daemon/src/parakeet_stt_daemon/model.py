@@ -166,6 +166,17 @@ def _disable_cuda_graph_decoder_config(decoding_cfg: Any) -> bool:
     return changed
 
 
+def _apply_greedy_decoding_defaults(decoding_cfg: Any, max_steps_per_timestep: int) -> None:
+    _set_cfg_value(decoding_cfg, "strategy", "greedy")
+    _disable_cuda_graph_decoder_config(decoding_cfg)
+    _set_cfg_value(decoding_cfg, "preserve_alignments", True)
+    _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
+    beam_cfg = _get_cfg_value(decoding_cfg, "beam")
+    _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
+    greedy_cfg = _get_cfg_value(decoding_cfg, "greedy")
+    _set_cfg_value(greedy_cfg, "max_symbols_per_step", int(max_steps_per_timestep))
+
+
 def _iter_cuda_graph_decoder_candidates(model: ASRModel) -> Iterator[Any]:
     """Yield likely NeMo decoder objects that may own CUDA graph state."""
     seen: set[int] = set()
@@ -538,7 +549,7 @@ class ParakeetStreamingTranscriber:
         max_steps_per_timestep = 5
         cfg = getattr(self.model, "_cfg", None) or getattr(self.model, "cfg", None)
         decoding_cfg = _get_cfg_value(cfg, "decoding")
-        greedy_cfg = getattr(decoding_cfg, "greedy", None)
+        greedy_cfg = _get_cfg_value(decoding_cfg, "greedy")
         configured = _get_cfg_value(greedy_cfg, "max_symbols_per_step")
         if configured is not None:
             max_steps_per_timestep = int(configured)
@@ -559,28 +570,14 @@ class ParakeetStreamingTranscriber:
                     try:
                         if open_dict_fn is not None:
                             with open_dict_fn(decoding_cfg):
-                                _set_cfg_value(decoding_cfg, "strategy", "greedy")
-                                _disable_cuda_graph_decoder_config(decoding_cfg)
-                                _set_cfg_value(decoding_cfg, "preserve_alignments", True)
-                                _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
-                                beam_cfg = _get_cfg_value(decoding_cfg, "beam")
-                                _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
-                                _set_cfg_value(
-                                    greedy_cfg,
-                                    "max_symbols_per_step",
-                                    int(max_steps_per_timestep),
+                                _apply_greedy_decoding_defaults(
+                                    decoding_cfg,
+                                    max_steps_per_timestep,
                                 )
                         else:
-                            _set_cfg_value(decoding_cfg, "strategy", "greedy")
-                            _disable_cuda_graph_decoder_config(decoding_cfg)
-                            _set_cfg_value(decoding_cfg, "preserve_alignments", True)
-                            _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
-                            beam_cfg = _get_cfg_value(decoding_cfg, "beam")
-                            _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
-                            _set_cfg_value(
-                                greedy_cfg,
-                                "max_symbols_per_step",
-                                int(max_steps_per_timestep),
+                            _apply_greedy_decoding_defaults(
+                                decoding_cfg,
+                                max_steps_per_timestep,
                             )
                     except Exception as exc:  # noqa: BLE001 - NeMo config shape varies by build
                         logger.warning(
