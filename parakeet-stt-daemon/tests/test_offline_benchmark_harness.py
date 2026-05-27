@@ -652,12 +652,14 @@ def test_run_streaming_probe_uses_probe_stream_constants(monkeypatch) -> None:
             right_context_secs: float,
             left_context_secs: float,
             batch_size: int,
+            enable_helper: bool = False,
         ) -> None:
             del model
             captured["chunk_secs"] = chunk_secs
             captured["right_context_secs"] = right_context_secs
             captured["left_context_secs"] = left_context_secs
             captured["batch_size"] = batch_size
+            captured["enable_helper"] = enable_helper
             self.chunk_secs = chunk_secs
             self.chunk_helper = object()
 
@@ -678,6 +680,123 @@ def test_run_streaming_probe_uses_probe_stream_constants(monkeypatch) -> None:
         "right_context_secs": PROBE_STREAM_RIGHT_CONTEXT_SECS,
         "left_context_secs": PROBE_STREAM_LEFT_CONTEXT_SECS,
         "batch_size": PROBE_STREAM_BATCH_SIZE,
+        "enable_helper": True,
+    }
+
+
+def test_run_offline_benchmark_stream_seal_uses_single_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from parakeet_stt_daemon.model import STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY
+
+    model = object()
+    load_calls: list[tuple[str, str]] = []
+    captured: dict[str, Any] = {}
+
+    class _FakeSealTranscriber:
+        def __init__(self, model_arg: object) -> None:
+            captured["seal_model"] = model_arg
+
+    class _FakeStreamer:
+        helper_active = False
+        _helper_class_name = None
+
+        def __init__(self, model_arg: object, **kwargs: Any) -> None:
+            captured["stream_model"] = model_arg
+            captured["stream_kwargs"] = kwargs
+            self.chunk_secs = kwargs["chunk_secs"]
+            self.fallback_reason = kwargs["helper_disabled_reason"]
+
+    def fake_load_parakeet_model(model_name: str, *, device: str) -> object:
+        load_calls.append((model_name, device))
+        return model
+
+    aggregate = {
+        "avg_wer": 0.0,
+        "infer_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+        "finalize_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+        "weighted_wer": 0.0,
+        "command_exact_match_rate": 1.0,
+        "command_exact_match_rate_strict": 1.0,
+        "command_exact_match_rate_normalized": 1.0,
+        "command_intent_slot_match_rate": 1.0,
+        "critical_token_recall": 1.0,
+        "warm_finalize_ms": {"avg": 0.0, "p50": 0.0, "p95": 0.0},
+        "punctuation": {"precision": 1.0, "recall": 1.0},
+        "punctuation_f1": 1.0,
+        "terminal_punctuation_accuracy": 1.0,
+        "aggregation_strategy": "single_run",
+    }
+
+    monkeypatch.setattr(_RUNNER, "load_parakeet_model", fake_load_parakeet_model)
+    monkeypatch.setattr(_RUNNER, "ParakeetTranscriber", _FakeSealTranscriber)
+    monkeypatch.setattr(_RUNNER, "ParakeetStreamingTranscriber", _FakeStreamer)
+    monkeypatch.setattr(_RUNNER, "_resolve_benchmark_cases", lambda **_kwargs: ([], None, None))
+    monkeypatch.setattr(
+        _RUNNER,
+        "_run_benchmark_once",
+        lambda **_kwargs: {"samples": []},
+    )
+    monkeypatch.setattr(_RUNNER, "_aggregate_run_results", lambda _runs: aggregate)
+    monkeypatch.setattr(_RUNNER, "_compute_baseline_comparison", lambda _baseline, _agg: None)
+    monkeypatch.setattr(_RUNNER, "evaluate_regression_thresholds", lambda **_kwargs: [])
+
+    args = argparse.Namespace(
+        bench_tier=None,
+        bench_runs=1,
+        warmup_samples=0,
+        bench_runtime="stream-seal",
+        stream_chunk_secs=2.0,
+        stream_right_context_secs=2.0,
+        stream_left_context_secs=10.0,
+        stream_batch_size=32,
+        stream_silence_floor_db=-40.0,
+        stream_max_tail_trim_secs=0.35,
+        bench_dir=tmp_path,
+        bench_output=tmp_path / "report.json",
+        bench_transcripts=None,
+        bench_manifest=None,
+        bench_append_legacy=False,
+        model="test-model",
+        device="cuda",
+        baseline=None,
+        calibrate_baseline=False,
+        baseline_output=None,
+        max_avg_wer=None,
+        max_p95_infer_ms=None,
+        max_p95_finalize_ms=None,
+        max_weighted_wer=None,
+        min_command_exact_match=None,
+        min_command_normalized_exact_match=None,
+        min_command_intent_slot_match=None,
+        min_critical_token_recall=None,
+        min_punctuation_f1=None,
+        min_terminal_punctuation_accuracy=None,
+        max_warm_p95_finalize_ms=None,
+        max_weighted_wer_delta=None,
+        max_command_exact_match_drop=None,
+        max_command_normalized_exact_match_drop=None,
+        max_command_intent_slot_match_drop=None,
+        max_critical_token_recall_drop=None,
+        max_punctuation_f1_drop=None,
+        max_terminal_punctuation_accuracy_drop=None,
+        max_warm_p95_finalize_ms_delta=None,
+    )
+
+    exit_code = _RUNNER.run_offline_benchmark(args)
+
+    assert exit_code == 0
+    assert load_calls == [("test-model", "cuda")]
+    assert captured["seal_model"] is model
+    assert captured["stream_model"] is model
+    assert captured["stream_kwargs"] == {
+        "chunk_secs": 2.0,
+        "right_context_secs": 2.0,
+        "left_context_secs": 10.0,
+        "batch_size": 32,
+        "enable_helper": False,
+        "helper_disabled_reason": STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
     }
 
 
@@ -689,7 +808,7 @@ class _DummyStreamSession:
         self._parent.fed_sample_counts[-1] += len(chunk)
 
     def finalize(self) -> str:
-        raise AssertionError("stream-seal finalization must use the isolated Seal transcriber")
+        raise AssertionError("stream-seal finalization must use the Seal transcriber")
 
 
 class _DummyStreamer:

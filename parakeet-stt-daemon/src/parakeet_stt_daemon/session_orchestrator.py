@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, Literal, TypeVar
+from typing import Literal, TypeVar
 from uuid import UUID
 
 import numpy as np
@@ -40,6 +40,7 @@ from .messages import (
     SessionEndReason,
 )
 from .model import (
+    STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
     ParakeetStreamingSession,
     ParakeetStreamingTranscriber,
     ParakeetTranscriber,
@@ -166,8 +167,7 @@ class SessionOrchestrator:
         )
         self._session_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
-        self._streaming_model: Any | None = None
-        self.streaming_transcriber = self._load_isolated_streaming_transcriber(settings)
+        self.streaming_transcriber = self._load_streaming_transcriber(settings)
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
@@ -196,28 +196,19 @@ class SessionOrchestrator:
             sample_rate=self.audio.sample_rate,
         )
 
-    def _load_isolated_streaming_transcriber(
+    def _load_streaming_transcriber(
         self, settings: ServerSettings
     ) -> ParakeetStreamingTranscriber | None:
         if not settings.streaming_enabled:
             return None
-        try:
-            self._streaming_model = load_parakeet_model(device=settings.device)
-        except Exception as exc:  # noqa: BLE001 - stream path must not take down Seal path
-            logger.warning(
-                "Failed to load isolated streaming model; disabling Stream path to preserve "
-                "Seal path accuracy: {}",
-                exc,
-            )
-            self._streaming_model = None
-            return None
-        logger.info("Loaded isolated Parakeet model for Stream path")
         return ParakeetStreamingTranscriber(
-            self._streaming_model,
+            self.model,
             chunk_secs=settings.chunk_secs,
             right_context_secs=settings.right_context_secs,
             left_context_secs=settings.left_context_secs,
             batch_size=settings.batch_size,
+            enable_helper=False,
+            helper_disabled_reason=STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
         )
 
     async def start(self, intent: StartSessionIntent) -> None:

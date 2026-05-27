@@ -80,6 +80,27 @@ def test_finalize_uses_offline_seal_even_with_retired_streaming_envs(monkeypatch
     assert parent.last_sample_rate == 16_000
 
 
+def test_streaming_transcriber_can_disable_helper_without_importing_nemo() -> None:
+    from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
+
+    transcriber = ParakeetStreamingTranscriber(
+        cast(Any, object()),
+        enable_helper=False,
+        helper_disabled_reason="streaming_helper_disabled:test",
+    )
+
+    session = transcriber.start_session(16_000)
+    processed = session.feed(np.array([0.1, 0.2], dtype=np.float32))
+
+    assert transcriber.helper_active is False
+    assert transcriber.fallback_reason == "streaming_helper_disabled:test"
+    assert transcriber._helper_class_name is None
+    assert processed is False
+    assert session.stream_path_executed is False
+    assert session.stream_chunks_processed == 0
+    assert session.stream_fallback_reason == "streaming_helper_disabled:test"
+
+
 def test_cuda_graph_decoder_config_is_disabled_before_decoder_rebuild() -> None:
     from parakeet_stt_daemon.model import _disable_cuda_graph_decoder_config
 
@@ -185,12 +206,18 @@ def test_tdt_streaming_helper_rebuilds_decoder_with_cuda_graphs_disabled(monkeyp
             self.decoding = SimpleNamespace(decoding=rebuilt_decoder)
 
     model = _FakeTDTModel()
+    original_decoding = model.decoding
 
-    transcriber = ParakeetStreamingTranscriber(cast(Any, model), batch_size=32)
+    transcriber = ParakeetStreamingTranscriber(
+        cast(Any, model),
+        batch_size=32,
+        enable_helper=True,
+    )
 
     assert transcriber.helper_active is True
     assert transcriber._helper_class_name == "BatchedFrameASRTDT"
     assert model.change_decoding_flags == [(False, False)]
+    assert model.decoding is not original_decoding
     assert rebuilt_decoder.disable_calls == 1
 
 
@@ -275,12 +302,18 @@ def test_tdt_stream_chunk_pads_terminal_frame_and_records_execution(monkeypatch)
         loss=SimpleNamespace(_loss=_FakeTDTLoss()),
         decoding=SimpleNamespace(decoding=SimpleNamespace()),
     )
+    model.change_decoding_strategy = lambda _decoding_cfg: setattr(
+        model,
+        "decoding",
+        SimpleNamespace(decoding=SimpleNamespace()),
+    )
 
     transcriber = ParakeetStreamingTranscriber(
         cast(Any, model),
         chunk_secs=0.2,
         right_context_secs=0.1,
         batch_size=32,
+        enable_helper=True,
     )
     session = transcriber.start_session(16_001)
 
