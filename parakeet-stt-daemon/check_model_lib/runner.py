@@ -75,6 +75,7 @@ def _run_benchmark_once(
                 raise ValueError("streaming transcriber is required for stream-seal runtime")
             hypothesis, infer_ms = _transcribe_stream_seal(
                 streaming_transcriber,
+                transcriber,
                 samples,
                 sample_rate=sample_rate,
                 silence_floor_db=stream_silence_floor_db,
@@ -256,8 +257,9 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
     transcriber = ParakeetTranscriber(model)
     streaming_transcriber: ParakeetStreamingTranscriber | None = None
     if args.bench_runtime == "stream-seal":
+        stream_model = load_parakeet_model(args.model, device=args.device)
         streaming_transcriber = ParakeetStreamingTranscriber(
-            model,
+            stream_model,
             chunk_secs=args.stream_chunk_secs,
             right_context_secs=args.stream_right_context_secs,
             left_context_secs=args.stream_left_context_secs,
@@ -338,6 +340,7 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             "fallback_reason": (
                 streaming_transcriber.fallback_reason if streaming_transcriber is not None else None
             ),
+            "stream_model_isolated": streaming_transcriber is not None,
         }
     report = {
         "benchmark": "offline",

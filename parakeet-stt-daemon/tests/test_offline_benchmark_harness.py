@@ -684,19 +684,12 @@ def test_run_streaming_probe_uses_probe_stream_constants(monkeypatch) -> None:
 class _DummyStreamSession:
     def __init__(self, parent: _DummyStreamer) -> None:
         self._parent = parent
-        self._chunks: list[list[float]] = []
 
     def feed(self, chunk: list[float]) -> None:
-        self._chunks.append(list(chunk))
+        self._parent.fed_sample_counts[-1] += len(chunk)
 
     def finalize(self) -> str:
-        total_samples = sum(len(chunk) for chunk in self._chunks)
-        self._parent.finalized_sample_counts.append(total_samples)
-        if total_samples in self._parent.finalize_outputs_by_sample_count:
-            return self._parent.finalize_outputs_by_sample_count[total_samples]
-        if self._parent.finalize_outputs:
-            return self._parent.finalize_outputs.pop(0)
-        return "ok"
+        raise AssertionError("stream-seal finalization must use the isolated Seal transcriber")
 
 
 class _DummyStreamer:
@@ -704,25 +697,46 @@ class _DummyStreamer:
         self,
         *,
         chunk_secs: float,
-        finalize_outputs: list[str] | None = None,
-        finalize_outputs_by_sample_count: dict[int, str] | None = None,
     ) -> None:
         self.chunk_secs = chunk_secs
-        self.finalize_outputs = list(finalize_outputs or [])
-        self.finalize_outputs_by_sample_count = dict(finalize_outputs_by_sample_count or {})
-        self.finalized_sample_counts: list[int] = []
+        self.fed_sample_counts: list[int] = []
 
     def start_session(self, sample_rate: int) -> _DummyStreamSession:
         del sample_rate
+        self.fed_sample_counts.append(0)
         return _DummyStreamSession(self)
+
+
+class _DummySealTranscriber:
+    def __init__(
+        self,
+        *,
+        outputs: list[str] | None = None,
+        outputs_by_sample_count: dict[int, str] | None = None,
+    ) -> None:
+        self.outputs = list(outputs or [])
+        self.outputs_by_sample_count = dict(outputs_by_sample_count or {})
+        self.transcribed_sample_counts: list[int] = []
+
+    def transcribe_samples(self, samples: np.ndarray, *, sample_rate: int) -> str:
+        del sample_rate
+        total_samples = int(samples.size)
+        self.transcribed_sample_counts.append(total_samples)
+        if total_samples in self.outputs_by_sample_count:
+            return self.outputs_by_sample_count[total_samples]
+        if self.outputs:
+            return self.outputs.pop(0)
+        return "ok"
 
 
 def test_transcribe_stream_seal_caps_tail_trimming() -> None:
     streamer = _DummyStreamer(chunk_secs=1.0)
+    seal_transcriber = _DummySealTranscriber()
     samples = np.zeros((160,), dtype=np.float32)  # sample_rate=100 => ready=100, tail=60
 
     hypothesis, _ = transcribe_stream_seal(
         streamer,
+        seal_transcriber,
         samples=samples,
         sample_rate=100,
         silence_floor_db=-40.0,
@@ -731,15 +745,18 @@ def test_transcribe_stream_seal_caps_tail_trimming() -> None:
 
     # Tail trim is capped to 0.2s (20 samples), so at least 40 tail samples are kept.
     assert hypothesis == "ok"
-    assert streamer.finalized_sample_counts == [140]
+    assert streamer.fed_sample_counts == [140]
+    assert seal_transcriber.transcribed_sample_counts == [140]
 
 
 def test_transcribe_stream_seal_retries_with_full_tail_when_empty() -> None:
-    streamer = _DummyStreamer(chunk_secs=1.0, finalize_outputs=["", "ok"])
+    streamer = _DummyStreamer(chunk_secs=1.0)
+    seal_transcriber = _DummySealTranscriber(outputs=["", "ok"])
     samples = np.zeros((160,), dtype=np.float32)  # ready=100, tail=60
 
     hypothesis, _ = transcribe_stream_seal(
         streamer,
+        seal_transcriber,
         samples=samples,
         sample_rate=100,
         silence_floor_db=-40.0,
@@ -748,13 +765,14 @@ def test_transcribe_stream_seal_retries_with_full_tail_when_empty() -> None:
 
     # First finalize uses capped tail (140 samples), retry uses full tail (160 samples).
     assert hypothesis == "ok"
-    assert streamer.finalized_sample_counts == [140, 160]
+    assert streamer.fed_sample_counts == [140, 160]
+    assert seal_transcriber.transcribed_sample_counts == [140, 160]
 
 
 def test_stream_seal_regression_cmd_087_non_empty_for_non_empty_reference() -> None:
-    streamer = _DummyStreamer(
-        chunk_secs=1.0,
-        finalize_outputs_by_sample_count={
+    streamer = _DummyStreamer(chunk_secs=1.0)
+    seal_transcriber = _DummySealTranscriber(
+        outputs_by_sample_count={
             140: "",
             160: _CMD_087_RECOVERED_HYPOTHESIS,
         },
@@ -763,6 +781,7 @@ def test_stream_seal_regression_cmd_087_non_empty_for_non_empty_reference() -> N
 
     hypothesis, _ = transcribe_stream_seal(
         streamer,
+        seal_transcriber,
         samples=samples,
         sample_rate=100,
         silence_floor_db=-40.0,
@@ -772,13 +791,14 @@ def test_stream_seal_regression_cmd_087_non_empty_for_non_empty_reference() -> N
     assert normalize_transcript(_CMD_087_REFERENCE)
     assert hypothesis.strip() != ""
     assert compute_normalized_wer(_CMD_087_REFERENCE, hypothesis) <= 0.15
-    assert streamer.finalized_sample_counts == [140, 160]
+    assert streamer.fed_sample_counts == [140, 160]
+    assert seal_transcriber.transcribed_sample_counts == [140, 160]
 
 
 def test_stream_seal_regression_cmd_073_retains_suffix_with_tail_trim_cap() -> None:
-    streamer = _DummyStreamer(
-        chunk_secs=1.0,
-        finalize_outputs_by_sample_count={
+    streamer = _DummyStreamer(chunk_secs=1.0)
+    seal_transcriber = _DummySealTranscriber(
+        outputs_by_sample_count={
             # No cap can trim all 60 tail samples and lose the suffix clause.
             100: _CMD_073_TRIMMED_HYPOTHESIS,
             # 0.35s cap (35 samples @100Hz) keeps 25 tail samples and preserves suffix.
@@ -789,6 +809,7 @@ def test_stream_seal_regression_cmd_073_retains_suffix_with_tail_trim_cap() -> N
 
     hypothesis, _ = transcribe_stream_seal(
         streamer,
+        seal_transcriber,
         samples=samples,
         sample_rate=100,
         silence_floor_db=-40.0,
@@ -798,4 +819,5 @@ def test_stream_seal_regression_cmd_073_retains_suffix_with_tail_trim_cap() -> N
     assert compute_normalized_wer(_CMD_073_REFERENCE, _CMD_073_TRIMMED_HYPOTHESIS) > 0.35
     assert compute_normalized_wer(_CMD_073_REFERENCE, hypothesis) <= 0.10
     assert _CMD_073_SUFFIX in normalize_transcript(hypothesis)
-    assert streamer.finalized_sample_counts == [125]
+    assert streamer.fed_sample_counts == [125]
+    assert seal_transcriber.transcribed_sample_counts == [125]
