@@ -46,6 +46,7 @@ from check_model_lib.runtime import (
 )
 from check_model_lib.thresholds import evaluate_regression_thresholds
 from parakeet_stt_daemon.model import (
+    STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
     ParakeetStreamingTranscriber,
     ParakeetTranscriber,
     load_parakeet_model,
@@ -75,6 +76,7 @@ def _run_benchmark_once(
                 raise ValueError("streaming transcriber is required for stream-seal runtime")
             hypothesis, infer_ms = _transcribe_stream_seal(
                 streaming_transcriber,
+                transcriber,
                 samples,
                 sample_rate=sample_rate,
                 silence_floor_db=stream_silence_floor_db,
@@ -262,6 +264,8 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             right_context_secs=args.stream_right_context_secs,
             left_context_secs=args.stream_left_context_secs,
             batch_size=args.stream_batch_size,
+            enable_helper=False,
+            helper_disabled_reason=STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
         )
     effective_device = str(getattr(model, "_parakeet_effective_device", args.device))
 
@@ -338,6 +342,8 @@ def run_offline_benchmark(args: argparse.Namespace) -> int:
             "fallback_reason": (
                 streaming_transcriber.fallback_reason if streaming_transcriber is not None else None
             ),
+            "stream_model_isolated": False,
+            "streaming_helper_policy": "disabled_for_seal_accuracy",
         }
     report = {
         "benchmark": "offline",
@@ -481,6 +487,7 @@ def run_streaming_probe(model, samples: np.ndarray) -> str:
             right_context_secs=PROBE_STREAM_RIGHT_CONTEXT_SECS,
             left_context_secs=PROBE_STREAM_LEFT_CONTEXT_SECS,
             batch_size=PROBE_STREAM_BATCH_SIZE,
+            enable_helper=True,
         )
     except Exception as exc:  # noqa: BLE001 - probe command must report any helper init failure
         return f"streaming helper init failed: {exc}"

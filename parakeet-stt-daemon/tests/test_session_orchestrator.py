@@ -337,6 +337,74 @@ def _stream_runtime(orchestrator: SessionOrchestrator) -> StreamPathRuntime:
     return orchestrator._stream_path_runtime_for_runtime()
 
 
+def test_constructor_stream_seal_uses_single_model_with_helper_disabled(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from parakeet_stt_daemon.model import STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY
+
+    model = object()
+    load_calls: list[str] = []
+    captured: dict[str, Any] = {}
+
+    class _ConstructAudio:
+        def __init__(self, *, sample_rate: int, **_kwargs: Any) -> None:
+            self.sample_rate = sample_rate
+
+        def configure_stream_chunk_size(self, chunk_samples: int) -> None:
+            captured["stream_chunk_samples"] = chunk_samples
+
+    class _ConstructSealTranscriber:
+        def __init__(self, model_arg: object) -> None:
+            captured["seal_model"] = model_arg
+
+    class _ConstructStreamingTranscriber:
+        helper_active = False
+        _helper_class_name = None
+
+        def __init__(self, model_arg: object, **kwargs: Any) -> None:
+            captured["stream_model"] = model_arg
+            captured["stream_kwargs"] = kwargs
+            self.fallback_reason = kwargs["helper_disabled_reason"]
+
+    def fake_load_parakeet_model(*, device: str) -> object:
+        load_calls.append(device)
+        return model
+
+    monkeypatch.setattr(orchestrator_module, "AudioInput", _ConstructAudio)
+    monkeypatch.setattr(orchestrator_module, "load_parakeet_model", fake_load_parakeet_model)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "ParakeetTranscriber",
+        _ConstructSealTranscriber,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "ParakeetStreamingTranscriber",
+        _ConstructStreamingTranscriber,
+    )
+
+    settings = ServerSettings(device="cpu", streaming_enabled=True)
+    orchestrator = SessionOrchestrator(settings)
+
+    assert load_calls == ["cpu"]
+    assert orchestrator.model is model
+    assert captured["seal_model"] is model
+    assert captured["stream_model"] is model
+    assert captured["stream_chunk_samples"] == int(settings.chunk_secs * 16_000)
+    assert captured["stream_kwargs"] == {
+        "chunk_secs": settings.chunk_secs,
+        "right_context_secs": settings.right_context_secs,
+        "left_context_secs": settings.left_context_secs,
+        "batch_size": settings.batch_size,
+        "enable_helper": False,
+        "helper_disabled_reason": STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
+    }
+    assert orchestrator.streaming_transcriber is not None
+    assert orchestrator.streaming_transcriber.fallback_reason == (
+        STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY
+    )
+
+
 T = TypeVar("T")
 
 

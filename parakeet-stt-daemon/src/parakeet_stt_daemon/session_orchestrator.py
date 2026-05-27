@@ -40,6 +40,7 @@ from .messages import (
     SessionEndReason,
 )
 from .model import (
+    STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
     ParakeetStreamingSession,
     ParakeetStreamingTranscriber,
     ParakeetTranscriber,
@@ -166,17 +167,7 @@ class SessionOrchestrator:
         )
         self._session_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
-        self.streaming_transcriber: ParakeetStreamingTranscriber | None = (
-            ParakeetStreamingTranscriber(
-                self.model,
-                chunk_secs=settings.chunk_secs,
-                right_context_secs=settings.right_context_secs,
-                left_context_secs=settings.left_context_secs,
-                batch_size=settings.batch_size,
-            )
-            if settings.streaming_enabled
-            else None
-        )
+        self.streaming_transcriber = self._load_streaming_transcriber(settings)
         self._active_stream: ParakeetStreamingSession | None = None
         self._stream_drain_task: asyncio.Task | None = None
         self._stream_drain_running = False
@@ -203,6 +194,21 @@ class SessionOrchestrator:
         self.interim_transcript_runtime = InterimTranscriptRuntime.from_settings(
             settings,
             sample_rate=self.audio.sample_rate,
+        )
+
+    def _load_streaming_transcriber(
+        self, settings: ServerSettings
+    ) -> ParakeetStreamingTranscriber | None:
+        if not settings.streaming_enabled:
+            return None
+        return ParakeetStreamingTranscriber(
+            self.model,
+            chunk_secs=settings.chunk_secs,
+            right_context_secs=settings.right_context_secs,
+            left_context_secs=settings.left_context_secs,
+            batch_size=settings.batch_size,
+            enable_helper=False,
+            helper_disabled_reason=STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY,
         )
 
     async def start(self, intent: StartSessionIntent) -> None:

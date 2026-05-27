@@ -19,6 +19,7 @@ import numpy as np
 from loguru import logger
 
 DEFAULT_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
+STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY = "streaming_helper_disabled:seal_accuracy"
 
 if TYPE_CHECKING:  # pragma: no cover
     import nemo.collections.asr as nemo_asr
@@ -163,6 +164,17 @@ def _disable_cuda_graph_decoder_config(decoding_cfg: Any) -> bool:
     if beam_cfg is not None:
         changed = _set_cfg_value(beam_cfg, "allow_cuda_graphs", False) or changed
     return changed
+
+
+def _apply_greedy_decoding_defaults(decoding_cfg: Any, max_steps_per_timestep: int) -> None:
+    _set_cfg_value(decoding_cfg, "strategy", "greedy")
+    _disable_cuda_graph_decoder_config(decoding_cfg)
+    _set_cfg_value(decoding_cfg, "preserve_alignments", True)
+    _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
+    beam_cfg = _get_cfg_value(decoding_cfg, "beam")
+    _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
+    greedy_cfg = _get_cfg_value(decoding_cfg, "greedy")
+    _set_cfg_value(greedy_cfg, "max_symbols_per_step", int(max_steps_per_timestep))
 
 
 def _iter_cuda_graph_decoder_candidates(model: ASRModel) -> Iterator[Any]:
@@ -383,6 +395,15 @@ class ParakeetStreamingSession:
         self._chunks.append(np.array(audio, dtype=np.float32, copy=True))
         if self.stream_fallback_reason is not None:
             return False
+        if not bool(getattr(self._parent, "helper_active", True)):
+            reason = str(
+                getattr(self._parent, "fallback_reason", None) or "streaming_helper_unavailable"
+            )
+            self.stream_fallback_reason = reason
+            mark_fallback = getattr(self._parent, "mark_stream_fallback", None)
+            if callable(mark_fallback):
+                mark_fallback(reason)
+            return False
         try:
             self._parent.process_stream_chunk(audio, self.sample_rate)
         except Exception as exc:  # noqa: BLE001 - session should fall back to Seal path
@@ -414,6 +435,8 @@ class ParakeetStreamingTranscriber:
         right_context_secs: float = 2.0,
         left_context_secs: float = 10.0,
         batch_size: int = 32,
+        enable_helper: bool = False,
+        helper_disabled_reason: str | None = None,
     ) -> None:
         self.model = model
         self.chunk_secs = float(chunk_secs)
@@ -425,6 +448,16 @@ class ParakeetStreamingTranscriber:
         self._helper_class_name: str | None = None
 
         self.offline = ParakeetTranscriber(model)
+        if not enable_helper:
+            self.fallback_reason = (
+                helper_disabled_reason or STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY
+            )
+            logger.info(
+                "NeMo streaming helper disabled ({}); using Seal path for final "
+                "transcription and rolling offline interim updates",
+                self.fallback_reason,
+            )
+            return
         self._init_helper()
 
     @property
@@ -516,7 +549,7 @@ class ParakeetStreamingTranscriber:
         max_steps_per_timestep = 5
         cfg = getattr(self.model, "_cfg", None) or getattr(self.model, "cfg", None)
         decoding_cfg = _get_cfg_value(cfg, "decoding")
-        greedy_cfg = getattr(decoding_cfg, "greedy", None)
+        greedy_cfg = _get_cfg_value(decoding_cfg, "greedy")
         configured = _get_cfg_value(greedy_cfg, "max_symbols_per_step")
         if configured is not None:
             max_steps_per_timestep = int(configured)
@@ -524,44 +557,38 @@ class ParakeetStreamingTranscriber:
             if model_is_tdt and batched_frame_asr_tdt is None:
                 logger.warning(
                     "TDT model detected but BatchedFrameASRTDT is unavailable; "
-                    "falling back to RNNT helper"
+                    "using offline fallback"
                 )
+                self.chunk_helper = None
+                self.fallback_reason = "init_failed:BatchedFrameASRTDTUnavailable"
+                return
             if model_is_tdt and batched_frame_asr_tdt is not None:
                 try:
                     change_decoding = getattr(self.model, "change_decoding_strategy", None)
-                    if callable(change_decoding) and decoding_cfg is not None:
-                        try:
-                            if open_dict_fn is not None:
-                                with open_dict_fn(decoding_cfg):
-                                    _set_cfg_value(decoding_cfg, "strategy", "greedy")
-                                    _disable_cuda_graph_decoder_config(decoding_cfg)
-                                    _set_cfg_value(decoding_cfg, "preserve_alignments", True)
-                                    _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
-                                    beam_cfg = _get_cfg_value(decoding_cfg, "beam")
-                                    _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
-                                    _set_cfg_value(
-                                        greedy_cfg,
-                                        "max_symbols_per_step",
-                                        int(max_steps_per_timestep),
-                                    )
-                            else:
-                                _set_cfg_value(decoding_cfg, "strategy", "greedy")
-                                _disable_cuda_graph_decoder_config(decoding_cfg)
-                                _set_cfg_value(decoding_cfg, "preserve_alignments", True)
-                                _set_cfg_value(decoding_cfg, "fused_batch_size", -1)
-                                beam_cfg = _get_cfg_value(decoding_cfg, "beam")
-                                _set_cfg_value(beam_cfg, "return_best_hypothesis", True)
-                                _set_cfg_value(
-                                    greedy_cfg, "max_symbols_per_step", int(max_steps_per_timestep)
+                    if not callable(change_decoding) or decoding_cfg is None:
+                        raise RuntimeError("streaming_decoding_builder_unavailable")
+                    try:
+                        if open_dict_fn is not None:
+                            with open_dict_fn(decoding_cfg):
+                                _apply_greedy_decoding_defaults(
+                                    decoding_cfg,
+                                    max_steps_per_timestep,
                                 )
-                            change_decoding(decoding_cfg)
-                            # change_decoding_strategy recreates the decoder with
-                            # CUDA graphs re-enabled; disable them again.
-                            _disable_cuda_graph_decoder(self.model)
-                        except Exception as exc:  # noqa: BLE001 - NeMo config shape varies by build
-                            logger.warning(
-                                "Failed to adjust decoding strategy for TDT streaming: {}", exc
+                        else:
+                            _apply_greedy_decoding_defaults(
+                                decoding_cfg,
+                                max_steps_per_timestep,
                             )
+                    except Exception as exc:  # noqa: BLE001 - NeMo config shape varies by build
+                        logger.warning(
+                            "Failed to adjust decoding strategy for TDT streaming: {}",
+                            exc,
+                        )
+                        raise
+                    change_decoding(decoding_cfg)
+                    # change_decoding_strategy recreates the decoder with
+                    # CUDA graphs re-enabled; disable them again.
+                    _disable_cuda_graph_decoder(self.model)
                     tdt_batch_size = 1
                     if self.batch_size != tdt_batch_size:
                         logger.info(
@@ -592,9 +619,12 @@ class ParakeetStreamingTranscriber:
                     return
                 except Exception as exc:  # noqa: BLE001 - helper init is best-effort
                     logger.warning(
-                        "TDT streaming helper init failed; falling back to RNNT helper: {}",
+                        "TDT streaming helper init failed; using offline fallback: {}",
                         exc,
                     )
+                    self.chunk_helper = None
+                    self.fallback_reason = f"init_failed:{exc.__class__.__name__}"
+                    return
             self.chunk_helper = FrameBatchChunkedRNNT(
                 asr_model=self.model,
                 frame_len=cast(Any, self.chunk_secs),
@@ -635,4 +665,5 @@ __all__ = [
     "ParakeetStreamingTranscriber",
     "ParakeetStreamingSession",
     "DEFAULT_MODEL_NAME",
+    "STREAMING_HELPER_DISABLED_FOR_SEAL_ACCURACY",
 ]

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from check_model_lib.constants import SAMPLE_RATE
-from parakeet_stt_daemon.model import ParakeetStreamingTranscriber
+from parakeet_stt_daemon.model import ParakeetStreamingTranscriber, ParakeetTranscriber
 
 
 def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
@@ -100,6 +100,7 @@ def _split_stream_ready_and_tail(
 
 def _transcribe_stream_seal(
     streamer: ParakeetStreamingTranscriber,
+    seal_transcriber: ParakeetTranscriber,
     samples: np.ndarray,
     *,
     sample_rate: int,
@@ -128,7 +129,13 @@ def _transcribe_stream_seal(
             session.feed(chunk)
         if active_tail.size:
             session.feed(active_tail)
-        return session.finalize()
+        if ready_chunks:
+            final_audio = np.concatenate([*ready_chunks, active_tail]).astype(
+                np.float32, copy=False
+            )
+        else:
+            final_audio = active_tail.astype(np.float32, copy=False)
+        return seal_transcriber.transcribe_samples(final_audio, sample_rate=sample_rate)
 
     infer_start = time.perf_counter()
     hypothesis = _finalize_with_tail(trimmed_tail)
