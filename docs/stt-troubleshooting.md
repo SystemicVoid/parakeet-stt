@@ -42,7 +42,7 @@ Canonical-source policy:
   | `--overlay-enabled <v>` | `true` | `PARAKEET_OVERLAY_ENABLED` |
   | `--overlay-adaptive-width <v>` | `false` | `PARAKEET_OVERLAY_ADAPTIVE_WIDTH` |
   | `--llm-pre-modifier-key <key>` | `KEY_SHIFT` | `PARAKEET_LLM_PRE_MODIFIER_KEY` |
-  | `--llm-base-url <url>` | `http://127.0.0.1:8080/v1` | `PARAKEET_LLM_BASE_URL` |
+  | `--llm-base-url <url>` | `http://127.0.0.1:8081/v1` | `PARAKEET_LLM_BASE_URL` |
   | `--llm-model <name>` | `local` | `PARAKEET_LLM_MODEL` |
   | `--llm-timeout-seconds <n>` | `20` | `PARAKEET_LLM_TIMEOUT_SECONDS` |
   | `--llm-max-tokens <n>` | `512` | `PARAKEET_LLM_MAX_TOKENS` |

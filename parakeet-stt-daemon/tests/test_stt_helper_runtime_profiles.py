@@ -868,7 +868,7 @@ def test_helper_start_cli_llm_base_url_overrides_env() -> None:
     )
 
     assert config["llm_base_url"] == "http://cli.local:8182/custom"
-    assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8080/v1"
+    assert config["managed_llm_api_base_url"] == "http://127.0.0.1:8081/v1"
 
 
 def test_get_stt_start_args_preserves_multiline_text_with_scalar_option() -> None:

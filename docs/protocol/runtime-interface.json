@@ -17,7 +17,7 @@
   "managed_llm": {
     "description": "Shared managed llama-server endpoint defaults consumed by the Client and Helper.",
     "default_host": "127.0.0.1",
-    "default_port": 8080,
+    "default_port": 8081,
     "env": {
       "base_url": "PARAKEET_LLM_BASE_URL",
       "host": "PARAKEET_LLM_SERVER_HOST",

@@ -11,7 +11,7 @@ pub(crate) const DAEMON_STATUS_PATH: &str = "/status";
 pub(crate) const DAEMON_HEALTH_PATH: &str = "/healthz";
 
 pub(crate) const DEFAULT_LLM_HOST: &str = "127.0.0.1";
-pub(crate) const DEFAULT_LLM_PORT: u16 = 8080;
+pub(crate) const DEFAULT_LLM_PORT: u16 = 8081;
 pub(crate) const LLM_API_PATH: &str = "/v1";
 #[allow(dead_code)]
 pub(crate) const LLM_HEALTH_PATH: &str = "/health";

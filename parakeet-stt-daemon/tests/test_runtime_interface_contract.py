@@ -112,8 +112,8 @@ def test_runtime_interface_urls_are_built_from_named_parts() -> None:
     assert runtime_interface.daemon_websocket_endpoint() == "ws://127.0.0.1:8765/ws"
     assert runtime_interface.daemon_status_url() == "http://127.0.0.1:8765/status"
     assert runtime_interface.daemon_health_url() == "http://127.0.0.1:8765/healthz"
-    assert runtime_interface.managed_llm_api_base_url() == "http://127.0.0.1:8080/v1"
-    assert runtime_interface.managed_llm_health_url() == "http://127.0.0.1:8080/health"
+    assert runtime_interface.managed_llm_api_base_url() == "http://127.0.0.1:8081/v1"
+    assert runtime_interface.managed_llm_health_url() == "http://127.0.0.1:8081/health"
 
 
 def test_operator_docs_reference_runtime_interface_defaults() -> None:
