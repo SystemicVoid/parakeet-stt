@@ -3,6 +3,11 @@
 The Daemon uses this module before offline Seal path finalization. The trimmer
 owns RMS fallback, optional VAD lifecycle, and the Runtime truth facts reported
 through status/logging.
+
+Policy: trimming must never remove speech. On a quiet mic (speech near -32 dBFS,
+noise near -55 dBFS) a trailing fricative sits around -50 dBFS, so the silence
+floor defaults well below that, and every trim is capped so a mis-set floor can
+cost at most ``DEFAULT_MAX_TAIL_TRIM_SECS`` of audio instead of whole words.
 """
 
 from __future__ import annotations
@@ -15,6 +20,11 @@ from loguru import logger
 
 TailTrimMode = Literal["rms", "vad"]
 VadFailureStage = Literal["load_failed", "runtime_failed", "warmup_failed"]
+
+# Personal eval sweep (2026-09): -40 dBFS changed the last words of 17/100 clips,
+# -50 left 2, -60 left 0. Keep the default at or below -60.
+DEFAULT_SILENCE_FLOOR_DB = -60.0
+DEFAULT_MAX_TAIL_TRIM_SECS = 0.35
 
 
 class VadAdapter(Protocol):
@@ -74,9 +84,11 @@ class SealPathTailTrimmer:
         silence_floor_db: float,
         vad_adapter: VadAdapter | None = None,
         warmup_sample_rate: int = 16_000,
+        max_tail_trim_secs: float = DEFAULT_MAX_TAIL_TRIM_SECS,
     ) -> None:
         self._vad_enabled = vad_enabled
         self._silence_floor_db = silence_floor_db
+        self._max_tail_trim_secs = max(0.0, float(max_tail_trim_secs))
         self._vad_adapter = vad_adapter if vad_adapter is not None else SileroVadAdapter()
         self._warmup_sample_rate = warmup_sample_rate
         self._last_outcome = TailTrimOutcome(
@@ -134,13 +146,22 @@ class SealPathTailTrimmer:
             trimmed = self._trim_with_vad(samples, sample_rate)
             if trimmed is not None:
                 return self._remember(
-                    trimmed,
+                    self._cap_trim(samples, trimmed, sample_rate),
                     tail_trim_mode="vad",
                     vad_active=True,
                     vad_fallback_reason=None,
                 )
 
-        return self._remember(self._trim_with_rms(samples, sample_rate))
+        trimmed = self._trim_with_rms(samples, sample_rate)
+        return self._remember(self._cap_trim(samples, trimmed, sample_rate))
+
+    def _cap_trim(self, samples: np.ndarray, trimmed: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Keep at least ``size - max_tail_trim_secs`` samples whatever the trimmer said."""
+        audio = samples.astype(np.float32, copy=False)
+        minimum_keep = max(0, audio.size - int(sample_rate * self._max_tail_trim_secs))
+        if trimmed.size >= minimum_keep:
+            return trimmed
+        return audio[:minimum_keep]
 
     def _trim_with_vad(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
         self.prepare()
@@ -212,6 +233,8 @@ def _format_vad_failure_reason(stage: VadFailureStage, exc: Exception) -> str:
 
 
 __all__ = [
+    "DEFAULT_MAX_TAIL_TRIM_SECS",
+    "DEFAULT_SILENCE_FLOOR_DB",
     "SealPathTailTrimmer",
     "SileroVadAdapter",
     "TailTrimMode",

@@ -18,6 +18,7 @@ from .runtime_interface import (
     daemon_status_url,
     daemon_websocket_endpoint,
 )
+from .tail_trim import DEFAULT_SILENCE_FLOOR_DB
 
 
 class ServerSettings(BaseSettings):
@@ -91,10 +92,13 @@ class ServerSettings(BaseSettings):
         ),
     )
     silence_floor_db: float = Field(
-        default=-40.0,
+        default=DEFAULT_SILENCE_FLOOR_DB,
         ge=-120.0,
         le=0.0,
-        description="Stop trimming tail silence when RMS exceeds this floor (dB).",
+        description=(
+            "Stop trimming tail silence when RMS exceeds this floor (dBFS). "
+            "Keep it below the level of quiet trailing consonants on the mic in use."
+        ),
     )
     vad_enabled: bool = Field(
         default=False,

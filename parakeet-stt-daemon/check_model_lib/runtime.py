@@ -11,6 +11,7 @@ import numpy as np
 
 from check_model_lib.constants import SAMPLE_RATE
 from parakeet_stt_daemon.model import ParakeetStreamingTranscriber, ParakeetTranscriber
+from parakeet_stt_daemon.tail_trim import SealPathTailTrimmer
 
 
 def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
@@ -60,29 +61,6 @@ def _read_wav_samples(path: Path) -> tuple[np.ndarray, int]:
     return sample_array.reshape(-1), sample_rate
 
 
-def _trim_tail_with_rms(
-    samples: np.ndarray,
-    *,
-    sample_rate: int,
-    silence_floor_db: float,
-    window_ms: int = 50,
-) -> np.ndarray:
-    if samples.size == 0:
-        return samples
-    window = max(1, int(sample_rate * window_ms / 1000))
-    audio = samples.astype(np.float32, copy=False)
-    idx = audio.size
-    while idx > 0:
-        start = max(0, idx - window)
-        window_slice = audio[start:idx]
-        rms = np.sqrt(np.mean(window_slice**2))
-        db = 20 * np.log10(max(rms, 1e-6))
-        if db > silence_floor_db:
-            break
-        idx = start
-    return audio[:idx]
-
-
 def _split_stream_ready_and_tail(
     samples: np.ndarray, *, sample_rate: int, chunk_secs: float
 ) -> tuple[list[np.ndarray], np.ndarray]:
@@ -112,16 +90,16 @@ def _transcribe_stream_seal(
     )
     trimmed_tail = tail
     if tail.size:
-        candidate_tail = _trim_tail_with_rms(
-            tail,
-            sample_rate=sample_rate,
-            silence_floor_db=silence_floor_db,
+        # Same trimmer the Daemon Seal path runs, so the gate sees its real policy.
+        trimmed_tail = (
+            SealPathTailTrimmer(
+                vad_enabled=False,
+                silence_floor_db=silence_floor_db,
+                max_tail_trim_secs=max_tail_trim_secs,
+            )
+            .trim(tail, sample_rate)
+            .samples
         )
-        max_trim_samples = max(0, int(sample_rate * max_tail_trim_secs))
-        minimum_keep = max(0, tail.size - max_trim_samples)
-        if candidate_tail.size < minimum_keep:
-            candidate_tail = tail[:minimum_keep]
-        trimmed_tail = candidate_tail
 
     def _finalize_with_tail(active_tail: np.ndarray) -> str:
         session = streamer.start_session(sample_rate)

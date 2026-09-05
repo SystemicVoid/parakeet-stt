@@ -111,6 +111,7 @@ class SealPathFinalizationResult:
     audio_duration_raw: float
     finalize_ms: int
     infer_ms: int
+    tail_trim_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +194,7 @@ class SealPathRuntime:
                 partial(self.tail_trimmer.trim, audio_samples, self.sample_rate),
             )
             trimmed = trim_outcome.samples
+            tail_trim_ms = int((audio_samples.size - trimmed.size) * 1000 / self.sample_rate)
             if trimmed.size == 0:
                 logger.info("Skipping offline transcription: silence trimming removed all samples")
                 self._release_device_cache(effective_device)
@@ -204,6 +206,7 @@ class SealPathRuntime:
                     audio_duration_raw=audio_duration_raw,
                     finalize_ms=int((time.perf_counter() - finalize_started) * 1000),
                     infer_ms=0,
+                    tail_trim_ms=tail_trim_ms,
                 )
 
             infer_started = time.perf_counter()
@@ -220,6 +223,7 @@ class SealPathRuntime:
                 audio_duration_raw=audio_duration_raw,
                 finalize_ms=int((time.perf_counter() - finalize_started) * 1000),
                 infer_ms=infer_ms,
+                tail_trim_ms=tail_trim_ms,
             )
         except Exception as exc:  # noqa: BLE001 - returned to orchestrator as model failure
             if not cache_released:

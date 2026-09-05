@@ -78,7 +78,7 @@ from .session import (
     StreamPathRuntime,
     StreamPathRuntimeFacts,
 )
-from .tail_trim import SealPathTailTrimmer
+from .tail_trim import DEFAULT_SILENCE_FLOOR_DB, SealPathTailTrimmer
 
 SESSION_GUARD_POLL_SECS = 0.1
 SESSION_GUARD_WARNING_FRACTION = 0.8  # emit warning at 80% of limit
@@ -437,12 +437,13 @@ class SessionOrchestrator:
                 else 0
             )
             logger.info(
-                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, audio_stop_ms={}, "
-                "latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, text_len={}, "
-                "chars_per_sec={:.1f}, runtime_truth={}",
+                "Session {} completed: audio_raw={:.2f}s, audio_ms={}, tail_trim_ms={}, "
+                "audio_stop_ms={}, latency_ms={}, finalize_ms={}, infer_ms={}, send_ms={}, "
+                "text_len={}, chars_per_sec={:.1f}, runtime_truth={}",
                 session.session_id,
                 finalization.audio_duration_raw,
                 finalization.audio_ms,
+                finalization.tail_trim_ms,
                 audio_stop_ms,
                 latency_ms,
                 finalization.finalize_ms,
@@ -982,7 +983,9 @@ class SessionOrchestrator:
         if not isinstance(tail_trimmer, SealPathTailTrimmer):
             tail_trimmer = SealPathTailTrimmer(
                 vad_enabled=bool(getattr(self, "_vad_enabled", False)),
-                silence_floor_db=float(getattr(self.settings, "silence_floor_db", -40.0)),
+                silence_floor_db=float(
+                    getattr(self.settings, "silence_floor_db", DEFAULT_SILENCE_FLOOR_DB)
+                ),
                 warmup_sample_rate=int(getattr(self.audio, "sample_rate", 16_000)),
             )
             self.tail_trimmer = tail_trimmer

@@ -138,6 +138,16 @@ The schema-defined Runtime Truth groups are `core`, `device`, `stream_path`,
   listening/finalizing motion, width changes, and opacity transitions are not
   inference, transport, or LLM progress evidence.
 
+### Seal path tail trimming
+
+Before Seal path finalization the Daemon trims trailing silence with an RMS
+floor (`PARAKEET_SILENCE_FLOOR_DB`, default -60 dBFS) and never removes more
+than 0.35 s. Both live in `parakeet_stt_daemon.tail_trim` and the eval harness
+imports them, so `just eval stream` exercises the same policy. A floor above the
+level of quiet trailing consonants (around -50 dBFS on a quiet mic) drops the
+last word of a Session; the per-session `completed:` log line reports
+`tail_trim_ms` so you can see how much audio the trim removed.
+
 ### Live Overlay text with `stream_path_executed=false`
 
 This is not automatically a contradiction. The Stream path truth fields report
