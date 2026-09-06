@@ -1,0 +1,1 @@
+/home/hugo/.config/forge/agents/.agents/agents-store/comment-sicko.md
