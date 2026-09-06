@@ -340,7 +340,8 @@ impl OverlayStateMachine {
         }
     }
 
-    /// Returns true when the deadline passed and the Overlay went hidden.
+    /// Returns true when something to repaint changed: the transient notice
+    /// expired, or the hide deadline passed and the Overlay went hidden.
     pub fn advance_time(&mut self, now_ms: u64) -> bool {
         let mut changed = false;
         if self

@@ -17,14 +17,14 @@ repos:
         name: python ruff format
         entry: uv run --project parakeet-stt-daemon ruff format --config parakeet-stt-daemon/pyproject.toml
         language: system
-        files: ^parakeet-stt-daemon/.*\.pyi?$
+        files: \.pyi?$
         stages: [pre-commit]
 
       - id: python-ruff-check
         name: python ruff check
         entry: uv run --project parakeet-stt-daemon ruff check --fix --config parakeet-stt-daemon/pyproject.toml
         language: system
-        files: ^parakeet-stt-daemon/.*\.pyi?$
+        files: \.pyi?$
         stages: [pre-commit]
 
       - id: python-ty-check

@@ -61,7 +61,7 @@ def flatten_pair_kerning(font: TTFont) -> dict[tuple[str, str], int]:
                 continue
             coverage = subtable.Coverage.glyphs
             if subtable.Format == 1:
-                for first, pair_set in zip(coverage, subtable.PairSet):
+                for first, pair_set in zip(coverage, subtable.PairSet, strict=True):
                     if first not in glyph_set:
                         continue
                     for record in pair_set.PairValueRecord:

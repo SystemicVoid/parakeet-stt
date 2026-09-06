@@ -538,7 +538,7 @@ $ git commit -m "<span class="caret">▍</span></pre>
     backdropKey = BACKDROPS.includes(params.get('backdrop')) ? params.get('backdrop') : 'chat';
     buildBackdrop(backdropKey);
     select(params.get('variant') || order[0]);
-    // ?auto=<scenario> runs a scenario on load (used by shoot.sh with headless Chrome virtual time).
+    // ?auto=<scenario> runs a scenario on load (used by shoot.py, run with `uv run`, against headless Chrome).
     const auto = params.get('auto');
     if (auto && scenarios[auto]) setTimeout(() => scenarios[auto](), 50);
     window.addEventListener('keydown', onKey);
