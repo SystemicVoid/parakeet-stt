@@ -350,7 +350,7 @@ impl OverlayProcessManager {
                 self.latest_message = Some(message.clone());
                 self.latest_warning = None;
             }
-            OverlayIpcMessage::SessionWarning { session_id } => {
+            OverlayIpcMessage::SessionWarning { session_id, .. } => {
                 if overlay_message_session_id(self.latest_message.as_ref()) == Some(*session_id) {
                     self.latest_warning = Some(message.clone());
                 }
@@ -916,7 +916,11 @@ mod tests {
             .expect("first sink should remain open");
         assert_eq!(first_state, state_message);
 
-        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        let warning_message = OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        };
         manager.send(warning_message.clone());
         let first_warning = timeout(Duration::from_millis(100), rx_first.recv())
             .await
@@ -1050,7 +1054,11 @@ mod tests {
             seq: 2,
             text: "current-state".to_string(),
         };
-        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        let warning_message = OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        };
         manager.send(state_message.clone());
         manager.send(warning_message.clone());
         manager.send(OverlayIpcMessage::InjectionComplete {

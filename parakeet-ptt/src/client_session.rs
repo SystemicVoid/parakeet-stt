@@ -1296,7 +1296,7 @@ pub(crate) async fn handle_server_message<S: OverlaySink>(
                 limit_seconds,
                 "session warning: approaching limit"
             );
-            overlay_router.route_session_warning(session_id);
+            overlay_router.route_session_warning(session_id, remaining_seconds, limit_seconds);
         }
         ServerMessage::Status(_) => {}
     }
