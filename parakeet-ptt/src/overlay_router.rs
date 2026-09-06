@@ -79,9 +79,12 @@ pub enum OverlayEvent {
     InjectionComplete {
         session_id: Uuid,
         success: bool,
+        copy_only: bool,
     },
     SessionWarning {
         session_id: Uuid,
+        remaining_seconds: f32,
+        limit_seconds: f32,
     },
 }
 
@@ -156,13 +159,21 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
         OverlayEvent::InjectionComplete {
             session_id,
             success,
+            copy_only,
         } => OverlayIpcMessage::InjectionComplete {
             session_id,
             success,
+            copy_only,
         },
-        OverlayEvent::SessionWarning { session_id } => {
-            OverlayIpcMessage::SessionWarning { session_id }
-        }
+        OverlayEvent::SessionWarning {
+            session_id,
+            remaining_seconds,
+            limit_seconds,
+        } => OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(remaining_seconds),
+            limit_seconds: Some(limit_seconds),
+        },
     }
 }
 
@@ -458,19 +469,33 @@ impl<S: OverlaySink> OverlayRouter<S> {
         self.metrics.note_interim_text();
     }
 
-    pub(crate) fn route_injection_complete(&mut self, session_id: Uuid, success: bool) {
+    pub(crate) fn route_injection_complete(
+        &mut self,
+        session_id: Uuid,
+        success: bool,
+        copy_only: bool,
+    ) {
         self.sink.on_overlay_event(OverlayEvent::InjectionComplete {
             session_id,
             success,
+            copy_only,
         });
     }
 
-    pub(crate) fn route_session_warning(&mut self, session_id: Uuid) {
+    pub(crate) fn route_session_warning(
+        &mut self,
+        session_id: Uuid,
+        remaining_seconds: f32,
+        limit_seconds: f32,
+    ) {
         if self.active_session_id != Some(session_id) {
             return;
         }
-        self.sink
-            .on_overlay_event(OverlayEvent::SessionWarning { session_id });
+        self.sink.on_overlay_event(OverlayEvent::SessionWarning {
+            session_id,
+            remaining_seconds,
+            limit_seconds,
+        });
     }
 
     fn allow_session(&self, expected_session_id: Option<Uuid>, incoming_session_id: Uuid) -> bool {
@@ -710,8 +735,8 @@ mod tests {
         let mut router = OverlayRouter::new(sink);
         router.note_session_started(active_session_id);
 
-        router.route_session_warning(inactive_session_id);
-        router.route_session_warning(active_session_id);
+        router.route_session_warning(inactive_session_id, 120.0, 600.0);
+        router.route_session_warning(active_session_id, 120.0, 600.0);
 
         assert_eq!(
             seen.lock()
@@ -719,6 +744,8 @@ mod tests {
                 .clone(),
             vec![OverlayEvent::SessionWarning {
                 session_id: active_session_id,
+                remaining_seconds: 120.0,
+                limit_seconds: 600.0,
             }]
         );
     }

@@ -1,0 +1,413 @@
+/* PROTOTYPE (throwaway). Variant C — "Ink".
+ *
+ * BOLD BET: a warm, LIGHT editorial object in a world of dark cards. A paper-toned galley
+ * strip (fixed 880 px measure, 3 px radius, one soft shadow) with a real serif and a real
+ * italic. The draft tail (text past state.committedLen) is *pencil*: italic, grey, provisional.
+ * When a burst commits it, each glyph is SET: it lifts, blanks for ~90 ms, and drops back as
+ * upright roman at full ink, in a left-to-right wave. That is the signature moment — type
+ * being set, not a CSS toggle.
+ *
+ * PALETTE (4, with roles): #f4efe5 paper (sheet) · #1a1712 ink (set text, blot, seal rule)
+ * · #8c8377 pencil (draft tail, meta, waiting rule) · #a33a22 rubric (reserved for the
+ * machine's voice and for trouble: LLM quote bar, error, cap warning). No other colour.
+ *
+ * TYPE: one family. Newsreader (OFL) with local fallback TeX Gyre Pagella / Charter.
+ * Roman 400 + true Italic 400 at 17px/25.5px; meta at 12px small-caps; LLM question 13.5px italic.
+ *
+ * LAYOUT / SILHOUETTE: bottom-centre, 32 px up. 880 x 81..183 px — a WIDE, SHORT strip
+ * (>10:1 when idle). That proportion plus 58/40 px margins is what keeps a light object from
+ * reading as a sticky note or a toast; nothing this wide is a notification. Left gutter holds
+ * the blot; text sits on a 782 px measure; the rule spans exactly that measure.
+ *
+ * AT A GLANCE (form/motion, not hue): listening = empty strip, one live ink blot, faint
+ * measure rule. Speaking = the measure fills; grey italic tail vs black roman body is visible
+ * texture from the corner of the eye. Sealing = the blot collapses into the rule's origin and
+ * the rule draws left→right under the text (text never leaves). Done = everything ink, rule
+ * whole, sheet lifts away upward. Empty/error = the sheet falls instead of lifting; rubric rule.
+ *
+ * A BURST LANDS: appended draft chars fade in at 16 ms stagger over ~110 ms (arrival, no
+ * motion); the chars the burst promoted set with the drop wave at 10 ms stagger (commitment,
+ * with motion). Two vocabularies, so arrival never looks like commitment.
+ *
+ * FOR THE RUST IMPLEMENTER: bundle two faces (Newsreader Regular + Italic; one weight each).
+ * Shapes: one rounded rect (r=3) + gaussian drop shadow, one 1 px rule, one SDF blot (circle
+ * with two low-frequency radial harmonics + a radial alpha falloff for the bleed). Per-glyph
+ * state is (alpha, dy, face) — the "set" is a face swap at the alpha trough, so glyph caches
+ * stay static; only alpha/dy are per-frame. Steady-state cost is the blot (44x44 px) plus the
+ * rule width; the text layer is repainted only on interim bursts, so idle listening is ~2 000 px
+ * of dirty rect at 20 fps. Truncate from the start (leading pencil ellipsis), never the end.
+ *
+ * RISK: a light sheet is bright over a dark terminal at night. Mitigations here: paper is
+ * #f4efe5 not white, the object is short, and it lives 2-15 s. If it still glares, the honest
+ * fix is a paper-tone ramp tied to the desktop's light/dark preference — not a dark card.
+ */
+(function () {
+  'use strict';
+
+  const W = 880, PAD_L = 58, PAD_R = 40, PAD_T = 22, PAD_B = 18;
+  const FS = 17, LH = 25.5, MAXL = 4, RULE_GAP = 14;
+  const MEASURE = W - PAD_L - PAD_R;
+  const INK = '#1a1712', PENCIL = '#8c8377', RUBRIC = '#a33a22';
+  const BLOT_X = 30, BLOT_Y = PAD_T + LH / 2;
+
+  let root, wrap, sheet, qEl, ruleEl, inkEl, metaEl, bodyEl, txtEl, qbar, blot, bctx;
+  let chars = [], offset = 0, curWord = null, ellEl = null;
+  let prevText = '', prevCommitted = -1, prevRoman = null;
+  let timers = new Set(), gen = 0;
+  let curLines = 1, blotR = 3.4, prevPhase = 'hidden', needIn = 0;
+
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const fmt = (ms) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  };
+
+  function clearTimers() {
+    gen += 1;
+    timers.forEach(clearTimeout);
+    timers.clear();
+  }
+
+  function resetText() {
+    clearTimers();
+    chars = [];
+    offset = 0;
+    curWord = null;
+    txtEl.textContent = '';
+    ellEl = null;
+    prevText = '';
+    prevCommitted = -1;
+  }
+
+  function appendChar(ch, roman, delay) {
+    if (ch === ' ' || ch === '\n') {
+      const node = document.createTextNode(' ');
+      txtEl.appendChild(node);
+      curWord = null;
+      chars.push({ ch, el: null, node, w: null, draft: !roman });
+      return;
+    }
+    if (!curWord || !curWord.isConnected) {
+      curWord = document.createElement('span');
+      curWord.className = 'w';
+      txtEl.appendChild(curWord);
+    }
+    const el = document.createElement('span');
+    el.className = roman ? 'c a' : 'c d a';
+    el.textContent = ch;
+    el.style.animationDelay = delay + 'ms';
+    curWord.appendChild(el);
+    chars.push({ ch, el, node: el, w: curWord, draft: !roman });
+  }
+
+  function dropFrom(k) {
+    for (let i = chars.length - 1; i >= k; i--) {
+      const c = chars[i];
+      if (c.node && c.node.parentNode) c.node.remove();
+      if (c.w && !c.w.firstChild) c.w.remove();
+    }
+    chars.length = Math.max(0, k);
+    curWord = null;
+    for (let i = chars.length - 1; i >= 0; i--) {
+      if (chars[i].w) { curWord = chars[i].w; break; }
+      if (chars[i].ch === ' ') break;
+    }
+  }
+
+  function dropFront(n) {
+    for (let i = 0; i < n && i < chars.length; i++) {
+      const c = chars[i];
+      if (c.node && c.node.parentNode) c.node.remove();
+      if (c.w && !c.w.firstChild) c.w.remove();
+    }
+    chars.splice(0, n);
+    offset += n;
+    if (curWord && !curWord.isConnected) curWord = null;
+    if (!ellEl) {
+      ellEl = document.createElement('span');
+      ellEl.className = 'ell';
+      ellEl.textContent = '… ';
+    }
+    if (txtEl.firstChild !== ellEl) txtEl.insertBefore(ellEl, txtEl.firstChild);
+  }
+
+  function commit(c, delay) {
+    if (!c.el) { c.draft = false; return; }
+    c.el.style.animationDelay = delay + 'ms';
+    c.el.classList.remove('a');
+    c.el.classList.add('s');
+    const g = gen;
+    const id = setTimeout(() => {
+      timers.delete(id);
+      if (g !== gen || !c.el.isConnected) return;
+      c.el.classList.remove('d');
+    }, delay + 92);
+    timers.add(id);
+    c.draft = false;
+  }
+
+  function syncText(s) {
+    const roman = s.mode === 'llm' && (s.phase === 'answering' || (s.phase === 'done' && !!s.question));
+    if (roman !== prevRoman) { prevRoman = roman; resetText(); }
+    const text = s.text || '';
+    if (text === prevText && s.committedLen === prevCommitted) return;
+
+    let k = 0;
+    const m = Math.min(prevText.length, text.length);
+    while (k < m && prevText[k] === text[k]) k += 1;
+
+    if (k < offset) {
+      resetText();
+      k = 0;
+    } else {
+      dropFrom(k - offset);
+    }
+    for (let i = k; i < text.length; i++) {
+      appendChar(text[i], roman, Math.min(560, (i - k) * 16));
+    }
+
+    // promote everything the burst made stable
+    const cl = s.committedLen - offset;
+    let first = -1;
+    for (let i = 0; i < chars.length && i < cl; i++) {
+      if (!chars[i].draft) continue;
+      if (first < 0) first = i;
+      commit(chars[i], Math.min(420, (i - first) * 10));
+    }
+
+    // 4-line clamp, truncating from the start (the newest words matter most)
+    const maxH = MAXL * LH + 1;
+    let guard = 0;
+    while (txtEl.scrollHeight > maxH && chars.length > 4 && guard++ < 400) {
+      let n = 1;
+      while (n < chars.length - 3 && chars[n].ch !== ' ') n += 1;
+      dropFront(n + 1);
+    }
+
+    const lines = clamp(Math.round(txtEl.scrollHeight / LH), 1, MAXL);
+    if (lines !== curLines) {
+      curLines = lines;
+      txtEl.style.height = lines * LH + 'px';
+    }
+    prevText = text;
+    prevCommitted = s.committedLen;
+  }
+
+  function drawBlot(r, t) {
+    const d = 44, dpr = 2;
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    bctx.clearRect(0, 0, d, d);
+    const cx = d / 2, cy = d / 2;
+    const halo = bctx.createRadialGradient(cx, cy, r * 0.9, cx, cy, Math.min(cx, r * 2.6));
+    halo.addColorStop(0, 'rgba(26,23,18,0.13)');
+    halo.addColorStop(1, 'rgba(26,23,18,0)');
+    bctx.fillStyle = halo;
+    bctx.fillRect(0, 0, d, d);
+    bctx.beginPath();
+    for (let i = 0; i <= 48; i++) {
+      const a = (i / 48) * Math.PI * 2;
+      const rr = r * (1 + 0.055 * Math.sin(3 * a + t * 0.0004) + 0.035 * Math.sin(5 * a - t * 0.0003));
+      const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+      if (i === 0) bctx.moveTo(x, y); else bctx.lineTo(x, y);
+    }
+    bctx.closePath();
+    bctx.fillStyle = INK;
+    bctx.fill();
+  }
+
+  OverlayProto.register('c', {
+    name: 'Ink',
+    mount(r) {
+      root = r;
+      if (!document.getElementById('c-font')) {
+        const l = document.createElement('link');
+        l.id = 'c-font';
+        l.rel = 'stylesheet';
+        l.href = 'https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;1,6..72,400&display=swap';
+        document.head.appendChild(l);
+      }
+      root.innerHTML = `
+        <style>
+          .variant-c .wrap { position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%); }
+          .variant-c .sheet {
+            width: ${W}px; box-sizing: border-box;
+            padding: ${PAD_T}px ${PAD_R}px ${PAD_B}px ${PAD_L}px;
+            display: flex; flex-direction: column; position: relative;
+            background: linear-gradient(#f7f2e9, #f0eadf);
+            border-radius: 3px;
+            box-shadow: 0 18px 38px rgba(18,12,4,.34), 0 2px 6px rgba(18,12,4,.20),
+                        inset 0 0 0 1px rgba(26,23,18,.10);
+            color: ${INK};
+            font-family: 'Newsreader', 'TeX Gyre Pagella', 'Bitstream Charter', Charter, 'Noto Serif', Georgia, serif;
+            font-size: ${FS}px; line-height: ${LH}px; font-weight: 400;
+            opacity: 0; transform: translateY(7px);
+            transition: opacity .14s ease-out, transform .17s cubic-bezier(.2,.8,.2,1);
+          }
+          .variant-c .sheet.in { opacity: 1; transform: translateY(0); }
+          .variant-c .sheet.in.out-lift { opacity: 0; transform: translateY(-13px);
+            transition: opacity .22s ease-out, transform .22s ease-out; }
+          .variant-c .sheet.in.out-fall { opacity: 0; transform: translateY(9px);
+            transition: opacity .2s ease-in, transform .2s ease-in; }
+
+          .variant-c .body { order: 3; position: relative; }
+          .variant-c .txt { height: ${LH}px; overflow: hidden; transition: height .18s ease-out;
+            word-break: normal; overflow-wrap: break-word; }
+          .variant-c .w { display: inline-block; white-space: pre; }
+          .variant-c .c { display: inline-block; color: ${INK}; }
+          .variant-c .c.d { font-style: italic; color: ${PENCIL}; }
+          .variant-c .ell { color: ${PENCIL}; }
+          .variant-c .c.a { animation: c-arrive .11s linear both; }
+          .variant-c .c.s { animation: c-set .21s cubic-bezier(.3,.7,.3,1) both; }
+          @keyframes c-arrive { from { opacity: 0 } to { opacity: 1 } }
+          @keyframes c-set {
+            0%   { opacity: 1;   transform: translateY(0) }
+            38%  { opacity: .10; transform: translateY(-1.6px) }
+            62%  { opacity: .80; transform: translateY(0) }
+            100% { opacity: 1;   transform: translateY(0) }
+          }
+
+          .variant-c .q { order: 1; display: none; font-style: italic; font-size: 13.5px;
+            line-height: 20px; color: ${PENCIL}; height: 20px; overflow: hidden; white-space: nowrap;
+            text-overflow: ellipsis; }
+          .variant-c .rule { order: 4; position: relative; height: 1px; margin-top: ${RULE_GAP}px;
+            width: ${MEASURE}px; }
+          .variant-c .sheet.llm .q { display: block; }
+          .variant-c .sheet.llm .rule { order: 2; margin: 9px 0 13px; }
+          .variant-c .sheet.llm .body { padding-left: 22px; }
+          .variant-c .track { position: absolute; inset: 0; background: rgba(26,23,18,.14);
+            opacity: 0; transition: opacity .12s linear; }
+          .variant-c .ink { position: absolute; left: 0; top: 0; height: 1px; width: 0;
+            background: ${INK}; }
+          .variant-c .meta { position: absolute; right: 0; bottom: 7px; font-size: 12px;
+            line-height: 14px; font-variant: small-caps; letter-spacing: .05em; color: ${PENCIL};
+            white-space: nowrap; opacity: 0; transition: opacity .15s linear; }
+
+          .variant-c .qbar { position: absolute; left: 0; top: 0; bottom: 0; width: 1px;
+            background: ${RUBRIC}; transform: scaleY(0); transform-origin: top;
+            transition: transform .22s ease-out; display: none; }
+          .variant-c .sheet.llm .qbar { display: block; }
+          .variant-c .sheet.llm.ans .qbar { transform: scaleY(1); }
+
+          .variant-c .blot { position: absolute; left: 0; top: 0; width: 44px; height: 44px;
+            margin: -22px 0 0 -22px; opacity: 0; transition: opacity .1s linear; }
+        </style>
+        <div class="wrap"><div class="sheet">
+          <div class="q"></div>
+          <div class="body"><div class="qbar"></div><div class="txt"></div></div>
+          <div class="rule"><div class="track"></div><div class="ink"></div><div class="meta"></div></div>
+          <canvas class="blot" width="88" height="88"></canvas>
+        </div></div>`;
+      wrap = root.querySelector('.wrap');
+      sheet = root.querySelector('.sheet');
+      qEl = root.querySelector('.q');
+      bodyEl = root.querySelector('.body');
+      txtEl = root.querySelector('.txt');
+      qbar = root.querySelector('.qbar');
+      ruleEl = root.querySelector('.rule');
+      inkEl = root.querySelector('.ink');
+      metaEl = root.querySelector('.meta');
+      blot = root.querySelector('.blot');
+      bctx = blot.getContext('2d');
+      prevPhase = 'hidden';
+      prevRoman = null;
+      resetText();
+    },
+
+    render(s, now) {
+      const vis = s.phase !== 'hidden';
+
+      if (s.phase !== prevPhase) {
+        if (prevPhase === 'hidden' && vis) {
+          sheet.classList.remove('out-lift', 'out-fall', 'in', 'llm', 'ans');
+          resetText();
+          curLines = 1;
+          txtEl.style.height = LH + 'px';
+          inkEl.style.width = '0px';
+          blotR = 3.4;
+          needIn = 2; // let the reset style flush before the entrance transition
+        } else if (!vis) {
+          const fall = s.success === false || !!s.reason;
+          sheet.classList.add(fall ? 'out-fall' : 'out-lift');
+        }
+        if (s.phase === 'answering') sheet.classList.add('llm', 'ans');
+        prevPhase = s.phase;
+      }
+      if (needIn > 0 && vis) {
+        needIn -= 1;
+        // touch layout so the pre-entrance style is committed before the class flips
+        if (needIn === 1) void sheet.offsetHeight;
+        else sheet.classList.add('in');
+      }
+      if (!vis) return;
+
+      syncText(s);
+
+      if (s.mode === 'llm' && s.question) {
+        sheet.classList.add('llm');
+        if (qEl.textContent !== s.question) qEl.textContent = s.question;
+      }
+
+      // ---- blot: the level signal. Swells with voice, collapses into the rule at seal.
+      const live = s.phase === 'listening' || s.phase === 'interim';
+      const sealing = s.phase === 'finalizing';
+      if (live || sealing) {
+        const norm = clamp((s.levelDb + 60) / 54, 0, 1);
+        const target = live ? 3.4 + Math.pow(norm, 1.15) * 7.4 : 2.0;
+        blotR += (target - blotR) * (target > blotR ? 0.35 : 0.12);
+        let x = BLOT_X, y = BLOT_Y;
+        if (sealing) {
+          const p = clamp((now - s.phaseAt) / 180, 0, 1);
+          const e = p * p * (3 - 2 * p);
+          const ruleY = PAD_T + curLines * LH + RULE_GAP;
+          x = BLOT_X + (PAD_L - BLOT_X) * e;
+          y = BLOT_Y + (ruleY - BLOT_Y) * e;
+        }
+        blot.style.transform = `translate(${x}px, ${y}px)`;
+        blot.style.opacity = sealing ? String(1 - clamp((now - s.phaseAt - 120) / 120, 0, 1)) : '1';
+        drawBlot(blotR, now);
+      } else if (blot.style.opacity !== '0') {
+        blot.style.opacity = '0';
+      }
+
+      // ---- rule: the measure line, then the seal drawn under the text
+      const answering = s.phase === 'answering' || (s.phase === 'done' && s.mode === 'llm' && s.question);
+      let inkW = 0, trackOn = 0, ruleColor = INK;
+      if (s.phase === 'listening' && !s.text) {
+        trackOn = 1;
+      } else if (sealing) {
+        trackOn = 1;
+        inkW = MEASURE * (1 - Math.exp(-Math.max(0, now - s.phaseAt - 110) / 330));
+      } else if (s.phase === 'error') {
+        trackOn = 1;
+        ruleColor = RUBRIC;
+        inkW = MEASURE * (1 - Math.exp(-(now - s.phaseAt) / 110));
+      } else if (s.phase === 'done' || answering) {
+        trackOn = 1;
+        if (s.text || s.question) inkW = MEASURE;
+        else { ruleColor = PENCIL; inkW = MEASURE * 0.5; }
+      }
+      inkEl.style.width = inkW.toFixed(1) + 'px';
+      inkEl.style.background = ruleColor;
+      root.querySelector('.track').style.opacity = String(trackOn);
+
+      // ---- meta: only for the rare states (cap warning, error, nothing heard)
+      let meta = '', metaColor = PENCIL;
+      if (s.phase === 'error') { meta = s.reason || 'session failed'; metaColor = RUBRIC; }
+      else if (s.phase === 'done' && !s.text && !s.success) meta = 'nothing heard';
+      else if (s.warning) { meta = fmt(s.sessionMs) + ' of ' + fmt(s.capMs); metaColor = RUBRIC; }
+      if (metaEl.textContent !== meta) metaEl.textContent = meta;
+      metaEl.style.color = metaColor;
+      metaEl.style.opacity = meta ? '1' : '0';
+    },
+
+    unmount() {
+      clearTimers();
+      chars = [];
+      offset = 0;
+      curWord = null;
+      ellEl = null;
+      prevText = '';
+      prevRoman = null;
+    },
+  });
+})();

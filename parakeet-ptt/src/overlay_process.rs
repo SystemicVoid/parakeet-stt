@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::config::OverlayMode;
 use crate::surface_focus::WaylandFocusCache;
@@ -235,6 +236,13 @@ pub struct OverlayProcessManager {
     active_output_name: Option<String>,
     latest_message: Option<OverlayIpcMessage>,
     latest_warning: Option<OverlayIpcMessage>,
+    /// When `latest_warning` arrived, so a replay after a renderer respawn can
+    /// age its remaining time instead of restarting the countdown.
+    latest_warning_at: Option<Instant>,
+    /// Which utterance is running and when it started, so a cap-only warning
+    /// (no remaining time from the Daemon) replays with the time the session
+    /// has already used. The nil-session busy notice never touches it.
+    utterance_started: Option<(Uuid, Instant)>,
     focus_cache: Option<WaylandFocusCache>,
     pending_output_name: Option<String>,
     utterance_active: bool,
@@ -344,15 +352,21 @@ impl OverlayProcessManager {
                 if overlay_message_session_id(self.latest_warning.as_ref()) != Some(*session_id) {
                     self.latest_warning = None;
                 }
+                if !session_id.is_nil()
+                    && self.utterance_started.map(|(id, _)| id) != Some(*session_id)
+                {
+                    self.utterance_started = Some((*session_id, Instant::now()));
+                }
                 self.latest_message = Some(message.clone());
             }
             OverlayIpcMessage::SessionEnded { .. } => {
                 self.latest_message = Some(message.clone());
                 self.latest_warning = None;
             }
-            OverlayIpcMessage::SessionWarning { session_id } => {
+            OverlayIpcMessage::SessionWarning { session_id, .. } => {
                 if overlay_message_session_id(self.latest_message.as_ref()) == Some(*session_id) {
                     self.latest_warning = Some(message.clone());
+                    self.latest_warning_at = Some(Instant::now());
                 }
             }
             OverlayIpcMessage::InjectionComplete { session_id, .. } => {
@@ -393,17 +407,66 @@ impl OverlayProcessManager {
     }
 
     fn replay_messages(&self) -> Vec<OverlayIpcMessage> {
+        self.replay_messages_at(Instant::now())
+    }
+
+    fn replay_messages_at(&self, now: Instant) -> Vec<OverlayIpcMessage> {
         let mut replay_messages = Vec::new();
         if let Some(message) = self.latest_message.clone() {
             let latest_session_id = overlay_message_session_id(Some(&message));
             replay_messages.push(message);
             if overlay_message_session_id(self.latest_warning.as_ref()) == latest_session_id {
                 if let Some(warning) = self.latest_warning.clone() {
-                    replay_messages.push(warning);
+                    replay_messages.push(self.aged_warning(warning, now));
                 }
             }
         }
         replay_messages
+    }
+
+    /// Subtracts the time since the warning arrived from its remaining seconds,
+    /// so a respawned renderer counts down from where the previous one was.
+    fn aged_warning(&self, warning: OverlayIpcMessage, now: Instant) -> OverlayIpcMessage {
+        let OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds,
+            limit_seconds,
+        } = warning
+        else {
+            return warning;
+        };
+        let age_seconds = self
+            .latest_warning_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+            .unwrap_or(0.0);
+        // A cap-only warning is resolved here: the respawned renderer's view
+        // starts its clock at zero, so it cannot subtract the session's age.
+        let remaining_seconds = remaining_seconds
+            .map(|seconds| (seconds - age_seconds).max(0.0))
+            .or_else(|| {
+                let limit = limit_seconds?;
+                let session_age = self
+                    .utterance_started
+                    .filter(|(id, _)| *id == session_id)
+                    .map(|(_, at)| now.saturating_duration_since(at).as_secs_f32())
+                    .unwrap_or(0.0);
+                Some((limit - session_age).max(0.0))
+            });
+        OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds,
+            limit_seconds,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_utterance_started_for_tests(&mut self, session_id: Uuid, at: Instant) {
+        self.utterance_started = Some((session_id, at));
+    }
+
+    #[cfg(test)]
+    fn set_latest_warning_at_for_tests(&mut self, at: Instant) {
+        self.latest_warning_at = Some(at);
     }
 
     fn replay_message_sequence(
@@ -568,6 +631,8 @@ impl OverlayProcessManager {
             active_output_name: None,
             latest_message: None,
             latest_warning: None,
+            latest_warning_at: None,
+            utterance_started: None,
             focus_cache,
             pending_output_name: None,
             utterance_active: false,
@@ -669,6 +734,173 @@ mod tests {
         OverlayLauncher, OverlayProcessManager, OverlayProcessMetrics, OverlayProcessSink,
     };
     use parakeet_ptt::overlay_ipc::{OverlayIpcMessage, OverlayTextProducer};
+    use std::time::Instant;
+
+    /// A replayed warning keeps its session and cap; its remaining time is aged
+    /// by however long the replay took, so allow a small drift.
+    fn assert_replayed_warning_matches(replayed: &OverlayIpcMessage, original: &OverlayIpcMessage) {
+        let (
+            OverlayIpcMessage::SessionWarning {
+                session_id: replayed_id,
+                remaining_seconds: replayed_remaining,
+                limit_seconds: replayed_limit,
+            },
+            OverlayIpcMessage::SessionWarning {
+                session_id,
+                remaining_seconds,
+                limit_seconds,
+            },
+        ) = (replayed, original)
+        else {
+            panic!("expected session warnings, got {replayed:?} and {original:?}");
+        };
+        assert_eq!(replayed_id, session_id);
+        assert_eq!(replayed_limit, limit_seconds);
+        match (replayed_remaining, remaining_seconds) {
+            (Some(replayed), Some(original)) => {
+                assert!(*replayed <= *original && original - replayed < 1.0);
+            }
+            (None, None) => {}
+            other => panic!("remaining mismatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replayed_cap_only_warning_counts_from_the_utterance_start() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::Disabled,
+            true,
+            queued_launcher(queue),
+            Duration::from_millis(1),
+        );
+        let session_id = Uuid::new_v4();
+        manager.latest_message = Some(OverlayIpcMessage::InterimState {
+            session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
+            seq: 1,
+            state: "listening".to_string(),
+        });
+        manager.latest_warning = Some(OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: None,
+            limit_seconds: Some(600.0),
+        });
+        let base = Instant::now();
+        manager.set_latest_warning_at_for_tests(base + Duration::from_secs(480));
+        manager.set_utterance_started_for_tests(session_id, base);
+        let replay = manager.replay_messages_at(base + Duration::from_secs(590));
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            limit_seconds: Some(limit),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay with a resolved remaining time: {replay:?}");
+        };
+        assert_eq!(*limit, 600.0);
+        assert!(
+            (9.0..=10.5).contains(remaining),
+            "remaining from the cap minus the session age: {remaining}"
+        );
+
+        let replay = manager.replay_messages_at(base + Duration::from_secs(700));
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert_eq!(*remaining, 0.0);
+    }
+
+    #[test]
+    fn the_busy_notice_does_not_restart_the_utterance_clock() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::Disabled,
+            true,
+            queued_launcher(queue),
+            Duration::from_millis(1),
+        );
+        let session_id = Uuid::new_v4();
+        let interim = |session_id: Uuid, seq: u64| OverlayIpcMessage::InterimState {
+            session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
+            seq,
+            state: "listening".to_string(),
+        };
+        let base = Instant::now();
+        manager.remember_replay_state(&interim(session_id, 1));
+        manager.set_utterance_started_for_tests(session_id, base);
+        manager.remember_replay_state(&interim(Uuid::nil(), 2));
+        manager.remember_replay_state(&interim(session_id, 3));
+        manager.remember_replay_state(&OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: None,
+            limit_seconds: Some(600.0),
+        });
+        let replay = manager.replay_messages_at(base + Duration::from_secs(590));
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert!(
+            (9.0..=10.5).contains(remaining),
+            "the clock kept counting through the busy notice: {remaining}"
+        );
+    }
+
+    #[test]
+    fn replayed_warning_is_aged_by_the_time_since_it_arrived() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::Disabled,
+            true,
+            queued_launcher(queue),
+            Duration::from_millis(1),
+        );
+        let session_id = Uuid::new_v4();
+        manager.latest_message = Some(OverlayIpcMessage::InterimState {
+            session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
+            seq: 1,
+            state: "listening".to_string(),
+        });
+        manager.latest_warning = Some(OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        });
+        let base = Instant::now();
+        manager.set_latest_warning_at_for_tests(base);
+        let replay = manager.replay_messages_at(base + Duration::from_secs(110));
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert!(
+            (9.0..=10.5).contains(remaining),
+            "aged remaining: {remaining}"
+        );
+
+        let replay = manager.replay_messages_at(base + Duration::from_secs(300));
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert_eq!(*remaining, 0.0, "never below zero");
+    }
 
     fn queued_launcher(
         queue: Arc<Mutex<VecDeque<std::result::Result<OverlayProcessSink, anyhow::Error>>>>,
@@ -916,7 +1148,11 @@ mod tests {
             .expect("first sink should remain open");
         assert_eq!(first_state, state_message);
 
-        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        let warning_message = OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        };
         manager.send(warning_message.clone());
         let first_warning = timeout(Duration::from_millis(100), rx_first.recv())
             .await
@@ -942,7 +1178,7 @@ mod tests {
             .await
             .expect("second sink should receive replayed warning")
             .expect("second sink should remain open");
-        assert_eq!(replayed_warning, warning_message);
+        assert_replayed_warning_matches(&replayed_warning, &warning_message);
 
         let forwarded_audio_level = timeout(Duration::from_millis(100), rx_second.recv())
             .await
@@ -993,6 +1229,7 @@ mod tests {
         let injection_complete_message = OverlayIpcMessage::InjectionComplete {
             session_id,
             success: true,
+            copy_only: false,
         };
         manager.send(injection_complete_message.clone());
         let _ = timeout(Duration::from_millis(100), rx_first.recv())
@@ -1050,12 +1287,17 @@ mod tests {
             seq: 2,
             text: "current-state".to_string(),
         };
-        let warning_message = OverlayIpcMessage::SessionWarning { session_id };
+        let warning_message = OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        };
         manager.send(state_message.clone());
         manager.send(warning_message.clone());
         manager.send(OverlayIpcMessage::InjectionComplete {
             session_id: Uuid::new_v4(),
             success: true,
+            copy_only: false,
         });
 
         for expected in [&state_message, &warning_message] {
@@ -1087,7 +1329,7 @@ mod tests {
             .await
             .expect("second sink should receive replayed warning")
             .expect("second sink should remain open");
-        assert_eq!(replayed_warning, warning_message);
+        assert_replayed_warning_matches(&replayed_warning, &warning_message);
         let forwarded_audio_level = timeout(Duration::from_millis(100), rx_second.recv())
             .await
             .expect("second sink should receive current audio level")

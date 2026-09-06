@@ -45,6 +45,10 @@ pub enum OverlayIpcMessage {
     InjectionComplete {
         session_id: Uuid,
         success: bool,
+        /// The client runs copy-only injection, so a success left the text on the
+        /// clipboard rather than pasting it.
+        #[serde(default)]
+        copy_only: bool,
     },
     SessionEnded {
         session_id: Uuid,
@@ -52,6 +56,12 @@ pub enum OverlayIpcMessage {
     },
     SessionWarning {
         session_id: Uuid,
+        /// Seconds left before the Session cap when the warning fired.
+        #[serde(default)]
+        remaining_seconds: Option<f32>,
+        /// The Session cap itself, in seconds.
+        #[serde(default)]
+        limit_seconds: Option<f32>,
     },
 }
 
@@ -117,6 +127,33 @@ mod tests {
     }
 
     #[test]
+    fn session_warning_decodes_without_cap_fields() {
+        let session_id = Uuid::new_v4();
+        let encoded = format!(r#"{{"type":"session_warning","session_id":"{session_id}"}}"#);
+        let decoded: OverlayIpcMessage =
+            serde_json::from_str(&encoded).expect("message should deserialize");
+        assert_eq!(
+            decoded,
+            OverlayIpcMessage::SessionWarning {
+                session_id,
+                remaining_seconds: None,
+                limit_seconds: None,
+            }
+        );
+
+        let message = OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: Some(120.0),
+            limit_seconds: Some(600.0),
+        };
+        let encoded = serde_json::to_string(&message).expect("message should serialize");
+        assert!(encoded.contains("\"remaining_seconds\":120.0"));
+        let decoded: OverlayIpcMessage =
+            serde_json::from_str(&encoded).expect("message should deserialize");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
     fn output_hint_serialization_roundtrip() {
         let message = OverlayIpcMessage::OutputHint {
             output_name: "HDMI-A-1".to_string(),
@@ -136,6 +173,7 @@ mod tests {
         let message = OverlayIpcMessage::InjectionComplete {
             session_id,
             success: true,
+            copy_only: false,
         };
 
         let encoded = serde_json::to_string(&message).expect("message should serialize");

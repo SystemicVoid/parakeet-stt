@@ -23,7 +23,7 @@ use crate::client_session::{
     ClientLlmQueryRuntime, ClientSessionAction, ClientSessionIgnoredHotkeyReason,
     ClientSessionRuntime, ClientSessionStartBlocker, LlmQueryAction, SessionIntent,
 };
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, InjectionMode};
 use crate::hotkey::{
     ensure_input_access, parse_pre_modifier_key_names, spawn_hotkey_loop, HotkeyEvent,
     HotkeyIntent, HotkeyTasks,
@@ -420,7 +420,10 @@ pub async fn run(config: ClientConfig, ports: ClientPorts) -> Result<()> {
     );
     let hotkey_runtime = hotkey_source.start(&config)?;
     let (injector_worker, mut injection_reports) = spawn_injector_worker(injection_runner);
-    let injection_dispatcher = ClientInjectionDispatcher::new(injector_worker.clone());
+    let injection_dispatcher = ClientInjectionDispatcher::new(
+        injector_worker.clone(),
+        matches!(config.injection_mode, InjectionMode::CopyOnly),
+    );
     let mut focus_router = ClientFocusRouter::new(focus_cache);
     let mut overlay_router = OverlayRouter::new(overlay_sink);
     spawn_event_loop_lag_monitor();

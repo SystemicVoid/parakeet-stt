@@ -134,9 +134,15 @@ The schema-defined Runtime Truth groups are `core`, `device`, `stream_path`,
   query mode. They can update the Overlay while the local LLM answers, but they
   are not Daemon interim transcript fields and do not affect Stream path or Seal
   path truth.
-- Renderer animation: local Overlay presentation only. Character fades,
-  listening/finalizing motion, width changes, and opacity transitions are not
-  inference, transport, or LLM progress evidence.
+- Renderer animation: local Overlay presentation only. The sheet's entrance
+  and exit, the coil level trace, the draft tail settling into ink, the seal
+  rule filling, width and height changes, the lamp word, and the timer are not
+  inference, transport, or LLM progress evidence. The timer counts from the
+  first event the renderer saw for the Session, so after an Overlay respawn it
+  restarts from zero; the cap countdown is replayed with its remaining time
+  aged, so it carries on from where the previous renderer was. The lamp reads
+  `PASTED` after a successful injection, or `COPIED` when the Client runs
+  copy-only injection.
 
 ### Seal path tail trimming
 

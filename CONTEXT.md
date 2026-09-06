@@ -38,8 +38,8 @@ The rolling audio ring (currently 2.5 s) the daemon keeps regardless of session 
 _Avoid_: lookback, prefix, jitter buffer.
 
 **Overlay**:
-The compact on-screen feedback widget rendered by the client during a session. Optional, on by default in the `stt` profile.
-_Avoid_: HUD, popup, indicator.
+The compact on-screen feedback widget rendered by the client during a session. Optional, on by default in the `stt` profile. Its presentation is the **Galley**: a paper **sheet** with an instrument column (the coil level trace, the **lamp** word such as `REC` / `DECODING` / `PASTED`, or `COPIED` under copy-only injection, and the session timer) beside the prose. Interim words arrive as the italic **draft tail** and set to roman ink once the next burst lands; the **seal rule** under the prose fills while the Seal path runs.
+_Avoid_: HUD, popup, indicator, panel, toast.
 
 **Injection**:
 Writing the transcript into the focused window. Two injection behaviors: `paste` (clipboard + paste shortcut) and `copy-only` (clipboard only).
