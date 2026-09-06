@@ -238,6 +238,9 @@ pub struct OverlayProcessManager {
     /// When `latest_warning` arrived, so a replay after a renderer respawn can
     /// age its remaining time instead of restarting the countdown.
     latest_warning_at: Option<Instant>,
+    /// When the current utterance started, so a cap-only warning (no remaining
+    /// time from the Daemon) replays with the time the session has already used.
+    utterance_started_at: Option<Instant>,
     focus_cache: Option<WaylandFocusCache>,
     pending_output_name: Option<String>,
     utterance_active: bool,
@@ -347,6 +350,9 @@ impl OverlayProcessManager {
                 if overlay_message_session_id(self.latest_warning.as_ref()) != Some(*session_id) {
                     self.latest_warning = None;
                 }
+                if overlay_message_session_id(self.latest_message.as_ref()) != Some(*session_id) {
+                    self.utterance_started_at = Some(Instant::now());
+                }
                 self.latest_message = Some(message.clone());
             }
             OverlayIpcMessage::SessionEnded { .. } => {
@@ -425,11 +431,28 @@ impl OverlayProcessManager {
             .latest_warning_at
             .map(|at| at.elapsed().as_secs_f32())
             .unwrap_or(0.0);
+        // A cap-only warning is resolved here: the respawned renderer's view
+        // starts its clock at zero, so it cannot subtract the session's age.
+        let remaining_seconds = remaining_seconds
+            .map(|seconds| (seconds - age_seconds).max(0.0))
+            .or_else(|| {
+                let limit = limit_seconds?;
+                let session_age = self
+                    .utterance_started_at
+                    .map(|at| at.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                Some((limit - session_age).max(0.0))
+            });
         OverlayIpcMessage::SessionWarning {
             session_id,
-            remaining_seconds: remaining_seconds.map(|seconds| (seconds - age_seconds).max(0.0)),
+            remaining_seconds,
             limit_seconds,
         }
+    }
+
+    #[cfg(test)]
+    fn set_utterance_started_at_for_tests(&mut self, at: Instant) {
+        self.utterance_started_at = Some(at);
     }
 
     #[cfg(test)]
@@ -600,6 +623,7 @@ impl OverlayProcessManager {
             latest_message: None,
             latest_warning: None,
             latest_warning_at: None,
+            utterance_started_at: None,
             focus_cache,
             pending_output_name: None,
             utterance_active: false,
@@ -730,6 +754,56 @@ mod tests {
             (None, None) => {}
             other => panic!("remaining mismatch: {other:?}"),
         }
+    }
+
+    #[test]
+    fn replayed_cap_only_warning_counts_from_the_utterance_start() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::Disabled,
+            true,
+            queued_launcher(queue),
+            Duration::from_millis(1),
+        );
+        let session_id = Uuid::new_v4();
+        manager.latest_message = Some(OverlayIpcMessage::InterimState {
+            session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
+            seq: 1,
+            state: "listening".to_string(),
+        });
+        manager.latest_warning = Some(OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: None,
+            limit_seconds: Some(600.0),
+        });
+        manager.set_latest_warning_at_for_tests(Instant::now() - Duration::from_secs(110));
+        manager.set_utterance_started_at_for_tests(Instant::now() - Duration::from_secs(590));
+        let replay = manager.replay_messages();
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            limit_seconds: Some(limit),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay with a resolved remaining time: {replay:?}");
+        };
+        assert_eq!(*limit, 600.0);
+        assert!(
+            (9.0..=10.5).contains(remaining),
+            "remaining from the cap minus the session age: {remaining}"
+        );
+
+        manager.set_utterance_started_at_for_tests(Instant::now() - Duration::from_secs(700));
+        let replay = manager.replay_messages();
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert_eq!(*remaining, 0.0);
     }
 
     #[test]

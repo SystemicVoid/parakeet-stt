@@ -189,42 +189,57 @@ impl Prose {
         now_ms: u64,
     ) -> Layout {
         let max_lines = max_lines.max(1);
-        // Each pass drops whole leading lines, so even a transcript thousands of
-        // words over budget settles in one or two passes. The ellipsis that
-        // replaces them can push one more wrap, hence the small retry budget.
-        for _ in 0..8 {
-            let (layout, line_starts) = self.layout_once(fonts, px, measure, now_ms);
-            if layout.lines <= max_lines {
-                return layout;
-            }
-            // Drop up to the first kept line. When that line starts at glyph 0
-            // (the ellipsis alone filled the line before it), drop a line more.
-            let first_kept_line = layout.lines - max_lines;
-            let drop = line_starts
-                .iter()
-                .skip(first_kept_line - 1)
-                .copied()
-                .find(|start| *start > 0)
-                .unwrap_or(0)
-                .min(self.glyphs.len());
-            if drop == 0 {
-                return layout;
-            }
-            self.glyphs.drain(..drop);
-            self.dropped += drop;
+        let layout = self.layout_once(fonts, px, measure, now_ms, 0);
+        if layout.lines <= max_lines {
+            return layout;
         }
-        self.layout_once(fonts, px, measure, now_ms).0
+        // Binary-search the smallest leading drop that fits the budget: the
+        // empty tail always fits, so the search always lands on a drop that
+        // does, and a transcript thousands of words over budget costs a dozen
+        // wrap passes rather than one per word. Then prefer the next word
+        // boundary when a whole-word tail still fits.
+        let fits =
+            |skip: usize| self.layout_once(fonts, px, measure, now_ms, skip).lines <= max_lines;
+        let (mut lo, mut hi) = (1usize, self.glyphs.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if fits(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let mut drop = hi;
+        if drop > 0
+            && self
+                .glyphs
+                .get(drop - 1)
+                .is_some_and(|glyph| glyph.ch != ' ')
+        {
+            let word_end = self.glyphs[drop..]
+                .iter()
+                .position(|glyph| glyph.ch == ' ')
+                .map(|at| drop + at + 1);
+            if let Some(end) = word_end.filter(|end| *end < self.glyphs.len() && fits(*end)) {
+                drop = end;
+            }
+        }
+        self.glyphs.drain(..drop);
+        self.dropped += drop;
+        self.layout_once(fonts, px, measure, now_ms, 0)
     }
 
-    /// One wrap pass. Also returns, for every line after the first, the index of
-    /// the glyph that starts it, so the clamp can drop whole lines.
+    /// One wrap pass over the glyphs after `skip`, behind an ellipsis when
+    /// anything has been dropped.
     fn layout_once(
         &self,
         fonts: &FontSet,
         px: f32,
         measure: f32,
         now_ms: u64,
-    ) -> (Layout, Vec<usize>) {
+        skip: usize,
+    ) -> Layout {
+        let dropped = self.dropped + skip;
         struct Item {
             ch: char,
             face: Face,
@@ -234,12 +249,12 @@ impl Prose {
             advance: f32,
         }
         let mut items: Vec<Item> = Vec::with_capacity(self.glyphs.len() + 2);
-        let ellipsis_len = if self.dropped > 0 {
+        let ellipsis_len = if dropped > 0 {
             ELLIPSIS.chars().count()
         } else {
             0
         };
-        if self.dropped > 0 {
+        if dropped > 0 {
             for ch in ELLIPSIS.chars() {
                 items.push(Item {
                     ch,
@@ -251,7 +266,7 @@ impl Prose {
                 });
             }
         }
-        for glyph in &self.glyphs {
+        for glyph in &self.glyphs[skip.min(self.glyphs.len())..] {
             let GlyphVisual {
                 face,
                 pencil,
@@ -270,7 +285,6 @@ impl Prose {
         }
 
         let mut placed = Vec::with_capacity(items.len());
-        let mut line_starts = Vec::new();
         let mut line = 0usize;
         let mut x = 0.0f32;
         let mut widest = 0.0f32;
@@ -302,11 +316,13 @@ impl Prose {
                 word_width += items[end].advance;
                 end += 1;
             }
-            if x > 0.0 && x + word_width > measure {
+            // The first word after the ellipsis stays glued to it and breaks
+            // mid-word if it must: the ellipsis alone on a line is wasted
+            // budget, and the clamp needs a drop index inside the text.
+            if x > 0.0 && index != ellipsis_len && x + word_width > measure {
                 widest = widest.max(content_end);
                 line += 1;
                 x = 0.0;
-                line_starts.push(index.saturating_sub(ellipsis_len));
             }
             for k in index..end {
                 if k > index && items[k - 1].face == items[k].face {
@@ -317,7 +333,6 @@ impl Prose {
                     widest = widest.max(content_end);
                     line += 1;
                     x = 0.0;
-                    line_starts.push(k.saturating_sub(ellipsis_len));
                 }
                 placed.push(Placed {
                     ch: items[k].ch,
@@ -334,14 +349,11 @@ impl Prose {
             index = end;
         }
         widest = widest.max(content_end);
-        (
-            Layout {
-                placed,
-                lines: line + 1,
-                widest,
-            },
-            line_starts,
-        )
+        Layout {
+            placed,
+            lines: line + 1,
+            widest,
+        }
     }
 }
 
@@ -505,6 +517,29 @@ mod tests {
         assert!(layout.lines <= 2);
         let kept = layout.placed.iter().filter(|p| p.ch == 'a').count();
         assert!(kept > 20, "a useful suffix survives: {kept}");
+    }
+
+    #[test]
+    fn clamp_to_one_line_never_leaves_the_ellipsis_alone_on_a_line() {
+        let fonts = fonts();
+        let word = "supercalifragilisticexpialidocious".repeat(3);
+        let mut probe = Prose::default();
+        probe.update(&word, 0);
+        let word_width = probe.layout(&fonts, 17.0, 1.0e6, 1, 5_000).widest;
+
+        let mut prose = Prose::default();
+        prose.update(&format!("alpha {word}"), 0);
+        let layout = prose.layout(&fonts, 17.0, word_width, 1, 5_000);
+        assert_eq!(
+            layout.lines, 1,
+            "the ellipsis shares the line with the tail"
+        );
+        let kept = layout
+            .placed
+            .iter()
+            .filter(|p| p.ch != '…' && p.ch != ' ')
+            .count();
+        assert!(kept > 10, "a useful tail survives: {kept}");
     }
 
     #[test]
