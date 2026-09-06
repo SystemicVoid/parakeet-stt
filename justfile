@@ -198,6 +198,10 @@ _eval-compare:
     just _eval-run-stream
     cd {{daemon_dir}} && python3 -c 'import json; from pathlib import Path; offline=json.loads(Path("bench_audio/personal/latest-offline.json").read_text(encoding="utf-8")); stream=json.loads(Path("bench_audio/personal/latest-stream.json").read_text(encoding="utf-8")); keys=("weighted_wer","command_exact_match_rate_strict","command_exact_match_rate_normalized","command_intent_slot_match_rate","critical_token_recall","punctuation_f1","terminal_punctuation_accuracy","warm_finalize_p95_ms"); metric=lambda r,k: float(r["aggregate"]["warm_finalize_ms"]["p95"]) if k=="warm_finalize_p95_ms" else float(r["aggregate"][k]); print("metric\toffline\tstream_seal\tdelta(stream-offline)"); [print(f"{k}\t{metric(offline,k):.6f}\t{metric(stream,k):.6f}\t{(metric(stream,k)-metric(offline,k)):.6f}") for k in keys]'
 
+# Render the scripted Galley overlay previews and stitch a contact sheet (ImageMagick 6).
+overlay-preview out="/tmp/parakeet-overlay-preview":
+    @bash -lc 'cd "{{repo_root}}/parakeet-ptt" && out="{{out}}" && cargo build -q --bin parakeet-overlay && rm -rf "$out" && ./target/debug/parakeet-overlay --preview-dir "$out" 2>/dev/null && cd "$out" && for f in *.ppm; do convert "$f" "${f%.ppm}.png"; done && montage -label "%t" *.png -tile 3x -geometry +6+6 -background "#bbb" contact-sheet.png && echo ">>> $out/contact-sheet.png"'
+
 # Serve the throwaway overlay look-and-feel prototype (parakeet-ptt/prototypes/overlay-look).
 overlay-proto port="8765":
     @bash -lc 'cd "{{repo_root}}/parakeet-ptt/prototypes/overlay-look" && echo ">>> http://localhost:{{port}}/?variant=c" && if curl -fs -o /dev/null "http://localhost:{{port}}/"; then echo "already serving on {{port}}"; else python3 -m http.server "{{port}}"; fi'
