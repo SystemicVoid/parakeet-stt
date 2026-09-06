@@ -92,11 +92,17 @@ evidence, Seal path finalization source, tail trim mode, VAD fallback, interim
 transcript source activity, overlay-event transport, timing, and counter fields;
 the Helper should read those fields from `/status` instead of re-deriving them.
 
-Use `stt status` for Helper process health: Daemon PID, Client PID, endpoint,
-tmux session, matching processes, and the normalized Daemon Runtime Truth block
-when `/status` is available. Use the Daemon `/status` payload, the Client
-startup status log line, and Daemon session runtime truth logs for deeper
-runtime truth. The Helper may parse `/status` to decide whether an existing
+Use `stt status` for Helper process health. It prints one line per subsystem:
+daemon, client, endpoint, pipeline, overlay, tmux. The pipeline and overlay
+lines are rendered from Daemon Runtime Truth and disappear when `/status` is
+unreachable. Colour is used only on a TTY and is dropped when `NO_COLOR` is set.
+
+- `stt status -v` appends the full normalized Runtime Truth block and the
+  matching daemon/client processes.
+- `stt status --json` prints the raw Daemon `/status` payload for scripting.
+
+Use the Daemon `/status` payload, the Client startup status log line, and
+Daemon session runtime truth logs for deeper runtime truth. The Helper may parse `/status` to decide whether an existing
 Daemon matches the requested Profile, but shell logic should not infer Stream
 path, Seal path, interim transcript, or Overlay transport state from process
 names, flags, or logs alone.
@@ -221,7 +227,7 @@ When this happens, inspect the groups separately:
 - Daemon start: `cd parakeet-stt-daemon && nohup uv run parakeet-stt-daemon >> /tmp/parakeet-daemon.log 2>&1 &`, records PID, then waits up to ~30s for `PARAKEET_HOST:PARAKEET_PORT` (default 127.0.0.1:8765) and will hop to the next free port if the default is busy (unless `PARAKEET_PORT` is set). Profile defaults determine streaming, device, and overlay behavior; the generated profile table above is the source of truth. On failure, it prints the last daemon log lines.
 - Client start (in tmux): appends a session header to `/tmp/parakeet-ptt.log`, prefers a compatible prebuilt `target/release/parakeet-ptt` binary, and falls back to `cargo run --release -- --endpoint <resolved endpoint>` only when the binary is missing or incompatible with the expected helper flags; output flows through `tee` so attaching to tmux shows live logs while still writing to the file.
 - Logging: append-only (`>>`) for both daemon and client; helper emits markers like `start client in tmux`, `running cargo run --release` into the client log.
-- Commands: `stt`/`stt start` (default detached tmux, stream+seal profile), `stt llm` (managed llama + STT), `stt off` (offline profile), `stt cpu` (offline CPU profile), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status`, `stt logs [client|daemon|both]`, `stt llm logs`, `stt llm show`, `stt tmux [attach|kill]` (attach/kill the helper tmux session created by `stt start`; does not launch daemon/client), `stt check` (daemon `--check`).
+- Commands: `stt`/`stt start` (default detached tmux, stream+seal profile), `stt llm` (managed llama + STT), `stt off` (offline profile), `stt cpu` (offline CPU profile), `stt show`/`stt attach` (attach to tmux), `stt restart`, `stt stop`, `stt status [-v|--json]`, `stt logs [client|daemon|both]`, `stt llm logs`, `stt llm show`, `stt tmux [attach|kill]` (attach/kill the helper tmux session created by `stt start`; does not launch daemon/client), `stt check` (daemon `--check`).
 
 ## Suspicions / hypotheses
 - The release binary may occasionally be in a bad state (stale build artifacts) and exits immediately; a rebuild should fix that, but we need logs to confirm.

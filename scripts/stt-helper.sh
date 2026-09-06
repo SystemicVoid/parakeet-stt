@@ -1295,11 +1295,328 @@ PY
 
     _print_daemon_runtime_truth() {
         local runtime_truth="$1"
-        echo "   - Daemon runtime truth:"
+        printf '%s\n' "$(_status_paint 2 'Daemon runtime truth:')"
         while IFS='=' read -r key value; do
             [ -n "$key" ] || continue
-            printf "     %s=%s\n" "$key" "$value"
+            printf "  %s=%s\n" "$key" "$value"
         done <<< "$runtime_truth"
+    }
+
+    _status_color_supported() {
+        [ -n "${_STT_STATUS_FORCE_COLOR:-}" ] && return 0
+        [ -z "${NO_COLOR:-}" ] || return 1
+        [ -t 1 ] || return 1
+        case "${TERM:-dumb}" in
+            dumb | "") return 1 ;;
+        esac
+        return 0
+    }
+
+    # Command substitution hides the real stdout, so the status command decides
+    # once (against the terminal) and the row printers read that decision.
+    _status_color_enabled() {
+        case "${_status_color:-}" in
+            1) return 0 ;;
+            0) return 1 ;;
+        esac
+        _status_color_supported
+    }
+
+    _status_paint() {
+        local sgr="$1"
+        shift
+        if _status_color_enabled; then
+            printf '\033[%sm%s\033[0m' "$sgr" "$*"
+        else
+            printf '%s' "$*"
+        fi
+    }
+
+    _status_row() {
+        local label="$1"
+        shift
+        printf '  %s  %s\n' "$(_status_paint 2 "$(printf '%-8s' "$label")")" "$*"
+    }
+
+    _status_truth_value() {
+        local runtime_truth="$1"
+        local key="$2"
+        printf '%s\n' "$runtime_truth" | awk -F'=' -v key="$key" '
+            $1 == key { sub(/^[^=]*=/, ""); print; exit }
+        '
+    }
+
+    _status_join() {
+        local separator=" · "
+        local joined=""
+        local part
+        for part in "$@"; do
+            [ -n "$part" ] || continue
+            if [ -z "$joined" ]; then
+                joined="$part"
+            else
+                joined="$joined$separator$part"
+            fi
+        done
+        printf '%s' "$joined"
+    }
+
+    _status_format_gpu_mem() {
+        local megabytes="$1"
+        [ -n "$megabytes" ] || return 0
+        awk -v mb="$megabytes" 'BEGIN {
+            if (mb + 0 >= 1024) { printf "%.1f GB VRAM", mb / 1024 } else { printf "%d MB VRAM", mb }
+        }'
+    }
+
+    _status_client_details() {
+        local pid="$1"
+        [ -r "/proc/$pid/cmdline" ] || return 0
+        local -a args=()
+        mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || return 0
+        local index injection_mode="" overlay_enabled="" llm_enabled=""
+        for ((index = 0; index < ${#args[@]}; index++)); do
+            case "${args[index]}" in
+                --injection-mode) injection_mode="${args[index + 1]:-}" ;;
+                --overlay-enabled) overlay_enabled="${args[index + 1]:-}" ;;
+                --llm-base-url) llm_enabled="true" ;;
+            esac
+        done
+        local overlay_label=""
+        case "$overlay_enabled" in
+            true) overlay_label="overlay on" ;;
+            false) overlay_label="overlay off" ;;
+        esac
+        local llm_label=""
+        [ "$llm_enabled" = "true" ] && llm_label="llm on"
+        _status_join "$injection_mode" "$overlay_label" "$llm_label"
+    }
+
+    _status_pipeline_summary() {
+        local runtime_truth="$1"
+        local streaming_enabled stream_helper_active stream_fallback_reason
+        local interim_enabled tail_trim_mode vad_enabled vad_active
+        streaming_enabled="$(_status_truth_value "$runtime_truth" streaming_enabled)"
+        stream_helper_active="$(_status_truth_value "$runtime_truth" stream_helper_active)"
+        stream_fallback_reason="$(_status_truth_value "$runtime_truth" stream_fallback_reason)"
+        interim_enabled="$(_status_truth_value "$runtime_truth" interim_transcript_enabled)"
+        tail_trim_mode="$(_status_truth_value "$runtime_truth" tail_trim_mode)"
+        vad_enabled="$(_status_truth_value "$runtime_truth" vad_enabled)"
+        vad_active="$(_status_truth_value "$runtime_truth" vad_active)"
+
+        local mode_label
+        if [ "$streaming_enabled" = "true" ]; then
+            if [ "$stream_helper_active" = "true" ]; then
+                mode_label="stream+seal · streaming live"
+            elif [ -n "$stream_fallback_reason" ]; then
+                mode_label="stream+seal · seal only (${stream_fallback_reason##*:})"
+            else
+                mode_label="stream+seal · seal only"
+            fi
+        else
+            mode_label="offline seal"
+        fi
+
+        local interim_label=""
+        case "$interim_enabled" in
+            true) interim_label="interim on" ;;
+            false) interim_label="interim off" ;;
+        esac
+        local trim_label=""
+        [ -n "$tail_trim_mode" ] && trim_label="trim $tail_trim_mode"
+        local vad_label=""
+        case "$vad_enabled" in
+            true) if [ "$vad_active" = "true" ]; then vad_label="vad active"; else vad_label="vad on"; fi ;;
+            false) vad_label="vad off" ;;
+        esac
+        _status_join "$mode_label" "$interim_label" "$trim_label" "$vad_label"
+    }
+
+    _status_overlay_summary() {
+        local runtime_truth="$1"
+        local overlay_enabled emitted dropped
+        overlay_enabled="$(_status_truth_value "$runtime_truth" overlay_events_enabled)"
+        emitted="$(_status_truth_value "$runtime_truth" overlay_events_emitted)"
+        dropped="$(_status_truth_value "$runtime_truth" overlay_events_dropped)"
+        [ -n "$overlay_enabled" ] || return 0
+
+        local state_label="events off"
+        [ "$overlay_enabled" = "true" ] && state_label="events on"
+        local counts_label=""
+        if [ -n "$emitted" ] || [ -n "$dropped" ]; then
+            counts_label="${emitted:-0} sent, ${dropped:-0} dropped"
+            if [ -n "$dropped" ] && [ "$dropped" -gt 0 ] 2>/dev/null; then
+                counts_label="$(_status_paint 33 "$counts_label")"
+            fi
+        fi
+        _status_join "$state_label" "$counts_label"
+    }
+
+    _print_status_summary() {
+        local runtime_truth="$1"
+        local daemon_pid="$2"
+        local endpoint="$3"
+        local status_url="$4"
+
+        local client_pid=""
+        if _pid_alive "$CLIENT_PID_FILE"; then
+            client_pid="$(cat "$CLIENT_PID_FILE")"
+        fi
+
+        local headline
+        if [ -n "$daemon_pid" ] && [ -n "$client_pid" ]; then
+            headline="$(_status_paint '1;32' ready)"
+        elif [ -n "$daemon_pid" ]; then
+            headline="$(_status_paint '1;33' 'daemon only')"
+        elif [ -n "$client_pid" ]; then
+            headline="$(_status_paint '1;33' 'client only')"
+        else
+            headline="$(_status_paint '1;31' stopped)"
+        fi
+        printf 'stt %s\n' "$headline"
+
+        if [ -n "$daemon_pid" ]; then
+            local device effective_device state sessions_active gpu_label device_label
+            device="$(_status_truth_value "$runtime_truth" device)"
+            effective_device="$(_status_truth_value "$runtime_truth" effective_device)"
+            state="$(_status_truth_value "$runtime_truth" state)"
+            sessions_active="$(_status_truth_value "$runtime_truth" sessions_active)"
+            gpu_label="$(_status_format_gpu_mem "$(_status_truth_value "$runtime_truth" gpu_mem_mb)")"
+            device_label="$effective_device"
+            if [ -n "$device" ] && [ -n "$effective_device" ] && [ "$device" != "$effective_device" ]; then
+                device_label="$effective_device (asked for $device)"
+            fi
+            local state_label=""
+            if [ -n "$state" ]; then
+                state_label="$state, ${sessions_active:-0} sessions"
+            fi
+            local unreachable_label=""
+            if [ -z "$runtime_truth" ]; then
+                unreachable_label="$(_status_paint 33 "no answer from $status_url")"
+            fi
+            _status_row daemon "$(_status_join "$(_status_paint 32 running)" "pid $daemon_pid" \
+                "$device_label" "$gpu_label" "$state_label" "$unreachable_label")"
+        else
+            _status_row daemon "$(_status_paint 31 'not running')"
+        fi
+
+        if [ -n "$client_pid" ]; then
+            _status_row client "$(_status_join "$(_status_paint 32 running)" "pid $client_pid" \
+                "$(_status_client_details "$client_pid")")"
+        else
+            _status_row client "$(_status_paint 31 'not running')"
+        fi
+
+        _status_row endpoint "$endpoint"
+
+        if [ -n "$runtime_truth" ]; then
+            _status_row pipeline "$(_status_pipeline_summary "$runtime_truth")"
+            local overlay_summary
+            overlay_summary="$(_status_overlay_summary "$runtime_truth")"
+            [ -n "$overlay_summary" ] && _status_row overlay "$overlay_summary"
+        fi
+
+        if _tmux_has_session "$TMUX_SESSION"; then
+            _status_row tmux "$TMUX_SESSION"
+        else
+            _status_row tmux "none · launch with 'stt start'"
+        fi
+    }
+
+    _print_status_processes() {
+        local pattern='(^|[/[:space:]])parakeet-(stt-daemon|ptt)([[:space:]]|$)'
+        local matches
+        matches="$(pgrep -af "$pattern" 2>/dev/null |
+            awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent')"
+        [ -n "$matches" ] || return 0
+        echo
+        printf '%s\n' "$(_status_paint 2 'Matching processes:')"
+        printf '%s\n' "$matches" | sed 's/^/  /'
+    }
+
+    _stt_status_command() {
+        local verbose=0
+        local as_json=0
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -v | --verbose | --full) verbose=1 ;;
+                --json) as_json=1 ;;
+                -h | --help)
+                    echo "usage: stt status [-v|--verbose] [--json]"
+                    return 0
+                    ;;
+                *)
+                    echo "stt status: unknown option '$1'" >&2
+                    echo "usage: stt status [-v|--verbose] [--json]" >&2
+                    return 2
+                    ;;
+            esac
+            shift
+        done
+
+        local _status_color=0
+        _status_color_supported && _status_color=1
+
+        local daemon_authority daemon_status_url
+        local daemon_identity_confirmed=0
+        daemon_authority="$(_daemon_lifecycle_authority)"
+        daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
+        local daemon_runtime_truth=""
+        daemon_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_authority" 2>/dev/null)" || daemon_runtime_truth=""
+        if [ -n "$daemon_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_authority"; then
+            daemon_identity_confirmed=1
+        else
+            local daemon_current_authority current_runtime_truth
+            daemon_current_authority="$(_daemon_lifecycle_current_authority)"
+            current_runtime_truth=""
+            if [ "$daemon_authority" != "$daemon_current_authority" ]; then
+                current_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_current_authority" 2>/dev/null)" || current_runtime_truth=""
+                if [ -n "$current_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_current_authority"; then
+                    daemon_authority="$daemon_current_authority"
+                    daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
+                    daemon_runtime_truth="$current_runtime_truth"
+                    daemon_identity_confirmed=1
+                    _daemon_lifecycle_persist_authority "$daemon_authority"
+                fi
+            fi
+        fi
+        if [ "$daemon_identity_confirmed" -eq 1 ]; then
+            _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
+        fi
+
+        if [ "$as_json" -eq 1 ]; then
+            local status_body
+            if ! status_body="$(_http_get "$daemon_status_url" 2>/dev/null)"; then
+                echo "stt status: no /status response from $daemon_status_url" >&2
+                return 1
+            fi
+            printf '%s\n' "$status_body" | python3 -m json.tool 2>/dev/null ||
+                printf '%s\n' "$status_body"
+            return 0
+        fi
+
+        local daemon_pid=""
+        if [ "$daemon_identity_confirmed" -eq 1 ] && _daemon_lifecycle_pid_alive; then
+            daemon_pid="$(_daemon_lifecycle_pid)"
+        fi
+
+        _print_status_summary \
+            "$daemon_runtime_truth" \
+            "$daemon_pid" \
+            "$(_daemon_lifecycle_ws_endpoint "$daemon_authority")" \
+            "$daemon_status_url"
+
+        [ "$verbose" -eq 1 ] || return 0
+
+        if [ -n "$daemon_runtime_truth" ]; then
+            echo
+            _print_daemon_runtime_truth "$daemon_runtime_truth"
+        elif [ -n "$daemon_pid" ]; then
+            echo
+            echo "Daemon runtime truth: unavailable from $daemon_status_url"
+        fi
+        _print_status_processes
+        return 0
     }
 
     _stop_running_daemon() {
@@ -1548,7 +1865,8 @@ Commands:
   llm [args]             Start/stop/status the managed llama + STT stack.
   stop                   Stop daemon/client, managed llama-server, and remove pid/port files.
   restart [options]      Restart with the same options as start.
-  status                 Show daemon/client/tmux status.
+  status [-v|--json]     One line per subsystem; -v adds the raw runtime truth
+                         block and matching processes, --json prints /status.
   logs [client|daemon|both]
                          Tail logs (default: both).
   show | attach          Attach to tmux session.
@@ -2238,59 +2556,7 @@ EOF
             fi
             ;;
         status)
-            echo ">>> Status:"
-            local daemon_authority
-            local daemon_status_url
-            local daemon_identity_confirmed=0
-            daemon_authority="$(_daemon_lifecycle_authority)"
-            daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
-            local daemon_runtime_truth=""
-            daemon_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_authority" 2>/dev/null)" || daemon_runtime_truth=""
-            if [ -n "$daemon_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_authority"; then
-                daemon_identity_confirmed=1
-            else
-                local daemon_current_authority current_runtime_truth
-                daemon_current_authority="$(_daemon_lifecycle_current_authority)"
-                current_runtime_truth=""
-                if [ "$daemon_authority" != "$daemon_current_authority" ]; then
-                    current_runtime_truth="$(_daemon_lifecycle_runtime_truth "$daemon_current_authority" 2>/dev/null)" || current_runtime_truth=""
-                    if [ -n "$current_runtime_truth" ] || _daemon_lifecycle_listener_process_identified "$daemon_current_authority"; then
-                        daemon_authority="$daemon_current_authority"
-                        daemon_status_url="$(_daemon_lifecycle_status_url "$daemon_authority")"
-                        daemon_runtime_truth="$current_runtime_truth"
-                        daemon_identity_confirmed=1
-                        _daemon_lifecycle_persist_authority "$daemon_authority"
-                    fi
-                fi
-            fi
-            if [ "$daemon_identity_confirmed" -eq 1 ]; then
-                _daemon_lifecycle_refresh_pid_from_listener "$daemon_authority" >/dev/null 2>&1 || true
-            fi
-            if [ "$daemon_identity_confirmed" -eq 1 ] && _daemon_lifecycle_pid_alive; then
-                echo "   - Daemon running (pid $(_daemon_lifecycle_pid))"
-            else
-                echo "   - Daemon not running"
-            fi
-            if _pid_alive "$CLIENT_PID_FILE"; then
-                echo "   - Client running (pid $(cat "$CLIENT_PID_FILE"))"
-            else
-                echo "   - Client not running"
-            fi
-            echo "   - Endpoint: $(_daemon_lifecycle_ws_endpoint "$daemon_authority")"
-            if pgrep -af "[p]arakeet" >/dev/null; then
-                echo "   - Matching processes:"
-                pgrep -af "[p]arakeet" | sed 's/^/     /'
-            fi
-            if _tmux_has_session "$TMUX_SESSION"; then
-                echo "   - tmux session: $TMUX_SESSION (attach/kill only; launch with 'stt start')"
-            else
-                echo "   - tmux session: none (attach/kill only; launch with 'stt start')"
-            fi
-            if [ -n "$daemon_runtime_truth" ]; then
-                _print_daemon_runtime_truth "$daemon_runtime_truth"
-            elif [ "$daemon_identity_confirmed" -eq 1 ] && _daemon_lifecycle_pid_alive; then
-                echo "   - Daemon runtime truth: unavailable from $daemon_status_url"
-            fi
+            _stt_status_command "$@"
             ;;
         tmux)
             local action="${1:-attach}"
