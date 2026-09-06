@@ -582,12 +582,11 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandRuntimeState {
 fn parse_cosmic_state_has_activated(state: &[u8]) -> bool {
     const COSMIC_STATE_ACTIVATED: u32 = 2;
 
-    state.chunks_exact(4).any(|chunk| {
-        <[u8; 4]>::try_from(chunk)
-            .ok()
-            .map(u32::from_ne_bytes)
-            .is_some_and(|value| value == COSMIC_STATE_ACTIVATED)
-    })
+    state
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|chunk| u32::from_ne_bytes(*chunk) == COSMIC_STATE_ACTIVATED)
 }
 
 #[cfg(test)]
