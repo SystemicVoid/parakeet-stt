@@ -56,7 +56,7 @@ repos:
         entry: cargo clippy --manifest-path parakeet-ptt/Cargo.toml --all-targets --all-features -- -D warnings
         language: system
         pass_filenames: false
-        files: ^parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs|tests/.*\.rs)$
+        files: ^parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs|tests/.*\.rs|assets/.*)$
         stages: [pre-push]
 
       - id: rust-test
@@ -64,5 +64,5 @@ repos:
         entry: cargo test --manifest-path parakeet-ptt/Cargo.toml -q
         language: system
         pass_filenames: false
-        files: ^(parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs|tests/.*\.rs)|docs/protocol/(schema|fixtures)/.*\.json)$
+        files: ^(parakeet-ptt/(Cargo\.toml|Cargo\.lock|src/.*\.rs|tests/.*\.rs|assets/.*)|docs/protocol/(schema|fixtures)/.*\.json)$
         stages: [pre-push]
