@@ -44,3 +44,8 @@ OPEN-ISSUES-TRACKER.md
 
 # OB1 local config
 .ob1/
+
+# Agent skill links: machine-local, rebuilt with `forge-skills install .`
+/.agents/skills/
+/.claude/skills/
+/.claude/agents/
