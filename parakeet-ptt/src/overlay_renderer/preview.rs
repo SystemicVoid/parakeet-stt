@@ -30,7 +30,7 @@ struct Scenario {
 }
 
 /// A speech-like dBFS envelope: syllables at ~4 Hz, words gated at ~0.7 Hz,
-/// resting on the owner's noise floor.
+/// resting on a quiet desktop mic's noise floor.
 fn level_db(t_ms: u64, speech: &[(u64, u64)]) -> f32 {
     let talking = speech.iter().any(|&(a, b)| t_ms >= a && t_ms < b);
     if !talking {
@@ -118,6 +118,7 @@ impl Script {
             OverlayIpcMessage::InjectionComplete {
                 session_id: self.session,
                 success,
+                copy_only: false,
             },
         ));
     }
@@ -285,14 +286,15 @@ fn scenarios() -> Vec<Scenario> {
 }
 
 /// Runs every scenario through the state machine and the sheet, writing one
-/// PPM per shot into `dir`. Returns the paths written.
-pub(super) fn write_previews(dir: &Path, spec: SheetSpec, fonts: FontSet) -> Result<Vec<PathBuf>> {
+/// PPM per shot into `dir`. Returns the paths written. Each scenario gets a
+/// fresh sheet and state machine so its clock can start at zero.
+pub(super) fn write_previews(dir: &Path, spec: SheetSpec) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let (width, height) = buffer_size(spec.content_width, spec.max_lines);
-    let mut galley = Galley::new(fonts, &spec);
     let mut written = Vec::new();
 
     for scenario in scenarios() {
+        let mut galley = Galley::new(FontSet::load()?, &spec);
         let mut machine = OverlayStateMachine::new(Duration::from_millis(600));
         let mut events = scenario.events.clone();
         events.sort_by_key(|(at, _)| *at);
@@ -302,9 +304,6 @@ pub(super) fn write_previews(dir: &Path, spec: SheetSpec, fonts: FontSet) -> Res
         let mut next_shot = 0;
         let mut next_level = 0;
         let mut bytes = vec![0u8; (width * height * 4) as usize];
-
-        // Start the sheet clean between scenarios.
-        galley.observe(&crate::overlay_state::OverlayVisibility::Hidden, &spec, 0);
 
         let mut now = 0;
         while next_shot < shots.len() {
@@ -324,7 +323,7 @@ pub(super) fn write_previews(dir: &Path, spec: SheetSpec, fonts: FontSet) -> Res
                     width,
                     height,
                 };
-                galley.paint(&mut frame, &spec, now);
+                galley.paint(&mut frame);
                 let path = dir.join(format!("{}-{}.ppm", scenario.name, shots[next_shot].1));
                 write_ppm(&path, &bytes, width, height)?;
                 written.push(path);
@@ -364,8 +363,7 @@ mod tests {
             adaptive_width: true,
             anchor_top: false,
         };
-        let written =
-            write_previews(&dir, spec, FontSet::load().expect("fonts")).expect("previews");
+        let written = write_previews(&dir, spec).expect("previews");
         let names: Vec<String> = written
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -383,7 +381,33 @@ mod tests {
                 "missing {expected} in {names:?}"
             );
         }
-        let sample = std::fs::read(dir.join("short-interim.ppm")).expect("read");
+        // Every frame that should carry text does, and the fault frame is rubric.
+        for (name, min_ink) in [
+            ("short-interim.ppm", 500),
+            ("long-four-lines.ppm", 2_000),
+            ("llm-answer.ppm", 500),
+            ("cap-countdown.ppm", 300),
+            ("error-fault.ppm", 100),
+        ] {
+            let (ink, _) = ink_and_rubric(&dir.join(name));
+            assert!(ink > min_ink, "{name} carries ink: {ink} dark px");
+        }
+        let (_, rubric) = ink_and_rubric(&dir.join("error-fault.ppm"));
+        assert!(rubric > 50, "the fault frame shows rubric: {rubric} px");
+        let (_, rubric) = ink_and_rubric(&dir.join("short-pasted.ppm"));
+        assert!(rubric < 5, "a pasted frame shows no rubric: {rubric} px");
+        let (ink, _) = ink_and_rubric(&dir.join("short-exit.ppm"));
+        let (ink_full, _) = ink_and_rubric(&dir.join("short-pasted.ppm"));
+        assert!(
+            ink < ink_full,
+            "the exit frame is fading: {ink} < {ink_full}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counts dark pixels and rubric (red-leaning) pixels in a PPM.
+    fn ink_and_rubric(path: &Path) -> (usize, usize) {
+        let sample = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
         let header_end = sample
             .iter()
             .enumerate()
@@ -393,12 +417,15 @@ mod tests {
             .0
             + 1;
         let body = &sample[header_end..];
-        let dark = body
+        let ink = body
             .chunks(3)
             .filter(|px| px[0] < 140 && px[1] < 140 && px[2] < 140)
             .count();
-        assert!(dark > 500, "the interim frame carries ink: {dark} dark px");
-        let _ = std::fs::remove_dir_all(&dir);
+        let rubric = body
+            .chunks(3)
+            .filter(|px| px[0] > 120 && px[0] as i32 - px[1] as i32 > 60)
+            .count();
+        (ink, rubric)
     }
 
     #[test]
@@ -408,6 +435,6 @@ mod tests {
             .step_by(10)
             .map(|t| level_db(t, &[(0, 2_000)]))
             .fold(f32::MIN, f32::max);
-        assert!(peak > -32.0, "speech peaks like the owner's mic: {peak}");
+        assert!(peak > -32.0, "speech peaks well above the floor: {peak}");
     }
 }

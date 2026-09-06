@@ -48,6 +48,15 @@ pub(super) struct Layout {
     pub widest: f32,
 }
 
+/// How one glyph looks this frame: which face, pencil or ink, its opacity and lift.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GlyphVisual {
+    face: Face,
+    pencil: bool,
+    alpha: f32,
+    dy: f32,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Prose {
     glyphs: Vec<ProseGlyph>,
@@ -78,10 +87,10 @@ impl Prose {
 
     /// Feeds the latest full text. Returns true when anything changed.
     pub(super) fn update(&mut self, text: &str, now_ms: u64) -> bool {
-        let chars: Vec<char> = text.chars().collect();
-        if chars == self.prev_text {
+        if text.chars().eq(self.prev_text.iter().copied()) {
             return false;
         }
+        let chars: Vec<char> = text.chars().collect();
         let mut common = 0;
         let limit = chars.len().min(self.prev_text.len());
         while common < limit && chars[common] == self.prev_text[common] {
@@ -131,7 +140,7 @@ impl Prose {
         }
     }
 
-    fn visual(&self, glyph: &ProseGlyph, now_ms: u64) -> (Face, bool, f32, f32) {
+    fn visual(&self, glyph: &ProseGlyph, now_ms: u64) -> GlyphVisual {
         let arrive = if now_ms <= glyph.arrive_at {
             0.0
         } else {
@@ -143,13 +152,27 @@ impl Prose {
             Face::Italic
         };
         match glyph.set_at {
-            None if glyph.draft => (base_face, true, arrive, 0.0),
-            None => (Face::Roman, false, arrive, 0.0),
+            None if glyph.draft => GlyphVisual {
+                face: base_face,
+                pencil: true,
+                alpha: arrive,
+                dy: 0.0,
+            },
+            None => GlyphVisual {
+                face: Face::Roman,
+                pencil: false,
+                alpha: arrive,
+                dy: 0.0,
+            },
             Some(set_at) => {
                 let (alpha, dy) = set_curve(now_ms, set_at);
                 let italic = now_ms < set_at + SET_FACE_SWITCH_MS;
-                let face = if italic { Face::Italic } else { Face::Roman };
-                (face, italic, arrive * alpha, dy)
+                GlyphVisual {
+                    face: if italic { Face::Italic } else { Face::Roman },
+                    pencil: italic,
+                    alpha: arrive * alpha,
+                    dy,
+                }
             }
         }
     }
@@ -166,25 +189,42 @@ impl Prose {
         now_ms: u64,
     ) -> Layout {
         let max_lines = max_lines.max(1);
-        let mut guard = 0;
-        loop {
-            let layout = self.layout_once(fonts, px, measure, now_ms);
-            if layout.lines <= max_lines || self.glyphs.len() <= 4 || guard >= 400 {
+        // Each pass drops whole leading lines, so even a transcript thousands of
+        // words over budget settles in one or two passes. The ellipsis that
+        // replaces them can push one more wrap, hence the small retry budget.
+        for _ in 0..8 {
+            let (layout, line_starts) = self.layout_once(fonts, px, measure, now_ms);
+            if layout.lines <= max_lines {
                 return layout;
             }
-            guard += 1;
-            // Drop the first word and the space after it.
-            let mut n = 1;
-            while n < self.glyphs.len() - 3 && self.glyphs[n].ch != ' ' {
-                n += 1;
+            // Drop up to the first kept line. When that line starts at glyph 0
+            // (the ellipsis alone filled the line before it), drop a line more.
+            let first_kept_line = layout.lines - max_lines;
+            let drop = line_starts
+                .iter()
+                .skip(first_kept_line - 1)
+                .copied()
+                .find(|start| *start > 0)
+                .unwrap_or(0)
+                .min(self.glyphs.len());
+            if drop == 0 {
+                return layout;
             }
-            let drop = (n + 1).min(self.glyphs.len());
             self.glyphs.drain(..drop);
             self.dropped += drop;
         }
+        self.layout_once(fonts, px, measure, now_ms).0
     }
 
-    fn layout_once(&self, fonts: &FontSet, px: f32, measure: f32, now_ms: u64) -> Layout {
+    /// One wrap pass. Also returns, for every line after the first, the index of
+    /// the glyph that starts it, so the clamp can drop whole lines.
+    fn layout_once(
+        &self,
+        fonts: &FontSet,
+        px: f32,
+        measure: f32,
+        now_ms: u64,
+    ) -> (Layout, Vec<usize>) {
         struct Item {
             ch: char,
             face: Face,
@@ -194,6 +234,11 @@ impl Prose {
             advance: f32,
         }
         let mut items: Vec<Item> = Vec::with_capacity(self.glyphs.len() + 2);
+        let ellipsis_len = if self.dropped > 0 {
+            ELLIPSIS.chars().count()
+        } else {
+            0
+        };
         if self.dropped > 0 {
             for ch in ELLIPSIS.chars() {
                 items.push(Item {
@@ -207,7 +252,12 @@ impl Prose {
             }
         }
         for glyph in &self.glyphs {
-            let (face, pencil, alpha, dy) = self.visual(glyph, now_ms);
+            let GlyphVisual {
+                face,
+                pencil,
+                alpha,
+                dy,
+            } = self.visual(glyph, now_ms);
             let ch = if glyph.ch == '\n' { ' ' } else { glyph.ch };
             items.push(Item {
                 ch,
@@ -220,6 +270,7 @@ impl Prose {
         }
 
         let mut placed = Vec::with_capacity(items.len());
+        let mut line_starts = Vec::new();
         let mut line = 0usize;
         let mut x = 0.0f32;
         let mut widest = 0.0f32;
@@ -255,6 +306,7 @@ impl Prose {
                 widest = widest.max(content_end);
                 line += 1;
                 x = 0.0;
+                line_starts.push(index.saturating_sub(ellipsis_len));
             }
             for k in index..end {
                 if k > index && items[k - 1].face == items[k].face {
@@ -265,6 +317,7 @@ impl Prose {
                     widest = widest.max(content_end);
                     line += 1;
                     x = 0.0;
+                    line_starts.push(k.saturating_sub(ellipsis_len));
                 }
                 placed.push(Placed {
                     ch: items[k].ch,
@@ -281,11 +334,14 @@ impl Prose {
             index = end;
         }
         widest = widest.max(content_end);
-        Layout {
-            placed,
-            lines: line + 1,
-            widest,
-        }
+        (
+            Layout {
+                placed,
+                lines: line + 1,
+                widest,
+            },
+            line_starts,
+        )
     }
 }
 
@@ -423,6 +479,32 @@ mod tests {
         let text: String = layout.placed.iter().map(|p| p.ch).collect();
         assert!(text.ends_with("kappa"), "newest words survive: {text}");
         assert!(!text.contains("alpha"));
+    }
+
+    #[test]
+    fn clamp_settles_a_huge_transcript_in_one_call() {
+        let fonts = fonts();
+        let mut prose = Prose::default();
+        let text = "alpha ".repeat(2_000);
+        prose.update(text.trim_end(), 0);
+        let layout = prose.layout(&fonts, 17.0, 300.0, 4, 5_000);
+        assert!(layout.lines <= 4, "lines: {}", layout.lines);
+        assert!(prose.dropped > 10_000, "dropped: {}", prose.dropped);
+        // A second call with the same text is stable.
+        let again = prose.layout(&fonts, 17.0, 300.0, 4, 5_000);
+        assert_eq!(again.lines, layout.lines);
+    }
+
+    #[test]
+    fn clamp_keeps_the_tail_of_an_oversized_word() {
+        let fonts = fonts();
+        let mut prose = Prose::default();
+        let word = "a".repeat(1_000);
+        prose.update(&word, 0);
+        let layout = prose.layout(&fonts, 17.0, 200.0, 2, 5_000);
+        assert!(layout.lines <= 2);
+        let kept = layout.placed.iter().filter(|p| p.ch == 'a').count();
+        assert!(kept > 20, "a useful suffix survives: {kept}");
     }
 
     #[test]

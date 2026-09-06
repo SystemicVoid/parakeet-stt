@@ -258,7 +258,7 @@ impl OverlayBackend for WaylandOverlayBackend {
         galley.observe(state, spec, now_ms);
         let title = galley.title();
         runtime
-            .present(|frame| galley.paint(frame, spec, now_ms), title.as_deref())
+            .present(|frame| galley.paint(frame), title.as_deref())
             .with_context(|| format!("overlay renderer backend failed for {kind:?}"))
     }
 
@@ -462,13 +462,9 @@ fn layer_margins_for_sheet(
     margin_x: u32,
     margin_y: u32,
 ) -> (i32, i32, i32, i32) {
-    let pad_y = if anchor.is_top() {
-        galley::SHADOW_PAD_TOP + galley::SLIDE_ROOM
-    } else {
-        galley::SHADOW_PAD_BOTTOM
-    };
-    let x = margin_x as i32 - galley::SHADOW_PAD_SIDE as i32;
-    let y = margin_y as i32 - pad_y as i32;
+    let (inset_x, inset_y) = galley::edge_insets(anchor.is_top());
+    let x = margin_x as i32 - inset_x as i32;
+    let y = margin_y as i32 - inset_y as i32;
     layer_margins(anchor, x, y)
 }
 
@@ -611,6 +607,14 @@ impl WaylandRuntime {
                 .context("failed waiting for compositor configure")?;
         }
 
+        // Painting is the expensive part; skip it when there is no slot to
+        // hand the frame to. The tick loop tries again while `frame_pending`.
+        if self.state.free_slot().is_none() {
+            debug!("overlay frame skipped: every shm slot is still held by the compositor");
+            self.frame_pending = true;
+            return Ok(());
+        }
+
         let dimensions = self.dimensions;
         let sheet = {
             let mut frame = Frame {
@@ -624,8 +628,7 @@ impl WaylandRuntime {
         match (&self.shell, sheet) {
             (ShellSurface::Layer { layer_surface }, Some(sheet)) => {
                 // The surface shrinks with the sheet so a centred anchor stays centred.
-                let surface_width = (sheet.w.round() as u32 + 2 * galley::SHADOW_PAD_SIDE)
-                    .clamp(1, dimensions.width);
+                let surface_width = galley::surface_width(sheet.w).clamp(1, dimensions.width);
                 layer_surface.set_size(surface_width, dimensions.height);
                 if !self.attach_full()? {
                     return Ok(());
@@ -1197,15 +1200,14 @@ where
         max_lines: cli.max_lines,
         adaptive_width_enabled,
     };
-    let fonts = FontSet::load().context("failed to load the bundled overlay fonts")?;
-
     if let Some(dir) = cli.preview_dir.as_deref() {
-        let written = preview::write_previews(dir, ui.sheet_spec(), fonts)
+        let written = preview::write_previews(dir, ui.sheet_spec())
             .with_context(|| format!("failed writing overlay previews into {}", dir.display()))?;
         info!(count = written.len(), dir = %dir.display(), "overlay preview frames written");
         return Ok(());
     }
 
+    let fonts = FontSet::load().context("failed to load the bundled overlay fonts")?;
     let mut built_backend = build_backend(cli.backend, &ui, cli.output_name.as_deref(), fonts);
     info!(
         backend = ?built_backend.kind,

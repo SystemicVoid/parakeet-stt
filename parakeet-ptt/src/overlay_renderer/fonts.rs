@@ -40,11 +40,33 @@ pub(super) struct GlyphBitmap {
     pub bitmap: Vec<u8>,
 }
 
+/// Rasterised glyphs are keyed by glyph index, so every character a face lacks
+/// shares one missing-glyph bitmap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphKey {
     face: Face,
-    ch: char,
+    glyph: u16,
     px_bits: u32,
+}
+
+/// The cache is cleared once it holds this many bitmaps; a session's worth of
+/// prose is a few hundred, so the bound only matters over a long process life.
+const GLYPH_CACHE_MAX: usize = 2_048;
+
+/// Face, size, tracking and colour for one run of text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TextStyle {
+    pub face: Face,
+    pub px: f32,
+    /// Extra advance after each glyph.
+    pub tracking: f32,
+    pub rgb: Rgb,
+}
+
+impl TextStyle {
+    pub(super) const fn with_rgb(self, rgb: Rgb) -> Self {
+        Self { rgb, ..self }
+    }
 }
 
 pub(super) struct FontSet {
@@ -92,15 +114,19 @@ impl FontSet {
     }
 
     pub(super) fn glyph(&mut self, face: Face, ch: char, px: f32) -> Arc<GlyphBitmap> {
+        let index = self.font(face).lookup_glyph_index(ch);
         let key = GlyphKey {
             face,
-            ch,
+            glyph: index,
             px_bits: px.to_bits(),
         };
         if let Some(glyph) = self.cache.get(&key) {
             return Arc::clone(glyph);
         }
-        let (metrics, bitmap) = self.font(face).rasterize(ch, px);
+        if self.cache.len() >= GLYPH_CACHE_MAX {
+            self.cache.clear();
+        }
+        let (metrics, bitmap) = self.font(face).rasterize_indexed(index, px);
         let glyph = Arc::new(GlyphBitmap { metrics, bitmap });
         self.cache.insert(key, Arc::clone(&glyph));
         glyph
@@ -120,20 +146,22 @@ impl FontSet {
         width
     }
 
-    /// Draws `text` in one face from `x` on `baseline`; returns the x after the last glyph.
-    #[allow(clippy::too_many_arguments)]
+    /// Draws `text` in `style` from `x` on `baseline`; returns the x after the last glyph.
     pub(super) fn draw_text(
         &mut self,
         frame: &mut Frame,
-        face: Face,
-        px: f32,
+        style: TextStyle,
         x: f32,
         baseline: f32,
         text: &str,
-        tracking: f32,
-        rgb: Rgb,
         alpha: f32,
     ) -> f32 {
+        let TextStyle {
+            face,
+            px,
+            tracking,
+            rgb,
+        } = style;
         let mut cursor = x;
         let mut prev: Option<char> = None;
         for ch in text.chars() {
@@ -146,6 +174,11 @@ impl FontSet {
             prev = Some(ch);
         }
         cursor
+    }
+
+    /// Width of `text` set in `style`.
+    pub(super) fn measure_styled(&self, style: TextStyle, text: &str) -> f32 {
+        self.measure(style.face, style.px, text, style.tracking)
     }
 
     /// Blits one rasterised glyph with its left edge at `x` on `baseline`.
@@ -227,5 +260,19 @@ mod tests {
             fonts.fit_with_ellipsis(Face::Italic, 13.5, "short", 120.0),
             "short"
         );
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded_and_shares_the_missing_glyph() {
+        let mut fonts = FontSet::load().expect("bundled fonts parse");
+        let missing_a = fonts.glyph(Face::Roman, '\u{E000}', 17.0);
+        let missing_b = fonts.glyph(Face::Roman, '\u{E001}', 17.0);
+        assert!(Arc::ptr_eq(&missing_a, &missing_b));
+        for code in 0x4E00..0x4E00 + 3 * GLYPH_CACHE_MAX as u32 {
+            let ch = char::from_u32(code).expect("cjk char");
+            // Distinct sizes defeat glyph-index sharing for characters the face lacks.
+            fonts.glyph(Face::Roman, ch, 17.0 + (code % 512) as f32);
+        }
+        assert!(fonts.cache.len() <= GLYPH_CACHE_MAX);
     }
 }

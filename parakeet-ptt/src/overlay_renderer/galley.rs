@@ -8,10 +8,8 @@
 //! runs. The sheet rises in, lifts out on success and falls out on failure.
 //! Every number here comes from the prototype (prototypes/overlay-look/variant-f.js).
 
-use uuid::Uuid;
-
 use super::coil::{Coil, LevelHistory};
-use super::fonts::{Face, FontSet};
+use super::fonts::{Face, FontSet, TextStyle};
 use super::paint::{Coverage, Frame, Rect, Rgb};
 use super::prose::{Layout, Prose};
 use crate::overlay_state::{OverlayMode, OverlayPhase, OverlayVisibility, SessionView};
@@ -50,6 +48,52 @@ const AUX_TRACKING: f32 = 0.08 * AUX_PX;
 const META_PX: f32 = 10.5;
 const META_TRACKING: f32 = 0.6;
 const DOT_RADIUS: f32 = 3.0;
+const NOTICE_PX: f32 = 12.0;
+
+const LAMP_TEXT: TextStyle = TextStyle {
+    face: Face::Mono,
+    px: LAMP_PX,
+    tracking: LAMP_TRACKING,
+    rgb: PENCIL,
+};
+const TIMER_TEXT: TextStyle = TextStyle {
+    face: Face::Mono,
+    px: TIMER_PX,
+    tracking: TIMER_TRACKING,
+    rgb: PENCIL,
+};
+const AUX_TEXT: TextStyle = TextStyle {
+    face: Face::Mono,
+    px: AUX_PX,
+    tracking: AUX_TRACKING,
+    rgb: PENCIL,
+};
+const QUESTION_TEXT: TextStyle = TextStyle {
+    face: Face::Italic,
+    px: QUESTION_PX,
+    tracking: 0.0,
+    rgb: PENCIL,
+};
+const STATUS_TEXT: TextStyle = TextStyle {
+    face: Face::Italic,
+    px: PROSE_PX,
+    tracking: 0.0,
+    rgb: PENCIL,
+};
+/// The error reason: small caps, tracked out, bottom right.
+const META_TEXT: TextStyle = TextStyle {
+    face: Face::Roman,
+    px: META_PX,
+    tracking: META_TRACKING,
+    rgb: RUBRIC,
+};
+/// The transient notice: a pencil status line in the same corner.
+const NOTICE_TEXT: TextStyle = TextStyle {
+    face: Face::Italic,
+    px: NOTICE_PX,
+    tracking: 0.0,
+    rgb: PENCIL,
+};
 
 /// Shadow: `0 18px 38px .34` plus `0 2px 6px .20`, so the buffer pads are asymmetric.
 pub(super) const SHADOW_PAD_TOP: u32 = 10;
@@ -90,16 +134,18 @@ pub(super) struct Lamp {
 pub(super) fn lamp_for(view: &SessionView) -> Lamp {
     let lamp = |word, dot, ink| Lamp { word, dot, ink };
     match view.phase {
+        OverlayPhase::Done { success: true } if view.copy_only => lamp("COPIED", SAGE, SAGE),
+        OverlayPhase::Done { success: true } => lamp("PASTED", SAGE, SAGE),
+        OverlayPhase::Done { success: false } if view.has_text() => lamp("FAILED", RUBRIC, RUBRIC),
+        OverlayPhase::Done { success: false } => lamp("NO TEXT", RUBRIC, RUBRIC),
+        // An abort or error ends any phase, including an LLM answer in progress.
+        _ if view.failed() => lamp("FAULT", RUBRIC, RUBRIC),
         OverlayPhase::Listening | OverlayPhase::Interim => match view.mode {
             OverlayMode::Llm => lamp("ASK", SLATE, PENCIL),
             OverlayMode::Stt => lamp("REC", SAGE, PENCIL),
         },
-        OverlayPhase::Finalizing if view.failed() => lamp("FAULT", RUBRIC, RUBRIC),
         OverlayPhase::Finalizing => lamp("DECODING", OCHRE, PENCIL),
         OverlayPhase::Answering => lamp("ANSWER", SLATE, SLATE),
-        OverlayPhase::Done { success: true } => lamp("PASTED", SAGE, SAGE),
-        OverlayPhase::Done { success: false } if view.has_text() => lamp("FAILED", RUBRIC, RUBRIC),
-        OverlayPhase::Done { success: false } => lamp("NO TEXT", RUBRIC, RUBRIC),
     }
 }
 
@@ -134,9 +180,26 @@ pub(super) fn max_sheet_height(max_lines: u32) -> u32 {
 /// Buffer size for a sheet of `content_width`: the sheet plus shadow pads plus slide room.
 pub(super) fn buffer_size(content_width: u32, max_lines: u32) -> (u32, u32) {
     (
-        content_width + 2 * SHADOW_PAD_SIDE,
+        surface_width(content_width as f32),
         max_sheet_height(max_lines) + SHADOW_PAD_TOP + SHADOW_PAD_BOTTOM + SLIDE_ROOM,
     )
+}
+
+/// Surface width for a sheet: the paper plus the side shadow pads. The paper
+/// always starts `SHADOW_PAD_SIDE` in from the left edge of the buffer.
+pub(super) fn surface_width(sheet_width: f32) -> u32 {
+    sheet_width.round() as u32 + 2 * SHADOW_PAD_SIDE
+}
+
+/// How far the paper sits from the surface edge, `(side, top or bottom)`, so a
+/// margin the operator measured to the paper can become a surface margin.
+pub(super) fn edge_insets(anchor_top: bool) -> (u32, u32) {
+    let vertical = if anchor_top {
+        SHADOW_PAD_TOP + SLIDE_ROOM
+    } else {
+        SHADOW_PAD_BOTTOM
+    };
+    (SHADOW_PAD_SIDE, vertical)
 }
 
 /// Where the sheet's top edge sits inside the buffer. Bottom anchors keep the sheet
@@ -267,20 +330,30 @@ impl Tween {
     }
 }
 
-/// The sheet rectangle painted this frame (for damage and window geometry).
-pub(super) type SheetRect = Rect;
+/// The bottom-right line: the error reason or the transient notice, measured.
+#[derive(Debug, Clone)]
+struct MetaLine {
+    text: String,
+    style: TextStyle,
+    width: f32,
+}
 
-/// What `observe` measured for the current frame: the prose layout, the width the
-/// sheet wants, and the height it has. `paint` only draws it.
+/// Everything `observe` decided for the current frame: the prose layout, the
+/// fitted question, the meta line, the width the sheet wants and the height it
+/// has. `paint` draws exactly this, at the time it was observed.
 #[derive(Debug, Clone)]
 struct Measured {
     layout: Layout,
     status_line: Option<String>,
+    question_line: Option<String>,
+    meta: Option<MetaLine>,
     llm_layout: bool,
     prose_indent: f32,
     lines_now: f32,
     sheet_height: f32,
     sheet_width: f32,
+    /// The prose measure at the current sheet width.
+    visible_measure: f32,
 }
 
 pub(super) struct Galley {
@@ -300,6 +373,9 @@ pub(super) struct Galley {
     lines: Tween,
     width: Tween,
     measured: Option<Measured>,
+    /// The spec and clock of the last `observe`; `paint` draws that frame.
+    spec: SheetSpec,
+    now_ms: u64,
     last_tick_ms: u64,
 }
 
@@ -327,6 +403,8 @@ impl Galley {
             lines: Tween::snapped(1.0, HEIGHT_ANIM_MS),
             width: Tween::snapped(rest_width as f32, WIDTH_ANIM_MS),
             measured: None,
+            spec: *spec,
+            now_ms: 0,
             last_tick_ms: 0,
         }
     }
@@ -344,6 +422,8 @@ impl Galley {
     ) {
         let dt_ms = now_ms.saturating_sub(self.last_tick_ms);
         self.last_tick_ms = now_ms;
+        self.spec = *spec;
+        self.now_ms = now_ms;
 
         match visibility {
             OverlayVisibility::Visible(incoming) => {
@@ -353,7 +433,7 @@ impl Galley {
                     .is_none_or(|current| current.session_id != incoming.session_id)
                     || self.motion.is_some_and(|m| m.exiting());
                 if arriving {
-                    self.start_session(incoming.session_id, now_ms);
+                    self.start_session(now_ms);
                 }
                 if self.phase != Some(incoming.phase) {
                     if self.phase == Some(OverlayPhase::Finalizing) {
@@ -405,6 +485,8 @@ impl Galley {
                         self.motion = None;
                         self.phase = None;
                         self.measured = None;
+                        self.levels.clear();
+                        self.coil.reset();
                     }
                 }
             }
@@ -491,20 +573,46 @@ impl Galley {
             .value(now_ms)
             .round()
             .clamp(MIN_SHEET_WIDTH as f32, max_width);
+        let visible_measure = sheet_width - PAD_L - PAD_R;
+
+        let question_line = if llm_layout {
+            let question = view.question.as_deref().unwrap_or_default();
+            Some(self.fonts.fit_with_ellipsis(
+                QUESTION_TEXT.face,
+                QUESTION_TEXT.px,
+                question,
+                visible_measure,
+            ))
+        } else {
+            None
+        };
+        let meta = if view.failed() {
+            let reason = view.reason.as_deref().unwrap_or("session failed");
+            Some((reason.to_uppercase(), META_TEXT))
+        } else {
+            view.notice.clone().map(|notice| (notice, NOTICE_TEXT))
+        }
+        .map(|(text, style)| MetaLine {
+            width: self.fonts.measure_styled(style, &text),
+            text,
+            style,
+        });
 
         Some(Measured {
             layout,
             status_line,
+            question_line,
+            meta,
             llm_layout,
             prose_indent,
             lines_now,
             sheet_height,
             sheet_width,
+            visible_measure,
         })
     }
 
-    fn start_session(&mut self, session_id: Uuid, now_ms: u64) {
-        let _ = session_id;
+    fn start_session(&mut self, now_ms: u64) {
         self.prose.reset();
         self.levels.clear();
         self.coil.reset();
@@ -526,15 +634,12 @@ impl Galley {
             || !self.width.settled(now_ms)
     }
 
-    /// Paints the sheet into `frame`. Returns the sheet rectangle, or `None` when
-    /// nothing is on screen.
-    pub(super) fn paint(
-        &mut self,
-        frame: &mut Frame,
-        spec: &SheetSpec,
-        now_ms: u64,
-    ) -> Option<SheetRect> {
+    /// Paints the frame `observe` last prepared into `frame`. Returns the sheet
+    /// rectangle, or `None` when nothing is on screen.
+    pub(super) fn paint(&mut self, frame: &mut Frame) -> Option<Rect> {
         frame.clear();
+        let spec = self.spec;
+        let now_ms = self.now_ms;
         let view = self.view.clone()?;
         let motion = self.motion.unwrap_or(Motion {
             kind: MotionKind::In,
@@ -550,11 +655,14 @@ impl Galley {
         let Measured {
             layout,
             status_line,
+            question_line,
+            meta,
             llm_layout,
             prose_indent,
             lines_now,
             sheet_height,
             sheet_width,
+            visible_measure,
         } = self.measured.clone()?;
 
         let sheet = Rect {
@@ -563,7 +671,6 @@ impl Galley {
             w: sheet_width,
             h: sheet_height.round(),
         };
-        let visible_measure = sheet_width - PAD_L - PAD_R;
 
         // ---- paper
         frame.draw_shadow(sheet, CORNER_RADIUS, 18.0, 38.0, SHADOW, 0.34);
@@ -620,13 +727,10 @@ impl Galley {
         );
         self.fonts.draw_text(
             frame,
-            Face::Mono,
-            LAMP_PX,
+            LAMP_TEXT.with_rgb(lamp.ink),
             column_x + 12.0,
             lamp_baseline,
             lamp.word,
-            LAMP_TRACKING,
-            lamp.ink,
             1.0,
         );
 
@@ -637,47 +741,28 @@ impl Galley {
         };
         self.fonts.draw_text(
             frame,
-            Face::Mono,
-            TIMER_PX,
+            TIMER_TEXT.with_rgb(timer_color),
             column_x,
             lamp_baseline + 16.0,
             &timer,
-            TIMER_TRACKING,
-            timer_color,
             1.0,
         );
         if matches!(view.phase, OverlayPhase::Done { .. }) && self.seal_took_ms > 0 {
             let aux = format!("seal {}ms", self.seal_took_ms);
-            self.fonts.draw_text(
-                frame,
-                Face::Mono,
-                AUX_PX,
-                column_x,
-                lamp_baseline + 30.0,
-                &aux,
-                AUX_TRACKING,
-                PENCIL,
-                1.0,
-            );
+            self.fonts
+                .draw_text(frame, AUX_TEXT, column_x, lamp_baseline + 30.0, &aux, 1.0);
         }
 
         // ---- prose column
         let prose_x = sheet.x + PAD_L + prose_indent;
         let mut body_top = sheet.y + PAD_T;
-        if llm_layout {
-            let question = view.question.as_deref().unwrap_or_default();
-            let fitted =
-                self.fonts
-                    .fit_with_ellipsis(Face::Italic, QUESTION_PX, question, visible_measure);
+        if let Some(question) = &question_line {
             self.fonts.draw_text(
                 frame,
-                Face::Italic,
-                QUESTION_PX,
+                QUESTION_TEXT,
                 sheet.x + PAD_L,
                 body_top + 13.2,
-                &fitted,
-                0.0,
-                PENCIL,
+                question,
                 1.0,
             );
             body_top += QUESTION_LINE + QUESTION_RULE_ABOVE + 1.0 + QUESTION_RULE_BELOW;
@@ -699,17 +784,8 @@ impl Galley {
             );
         }
         if let Some(status) = &status_line {
-            self.fonts.draw_text(
-                frame,
-                Face::Italic,
-                PROSE_PX,
-                prose_x,
-                first_baseline,
-                status,
-                0.0,
-                PENCIL,
-                1.0,
-            );
+            self.fonts
+                .draw_text(frame, STATUS_TEXT, prose_x, first_baseline, status, 1.0);
         }
 
         // ---- quote bar (LLM answer)
@@ -738,11 +814,15 @@ impl Galley {
         let since_phase = now_ms.saturating_sub(self.phase_at_ms) as f32;
         let (track, ink_width, rule_color) = match view.phase {
             OverlayPhase::Listening if view.transcript.trim().is_empty() => (true, 0.0, INK),
-            OverlayPhase::Finalizing | OverlayPhase::Done { .. } if error => (
-                true,
-                visible_measure * (1.0 - (-since_phase / 110.0).exp()),
-                RUBRIC,
-            ),
+            OverlayPhase::Finalizing | OverlayPhase::Answering | OverlayPhase::Done { .. }
+                if error =>
+            {
+                (
+                    true,
+                    visible_measure * (1.0 - (-since_phase / 110.0).exp()),
+                    RUBRIC,
+                )
+            }
             OverlayPhase::Finalizing => (
                 true,
                 visible_measure * (1.0 - (-((since_phase - 110.0).max(0.0)) / 330.0).exp()),
@@ -763,22 +843,8 @@ impl Galley {
             frame.hline(x0, x0 + ink_width, rule_y as i32, rule_color, 1.0);
         }
 
-        // ---- meta: the error reason, or a transient notice
-        let meta = if error {
-            Some((
-                view.reason
-                    .clone()
-                    .unwrap_or_else(|| "session failed".to_string()),
-                RUBRIC,
-            ))
-        } else {
-            view.notice.clone().map(|notice| (notice, PENCIL))
-        };
-        if let Some((text, color)) = meta {
-            let text = text.to_uppercase();
-            let width = self
-                .fonts
-                .measure(Face::Roman, META_PX, &text, META_TRACKING);
+        // ---- meta: the error reason, or the transient notice
+        if let Some(MetaLine { text, style, width }) = &meta {
             let meta_y = if llm_layout {
                 sheet.bottom() - PAD_B - 1.0
             } else {
@@ -786,13 +852,10 @@ impl Galley {
             };
             self.fonts.draw_text(
                 frame,
-                Face::Roman,
-                META_PX,
+                *style,
                 sheet.x + PAD_L + visible_measure - width,
                 meta_y - 10.0,
-                &text,
-                META_TRACKING,
-                color,
+                text,
                 1.0,
             );
         }
@@ -852,6 +915,7 @@ fn status_text(view: &SessionView) -> Option<String> {
 mod tests {
     use super::*;
     use crate::overlay_state::CapWarning;
+    use uuid::Uuid;
 
     fn view(phase: OverlayPhase) -> SessionView {
         SessionView {
@@ -864,6 +928,7 @@ mod tests {
             status: None,
             notice: None,
             reason: None,
+            copy_only: false,
             started_ms: 0,
             ended_ms: None,
             warning: None,
@@ -951,8 +1016,74 @@ mod tests {
             &spec(),
             now_ms + 1_000,
         );
-        let rect = galley.paint(&mut frame, &spec(), now_ms + 1_000);
+        let rect = galley.paint(&mut frame);
         (rect, bytes)
+    }
+
+    #[test]
+    fn copy_only_success_reads_copied_and_an_aborted_answer_reads_fault() {
+        let mut copied = view(OverlayPhase::Done { success: true });
+        copied.copy_only = true;
+        assert_eq!(lamp_for(&copied).word, "COPIED");
+
+        let mut aborted = view(OverlayPhase::Answering);
+        aborted.mode = OverlayMode::Llm;
+        aborted.question = Some("what is a mutex".to_string());
+        aborted.reason = Some("error".to_string());
+        assert_eq!(lamp_for(&aborted).word, "FAULT");
+        assert_eq!(lamp_for(&aborted).dot, RUBRIC);
+    }
+
+    #[test]
+    fn a_new_session_during_the_exit_restarts_the_entrance() {
+        let mut galley = Galley::new(FontSet::load().expect("fonts"), &spec());
+        let first = view(OverlayPhase::Done { success: true });
+        paint_view(&mut galley, &first, 0);
+        galley.observe(&OverlayVisibility::Hidden, &spec(), 2_000);
+        assert!(galley.motion.is_some_and(|m| m.exiting()));
+
+        let second = view(OverlayPhase::Listening);
+        galley.observe(&OverlayVisibility::Visible(second.clone()), &spec(), 2_050);
+        assert!(galley.motion.is_some_and(|m| !m.exiting()));
+        assert_eq!(
+            galley.view.as_ref().map(|v| v.session_id),
+            Some(second.session_id)
+        );
+        // One tick in, the entrance has some opacity.
+        galley.observe(&OverlayVisibility::Visible(second.clone()), &spec(), 2_100);
+        let (w, h) = buffer_size(DEFAULT_SHEET_WIDTH, 4);
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        let mut frame = Frame {
+            bytes: &mut bytes,
+            width: w,
+            height: h,
+        };
+        assert!(galley.paint(&mut frame).is_some());
+    }
+
+    #[test]
+    fn the_notice_is_a_pencil_status_line_and_the_reason_wins_over_it() {
+        let mut galley = Galley::new(FontSet::load().expect("fonts"), &spec());
+        let mut busy = view(OverlayPhase::Answering);
+        busy.notice = Some("LLM busy; wait for current answer".to_string());
+        paint_view(&mut galley, &busy, 0);
+        let meta = galley
+            .measured
+            .as_ref()
+            .and_then(|m| m.meta.clone())
+            .expect("meta");
+        assert_eq!(meta.text, "LLM busy; wait for current answer");
+        assert_eq!(meta.style, NOTICE_TEXT);
+
+        busy.reason = Some("error".to_string());
+        paint_view(&mut galley, &busy, 2_000);
+        let meta = galley
+            .measured
+            .as_ref()
+            .and_then(|m| m.meta.clone())
+            .expect("meta");
+        assert_eq!(meta.text, "ERROR");
+        assert_eq!(meta.style, META_TEXT);
     }
 
     #[test]
@@ -1008,7 +1139,7 @@ mod tests {
             width: w,
             height: h,
         };
-        assert!(galley.paint(&mut frame, &spec(), 3_000).is_none());
+        assert!(galley.paint(&mut frame).is_none());
         assert!(bytes.iter().all(|b| *b == 0));
     }
 
@@ -1029,7 +1160,7 @@ mod tests {
             ..spec()
         };
         galley.observe(&OverlayVisibility::Visible(v.clone()), &dim, 2_500);
-        galley.paint(&mut frame, &dim, 2_500);
+        galley.paint(&mut frame);
         let max_full = full.iter().skip(3).step_by(4).max().copied().unwrap_or(0);
         let max_dim = bytes.iter().skip(3).step_by(4).max().copied().unwrap_or(0);
         assert_eq!(max_full, 255);

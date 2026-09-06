@@ -17,10 +17,17 @@ const BIN_MS: u64 = PROFILE_SPAN_MS / PROFILE_BINS as u64;
 /// Levels older than this are forgotten.
 const HISTORY_KEEP_MS: u64 = PROFILE_SPAN_MS + 500;
 
-/// dBFS at and below which the coil rests (the owner's mic noise floor).
-const DB_FLOOR: f32 = -55.0;
-/// dBFS at and above which the coil is fully open.
-const DB_CEIL: f32 = -25.0;
+/// dBFS the floor rests at before any level arrives (a quiet desktop mic).
+const FLOOR_START_DB: f32 = -55.0;
+/// The coil is fully open this far above the floor.
+const DB_SPAN: f32 = 30.0;
+/// The floor is the quietest level in the kept history: word gaps keep it at
+/// the mic's noise while a sentence runs, and a hotter mic is learned within
+/// one history window.
+const FLOOR_MIN_DB: f32 = -90.0;
+const FLOOR_MAX_DB: f32 = -35.0;
+/// Fewer samples than this say nothing about the floor yet.
+const FLOOR_MIN_SAMPLES: usize = 10;
 
 const TURNS: f32 = 8.0;
 const SEGMENTS: usize = 420;
@@ -30,12 +37,8 @@ const ROTATION_LIVE: f32 = -2.2;
 const ROTATION_IDLE: f32 = -0.8;
 const FADE_MS: f32 = 900.0;
 
-/// Maps dBFS to 0..1 with the owner's mic in mind (noise about -55, speech about -32).
-pub(super) fn norm_level(db: f32) -> f32 {
-    ((db - DB_FLOOR) / (DB_CEIL - DB_FLOOR)).clamp(0.0, 1.0)
-}
-
-/// A time-stamped ring of microphone levels.
+/// A time-stamped ring of microphone levels plus the noise floor it has
+/// learned, so the coil reads the same on a quiet mic and a hot one.
 #[derive(Debug, Default)]
 pub(super) struct LevelHistory {
     samples: VecDeque<(u64, f32)>,
@@ -60,11 +63,29 @@ impl LevelHistory {
         self.samples.clear();
     }
 
+    /// The mic's noise floor: the quietest level in the kept history.
+    fn floor_db(&self) -> f32 {
+        if self.samples.len() < FLOOR_MIN_SAMPLES {
+            return FLOOR_START_DB;
+        }
+        self.samples
+            .iter()
+            .map(|&(_, db)| db)
+            .reduce(f32::min)
+            .unwrap_or(FLOOR_START_DB)
+            .clamp(FLOOR_MIN_DB, FLOOR_MAX_DB)
+    }
+
+    /// Maps dBFS to 0..1 above the learned floor.
+    fn norm(&self, db: f32) -> f32 {
+        ((db - self.floor_db()) / DB_SPAN).clamp(0.0, 1.0)
+    }
+
     /// The most recent level, normalised, or 0 when nothing has arrived.
     pub(super) fn latest(&self) -> f32 {
         self.samples
             .back()
-            .map(|&(_, db)| norm_level(db))
+            .map(|&(_, db)| self.norm(db))
             .unwrap_or(0.0)
     }
 
@@ -79,7 +100,7 @@ impl LevelHistory {
                 continue;
             }
             let index = (((t - start) / BIN_MS) as usize).min(PROFILE_BINS - 1);
-            let value = norm_level(db);
+            let value = self.norm(db);
             bins[index] = if bins[index].is_nan() {
                 value
             } else {
@@ -199,14 +220,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn norm_level_maps_the_mic_range() {
-        assert_eq!(norm_level(-70.0), 0.0);
-        assert_eq!(norm_level(-10.0), 1.0);
-        let speech = norm_level(-32.0);
+    fn the_floor_follows_the_mic_so_speech_reads_the_same_on_quiet_and_hot_mics() {
+        let mut quiet = LevelHistory::default();
+        for t in (0..1_000).step_by(50) {
+            quiet.push(t, -55.0);
+        }
+        quiet.push(1_000, -32.0);
+        let quiet_speech = quiet.latest();
         assert!(
-            speech > 0.6 && speech < 0.9,
-            "speech sits high in the range: {speech}"
+            quiet_speech > 0.6 && quiet_speech < 0.9,
+            "speech sits high in the range: {quiet_speech}"
         );
+
+        let mut hot = LevelHistory::default();
+        for t in (0..1_000).step_by(50) {
+            hot.push(t, -35.0);
+        }
+        assert!(hot.latest() < 0.1, "steady noise is the floor, not signal");
+        hot.push(1_000, -35.0 + 23.0);
+        assert!(
+            (hot.latest() - quiet_speech).abs() < 0.1,
+            "the same lift above the floor reads the same: {}",
+            hot.latest()
+        );
+    }
+
+    #[test]
+    fn a_sentence_with_word_gaps_does_not_lift_the_floor() {
+        let mut history = LevelHistory::default();
+        for t in (0..1_000).step_by(50) {
+            history.push(t, -55.0);
+        }
+        // Words at -30 with 100 ms gaps back at the noise floor.
+        for t in (1_000..6_000).step_by(50) {
+            let in_gap = t % 400 < 100;
+            history.push(t, if in_gap { -55.0 } else { -30.0 });
+        }
+        assert!(history.floor_db() < -52.0, "floor: {}", history.floor_db());
+        assert!(history.latest() > 0.6);
+    }
+
+    #[test]
+    fn non_finite_levels_are_ignored() {
+        let mut history = LevelHistory::default();
+        history.push(0, f32::NAN);
+        history.push(10, f32::INFINITY);
+        assert!(history.samples.is_empty());
+        assert_eq!(history.floor_db(), FLOOR_START_DB);
     }
 
     #[test]
