@@ -43,7 +43,9 @@ stt status
 stt show
 stt logs both
 ```
-`stt status` reports Helper process health. Runtime truth for Stream path,
+`stt status` prints one line per subsystem (daemon, client, endpoint, pipeline,
+overlay, tmux). Add `-v` for the full runtime truth block and matching
+processes, or `--json` for the raw Daemon `/status` payload. Runtime truth for Stream path,
 Seal path, Daemon interim transcript sources, and Overlay event transport lives
 in the Daemon `/status` payload and the Client startup status log line. See
 [`docs/stt-troubleshooting.md`](docs/stt-troubleshooting.md) for the field guide.

@@ -768,7 +768,7 @@ exit 42
         completed = _run_stt_helper_command("status", extra_env=env)
 
     assert completed.returncode == 0
-    assert "tmux session: none (attach/kill only; launch with 'stt start')" in completed.stdout
+    assert "none \u00b7 launch with 'stt start'" in completed.stdout
 
 
 def test_llm_direct_profile_forwards_remaining_start_args_once(tmp_path: Path) -> None:
@@ -1206,11 +1206,25 @@ exit 22
             text=True,
             capture_output=True,
         )
+        verbose = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"source {shlex.quote(str(HELPER_PATH))} && stt status --verbose",
+            ],
+            check=True,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
 
-        assert f"Daemon running (pid {listener_pid})" in completed.stdout
-        assert f"Endpoint: ws://127.0.0.1:{listener_port}/ws" in completed.stdout
-        assert "Daemon runtime truth:" in completed.stdout
-        assert "sessions_active=0" in completed.stdout
+        assert f"running \u00b7 pid {listener_pid}" in completed.stdout
+        assert f"ws://127.0.0.1:{listener_port}/ws" in completed.stdout
+        assert "idle, 0 sessions" in completed.stdout
+        assert "sessions_active=0" not in completed.stdout
+        assert "Daemon runtime truth:" in verbose.stdout
+        assert "sessions_active=0" in verbose.stdout
         assert curl_url_file.read_text(encoding="utf-8").strip() == expected_status_url
         assert pid_file.read_text(encoding="utf-8").strip() == listener_pid
 
