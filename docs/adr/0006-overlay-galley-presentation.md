@@ -1,0 +1,15 @@
+# Overlay presentation: the Galley sheet, bundled fonts, and a stateless painter
+
+The first Overlay renderer was a dark panel with a rotating "Listening..." phrase, an accent stripe, a dithered waveform, and a system-font cascade (`--font`, fontdb). It looked like a notification, its typography changed from machine to machine, and every animation was a separate ad-hoc state hanging off the Wayland backend. Issue #202 replaced the look after a round of throwaway web prototypes (`parakeet-ptt/prototypes/overlay-look`, variant F, kept in the repo as the design reference).
+
+The Overlay now paints the **Galley sheet**: a paper card with an instrument column (a coil whose radius follows the last two seconds of microphone level, the lamp word with its dot, the session timer, an aux line for the seal time) beside prose set in Newsreader. Interim words arrive as an italic pencil draft tail and set to roman ink when the next burst lands; a rule under the prose fills while the Seal path runs; LLM answers sit under the question and a slate quote bar. The sheet rises in, lifts out after a paste, and falls out on failure. Every number comes from the prototype and lives in one composition module.
+
+Three decisions shape the code:
+
+- **Fonts are bundled, not discovered.** Newsreader (roman and italic, instanced at opsz 18 / wght 400 with overlaps removed and GPOS kerning baked into a legacy `kern` table because fontdue reads only that) and Fira Code Regular ship in `parakeet-ptt/assets/fonts` under the OFL and are embedded with `include_bytes!`. `scripts/build-overlay-fonts.py` regenerates them. The `--font` flag and the glyph-cache env switch are gone: the look no longer depends on what the host has installed.
+- **The painter is a pure function of state and time.** `OverlayStateMachine` folds IPC into an `OverlayVisibility` (a `SessionView` with mode, phase, transcript, question, answer, notice, reason, timestamps and the cap warning). The `galley` module observes that view plus a clock and paints pixels; the Wayland runtime only sizes the surface and commits the buffer. Because nothing in the painter touches a compositor, `--preview-dir` writes scripted frames for six scenarios to disk and `just overlay-preview` stitches a contact sheet, so the look can be checked and reviewed without a session.
+- **Presentation stays out of runtime truth.** The lamp, the timer, the coil and the seal rule are local feedback and never a source of truth (see `0004-runtime-truth-single-owner-contract.md`). The renderer's timer starts at the first event it saw for the Session, so it restarts after an Overlay respawn; that is accepted rather than plumbing session start times through the IPC.
+
+Costs: the crate carries about 600 KB of font data; the renderer paints the whole buffer (about a megabyte) on every animation tick at 33 ms while a sheet is visible; and any change to the look means editing constants in Rust rather than CSS, with the prototype as the reference to diff against.
+
+Issues: #202.
