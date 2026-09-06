@@ -407,13 +407,17 @@ impl OverlayProcessManager {
     }
 
     fn replay_messages(&self) -> Vec<OverlayIpcMessage> {
+        self.replay_messages_at(Instant::now())
+    }
+
+    fn replay_messages_at(&self, now: Instant) -> Vec<OverlayIpcMessage> {
         let mut replay_messages = Vec::new();
         if let Some(message) = self.latest_message.clone() {
             let latest_session_id = overlay_message_session_id(Some(&message));
             replay_messages.push(message);
             if overlay_message_session_id(self.latest_warning.as_ref()) == latest_session_id {
                 if let Some(warning) = self.latest_warning.clone() {
-                    replay_messages.push(self.aged_warning(warning));
+                    replay_messages.push(self.aged_warning(warning, now));
                 }
             }
         }
@@ -422,7 +426,7 @@ impl OverlayProcessManager {
 
     /// Subtracts the time since the warning arrived from its remaining seconds,
     /// so a respawned renderer counts down from where the previous one was.
-    fn aged_warning(&self, warning: OverlayIpcMessage) -> OverlayIpcMessage {
+    fn aged_warning(&self, warning: OverlayIpcMessage, now: Instant) -> OverlayIpcMessage {
         let OverlayIpcMessage::SessionWarning {
             session_id,
             remaining_seconds,
@@ -433,7 +437,7 @@ impl OverlayProcessManager {
         };
         let age_seconds = self
             .latest_warning_at
-            .map(|at| at.elapsed().as_secs_f32())
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
             .unwrap_or(0.0);
         // A cap-only warning is resolved here: the respawned renderer's view
         // starts its clock at zero, so it cannot subtract the session's age.
@@ -444,7 +448,7 @@ impl OverlayProcessManager {
                 let session_age = self
                     .utterance_started
                     .filter(|(id, _)| *id == session_id)
-                    .map(|(_, at)| at.elapsed().as_secs_f32())
+                    .map(|(_, at)| now.saturating_duration_since(at).as_secs_f32())
                     .unwrap_or(0.0);
                 Some((limit - session_age).max(0.0))
             });
@@ -782,10 +786,10 @@ mod tests {
             remaining_seconds: None,
             limit_seconds: Some(600.0),
         });
-        manager.set_latest_warning_at_for_tests(Instant::now() - Duration::from_secs(110));
-        manager
-            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(590));
-        let replay = manager.replay_messages();
+        let base = Instant::now();
+        manager.set_latest_warning_at_for_tests(base + Duration::from_secs(480));
+        manager.set_utterance_started_for_tests(session_id, base);
+        let replay = manager.replay_messages_at(base + Duration::from_secs(590));
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
             limit_seconds: Some(limit),
@@ -800,9 +804,7 @@ mod tests {
             "remaining from the cap minus the session age: {remaining}"
         );
 
-        manager
-            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(700));
-        let replay = manager.replay_messages();
+        let replay = manager.replay_messages_at(base + Duration::from_secs(700));
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
             ..
@@ -829,9 +831,9 @@ mod tests {
             seq,
             state: "listening".to_string(),
         };
+        let base = Instant::now();
         manager.remember_replay_state(&interim(session_id, 1));
-        manager
-            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(590));
+        manager.set_utterance_started_for_tests(session_id, base);
         manager.remember_replay_state(&interim(Uuid::nil(), 2));
         manager.remember_replay_state(&interim(session_id, 3));
         manager.remember_replay_state(&OverlayIpcMessage::SessionWarning {
@@ -839,7 +841,7 @@ mod tests {
             remaining_seconds: None,
             limit_seconds: Some(600.0),
         });
-        let replay = manager.replay_messages();
+        let replay = manager.replay_messages_at(base + Duration::from_secs(590));
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
             ..
@@ -874,8 +876,9 @@ mod tests {
             remaining_seconds: Some(120.0),
             limit_seconds: Some(600.0),
         });
-        manager.set_latest_warning_at_for_tests(Instant::now() - Duration::from_secs(110));
-        let replay = manager.replay_messages();
+        let base = Instant::now();
+        manager.set_latest_warning_at_for_tests(base);
+        let replay = manager.replay_messages_at(base + Duration::from_secs(110));
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
             ..
@@ -888,8 +891,7 @@ mod tests {
             "aged remaining: {remaining}"
         );
 
-        manager.set_latest_warning_at_for_tests(Instant::now() - Duration::from_secs(300));
-        let replay = manager.replay_messages();
+        let replay = manager.replay_messages_at(base + Duration::from_secs(300));
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
             ..

@@ -257,7 +257,7 @@
         return;
       }
 
-      const llmAnswer = s.mode === 'llm' && (s.phase === 'answering' || (s.phase === 'done' && !!s.question));
+      const llmAnswer = s.mode === 'llm' && !!s.question && (s.phase === 'answering' || s.phase === 'done');
 
       // ---- tape line: your words. Right-anchored, oldest dissolve off the left.
       const tapeText = llmAnswer ? s.question : s.text;

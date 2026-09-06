@@ -97,6 +97,7 @@ async def main(specs):
                 await asyncio.sleep(0.03)
             else:
                 print(f"timeout waiting for {phase} in {spec}", file=sys.stderr)
+                continue
             await asyncio.sleep(extra_ms / 1000)
             shot = await call("Page.captureScreenshot", format="png")
             path = f"{OUT}/{tag}-{scn}-{phase}+{extra_ms}-{bd}.png"

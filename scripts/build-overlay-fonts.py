@@ -54,10 +54,13 @@ def flatten_pair_kerning(font: TTFont) -> dict[tuple[str, str], int]:
         if record.FeatureTag == "kern":
             lookup_indices.update(record.Feature.LookupListIndex)
     for index in sorted(lookup_indices):
-        for subtable in gpos.LookupList.Lookup[index].SubTable:
-            if subtable.LookupType == 9:
+        lookup = gpos.LookupList.Lookup[index]
+        for subtable in lookup.SubTable:
+            subtable_type = lookup.LookupType
+            if subtable_type == 9:
+                subtable_type = subtable.ExtensionLookupType
                 subtable = subtable.ExtSubTable
-            if subtable.LookupType != 2:
+            if subtable_type != 2:
                 continue
             coverage = subtable.Coverage.glyphs
             if subtable.Format == 1:
