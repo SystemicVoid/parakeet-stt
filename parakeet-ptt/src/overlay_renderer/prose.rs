@@ -196,33 +196,46 @@ impl Prose {
         // Binary-search the smallest leading drop that fits the budget: the
         // empty tail always fits, so the search always lands on a drop that
         // does, and a transcript thousands of words over budget costs a dozen
-        // wrap passes rather than one per word. Then prefer the next word
-        // boundary when a whole-word tail still fits.
-        let fits =
-            |skip: usize| self.layout_once(fonts, px, measure, now_ms, skip).lines <= max_lines;
+        // wrap passes rather than one per word.
+        let lines_at = |skip: usize| self.layout_once(fonts, px, measure, now_ms, skip).lines;
         let (mut lo, mut hi) = (1usize, self.glyphs.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if fits(mid) {
+            if lines_at(mid) <= max_lines {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
         let mut drop = hi;
+        let is_break = |ch: char| matches!(ch, ' ' | '\n');
+        // Snap to the next word boundary when the whole-word tail still uses
+        // as many lines, so a partial word is not shown at the price of a line.
         if drop > 0
             && self
                 .glyphs
                 .get(drop - 1)
-                .is_some_and(|glyph| glyph.ch != ' ')
+                .is_some_and(|glyph| !is_break(glyph.ch))
         {
+            let lines = lines_at(drop);
             let word_end = self.glyphs[drop..]
                 .iter()
-                .position(|glyph| glyph.ch == ' ')
+                .position(|glyph| is_break(glyph.ch))
                 .map(|at| drop + at + 1);
-            if let Some(end) = word_end.filter(|end| *end < self.glyphs.len() && fits(*end)) {
+            if let Some(end) =
+                word_end.filter(|end| *end < self.glyphs.len() && lines_at(*end) == lines)
+            {
                 drop = end;
             }
+        }
+        // Never start the tail with a space: it would separate the ellipsis
+        // from the first word and could leave the ellipsis alone on a line.
+        while self
+            .glyphs
+            .get(drop)
+            .is_some_and(|glyph| is_break(glyph.ch))
+        {
+            drop += 1;
         }
         self.glyphs.drain(..drop);
         self.dropped += drop;
@@ -540,6 +553,18 @@ mod tests {
             .filter(|p| p.ch != '…' && p.ch != ' ')
             .count();
         assert!(kept > 10, "a useful tail survives: {kept}");
+    }
+
+    #[test]
+    fn clamp_does_not_trade_a_line_for_a_whole_word_tail() {
+        let fonts = fonts();
+        let mut prose = Prose::default();
+        let run = "x".repeat(100);
+        prose.update(&format!("a {run} b"), 0);
+        let layout = prose.layout(&fonts, 17.0, 320.0, 2, 5_000);
+        assert_eq!(layout.lines, 2, "both budget lines are used");
+        let kept = layout.placed.iter().filter(|p| p.ch == 'x').count();
+        assert!(kept > 40, "the run's tail survives: {kept}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::config::OverlayMode;
 use crate::surface_focus::WaylandFocusCache;
@@ -238,9 +239,10 @@ pub struct OverlayProcessManager {
     /// When `latest_warning` arrived, so a replay after a renderer respawn can
     /// age its remaining time instead of restarting the countdown.
     latest_warning_at: Option<Instant>,
-    /// When the current utterance started, so a cap-only warning (no remaining
-    /// time from the Daemon) replays with the time the session has already used.
-    utterance_started_at: Option<Instant>,
+    /// Which utterance is running and when it started, so a cap-only warning
+    /// (no remaining time from the Daemon) replays with the time the session
+    /// has already used. The nil-session busy notice never touches it.
+    utterance_started: Option<(Uuid, Instant)>,
     focus_cache: Option<WaylandFocusCache>,
     pending_output_name: Option<String>,
     utterance_active: bool,
@@ -350,8 +352,10 @@ impl OverlayProcessManager {
                 if overlay_message_session_id(self.latest_warning.as_ref()) != Some(*session_id) {
                     self.latest_warning = None;
                 }
-                if overlay_message_session_id(self.latest_message.as_ref()) != Some(*session_id) {
-                    self.utterance_started_at = Some(Instant::now());
+                if !session_id.is_nil()
+                    && self.utterance_started.map(|(id, _)| id) != Some(*session_id)
+                {
+                    self.utterance_started = Some((*session_id, Instant::now()));
                 }
                 self.latest_message = Some(message.clone());
             }
@@ -438,8 +442,9 @@ impl OverlayProcessManager {
             .or_else(|| {
                 let limit = limit_seconds?;
                 let session_age = self
-                    .utterance_started_at
-                    .map(|at| at.elapsed().as_secs_f32())
+                    .utterance_started
+                    .filter(|(id, _)| *id == session_id)
+                    .map(|(_, at)| at.elapsed().as_secs_f32())
                     .unwrap_or(0.0);
                 Some((limit - session_age).max(0.0))
             });
@@ -451,8 +456,8 @@ impl OverlayProcessManager {
     }
 
     #[cfg(test)]
-    fn set_utterance_started_at_for_tests(&mut self, at: Instant) {
-        self.utterance_started_at = Some(at);
+    fn set_utterance_started_for_tests(&mut self, session_id: Uuid, at: Instant) {
+        self.utterance_started = Some((session_id, at));
     }
 
     #[cfg(test)]
@@ -623,7 +628,7 @@ impl OverlayProcessManager {
             latest_message: None,
             latest_warning: None,
             latest_warning_at: None,
-            utterance_started_at: None,
+            utterance_started: None,
             focus_cache,
             pending_output_name: None,
             utterance_active: false,
@@ -778,7 +783,8 @@ mod tests {
             limit_seconds: Some(600.0),
         });
         manager.set_latest_warning_at_for_tests(Instant::now() - Duration::from_secs(110));
-        manager.set_utterance_started_at_for_tests(Instant::now() - Duration::from_secs(590));
+        manager
+            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(590));
         let replay = manager.replay_messages();
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
@@ -794,7 +800,8 @@ mod tests {
             "remaining from the cap minus the session age: {remaining}"
         );
 
-        manager.set_utterance_started_at_for_tests(Instant::now() - Duration::from_secs(700));
+        manager
+            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(700));
         let replay = manager.replay_messages();
         let Some(OverlayIpcMessage::SessionWarning {
             remaining_seconds: Some(remaining),
@@ -804,6 +811,46 @@ mod tests {
             panic!("warning should replay: {replay:?}");
         };
         assert_eq!(*remaining, 0.0);
+    }
+
+    #[test]
+    fn the_busy_notice_does_not_restart_the_utterance_clock() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut manager = OverlayProcessManager::new_for_tests(
+            OverlayMode::Disabled,
+            true,
+            queued_launcher(queue),
+            Duration::from_millis(1),
+        );
+        let session_id = Uuid::new_v4();
+        let interim = |session_id: Uuid, seq: u64| OverlayIpcMessage::InterimState {
+            session_id,
+            producer: OverlayTextProducer::DaemonSttInterim,
+            seq,
+            state: "listening".to_string(),
+        };
+        manager.remember_replay_state(&interim(session_id, 1));
+        manager
+            .set_utterance_started_for_tests(session_id, Instant::now() - Duration::from_secs(590));
+        manager.remember_replay_state(&interim(Uuid::nil(), 2));
+        manager.remember_replay_state(&interim(session_id, 3));
+        manager.remember_replay_state(&OverlayIpcMessage::SessionWarning {
+            session_id,
+            remaining_seconds: None,
+            limit_seconds: Some(600.0),
+        });
+        let replay = manager.replay_messages();
+        let Some(OverlayIpcMessage::SessionWarning {
+            remaining_seconds: Some(remaining),
+            ..
+        }) = replay.get(1)
+        else {
+            panic!("warning should replay: {replay:?}");
+        };
+        assert!(
+            (9.0..=10.5).contains(remaining),
+            "the clock kept counting through the busy notice: {remaining}"
+        );
     }
 
     #[test]
