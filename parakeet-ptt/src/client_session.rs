@@ -55,6 +55,9 @@ pub(crate) struct ClientFocusRouter {
 #[derive(Clone)]
 pub(crate) struct ClientInjectionDispatcher {
     worker: InjectorWorkerHandle,
+    /// The configured injection behaviour is copy-only, so the Overlay reports
+    /// a success as copied rather than pasted.
+    copy_only: bool,
 }
 
 pub(crate) struct ClientLlmQueryRuntime {
@@ -661,8 +664,8 @@ impl ClientLlmQueryRuntime {
 }
 
 impl ClientInjectionDispatcher {
-    pub(crate) fn new(worker: InjectorWorkerHandle) -> Self {
-        Self { worker }
+    pub(crate) fn new(worker: InjectorWorkerHandle, copy_only: bool) -> Self {
+        Self { worker, copy_only }
     }
 
     async fn dispatch_raw_final_result(
@@ -906,7 +909,7 @@ impl ClientInjectionDispatcher {
             );
         }
 
-        overlay_router.route_injection_complete(report.session_id, success);
+        overlay_router.route_injection_complete(report.session_id, success, self.copy_only);
     }
 }
 
@@ -1532,7 +1535,7 @@ mod tests {
         injector_worker: &InjectorWorkerHandle,
     ) -> anyhow::Result<()> {
         let mut focus_router = ClientFocusRouter::default();
-        let injection_dispatcher = ClientInjectionDispatcher::new(injector_worker.clone());
+        let injection_dispatcher = ClientInjectionDispatcher::new(injector_worker.clone(), false);
         handle_server_message(
             message,
             runtime,
@@ -2284,7 +2287,7 @@ mod tests {
             seen: Arc::clone(&seen_jobs),
         });
         let (worker, mut reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let dispatcher = ClientInjectionDispatcher::new(worker);
+        let dispatcher = ClientInjectionDispatcher::new(worker, false);
         let session_id = Uuid::new_v4();
         let mut focus_router = ClientFocusRouter::default();
         let parent_focus = parent_focus_from_observation(FocusObservation::from_wayland(
@@ -2381,7 +2384,7 @@ mod tests {
             .await
             .expect("second enqueue should fill the bounded queue");
 
-        let dispatcher = ClientInjectionDispatcher::new(worker);
+        let dispatcher = ClientInjectionDispatcher::new(worker, false);
         let session_id = Uuid::new_v4();
         let mut focus_router = ClientFocusRouter::default();
         focus_router.record_parent_focus_for_tests(
@@ -2432,7 +2435,7 @@ mod tests {
             seen: Arc::new(Mutex::new(Vec::new())),
         });
         let (worker, _reports) = spawn_injector_worker_with_capacity(injector, 4);
-        let dispatcher = ClientInjectionDispatcher::new(worker.clone());
+        let dispatcher = ClientInjectionDispatcher::new(worker.clone(), false);
         let session_id = Uuid::new_v4();
         let seen_overlay_events = Arc::new(Mutex::new(Vec::<OverlayEvent>::new()));
         let mut overlay_router = OverlayRouter::new(RecordingOverlaySink {
@@ -2481,6 +2484,7 @@ mod tests {
             &[OverlayEvent::InjectionComplete {
                 session_id,
                 success: false,
+                copy_only: false,
             }]
         );
     }
@@ -2536,7 +2540,7 @@ mod tests {
         let (mut runtime, session_id) = runtime_waiting_for_result_with_timing(stop_message_at);
         let mut focus_router = ClientFocusRouter::default();
         let mut overlay_router = OverlayRouter::new(NoopOverlaySink);
-        let injection_dispatcher = ClientInjectionDispatcher::new(worker.clone());
+        let injection_dispatcher = ClientInjectionDispatcher::new(worker.clone(), false);
 
         handle_server_message(
             ServerMessage::FinalResult {

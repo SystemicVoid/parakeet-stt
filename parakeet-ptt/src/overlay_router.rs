@@ -79,6 +79,7 @@ pub enum OverlayEvent {
     InjectionComplete {
         session_id: Uuid,
         success: bool,
+        copy_only: bool,
     },
     SessionWarning {
         session_id: Uuid,
@@ -158,9 +159,11 @@ fn overlay_event_to_ipc(event: OverlayEvent) -> OverlayIpcMessage {
         OverlayEvent::InjectionComplete {
             session_id,
             success,
+            copy_only,
         } => OverlayIpcMessage::InjectionComplete {
             session_id,
             success,
+            copy_only,
         },
         OverlayEvent::SessionWarning {
             session_id,
@@ -466,10 +469,16 @@ impl<S: OverlaySink> OverlayRouter<S> {
         self.metrics.note_interim_text();
     }
 
-    pub(crate) fn route_injection_complete(&mut self, session_id: Uuid, success: bool) {
+    pub(crate) fn route_injection_complete(
+        &mut self,
+        session_id: Uuid,
+        success: bool,
+        copy_only: bool,
+    ) {
         self.sink.on_overlay_event(OverlayEvent::InjectionComplete {
             session_id,
             success,
+            copy_only,
         });
     }
 

@@ -62,6 +62,8 @@ pub struct SessionView {
     /// A transient notice layered over the view (the busy rejection).
     pub notice: Option<String>,
     pub reason: Option<String>,
+    /// The client injects copy-only, so a successful injection copied rather than pasted.
+    pub copy_only: bool,
     pub started_ms: u64,
     /// Set when the Session ended (or finalization started); the timer freezes here.
     pub ended_ms: Option<u64>,
@@ -84,6 +86,7 @@ impl SessionView {
             status: None,
             notice: None,
             reason: None,
+            copy_only: false,
             started_ms: now_ms,
             ended_ms: None,
             warning: None,
@@ -169,6 +172,9 @@ pub struct OverlayStateMachine {
     active_session_id: Option<Uuid>,
     last_seq_by_producer: HashMap<OverlayTextProducer, u64>,
     hide_deadline_ms: Option<u64>,
+    /// When the transient notice clears; the busy sequence ends it with a nil
+    /// `SessionEnded`, which would otherwise erase the notice before it was seen.
+    notice_deadline_ms: Option<u64>,
     auto_hide_after_ms: u64,
 }
 
@@ -179,6 +185,7 @@ impl OverlayStateMachine {
             active_session_id: None,
             last_seq_by_producer: HashMap::new(),
             hide_deadline_ms: None,
+            notice_deadline_ms: None,
             auto_hide_after_ms: auto_hide_after.as_millis() as u64,
         }
     }
@@ -200,6 +207,7 @@ impl OverlayStateMachine {
             } => {
                 if session_id.is_nil() {
                     self.set_notice(Some(state));
+                    self.notice_deadline_ms = None;
                     return ApplyOutcome::Applied;
                 }
                 if let Some(outcome) = self.apply_seq(session_id, producer, seq) {
@@ -239,6 +247,7 @@ impl OverlayStateMachine {
             } => {
                 if session_id.is_nil() {
                     self.set_notice(Some(text));
+                    self.notice_deadline_ms = None;
                     return ApplyOutcome::Applied;
                 }
                 if let Some(outcome) = self.apply_seq(session_id, producer, seq) {
@@ -265,7 +274,7 @@ impl OverlayStateMachine {
             }
             OverlayIpcMessage::SessionEnded { session_id, reason } => {
                 if session_id.is_nil() {
-                    self.set_notice(None);
+                    self.notice_deadline_ms = Some(now_ms.saturating_add(self.auto_hide_after_ms));
                     return ApplyOutcome::Applied;
                 }
                 if let Some(active_session_id) = self.active_session_id {
@@ -287,18 +296,28 @@ impl OverlayStateMachine {
             OverlayIpcMessage::SessionWarning {
                 session_id,
                 remaining_seconds,
-                ..
+                limit_seconds,
             } => {
                 if self.active_session_id != Some(session_id) {
                     return ApplyOutcome::DroppedSessionMismatch;
                 }
                 if let OverlayVisibility::Visible(view) = &mut self.visibility {
                     if view.session_id == session_id {
+                        let to_ms = |seconds: f32| (seconds.max(0.0) * 1000.0).round() as u64;
+                        let elapsed_ms = view.elapsed_ms(now_ms);
+                        // Prefer the Daemon's remaining time; fall back to the cap
+                        // minus the time this view has seen.
+                        let remaining_ms = remaining_seconds
+                            .filter(|seconds| seconds.is_finite())
+                            .map(to_ms)
+                            .or_else(|| {
+                                limit_seconds
+                                    .filter(|seconds| seconds.is_finite())
+                                    .map(|limit| to_ms(limit).saturating_sub(elapsed_ms))
+                            });
                         view.warning = Some(CapWarning {
                             at_ms: now_ms,
-                            remaining_ms: remaining_seconds
-                                .filter(|seconds| seconds.is_finite())
-                                .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64),
+                            remaining_ms,
                         });
                     }
                 }
@@ -307,9 +326,11 @@ impl OverlayStateMachine {
             OverlayIpcMessage::InjectionComplete {
                 session_id,
                 success,
+                copy_only,
             } => match &mut self.visibility {
                 OverlayVisibility::Visible(view) if view.session_id == session_id => {
                     view.phase = OverlayPhase::Done { success };
+                    view.copy_only = copy_only;
                     view.ended_ms.get_or_insert(now_ms);
                     self.hide_deadline_ms = Some(now_ms.saturating_add(DONE_LINGER_MS));
                     ApplyOutcome::Applied
@@ -321,16 +342,26 @@ impl OverlayStateMachine {
 
     /// Returns true when the deadline passed and the Overlay went hidden.
     pub fn advance_time(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        if self
+            .notice_deadline_ms
+            .is_some_and(|deadline| now_ms >= deadline)
+        {
+            self.notice_deadline_ms = None;
+            self.set_notice(None);
+            changed = true;
+        }
         if let Some(deadline_ms) = self.hide_deadline_ms {
             if now_ms >= deadline_ms {
                 self.visibility = OverlayVisibility::Hidden;
                 self.active_session_id = None;
                 self.last_seq_by_producer.clear();
                 self.hide_deadline_ms = None;
+                self.notice_deadline_ms = None;
                 return true;
             }
         }
-        false
+        changed
     }
 
     fn set_notice(&mut self, notice: Option<String>) {
@@ -353,6 +384,7 @@ impl OverlayStateMachine {
             self.visibility =
                 OverlayVisibility::Visible(SessionView::new(session_id, producer, now_ms));
             self.hide_deadline_ms = None;
+            self.notice_deadline_ms = None;
         }
         match &mut self.visibility {
             OverlayVisibility::Visible(view) => view,
@@ -452,6 +484,7 @@ mod tests {
         OverlayIpcMessage::InjectionComplete {
             session_id,
             success,
+            copy_only: false,
         }
     }
 
@@ -601,6 +634,14 @@ mod tests {
             ),
             ApplyOutcome::Applied
         );
+        // The notice outlives the nil SessionEnded that closes the busy sequence.
+        assert_eq!(
+            view(&machine).notice.as_deref(),
+            Some("LLM busy; wait for current answer")
+        );
+        assert_eq!(view(&machine).reason, None);
+        assert!(!machine.advance_time(700 + 499));
+        assert!(machine.advance_time(700 + 500));
         assert_eq!(view(&machine).notice, None);
         assert_eq!(view(&machine).reason, None);
 
@@ -657,6 +698,40 @@ mod tests {
         );
         assert!(view(&machine).warning.is_some());
         assert_eq!(view(&machine).remaining_ms(200), None);
+    }
+
+    #[test]
+    fn warning_with_only_the_cap_counts_down_from_the_cap_minus_elapsed() {
+        let mut machine = machine();
+        let session_id = Uuid::new_v4();
+        machine.apply_event(text(session_id, 1, "talk"), 0);
+        machine.apply_event(
+            OverlayIpcMessage::SessionWarning {
+                session_id,
+                remaining_seconds: None,
+                limit_seconds: Some(10.0),
+            },
+            4_000,
+        );
+        assert_eq!(view(&machine).remaining_ms(4_000), Some(6_000));
+        assert_eq!(view(&machine).remaining_ms(9_000), Some(1_000));
+    }
+
+    #[test]
+    fn copy_only_injection_is_remembered_on_the_view() {
+        let mut machine = machine();
+        let session_id = Uuid::new_v4();
+        machine.apply_event(text(session_id, 1, "talk"), 0);
+        machine.apply_event(
+            OverlayIpcMessage::InjectionComplete {
+                session_id,
+                success: true,
+                copy_only: true,
+            },
+            100,
+        );
+        assert_eq!(view(&machine).phase, OverlayPhase::Done { success: true });
+        assert!(view(&machine).copy_only);
     }
 
     #[test]

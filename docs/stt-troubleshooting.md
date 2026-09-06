@@ -139,8 +139,10 @@ The schema-defined Runtime Truth groups are `core`, `device`, `stream_path`,
   rule filling, width and height changes, the lamp word, and the timer are not
   inference, transport, or LLM progress evidence. The timer counts from the
   first event the renderer saw for the Session, so after an Overlay respawn it
-  restarts from zero; the cap countdown likewise only shows if the warning
-  arrived after the respawn.
+  restarts from zero; the cap countdown is replayed with its remaining time
+  aged, so it carries on from where the previous renderer was. The lamp reads
+  `PASTED` after a successful injection, or `COPIED` when the Client runs
+  copy-only injection.
 
 ### Seal path tail trimming
 

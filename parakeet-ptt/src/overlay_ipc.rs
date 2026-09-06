@@ -45,6 +45,10 @@ pub enum OverlayIpcMessage {
     InjectionComplete {
         session_id: Uuid,
         success: bool,
+        /// The client runs copy-only injection, so a success left the text on the
+        /// clipboard rather than pasting it.
+        #[serde(default)]
+        copy_only: bool,
     },
     SessionEnded {
         session_id: Uuid,
@@ -169,6 +173,7 @@ mod tests {
         let message = OverlayIpcMessage::InjectionComplete {
             session_id,
             success: true,
+            copy_only: false,
         };
 
         let encoded = serde_json::to_string(&message).expect("message should serialize");
