@@ -60,7 +60,8 @@
   const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
   const norm = (db) => clamp((db + 55) / 30, 0, 1); // owner's mic: noise ≈ -55, speech ≈ -32
   const fmtUp = (ms) => {
-    const s = Math.max(0, ms) / 1000, m = Math.floor(s / 60), r = s - m * 60;
+    // Round to tenths before the minute split so 59.95 s reads 1:00.0, not 0:60.0.
+    const tenths = Math.round(Math.max(0, ms) / 100), m = Math.floor(tenths / 600), r = (tenths - m * 600) / 10;
     return m + ':' + (r < 10 ? '0' : '') + r.toFixed(1);
   };
   const fmtDown = (ms) => {

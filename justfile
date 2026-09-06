@@ -204,4 +204,4 @@ overlay-preview out="/tmp/parakeet-overlay-preview":
 
 # Serve the throwaway overlay look-and-feel prototype (parakeet-ptt/prototypes/overlay-look).
 overlay-proto port="8765":
-    @bash -lc 'cd "{{repo_root}}/parakeet-ptt/prototypes/overlay-look" && echo ">>> http://localhost:{{port}}/?variant=c" && if curl -fs -o /dev/null "http://localhost:{{port}}/"; then echo "already serving on {{port}}"; else python3 -m http.server "{{port}}"; fi'
+    @bash -lc 'cd "{{repo_root}}/parakeet-ptt/prototypes/overlay-look" && echo ">>> http://localhost:{{port}}/?variant=f" && if curl -fs -o /dev/null "http://localhost:{{port}}/"; then echo "already serving on {{port}}"; else python3 -m http.server "{{port}}"; fi'

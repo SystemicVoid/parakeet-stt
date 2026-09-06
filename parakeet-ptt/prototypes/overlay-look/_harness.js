@@ -176,7 +176,7 @@
     while (elapsed < durationMs) {
       const step = Math.min(CHUNK_MS, durationMs - elapsed);
       await sleep(step);
-      if (token !== runToken) return false;
+      if (token !== runToken || !speaking) return false;
       elapsed += step;
       const spoken = Math.min(words.length, Math.floor((elapsed / 1000) * wps));
       if (spoken <= prevSpokenCount) continue;

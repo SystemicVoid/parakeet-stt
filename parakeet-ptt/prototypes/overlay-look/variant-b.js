@@ -70,9 +70,10 @@
   const esc = (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c);
 
   function clock(ms) {
-    const s = Math.max(0, ms) / 1000;
-    const m = Math.floor(s / 60);
-    const r = s - m * 60;
+    // Round to tenths before the minute split so 59.95 s reads 01:00.0, not 00:60.0.
+    const tenths = Math.round(Math.max(0, ms) / 100);
+    const m = Math.floor(tenths / 600);
+    const r = (tenths - m * 600) / 10;
     return String(m).padStart(2, '0') + ':' + (r < 10 ? '0' : '') + r.toFixed(1);
   }
 
