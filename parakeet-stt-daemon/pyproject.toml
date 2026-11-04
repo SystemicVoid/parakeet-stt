@@ -30,7 +30,7 @@ Repository = "https://github.com/SystemicVoid/parakeet-stt"
 
 [project.optional-dependencies]
 inference = [
-  "torch>=2.5.1",
+  "torch>=2.13.0",
   "nemo-toolkit[asr]>=2.6.2,<2.7",
 ]
 
