@@ -7,7 +7,7 @@ import os
 import shlex
 import subprocess
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -50,7 +50,7 @@ START_PROFILE_ROW_FIELDS = (
 
 
 @contextmanager
-def _preserve_paths(*paths: Path) -> Iterator[None]:
+def _preserve_paths(*paths: Path) -> Generator[None]:
     snapshots = {path: path.read_bytes() if path.exists() else None for path in paths}
     try:
         yield
